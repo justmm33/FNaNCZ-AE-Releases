@@ -1,3 +1,3 @@
 latest = "v.1.3.10"
-download_link_windows = "https://www.mediafire.com/file/mq64juw9puab2wv/Five+Nights+at+NCZ+AE+v1.3.10.zip/file"
-download_link_android = "https://www.mediafire.com/file/9bwdtcjelfw0pgr/Five+Nights+at+NCZ+AE+v1.3.10.apk/file"
+download_link_windows = "https://www.mediafire.com/file/dq9ukyx6vbc5jwo/Five+Nights+at+NCZ+AE+v1.3.10.zip/file"
+download_link_android = "https://www.mediafire.com/file/mmrhsmnyozqbt4y/Five+Nights+at+NCZ+AE+v1.3.10.apk/file"
