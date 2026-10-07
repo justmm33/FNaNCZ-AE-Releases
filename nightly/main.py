@@ -7971,7 +7971,18 @@ def pretty_game_name(name):
         return re.sub(r"(^|[\s\-_:.])([a-z])", lambda m: m.group(1) + m.group(2).upper(), name)
     return name
 
+_library_snapshot = []  # every game card in the launcher, kept up to date from the GUI thread
+
+def _canonical_title(name):
+    low = str(name).lower()
+    for t in _library_snapshot:
+        if t.lower() == low:
+            return t
+    return name
+
 def friends_library_titles():
+    if _library_snapshot:
+        return list(_library_snapshot)
     titles = []
     for info in GAME_INFO.values():
         if os.path.isdir(installed_game_dir(info["name"])) or os.path.isdir(wine_game_dir(info["name"])):
@@ -7994,13 +8005,13 @@ def _game_name_for_args(args):
         full = os.path.abspath(a)
         norm = os.path.normcase(full)
         if norm in known:
-            return known[norm]
+            return _canonical_title(known[norm])
         if norm.startswith(games_root + os.sep):
             first = os.path.relpath(full, os.path.abspath(GAMES_DIR)).split(os.sep)[0]
             for info in GAME_INFO.values():
                 if first.lower().startswith(info["name"].lower()):
-                    return info["name"]
-            return first
+                    return _canonical_title(info["name"])
+            return _canonical_title(first)
     return None
 
 _running = {}  # game name -> Popen of the running game
@@ -8970,6 +8981,61 @@ def _selfupdate_init(self):
     QTimer.singleShot(1500, lambda: threading.Thread(target=work, daemon=True).start())
 
 AdaptiveApp.__init__ = _selfupdate_init
+
+
+# ---------------------------------------------------------------- full library for friends + NCZFront "playing"
+_lib_prev_init = AdaptiveApp.__init__
+
+def _lib_init(self):
+    _lib_prev_init(self)
+    def snap():
+        titles = []
+        for card, title in list(self.cards):
+            try:
+                card.objectName()  # raises if the card was deleted
+            except RuntimeError:
+                continue
+            t = pretty_game_name(title)
+            if t and t not in titles:
+                titles.append(t)
+        if titles and titles != _library_snapshot:
+            first = not _library_snapshot
+            _library_snapshot[:] = titles
+            if not first:
+                for cb in list(_playing_listeners):
+                    cb()
+    self._lib_timer = QTimer(self)
+    self._lib_timer.setInterval(3000)
+    self._lib_timer.timeout.connect(snap)
+    self._lib_timer.start()
+    snap()
+
+AdaptiveApp.__init__ = _lib_init
+
+# NCZFront is a website, so there is no process to watch: count it as "playing" for 30 minutes after opening.
+_web_until = {"t": 0.0}
+_real_webbrowser_open = webbrowser.open
+
+def _tracked_webbrowser_open(url, *a, **k):
+    result = _real_webbrowser_open(url, *a, **k)
+    try:
+        if str(url).rstrip("/") == NCZFRONT_URL.rstrip("/"):
+            _web_until["t"] = time.time() + 1800
+            _now_playing["name"] = "NCZFront"
+            for cb in list(_playing_listeners):
+                cb()
+            def expire():
+                time.sleep(1805)
+                if time.time() >= _web_until["t"] and _now_playing["name"] == "NCZFront":
+                    _now_playing["name"] = next(iter(_running), None)
+                    for cb in list(_playing_listeners):
+                        cb()
+            threading.Thread(target=expire, daemon=True).start()
+    except Exception:
+        pass
+    return result
+
+webbrowser.open = _tracked_webbrowser_open
 
 if __name__ == "__main__":
     main()
