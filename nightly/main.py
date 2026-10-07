@@ -8133,6 +8133,12 @@ def _friend_cover_file(uid, key, b64):
         return None
     return path
 
+# Idle = the launcher window is minimized (or hidden in the tray).
+_window_state = {"minimized": False}
+
+def is_idle():
+    return _window_state["minimized"]
+
 def cloud_publish_presence():
     token, uid = get_id_token()
     username, avatar = load_profile_cache()
@@ -8140,6 +8146,7 @@ def cloud_publish_presence():
         "username": username or (load_account() or {}).get("email", "").split("@")[0] or "Player",
         "library": friends_library_titles(),
         "playing": _now_playing["name"] or "",
+        "idle": is_idle(),
         "seen": {".sv": "timestamp"},
         "photo": None,
     }
@@ -8151,6 +8158,10 @@ def cloud_publish_presence():
         cloud_publish_covers(token, uid)
     except CloudError:
         pass  # covers are optional; never break presence over them
+
+def cloud_publish_offline():
+    token, uid = get_id_token()
+    _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "idle": False, "playing": ""})
 
 def cloud_accept_friend(other):
     token, uid = get_id_token()
@@ -8246,6 +8257,8 @@ def _friend_status(d):
         return f"Playing {pretty_game_name(d['playing'])}", GREEN
     seen = d.get("seen")
     if isinstance(seen, (int, float)) and time.time() * 1000 - seen < FRIEND_ONLINE_WINDOW_MS:
+        if d.get("idle") is True:
+            return "Idle", "#3b82f6"
         return "Online", GREEN
     return "Offline", "#888888"
 
@@ -9201,6 +9214,39 @@ def _tracked_webbrowser_open(url, *a, **k):
     return result
 
 webbrowser.open = _tracked_webbrowser_open
+
+# ---------------------------------------------------------------- idle (minimized) + offline (quit) for friends
+_idle_prev_init = AdaptiveApp.__init__
+
+def _idle_init(self):
+    _idle_prev_init(self)
+
+    def refresh_state():
+        minimized = self.isMinimized() or not self.isVisible()
+        if minimized != _window_state["minimized"]:
+            _window_state["minimized"] = minimized
+            self.friends_page._playing_changed()  # publishes presence right away if signed in
+
+    self._state_timer = QTimer(self)
+    self._state_timer.setInterval(1000)
+    self._state_timer.timeout.connect(refresh_state)
+    self._state_timer.start()
+
+    def go_offline():
+        if not self.friends_page._signed_in():
+            return
+        def work():
+            try:
+                cloud_publish_offline()
+            except Exception:
+                pass
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(3)  # don't hang the exit if the network is down
+
+    QApplication.instance().aboutToQuit.connect(go_offline)
+
+AdaptiveApp.__init__ = _idle_init
 
 if __name__ == "__main__":
     main()
