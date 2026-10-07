@@ -8934,6 +8934,8 @@ def self_update_check():
     """Replaces this script with the latest release if it differs. True if it was replaced."""
     if getattr(sys, "frozen", False):
         return False  # packaged builds can't rewrite themselves
+    if os.environ.get("NCZ_NO_UPDATE"):
+        return False  # handy for testing a local build
     path = os.path.abspath(__file__)
     acct = load_account()
     base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
