@@ -8913,5 +8913,63 @@ def _stop_init(self):
 
 AdaptiveApp.__init__ = _stop_init
 
+
+# ---------------------------------------------------------------- self-update at launch
+SELF_UPDATE_STABLE_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/main.py"
+SELF_UPDATE_NIGHTLY_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/nightly/main.py"
+NIGHTLY_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
+
+def self_update_check():
+    """Replaces this script with the latest release if it differs. True if it was replaced."""
+    if getattr(sys, "frozen", False):
+        return False  # packaged builds can't rewrite themselves
+    path = os.path.abspath(__file__)
+    acct = load_account()
+    base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
+    req = urllib.request.Request(f"{base}?t={int(time.time())}",
+                                 headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        remote = resp.read()
+    if len(remote) < 2000:
+        return False
+    def norm(b):
+        return b.replace(b"\r\n", b"\n").strip()
+    with open(path, "rb") as f:
+        local = f.read()
+    if norm(remote) == norm(local):
+        return False
+    compile(remote, path, "exec")  # refuse to install a broken download
+    tmp = path + ".update"
+    with open(tmp, "wb") as f:
+        f.write(remote)
+    try:
+        shutil.copy2(path, path + ".bak")
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return True
+
+class _SelfUpdateSignal(QObject):
+    updated = pyqtSignal()
+
+_selfupdate_prev_init = AdaptiveApp.__init__
+
+def _selfupdate_init(self):
+    _selfupdate_prev_init(self)
+    self._selfupdate_sig = _SelfUpdateSignal(self)
+    self._selfupdate_sig.updated.connect(lambda: QMessageBox.information(
+        self, "Launcher updated",
+        "The launcher has been updated to the latest version.\n\n"
+        "Please restart the tool to apply the update."))
+    def work():
+        try:
+            if self_update_check():
+                self._selfupdate_sig.updated.emit()
+        except Exception:
+            pass
+    QTimer.singleShot(1500, lambda: threading.Thread(target=work, daemon=True).start())
+
+AdaptiveApp.__init__ = _selfupdate_init
+
 if __name__ == "__main__":
     main()
