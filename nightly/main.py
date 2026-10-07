@@ -8509,7 +8509,6 @@ class FriendsPage(QWidget):
             for uid, (online, playing) in state.items():
                 was_online, was_playing = self._prev_state.get(uid, (False, ""))
                 name = self.friends[uid].get("username") or "A friend"
-                self.notify_uid = uid
                 if playing and playing != was_playing:
                     self.friend_event.emit(name, f"is now playing {pretty_game_name(playing)}", uid)
                 elif online and not was_online:
@@ -8534,7 +8533,6 @@ class FriendsPage(QWidget):
                     continue
                 name = self.friends.get(uid, {}).get("username") or "A friend"
                 text = str(msg.get("text", ""))
-                self.notify_uid = uid
                 self.friend_event.emit(name, text if len(text) <= 100 else text[:97] + "...", uid)
         self._prev_last = {uid: key for uid, (key, _m) in last.items()}
 
@@ -8840,7 +8838,7 @@ def _friends_init(self):
 AdaptiveApp.__init__ = _friends_init
 
 # ---------------------------------------------------------------- background + tray notifications
-from PyQt6.QtWidgets import QSystemTrayIcon
+from PyQt6.QtWidgets import QSystemTrayIcon, QStyle
 from PyQt6.QtGui import QAction
 
 _tray_prev_init = AdaptiveApp.__init__
@@ -8849,19 +8847,20 @@ def _tray_init(self):
     _tray_prev_init(self)
     self._really_quit = False
     self._tray = None
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        return
+    self._tray_hint_shown = False
     app = QApplication.instance()
-    app.setQuitOnLastWindowClosed(False)
+
+    # The tray icon is optional. GNOME (without the AppIndicator extension) and some Wayland
+    # setups report "no system tray", but desktop notifications can still work through
+    # notify-send, so only the tray-specific parts are skipped when it's missing.
     icon = self.windowIcon()
-    tray = QSystemTrayIcon(icon, self)
-    tray.setToolTip("NCZ Games Launcher")
-    menu = QMenu()
-    open_act = QAction("Open launcher", menu)
-    quit_act = QAction("Quit", menu)
-    menu.addAction(open_act)
-    menu.addAction(quit_act)
-    tray.setContextMenu(menu)
+    if icon.isNull():
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+    tray = None
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        app.setQuitOnLastWindowClosed(False)
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("NCZ Games Launcher")
 
     def show_window():
         self.showNormal()
@@ -8878,23 +8877,34 @@ def _tray_init(self):
         if b:
             b.setChecked(True)
 
-    def quit_app():
-        self._really_quit = True
-        tray.hide()
-        app.quit()
+    if tray is not None:
+        menu = QMenu(self)
+        self._tray_menu = menu
+        open_act = QAction("Open launcher", menu)
+        quit_act = QAction("Quit", menu)
+        menu.addAction(open_act)
+        menu.addAction(quit_act)
+        tray.setContextMenu(menu)
 
-    open_act.triggered.connect(show_window)
-    quit_act.triggered.connect(quit_app)
-    tray.activated.connect(lambda reason: show_window()
-                           if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-    tray.messageClicked.connect(show_friends)
-    use_ns = False
-    if sys.platform.startswith("linux") and shutil.which("notify-send"):
+        def quit_app():
+            self._really_quit = True
+            tray.hide()
+            app.quit()
+
+        open_act.triggered.connect(show_window)
+        quit_act.triggered.connect(quit_app)
+        tray.activated.connect(lambda reason: show_window()
+                               if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        tray.messageClicked.connect(show_friends)
+
+    has_ns = sys.platform.startswith("linux") and bool(shutil.which("notify-send"))
+    ns_actions = False
+    if has_ns:
         try:
-            use_ns = "--action" in subprocess.run(["notify-send", "--help"], capture_output=True,
-                                                  text=True, timeout=5).stdout
+            r = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=5)
+            ns_actions = "--action" in ((r.stdout or "") + (r.stderr or ""))
         except Exception:
-            use_ns = False
+            ns_actions = False
 
     def friend_picture(uid):
         d = self.friends_page.friends.get(uid) or self.friends_page.requests.get(uid) or {}
@@ -8910,11 +8920,12 @@ def _tray_init(self):
         return path, QIcon(path)
 
     def notify_send(title, msg, icon_path, uid):
-        args = ["notify-send", "-a", "NCZ Games Launcher", "-t", "5000",
-                "-A", "default=Open", "-w"]
+        args = ["notify-send", "-a", "NCZ Games Launcher", "-t", "5000"]
+        if ns_actions:
+            args += ["-A", "default=Open", "-w"]
         if icon_path:
             args += ["-i", icon_path]
-        args += [title, msg]
+        args += ["--", title, msg]  # "--" so a message starting with "-" isn't read as an option
         def work():
             try:
                 p = _RealPopen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -8923,18 +8934,22 @@ def _tray_init(self):
                 except subprocess.TimeoutExpired:
                     p.kill()
                     return
-                if out.strip() == "default":
+                if ns_actions and out.strip() == "default":
                     self.friends_page.notif_clicked.emit(uid)
             except Exception:
                 pass
         threading.Thread(target=work, daemon=True).start()
 
     def notify(name, msg, uid):
-        icon_path, pic = friend_picture(uid)
-        if use_ns:
+        self.friends_page.notify_uid = uid
+        try:
+            icon_path, pic = friend_picture(uid)
+        except Exception:
+            icon_path, pic = None, None
+        if has_ns:
             fallback_icon = asset_path("icon.png")
             notify_send(name, msg, icon_path or (fallback_icon if os.path.exists(fallback_icon) else None), uid)
-        else:
+        elif tray is not None:
             tray.showMessage(name, msg, pic or icon, 5000)
 
     def on_clicked(uid):
@@ -8943,9 +8958,10 @@ def _tray_init(self):
 
     self.friends_page.notif_clicked.connect(on_clicked)
     self.friends_page.friend_event.connect(notify)
-    tray.show()
+    if tray is not None:
+        tray.show()
     self._tray = tray
-    self._tray_hint_shown = False
+
 
 def _tray_close_event(self, event):
     tray = getattr(self, "_tray", None)
