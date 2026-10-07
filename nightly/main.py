@@ -9417,88 +9417,172 @@ class GmodAddonManagerPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtWidgets import QTabWidget, QListWidget, QListWidgetItem, QProgressBar
-        self._QListWidgetItem = QListWidgetItem
+        from PyQt6.QtWidgets import QProgressBar, QSizePolicy
+        self._QSizePolicy = QSizePolicy
         self.root = None
         self.worker = None
+        self.rows = []
         self.setObjectName("Content")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 28, 36, 24)
-        layout.setSpacing(0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(36, 28, 36, 20)
+        outer.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(0)
         title = QLabel("Garry's Mod Addon Manager")
         title.setObjectName("PageTitle")
-        layout.addWidget(title)
-        layout.addSpacing(16)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("PageCount")
+        head.addWidget(title)
+        head.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addStretch()
+        outer.addLayout(head)
+        outer.addSpacing(4)
+        self.path_label = QLabel()
+        self.path_label.setObjectName("RowDesc")
+        outer.addWidget(self.path_label)
+        outer.addSpacing(18)
 
-        tabs = QTabWidget()
-        layout.addWidget(tabs, 1)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(8)
+        self.tab_group = QButtonGroup(self)
+        for i, text in enumerate(("Installed addons", "Install from Workshop")):
+            b = QPushButton(text)
+            b.setObjectName("GmodTab")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.tab_group.addButton(b, i)
+            tabs.addWidget(b)
+        tabs.addStretch()
+        self.tab_group.button(0).setChecked(True)
+        outer.addLayout(tabs)
+        outer.addSpacing(16)
+        self.stack = QStackedWidget()
+        outer.addWidget(self.stack, 1)
+        self.tab_group.idClicked.connect(self.stack.setCurrentIndex)
 
-        # ---- Extract & Install
-        ex = QWidget()
-        exl = QVBoxLayout(ex)
-        exl.setContentsMargins(0, 16, 0, 0)
-        exl.setSpacing(10)
-        hint = QLabel("Pick the folder with your Workshop addons (.gma / legacy .bin). "
-                      "They are extracted into garrysmod/addons.")
-        hint.setObjectName("RowDesc")
-        hint.setWordWrap(True)
-        exl.addWidget(hint)
-        row = QHBoxLayout()
-        self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("Workshop addons path")
-        self.path_edit.setText(load_launcher_settings().get("gmod_workshop_path", ""))
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self.browse_workshop)
-        clear = QPushButton("Clear path cache")
-        clear.clicked.connect(self.clear_path_cache)
-        row.addWidget(self.path_edit, 1)
-        row.addWidget(browse)
-        row.addWidget(clear)
-        exl.addLayout(row)
-        self.extract_btn = QPushButton("Extract && Install addons")
-        self.extract_btn.setObjectName("Primary")
-        self.extract_btn.setFixedHeight(38)
-        self.extract_btn.clicked.connect(self.start_extract)
-        exl.addWidget(self.extract_btn)
-        self.bar = QProgressBar()
-        self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(8)
-        exl.addWidget(self.bar)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        exl.addWidget(self.log_view, 1)
-        tabs.addTab(ex, "Extract && Install")
-
-        # ---- Enable / Disable
-        tg = QWidget()
-        tgl = QVBoxLayout(tg)
-        tgl.setContentsMargins(0, 16, 0, 0)
-        tgl.setSpacing(10)
-        top = QHBoxLayout()
+        # ---------------- page 0: installed addons
+        lib = QWidget()
+        ll = QVBoxLayout(lib)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(12)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
         self.filter_edit = QLineEdit()
         self.filter_edit.setObjectName("Search")
         self.filter_edit.setPlaceholderText("Search addons")
         self.filter_edit.setClearButtonEnabled(True)
         self.filter_edit.setFixedHeight(36)
         self.filter_edit.textChanged.connect(self.apply_addon_filter)
-        self.count_label = QLabel()
-        self.count_label.setObjectName("RowDesc")
-        en_all = QPushButton("Enable all")
-        en_all.clicked.connect(lambda: self.set_all(True))
-        dis_all = QPushButton("Disable all")
-        dis_all.clicked.connect(lambda: self.set_all(False))
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_addons)
-        top.addWidget(self.filter_edit, 1)
-        top.addWidget(en_all)
-        top.addWidget(dis_all)
-        top.addWidget(refresh)
-        tgl.addLayout(top)
-        tgl.addWidget(self.count_label)
-        self.addon_list = QListWidget()
-        self.addon_list.itemChanged.connect(self.on_item_changed)
-        tgl.addWidget(self.addon_list, 1)
-        tabs.addTab(tg, "Enable / Disable")
+        bar.addWidget(self.filter_edit, 1)
+        for text, fn in (("Enable all", lambda: self.set_all(True)),
+                         ("Disable all", lambda: self.set_all(False)),
+                         ("Refresh", self.refresh_addons)):
+            b = QPushButton(text)
+            b.setFixedHeight(36)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, f=fn: f())
+            bar.addWidget(b)
+        ll.addLayout(bar)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_container = QWidget()
+        self.list_container.setObjectName("GridContainer")
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 0, 12, 16)
+        self.list_layout.setSpacing(8)
+        self.list_layout.addStretch()
+        scroll.setWidget(self.list_container)
+        ll.addWidget(scroll, 1)
+        self.empty_label = QLabel("No addons found.\nUse \"Install from Workshop\" to add some.")
+        self.empty_label.setObjectName("EmptyState")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ll.addWidget(self.empty_label)
+        self.empty_label.hide()
+        self.stack.addWidget(lib)
+
+        # ---------------- page 1: install from workshop
+        inst = QWidget()
+        il = QVBoxLayout(inst)
+        il.setContentsMargins(0, 0, 0, 0)
+        il.setSpacing(14)
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        pl.setSpacing(6)
+        t = QLabel("Workshop addons folder")
+        t.setObjectName("RowTitle")
+        d = QLabel("Folder with your downloaded .gma and legacy .bin addons. "
+                   "Each one is extracted into garrysmod/addons under its title.")
+        d.setObjectName("RowDesc")
+        d.setWordWrap(True)
+        pl.addWidget(t)
+        pl.addWidget(d)
+        pl.addSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Choose your Workshop addons folder")
+        self.path_edit.setText(load_launcher_settings().get("gmod_workshop_path", ""))
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self.browse_workshop)
+        row.addWidget(self.path_edit, 1)
+        row.addWidget(browse)
+        pl.addLayout(row)
+        pl.addSpacing(8)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.extract_btn = QPushButton("Extract && Install addons")
+        self.extract_btn.setObjectName("Primary")
+        self.extract_btn.setFixedHeight(38)
+        self.extract_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.extract_btn.clicked.connect(self.start_extract)
+        clear = QPushButton("Clear path cache")
+        clear.setFixedHeight(38)
+        clear.clicked.connect(self.clear_path_cache)
+        actions.addWidget(self.extract_btn)
+        actions.addWidget(clear)
+        actions.addStretch()
+        pl.addLayout(actions)
+        il.addWidget(panel)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        il.addWidget(self.bar)
+        self.log_view = QTextEdit()
+        self.log_view.setObjectName("GmodLog")
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("Extraction log will appear here")
+        il.addWidget(self.log_view, 1)
+        self.stack.addWidget(inst)
+
+        self._apply_css()
+
+    # ---- styling (follows the launcher's light/dark theme)
+    def _apply_css(self):
+        dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        t = THEMES["dark" if dark else "light"]
+        self.setStyleSheet(f"""
+QPushButton#GmodTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
+    border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
+QPushButton#GmodTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
+QPushButton#GmodTab:checked {{ background: {t['accent']}; color: #0b0b0d; border: 1px solid {t['accent']}; }}
+QFrame#GmodRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
+QFrame#GmodRow:hover {{ border: 1px solid {t['accent']}; }}
+QPushButton#GmodToggle {{ background: {t['button']}; color: {t['subtext']}; border-radius: 13px;
+    padding: 0 14px; min-width: 70px; font-size: 12px; }}
+QPushButton#GmodToggle:hover {{ background: {t['button_hover']}; }}
+QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: #0b0b0d; }}
+QPushButton#GmodToggle:checked:hover {{ background: {t['accent_hover']}; }}
+QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px solid {t['border']};
+    border-radius: 10px; padding: 10px; font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 12px; }}
+""")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_css()
 
     # ---- helpers
     def addons_dir(self):
@@ -9507,6 +9591,7 @@ class GmodAddonManagerPage(QWidget):
     def set_root(self, root):
         changed = root != self.root
         self.root = root
+        self.path_label.setText(os.path.join(root, "garrysmod", "addons") if root else "")
         if root:
             try:
                 os.makedirs(os.path.join(self.addons_dir(), "disabled"), exist_ok=True)
@@ -9549,6 +9634,7 @@ class GmodAddonManagerPage(QWidget):
         os.makedirs(self.addons_dir(), exist_ok=True)
         self.log_view.clear()
         self.extract_btn.setEnabled(False)
+        self.extract_btn.setText("Extracting...")
         self.bar.setValue(0)
         self.worker = GmodExtractWorker(workshop, self.addons_dir(), self)
         self.worker.log.connect(self.log)
@@ -9558,12 +9644,19 @@ class GmodAddonManagerPage(QWidget):
 
     def _extract_done(self):
         self.extract_btn.setEnabled(True)
+        self.extract_btn.setText("Extract && Install addons")
         self.refresh_addons()
 
-    # ---- enable / disable
+    # ---- installed addons list
+    def _clean(self, name):
+        return name[:-len(self.DISABLED_SUFFIX)] if name.endswith(self.DISABLED_SUFFIX) else name
+
     def refresh_addons(self):
-        self.addon_list.blockSignals(True)
-        self.addon_list.clear()
+        for r in self.rows:
+            r["frame"].setParent(None)
+            r["frame"].deleteLater()
+        self.rows = []
+        found = []
         if self.root:
             base = self.addons_dir()
             off = os.path.join(base, "disabled")
@@ -9572,61 +9665,86 @@ class GmodAddonManagerPage(QWidget):
                     return [n for n in os.listdir(p) if os.path.isdir(os.path.join(p, n)) and not n.startswith(".")]
                 except OSError:
                     return []
-            rows = [(n, True) for n in dirs(base) if n != "disabled"] + [(n, False) for n in dirs(off)]
-            rows.sort(key=lambda r: self._clean(r[0]).lower())
-            for real, enabled in rows:
-                item = self._QListWidgetItem(self._clean(real))
-                item.setData(Qt.ItemDataRole.UserRole, real)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
-                self.addon_list.addItem(item)
-        self.addon_list.blockSignals(False)
+            found = [(n, True) for n in dirs(base) if n != "disabled"] + [(n, False) for n in dirs(off)]
+            found.sort(key=lambda r: self._clean(r[0]).lower())
+        for real, enabled in found:
+            self._add_row(real, enabled)
         self.apply_addon_filter()
 
-    def _clean(self, name):
-        return name[:-len(self.DISABLED_SUFFIX)] if name.endswith(self.DISABLED_SUFFIX) else name
+    def _add_row(self, real, enabled):
+        frame = QFrame()
+        frame.setObjectName("GmodRow")
+        frame.setFixedHeight(52)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(18, 0, 12, 0)
+        h.setSpacing(12)
+        name = QLabel(self._clean(real))
+        name.setObjectName("RowTitle")
+        name.setToolTip(self._clean(real))
+        name.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        btn = QPushButton()
+        btn.setObjectName("GmodToggle")
+        btn.setCheckable(True)
+        btn.setFixedHeight(26)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        h.addWidget(name, 1)
+        h.addWidget(btn)
+        row = {"real": real, "frame": frame, "btn": btn, "name": self._clean(real)}
+        btn.setChecked(enabled)
+        btn.setText("Enabled" if enabled else "Disabled")
+        btn.toggled.connect(lambda checked, r=row: self.on_toggle(r, checked))
+        self.list_layout.insertWidget(self.list_layout.count() - 1, frame)
+        self.rows.append(row)
 
     def apply_addon_filter(self, *_):
         q = self.filter_edit.text().strip().lower()
         shown = enabled = 0
-        for i in range(self.addon_list.count()):
-            it = self.addon_list.item(i)
-            vis = q in it.text().lower()
-            it.setHidden(not vis)
+        for r in self.rows:
+            vis = q in r["name"].lower()
+            r["frame"].setVisible(vis)
             if vis:
                 shown += 1
-                enabled += it.checkState() == Qt.CheckState.Checked
-        self.count_label.setText(f"{shown} addons, {enabled} enabled")
+                enabled += r["btn"].isChecked()
+        self.empty_label.setVisible(not shown)
+        self.count_label.setText(f"{shown} addon{'s' if shown != 1 else ''}, {enabled} enabled" if self.rows else "")
 
-    def _move(self, item, enable):
-        real = item.data(Qt.ItemDataRole.UserRole)
+    def _move(self, row, enable):
         base, off = self.addons_dir(), os.path.join(self.addons_dir(), "disabled")
-        name = self._clean(real)
+        name = row["name"]
         if enable:
-            src, dst = os.path.join(off, real), os.path.join(base, name)
+            src, dst = os.path.join(off, row["real"]), os.path.join(base, name)
         else:
-            src, dst = os.path.join(base, real), os.path.join(off, name + self.DISABLED_SUFFIX)
+            src, dst = os.path.join(base, row["real"]), os.path.join(off, name + self.DISABLED_SUFFIX)
         if os.path.exists(dst):
             raise OSError(f'"{os.path.basename(dst)}" already exists in the destination folder')
         shutil.move(src, dst)
+        row["real"] = os.path.basename(dst)
 
-    def on_item_changed(self, item):
+    def on_toggle(self, row, enable):
+        btn = row["btn"]
         try:
-            self._move(item, item.checkState() == Qt.CheckState.Checked)
+            self._move(row, enable)
+            btn.setText("Enabled" if enable else "Disabled")
         except Exception as e:
+            btn.blockSignals(True)
+            btn.setChecked(not enable)
+            btn.blockSignals(False)
             QMessageBox.warning(self, "Addon Manager", f"Couldn't move addon: {e}")
-        self.refresh_addons()
+        self.apply_addon_filter()
 
     def set_all(self, enable):
-        for i in range(self.addon_list.count()):
-            it = self.addon_list.item(i)
-            if it.isHidden() or (it.checkState() == Qt.CheckState.Checked) == enable:
+        for r in self.rows:
+            if not r["frame"].isVisible() or r["btn"].isChecked() == enable:
                 continue
             try:
-                self._move(it, enable)
+                self._move(r, enable)
+                r["btn"].blockSignals(True)
+                r["btn"].setChecked(enable)
+                r["btn"].setText("Enabled" if enable else "Disabled")
+                r["btn"].blockSignals(False)
             except Exception as e:
-                self.log(f"Couldn't move {it.text()}: {e}", "error")
-        self.refresh_addons()
+                self.log(f"Couldn't move {r['name']}: {e}", "error")
+        self.apply_addon_filter()
 
 _gmod_prev_init = AdaptiveApp.__init__
 
@@ -9639,6 +9757,7 @@ def _gmod_init(self):
     self.nav_group.addButton(self.gmod_btn, idx)
     sidebar_layout = self.nav_group.button(0).parent().layout()
     sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
+    self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 13px 8px 13px 22px; font-size: 13px; }")
     self.gmod_btn.hide()
 
     def refresh_gmod():
