@@ -8051,6 +8051,88 @@ def _tracked_popen(*a, **k):
 
 subprocess.Popen = _tracked_popen
 
+import hashlib as _hashlib
+
+_library_covers = {}   # pretty game title -> cover image path (kept up to date from the GUI thread)
+_covers_sig = {"v": None}
+_cover_enc_cache = {}
+
+def _cover_key(title):
+    return _hashlib.md5(str(title).lower().encode("utf-8")).hexdigest()[:12]
+
+def _encode_cover(path):
+    """Small JPEG (base64) of a cover image, cached until the file changes."""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return None
+    cached = _cover_enc_cache.get(path)
+    if cached and cached[0] == mt:
+        return cached[1]
+    img = QImage(path)
+    enc = None
+    if not img.isNull():
+        img = img.scaledToWidth(120, Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_RGB32)
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        if img.save(buf, "JPEG", 72) and buf.data():
+            enc = base64.b64encode(bytes(buf.data())).decode("ascii")
+            if len(enc) > 60000:
+                enc = None
+    _cover_enc_cache[path] = (mt, enc)
+    return enc
+
+def cloud_publish_covers(token, uid):
+    covers = {}
+    for title, path in list(_library_covers.items()):
+        enc = _encode_cover(path)
+        if enc:
+            covers[_cover_key(title)] = enc
+    sig = (uid, tuple(sorted((k, hash(v)) for k, v in covers.items())))
+    if not covers or sig == _covers_sig["v"]:
+        return
+    _http_json(_fdb(f"covers/{uid}", token), "PUT", covers)
+    _covers_sig["v"] = sig
+
+def cloud_fetch_covers(friend_uid):
+    token, _uid = get_id_token()
+    data = _http_json(_fdb(f"covers/{friend_uid}", token))
+    return data if isinstance(data, dict) else {}
+
+def library_cover_paths():
+    """{game title: cover image path} for every game in the library, one method for all of them:
+    NCZ games (assets folder), store games + Add Existing Game, and custom games."""
+    out = {}
+    for name, fname in ((AE_GAME_NAME, "fnanczaecover.png"), (NCZ2_GAME_NAME, "fnancz2cover.png"),
+                        ("NCZFront", "nczfront-cover.png")):
+        path = asset_path(fname)
+        if os.path.exists(path):
+            out[pretty_game_name(name)] = path
+    for g in load_steam_library():
+        if g.get("title") and g.get("cover") and os.path.exists(g["cover"]):
+            out[pretty_game_name(g["title"])] = g["cover"]
+    for g in load_custom_games():
+        if g.get("title") and g.get("cover_path") and os.path.exists(g["cover_path"]):
+            out[pretty_game_name(g["title"])] = g["cover_path"]
+    return out
+
+def _friend_cover_file(uid, key, b64):
+    """Writes a friend's cover to a small cache file so the normal cover renderer can draw it."""
+    raw = _decode_photo(b64)
+    if not raw:
+        return None
+    folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "friend_covers")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, re.sub(r"[^A-Za-z0-9]", "_", uid) + "_" + key + ".jpg")
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) != len(raw):
+            with open(path, "wb") as f:
+                f.write(raw)
+    except OSError:
+        return None
+    return path
+
 def cloud_publish_presence():
     token, uid = get_id_token()
     username, avatar = load_profile_cache()
@@ -8065,6 +8147,10 @@ def cloud_publish_presence():
         with open(avatar, "rb") as f:
             payload["photo"] = base64.b64encode(f.read()).decode("ascii")
     _http_json(_fdb(f"public/{uid}", token), "PATCH", payload)
+    try:
+        cloud_publish_covers(token, uid)
+    except CloudError:
+        pass  # covers are optional; never break presence over them
 
 def cloud_accept_friend(other):
     token, uid = get_id_token()
@@ -8261,6 +8347,8 @@ class FriendsPage(QWidget):
         self._prev_state = None
         self._prev_reqs = None
         self._prev_last = None
+        self.covers = {}
+        self._lib_sig = None
         self.notify_uid = None
         self.requests = {}
         self.friends = {}
@@ -8578,10 +8666,18 @@ class FriendsPage(QWidget):
         lib_title = QLabel("Library")
         lib_title.setObjectName("RowTitle")
         lay.addWidget(lib_title)
-        self.p_library = QLabel("")
-        self.p_library.setWordWrap(True)
-        self.p_library.setObjectName("RowDesc")
-        lay.addWidget(self.p_library)
+        self.lib_scroll = QScrollArea()
+        self.lib_scroll.setWidgetResizable(True)
+        self.lib_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.lib_scroll.setFixedHeight(200)
+        self.lib_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lib_holder = QWidget()
+        self.lib_row = QHBoxLayout(lib_holder)
+        self.lib_row.setContentsMargins(0, 0, 0, 0)
+        self.lib_row.setSpacing(12)
+        self.lib_row.addStretch()
+        self.lib_scroll.setWidget(lib_holder)
+        lay.addWidget(self.lib_scroll)
         lay.addSpacing(10)
 
         msg_title = QLabel("Messages")
@@ -8607,10 +8703,12 @@ class FriendsPage(QWidget):
         self.current_uid = uid
         self._last_msg_key = ""
         self.chat_view.reset()
+        self._lib_sig = None
         self._fill_profile()
         self.stack.setCurrentIndex(1)
         self.load_messages()
         self.chat_timer.start()
+        self._run(lambda: cloud_fetch_covers(uid), lambda r, e: self._on_covers(uid, r))
 
     def close_friend(self):
         self.chat_timer.stop()
@@ -8627,9 +8725,55 @@ class FriendsPage(QWidget):
         self.p_status.setStyleSheet(f"color: {color};")
         apply_avatar(self.p_avatar, _friend_avatar_file(self.current_uid, d.get("photo")),
                      name[:1].upper(), 72)
-        lib = d.get("library")
-        self.p_library.setText("\n".join("• " + pretty_game_name(t) for t in lib) if isinstance(lib, list) and lib
-                               else "No games yet.")
+        self._fill_library(d.get("library"))
+
+    def _fill_library(self, lib):
+        uid = self.current_uid
+        covers = self.covers.get(uid, {})
+        titles = [pretty_game_name(t) for t in lib] if isinstance(lib, list) else []
+        sig = (uid, tuple(titles), tuple(sorted(covers)))
+        if sig == self._lib_sig:
+            return
+        self._lib_sig = sig
+        while self.lib_row.count() > 1:
+            w = self.lib_row.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        if not titles:
+            empty = QLabel("No games yet.")
+            empty.setObjectName("RowDesc")
+            self.lib_row.insertWidget(0, empty)
+            return
+        for i, t in enumerate(titles):
+            tile = QWidget()
+            tile.setFixedWidth(96)
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(0, 0, 0, 0)
+            tl.setSpacing(4)
+            cover = QLabel()
+            cover.setFixedSize(96, 128)
+            cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            path = _friend_cover_file(uid, _cover_key(t), covers.get(_cover_key(t)))
+            pix = rounded_cover_pixmap(path, 96, 128, 8) if path else None
+            if pix:
+                cover.setPixmap(pix)
+            else:
+                cover.setText(t[:1].upper())
+                cover.setStyleSheet("background: rgba(128,128,128,0.25); border-radius: 8px; "
+                                    "font-size: 28px; font-weight: bold;")
+            name = QLabel(t)
+            name.setWordWrap(True)
+            name.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            name.setStyleSheet("font-size: 11px;")
+            name.setFixedHeight(32)
+            tl.addWidget(cover)
+            tl.addWidget(name)
+            self.lib_row.insertWidget(i, tile)
+
+    def _on_covers(self, uid, res):
+        self.covers[uid] = res if isinstance(res, dict) else {}
+        if self.current_uid == uid and self.stack.currentIndex() == 1:
+            self._fill_profile()
 
     def load_messages(self):
         uid = self.current_uid
@@ -9000,9 +9144,12 @@ def _lib_init(self):
             t = pretty_game_name(title)
             if t and t not in titles:
                 titles.append(t)
-        if titles and titles != _library_snapshot:
+        covers = library_cover_paths()
+        if titles and (titles != _library_snapshot or covers != _library_covers):
             first = not _library_snapshot
             _library_snapshot[:] = titles
+            _library_covers.clear()
+            _library_covers.update(covers)
             if not first:
                 for cb in list(_playing_listeners):
                     cb()
