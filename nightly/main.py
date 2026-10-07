@@ -9248,5 +9248,416 @@ def _idle_init(self):
 
 AdaptiveApp.__init__ = _idle_init
 
+# ---------------------------------------------------------------- Garry's Mod Addon Manager tab
+# Pure-Python port of "Gmod Alternate Addon Manager" (extract workshop addons + enable/disable).
+# The tab only appears while Garry's Mod is installed through the launcher.
+import struct as _struct
+import lzma as _lzma
+
+def find_gmod_root():
+    """Return the folder that contains 'garrysmod/' for Garry's Mod installed via the launcher
+    or added with Add Existing Game, else None."""
+    for g in load_steam_library() + load_custom_games():
+        exe = g.get("exe_path")
+        key = re.sub(r"[^a-z0-9]", "", str(g.get("title", "")).lower())
+        if not exe or not (g.get("appid") == 4000 or "garrysmod" in key or "gmod" in key):
+            continue
+        d = os.path.dirname(os.path.abspath(exe))
+        for _ in range(4):  # gmod.exe can sit in bin/win64, so walk up to the folder with garrysmod/
+            if os.path.isdir(os.path.join(d, "garrysmod")):
+                return d
+            if os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+    if not os.path.isdir(GAMES_DIR):
+        return None
+    try:
+        children = sorted(os.listdir(GAMES_DIR))
+    except OSError:
+        return None
+    for name in children:
+        if "garrysmod" not in re.sub(r"[^a-z0-9]", "", name.lower()):
+            continue
+        base = os.path.join(GAMES_DIR, name)
+        if not os.path.isdir(base):
+            continue
+        if os.path.isdir(os.path.join(base, "garrysmod")):
+            return base
+        for folder, dirs, _files in os.walk(base):  # archive may have nested one folder deeper
+            if "garrysmod" in dirs:
+                return folder
+            if folder[len(base):].count(os.sep) >= 2:
+                dirs[:] = []
+    return None
+
+def _gma_cstr(buf, pos):
+    end = buf.index(b"\0", pos)
+    return bytes(buf[pos:end]).decode("utf-8", "replace"), end + 1
+
+def extract_gma(data, dest):
+    """Extract GMA bytes into dest. Returns the addon title (from its JSON description, else its name)."""
+    buf = memoryview(data)
+    if bytes(buf[:4]) != b"GMAD":
+        raise ValueError("not a GMA file")
+    version = buf[4]
+    pos = 5 + 16  # version, steamid, timestamp
+    if version > 1:
+        while True:
+            s, pos = _gma_cstr(data, pos)
+            if not s:
+                break
+    name, pos = _gma_cstr(data, pos)
+    desc, pos = _gma_cstr(data, pos)
+    _author, pos = _gma_cstr(data, pos)
+    pos += 4  # addon version
+    entries = []
+    while True:
+        num = _struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        if num == 0:
+            break
+        fname, pos = _gma_cstr(data, pos)
+        size = _struct.unpack_from("<q", data, pos)[0]
+        pos += 12  # size + crc
+        entries.append((fname, size))
+    info = {}
+    try:
+        parsed = json.loads(desc)
+        if isinstance(parsed, dict):
+            info = parsed
+    except Exception:
+        pass
+    title = str(info.get("title") or name or "").strip()
+    os.makedirs(dest, exist_ok=True)
+    root = os.path.abspath(dest)
+    for fname, size in entries:
+        rel = fname.replace("\\", "/").lstrip("/")
+        target = os.path.abspath(os.path.join(root, rel))
+        if target != root and target.startswith(root + os.sep):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(buf[pos:pos + size])
+        pos += size
+    with open(os.path.join(root, "addon.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": title, "type": info.get("type", ""), "tags": info.get("tags", []),
+                   "ignore": info.get("ignore", [])}, f, indent=2)
+    return title
+
+def read_workshop_file(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if path.lower().endswith(".bin"):  # legacy workshop files are LZMA-compressed GMAs
+        raw = _lzma.LZMADecompressor(format=_lzma.FORMAT_ALONE).decompress(raw)
+    return raw
+
+def safe_addon_name(title, fallback):
+    safe = re.sub(r'[<>:"/\\|?*]', "_", title or "").strip().rstrip(".")
+    return safe or fallback
+
+def extract_workshop_folder(workshop, addons_dir, log, progress):
+    files = []
+    for folder, _d, names in os.walk(workshop):
+        for n in names:
+            if n.lower().endswith((".gma", ".bin")):
+                files.append(os.path.join(folder, n))
+    bins = {os.path.splitext(p)[0].lower() for p in files if p.lower().endswith(".bin")}
+    files = [p for p in files if not (p.lower().endswith(".gma") and os.path.splitext(p)[0].lower() in bins)]
+    total, done, skipped, failed = len(files), 0, 0, 0
+    if not total:
+        log("No .gma or .bin addons found in that folder.", "warn")
+        return
+    for i, path in enumerate(files, 1):
+        progress(i - 1, total)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        tmp = None
+        try:
+            data = read_workshop_file(path)
+            tmp = os.path.join(addons_dir, f".extract_tmp_{os.getpid()}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            title = extract_gma(data, tmp)
+            safe = safe_addon_name(title, stem)
+            final = os.path.join(addons_dir, safe)
+            if os.path.isdir(final) or os.path.isdir(os.path.join(addons_dir, "disabled", safe + "(Disabled)")):
+                log(f'Directory "{safe}" already exists, skipped', "warn")
+                skipped += 1
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+            os.replace(tmp, final)
+            log(f'Extracted "{title or safe}"', "info")
+            done += 1
+        except Exception as e:
+            log(f"Failed to extract {os.path.basename(path)}: {e}", "error")
+            failed += 1
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+    progress(total, total)
+    msg = f"Total found addons [{total}], extracted [{done}], skipped [{skipped}], failed [{failed}]"
+    log(msg, "ok" if not failed else "error")
+    log("Extraction complete", "ok")
+
+class GmodExtractWorker(QThread):
+    log = pyqtSignal(str, str)
+    progress = pyqtSignal(int, int)
+
+    def __init__(self, workshop, addons_dir, parent=None):
+        super().__init__(parent)
+        self.workshop = workshop
+        self.addons_dir = addons_dir
+
+    def run(self):
+        try:
+            extract_workshop_folder(self.workshop, self.addons_dir,
+                                    lambda t, k: self.log.emit(t, k),
+                                    lambda a, b: self.progress.emit(a, b))
+        except Exception as e:
+            self.log.emit(f"Error: {e}", "error")
+
+class GmodAddonManagerPage(QWidget):
+    DISABLED_SUFFIX = "(Disabled)"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QTabWidget, QListWidget, QListWidgetItem, QProgressBar
+        self._QListWidgetItem = QListWidgetItem
+        self.root = None
+        self.worker = None
+        self.setObjectName("Content")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(36, 28, 36, 24)
+        layout.setSpacing(0)
+        title = QLabel("Garry's Mod Addon Manager")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        layout.addSpacing(16)
+
+        tabs = QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        # ---- Extract & Install
+        ex = QWidget()
+        exl = QVBoxLayout(ex)
+        exl.setContentsMargins(0, 16, 0, 0)
+        exl.setSpacing(10)
+        hint = QLabel("Pick the folder with your Workshop addons (.gma / legacy .bin). "
+                      "They are extracted into garrysmod/addons.")
+        hint.setObjectName("RowDesc")
+        hint.setWordWrap(True)
+        exl.addWidget(hint)
+        row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Workshop addons path")
+        self.path_edit.setText(load_launcher_settings().get("gmod_workshop_path", ""))
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self.browse_workshop)
+        clear = QPushButton("Clear path cache")
+        clear.clicked.connect(self.clear_path_cache)
+        row.addWidget(self.path_edit, 1)
+        row.addWidget(browse)
+        row.addWidget(clear)
+        exl.addLayout(row)
+        self.extract_btn = QPushButton("Extract && Install addons")
+        self.extract_btn.setObjectName("Primary")
+        self.extract_btn.setFixedHeight(38)
+        self.extract_btn.clicked.connect(self.start_extract)
+        exl.addWidget(self.extract_btn)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        exl.addWidget(self.bar)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        exl.addWidget(self.log_view, 1)
+        tabs.addTab(ex, "Extract && Install")
+
+        # ---- Enable / Disable
+        tg = QWidget()
+        tgl = QVBoxLayout(tg)
+        tgl.setContentsMargins(0, 16, 0, 0)
+        tgl.setSpacing(10)
+        top = QHBoxLayout()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setObjectName("Search")
+        self.filter_edit.setPlaceholderText("Search addons")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setFixedHeight(36)
+        self.filter_edit.textChanged.connect(self.apply_addon_filter)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("RowDesc")
+        en_all = QPushButton("Enable all")
+        en_all.clicked.connect(lambda: self.set_all(True))
+        dis_all = QPushButton("Disable all")
+        dis_all.clicked.connect(lambda: self.set_all(False))
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh_addons)
+        top.addWidget(self.filter_edit, 1)
+        top.addWidget(en_all)
+        top.addWidget(dis_all)
+        top.addWidget(refresh)
+        tgl.addLayout(top)
+        tgl.addWidget(self.count_label)
+        self.addon_list = QListWidget()
+        self.addon_list.itemChanged.connect(self.on_item_changed)
+        tgl.addWidget(self.addon_list, 1)
+        tabs.addTab(tg, "Enable / Disable")
+
+    # ---- helpers
+    def addons_dir(self):
+        return os.path.join(self.root, "garrysmod", "addons") if self.root else None
+
+    def set_root(self, root):
+        changed = root != self.root
+        self.root = root
+        if root:
+            try:
+                os.makedirs(os.path.join(self.addons_dir(), "disabled"), exist_ok=True)
+            except OSError:
+                pass
+        if changed:
+            self.refresh_addons()
+
+    def log(self, text, kind="info"):
+        color = {"ok": GREEN, "warn": "#eab308", "error": RED}.get(kind)
+        esc = html_lib.escape(text)
+        self.log_view.append(f'<span style="color:{color}">{esc}</span>' if color else esc)
+
+    def browse_workshop(self):
+        start = self.path_edit.text() or os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(self, "Workshop addons folder", start)
+        if path:
+            self.path_edit.setText(path)
+            s = load_launcher_settings()
+            s["gmod_workshop_path"] = path
+            save_launcher_settings(s)
+
+    def clear_path_cache(self):
+        s = load_launcher_settings()
+        s.pop("gmod_workshop_path", None)
+        save_launcher_settings(s)
+        self.path_edit.clear()
+        self.log("Deleted all path cache", "warn")
+
+    def start_extract(self):
+        if not self.root:
+            return
+        workshop = self.path_edit.text().strip()
+        if not os.path.isdir(workshop):
+            QMessageBox.warning(self, "Workshop path", "Workshop path is invalid.")
+            return
+        s = load_launcher_settings()
+        s["gmod_workshop_path"] = workshop
+        save_launcher_settings(s)
+        os.makedirs(self.addons_dir(), exist_ok=True)
+        self.log_view.clear()
+        self.extract_btn.setEnabled(False)
+        self.bar.setValue(0)
+        self.worker = GmodExtractWorker(workshop, self.addons_dir(), self)
+        self.worker.log.connect(self.log)
+        self.worker.progress.connect(lambda a, b: (self.bar.setMaximum(max(b, 1)), self.bar.setValue(a)))
+        self.worker.finished.connect(self._extract_done)
+        self.worker.start()
+
+    def _extract_done(self):
+        self.extract_btn.setEnabled(True)
+        self.refresh_addons()
+
+    # ---- enable / disable
+    def refresh_addons(self):
+        self.addon_list.blockSignals(True)
+        self.addon_list.clear()
+        if self.root:
+            base = self.addons_dir()
+            off = os.path.join(base, "disabled")
+            def dirs(p):
+                try:
+                    return [n for n in os.listdir(p) if os.path.isdir(os.path.join(p, n)) and not n.startswith(".")]
+                except OSError:
+                    return []
+            rows = [(n, True) for n in dirs(base) if n != "disabled"] + [(n, False) for n in dirs(off)]
+            rows.sort(key=lambda r: self._clean(r[0]).lower())
+            for real, enabled in rows:
+                item = self._QListWidgetItem(self._clean(real))
+                item.setData(Qt.ItemDataRole.UserRole, real)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+                self.addon_list.addItem(item)
+        self.addon_list.blockSignals(False)
+        self.apply_addon_filter()
+
+    def _clean(self, name):
+        return name[:-len(self.DISABLED_SUFFIX)] if name.endswith(self.DISABLED_SUFFIX) else name
+
+    def apply_addon_filter(self, *_):
+        q = self.filter_edit.text().strip().lower()
+        shown = enabled = 0
+        for i in range(self.addon_list.count()):
+            it = self.addon_list.item(i)
+            vis = q in it.text().lower()
+            it.setHidden(not vis)
+            if vis:
+                shown += 1
+                enabled += it.checkState() == Qt.CheckState.Checked
+        self.count_label.setText(f"{shown} addons, {enabled} enabled")
+
+    def _move(self, item, enable):
+        real = item.data(Qt.ItemDataRole.UserRole)
+        base, off = self.addons_dir(), os.path.join(self.addons_dir(), "disabled")
+        name = self._clean(real)
+        if enable:
+            src, dst = os.path.join(off, real), os.path.join(base, name)
+        else:
+            src, dst = os.path.join(base, real), os.path.join(off, name + self.DISABLED_SUFFIX)
+        if os.path.exists(dst):
+            raise OSError(f'"{os.path.basename(dst)}" already exists in the destination folder')
+        shutil.move(src, dst)
+
+    def on_item_changed(self, item):
+        try:
+            self._move(item, item.checkState() == Qt.CheckState.Checked)
+        except Exception as e:
+            QMessageBox.warning(self, "Addon Manager", f"Couldn't move addon: {e}")
+        self.refresh_addons()
+
+    def set_all(self, enable):
+        for i in range(self.addon_list.count()):
+            it = self.addon_list.item(i)
+            if it.isHidden() or (it.checkState() == Qt.CheckState.Checked) == enable:
+                continue
+            try:
+                self._move(it, enable)
+            except Exception as e:
+                self.log(f"Couldn't move {it.text()}: {e}", "error")
+        self.refresh_addons()
+
+_gmod_prev_init = AdaptiveApp.__init__
+
+def _gmod_init(self):
+    _gmod_prev_init(self)
+    self.gmod_page = GmodAddonManagerPage()
+    self.pages.addWidget(self.gmod_page)
+    idx = self.pages.indexOf(self.gmod_page)
+    self.gmod_btn = self.make_nav_button("Garry's Mod Addon Manager", checkable=True)
+    self.nav_group.addButton(self.gmod_btn, idx)
+    sidebar_layout = self.nav_group.button(0).parent().layout()
+    sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
+    self.gmod_btn.hide()
+
+    def refresh_gmod():
+        root = find_gmod_root()
+        self.gmod_btn.setVisible(bool(root))
+        self.gmod_page.set_root(root)
+        if not root and self.pages.currentWidget() is self.gmod_page:
+            self.nav_group.button(0).setChecked(True)
+            self.pages.setCurrentIndex(0)
+
+    refresh_gmod()
+    self._gmod_timer = QTimer(self)
+    self._gmod_timer.setInterval(4000)
+    self._gmod_timer.timeout.connect(refresh_gmod)
+    self._gmod_timer.start()
+    self.pages.currentChanged.connect(
+        lambda _i: self.gmod_page.refresh_addons() if self.pages.currentWidget() is self.gmod_page else None)
+
+AdaptiveApp.__init__ = _gmod_init
+
 if __name__ == "__main__":
     main()
