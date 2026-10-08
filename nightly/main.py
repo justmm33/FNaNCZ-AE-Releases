@@ -1489,7 +1489,7 @@ class SettingsPage(QWidget):
 class CreditsPage(QWidget):
     CREDITS = (
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
-        ("mr.fancypigeon", "Linux Script for FNaNCZ 1 and 2, and ideas", "pigeon.png"),
+        ("mr.fancypigeon", "Linux Script for FNaNCZ 1 and 2, GMOD addon manager, idea for steam workshop and other ideas", "pigeon.png"),
         ("notacape", "NCZFront", "notacape.png"),
     )
 
