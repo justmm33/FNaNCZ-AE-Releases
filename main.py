@@ -89,6 +89,82 @@ def system_env():
             env.pop("LD_LIBRARY_PATH", None)
     return env
 
+# ---------------------------------------------------------------- Direct3D renderer (Wine / Proton)
+WINE_D3D_MODES = {
+    "default": "Default",
+    "wined3d": "WineD3D (OpenGL)",
+    "dxvk": "DXVK (Vulkan, D3D 8-11)",
+    "dxvk_vkd3d": "DXVK + VKD3D (Vulkan, D3D 8-12)",
+}
+_D3D_DLLS = "d3d8,d3d9,d3d10core,d3d11,dxgi"
+_D3D12_DLLS = "d3d12,d3d12core"
+
+def get_wine_d3d_mode():
+    mode = load_launcher_settings().get("wine_d3d", "default")
+    return mode if mode in WINE_D3D_MODES else "default"
+
+def _wine_prefix():
+    return os.environ.get("WINEPREFIX") or os.path.expanduser("~/.wine")
+
+def wine_game_env():
+    """system_env() plus the DLL overrides for the chosen Direct3D renderer."""
+    env = system_env()
+    mode = get_wine_d3d_mode()
+    if mode == "default":
+        return env
+    if mode == "wined3d":
+        override = f"{_D3D_DLLS}=b"                      # always use Wine's own Direct3D
+    else:
+        override = f"{_D3D_DLLS}=n,b"                    # DXVK if it's in the prefix, else Wine's
+        if mode == "dxvk_vkd3d":
+            override += f";{_D3D12_DLLS}=n,b"
+    old = env.get("WINEDLLOVERRIDES", "")
+    env["WINEDLLOVERRIDES"] = (old + ";" if old else "") + override
+    return env
+
+def apply_proton_d3d(env):
+    """Proton already uses DXVK/VKD3D by default, so only WineD3D needs asking for."""
+    if get_wine_d3d_mode() == "wined3d":
+        env["PROTON_USE_WINED3D"] = "1"
+    return env
+
+def _d3d_components_missing(mode):
+    want = ["dxvk"] + (["vkd3d"] if mode == "dxvk_vkd3d" else [])
+    try:
+        with open(os.path.join(_wine_prefix(), ".ncz_d3d_installed"), encoding="utf-8") as f:
+            have = set(f.read().split())
+    except OSError:
+        have = set()
+    return [w for w in want if w not in have]
+
+def launch_wine(wine_path, exe, cwd):
+    """Starts a Windows exe under wine with the chosen Direct3D renderer.
+    For DXVK/VKD3D, the first launch installs them into the prefix with winetricks (if it's installed)."""
+    env = wine_game_env()
+    mode = get_wine_d3d_mode()
+    tricks = shutil.which("winetricks")
+    missing = _d3d_components_missing(mode) if mode.startswith("dxvk") else []
+    if missing and tricks:
+        def work():
+            try:
+                e = system_env()
+                e["WINE"] = wine_path
+                r = subprocess.run([tricks, "-q"] + missing, env=e, timeout=1800, capture_output=True)
+                if r.returncode == 0:
+                    prefix = _wine_prefix()
+                    os.makedirs(prefix, exist_ok=True)
+                    with open(os.path.join(prefix, ".ncz_d3d_installed"), "a", encoding="utf-8") as f:
+                        f.write(" ".join(missing) + "\n")
+            except Exception:
+                pass
+            try:
+                subprocess.Popen([wine_path, exe], cwd=cwd, env=env)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+        return
+    subprocess.Popen([wine_path, exe], cwd=cwd, env=env)
+
 def find_wine():
     """Returns (path, version) for the first working wine found, or None. Linux only."""
     if not sys.platform.startswith("linux"):
@@ -268,7 +344,7 @@ def get_launcher_settings_path():
     return os.path.expanduser("~/.config/NCZ_Games_Launcher/launcher.json")
 
 def load_launcher_settings():
-    settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP"}
+    settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default"}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -278,6 +354,8 @@ def load_launcher_settings():
                 mode = str(loaded.get("dark_mode", "system")).lower()
                 if mode in ("off", "on", "system"):
                     settings["dark_mode"] = mode
+                if loaded.get("wine_d3d") in ("default", "wined3d", "dxvk", "dxvk_vkd3d"):
+                    settings["wine_d3d"] = loaded["wine_d3d"]
                 if loaded.get("currency") in ("EGP", "QAR", "USD", "SAR"):
                     settings["currency"] = loaded["currency"]
                 key = loaded.get("steamgriddb_api_key", "")
@@ -1421,6 +1499,34 @@ class SettingsPage(QWidget):
         cur_row.addWidget(self.currency_combo)
         cur_panel_layout.addLayout(cur_row)
         layout.addWidget(cur_panel)
+
+        if sys.platform.startswith("linux"):
+            layout.addSpacing(12)
+            d3d_panel = QFrame()
+            d3d_panel.setObjectName("Panel")
+            d3d_panel_layout = QVBoxLayout(d3d_panel)
+            d3d_panel_layout.setContentsMargins(22, 18, 22, 18)
+            d3d_row = QHBoxLayout()
+            d3d_text = QVBoxLayout()
+            d3d_text.setSpacing(2)
+            d3d_name = QLabel("Direct3D Renderer")
+            d3d_name.setObjectName("RowTitle")
+            d3d_desc = QLabel("Used for Windows games run with Wine or Proton. DXVK/VKD3D are installed "
+                              "into your Wine prefix on first launch (needs winetricks).")
+            d3d_desc.setObjectName("RowDesc")
+            d3d_desc.setWordWrap(True)
+            d3d_text.addWidget(d3d_name)
+            d3d_text.addWidget(d3d_desc)
+            self.d3d_combo = QComboBox()
+            self.d3d_combo.setFixedWidth(240)
+            for key, label in WINE_D3D_MODES.items():
+                self.d3d_combo.addItem(label, key)
+            self.d3d_combo.setCurrentIndex(max(self.d3d_combo.findData(get_wine_d3d_mode()), 0))
+            self.d3d_combo.currentIndexChanged.connect(self.on_wine_d3d_changed)
+            d3d_row.addLayout(d3d_text, 1)
+            d3d_row.addWidget(self.d3d_combo)
+            d3d_panel_layout.addLayout(d3d_row)
+            layout.addWidget(d3d_panel)
         layout.addStretch()
 
     def on_save_sgdb_key(self):
@@ -1466,6 +1572,11 @@ class SettingsPage(QWidget):
             return
         QApplication.restoreOverrideCursor()
         QMessageBox.information(self, "Desktop Shortcut", f"Shortcut created:\n{path}")
+
+    def on_wine_d3d_changed(self):
+        settings = load_launcher_settings()
+        settings["wine_d3d"] = self.d3d_combo.currentData()
+        save_launcher_settings(settings)
 
     def on_currency_changed(self):
         settings = load_launcher_settings()
@@ -3192,7 +3303,7 @@ class AdaptiveApp(QMainWindow):
                 return
 
         try:
-            subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
+            launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
         except Exception as e:
             QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
 
@@ -4005,7 +4116,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                         if self.wine:
                             wine_path, _ = self.wine
                             try:
-                                subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
+                                launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
                             except Exception as e:
                                 QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
                         else:
@@ -4022,7 +4133,10 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                 
                 def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
                     link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
-                    card_widget = DownloadCard(t, link, expected_size, p, self)
+                    cancelled, existing = _ask_existing_archive(self, t)
+                    if cancelled:
+                        return
+                    card_widget = DownloadCard(t, link, expected_size, p, self, existing_zip_path=existing)
                     
                     def on_dl_finished(_path):
                         update_steam_card_state()
@@ -4697,6 +4811,7 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
                 env = os.environ.copy()
                 env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
                 env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
+                apply_proton_d3d(env)
                 try:
                     subprocess.Popen([compat_tool, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
                 except Exception as e:
@@ -4709,7 +4824,7 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
             elif self.wine:
                 wine_path, _ = self.wine
                 try:
-                    subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
+                    launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
                 except Exception as e:
                     QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
             else:
@@ -4829,12 +4944,27 @@ def extract_archive(dest_path, extract_dir):
                     continue
         try:
             import rarfile
+        except ImportError:
+            # no rarfile package: install it into the environment the launcher runs in, then ask for a restart
+            if getattr(sys, "frozen", False):
+                raise ValueError("RAR support needs the 'rarfile' package, which can't be installed into a packaged build. "
+                                 "Install 7-Zip or unrar instead.")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "rarfile"], capture_output=True, text=True,
+                               timeout=300, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                raise ValueError("RAR archive detected but the 'rarfile' package is missing, and installing it automatically "
+                                 "failed. Run:  pip install rarfile  (or install 7-Zip / unrar).")
+            raise ValueError("The 'rarfile' package was just installed. Please restart the launcher, then run the "
+                             "download again (the archive is already downloaded).")
+        try:
             with rarfile.RarFile(dest_path) as rf:
                 rf.extractall(extract_dir)
             return
         except Exception:
             pass
-        raise ValueError("RAR archive detected, but no extraction tool ('7z' or 'unrar') or 'rarfile' module is available.")
+        raise ValueError("RAR archive detected, but no extraction tool ('7z' or 'unrar') is available for rarfile to use. "
+                         "Install 7-Zip or unrar.")
     
     raise ValueError("Downloaded file is neither a valid ZIP nor a supported RAR archive.")
 
@@ -5686,6 +5816,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
                         env = os.environ.copy()
                         env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
                         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
+                        apply_proton_d3d(env)
                         try:
                             subprocess.Popen([proton_bin, "run", custom_exe], cwd=os.path.dirname(custom_exe), env=env)
                         except Exception as e:
@@ -5693,7 +5824,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
                     elif self.wine:
                         wine_path, _ = self.wine
                         try:
-                            subprocess.Popen([wine_path, custom_exe], cwd=os.path.dirname(custom_exe), env=system_env())
+                            launch_wine(wine_path, custom_exe, os.path.dirname(custom_exe))
                         except Exception as e:
                             QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
                     else:
@@ -5768,6 +5899,7 @@ def _unified_build_library_page(self):
             menu = QMenu(add_btn)
             menu.addAction("Add Custom Game").triggered.connect(self.open_add_custom_game_dialog)
             menu.addAction("Add Existing Game").triggered.connect(self.open_add_existing_game_dialog)
+            menu.addAction("Add Existing Fan Game").triggered.connect(lambda _c=False: self._fan_add_existing())
             
             def show_menu():
                 pos = add_btn.mapToGlobal(add_btn.rect().bottomLeft())
@@ -5865,7 +5997,7 @@ def friends_library_titles():
     for info in GAME_INFO.values():
         if os.path.isdir(installed_game_dir(info["name"])) or os.path.isdir(wine_game_dir(info["name"])):
             titles.append(info["name"])
-    for g in load_steam_library() + load_custom_games():
+    for g in load_steam_library() + load_custom_games() + load_fan_library():
         t = g.get("title")
         if t and t not in titles:
             titles.append(t)
@@ -5993,6 +6125,9 @@ def library_cover_paths():
     for g in load_custom_games():
         if g.get("title") and g.get("cover_path") and os.path.exists(g["cover_path"]):
             out[pretty_game_name(g["title"])] = g["cover_path"]
+    for g in load_fan_library():
+        if g.get("title") and g.get("cover") and os.path.exists(g["cover"]):
+            out[pretty_game_name(g["title"])] = g["cover"]
     return out
 
 def _friend_cover_file(uid, key, b64):
@@ -7057,6 +7192,14 @@ def _lib_init(self):
         for card, title in list(self.cards):
             try:
                 card.objectName()  # raises if the card was deleted
+            except RuntimeError:
+                continue
+            t = pretty_game_name(title)
+            if t and t not in titles:
+                titles.append(t)
+        for card, title in list(getattr(self, "fan_lib_list", [])):
+            try:
+                card.objectName()
             except RuntimeError:
                 continue
             t = pretty_game_name(title)
@@ -9107,14 +9250,115 @@ def _fan_csv_path():
 
 _FAN_CACHE = None
 
+FAN_DEFAULT_CATEGORIES = (("Undertale", "undertale"), ("FNF", "fnf"), ("FNaF", "fnaf"), ("Bendy", "bendy"))
+
+def get_custom_fan_csv_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_games_custom.csv")
+
+def get_fan_categories():
+    """[(button label, tag)] : All, the built-in categories, then any custom ones you've added."""
+    cats = [("All", "")] + list(FAN_DEFAULT_CATEGORIES)
+    known = {t for _l, t in cats}
+    path = get_custom_fan_csv_path()
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                for row in _csv.DictReader(f):
+                    for t in (row.get("tags") or "").split(","):
+                        t = t.strip()
+                        if t and t.lower() not in known:
+                            known.add(t.lower())
+                            cats.append((t, t.lower()))
+        except Exception:
+            pass
+    return cats
+
+def add_custom_fan_game(name, link, category):
+    """Saves a game to fan_games_custom.csv. Returns an error message, or "" when it worked."""
+    name, link, category = name.strip(), link.strip(), category.strip()
+    if not name:
+        return "Enter the game's name."
+    if link and not link.lower().startswith("http"):
+        link = "https://" + link
+    m = re.search(r"/games/[^/]+/(\d+)", link)
+    if not m:
+        return "Paste a Game Jolt game link, like https://gamejolt.com/games/name/12345"
+    if int(m.group(1)) in {g[0] for g in load_fan_games()}:
+        return "That game is already in the list."
+    if not category:
+        return "Pick a category (or type a custom one)."
+    path = get_custom_fan_csv_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            w = _csv.writer(f)
+            if new:
+                w.writerow(["name", "link", "tags"])
+            w.writerow([name, link, category.replace(",", " ")])
+    except OSError as e:
+        return f"Couldn't save the game: {e}"
+    return ""
+
+def reload_fan_games():
+    """Throws away the cached list so the csv files are read again."""
+    global _FAN_CACHE
+    _FAN_CACHE = None
+    return load_fan_games()
+
+class AddFanGameDialog(QDialog):
+    def __init__(self, parent, categories):
+        super().__init__(parent)
+        self.setWindowTitle("Add Fan Game")
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Game name")
+        self.link_edit = QLineEdit()
+        self.link_edit.setPlaceholderText("https://gamejolt.com/games/name/12345")
+        self.cat_combo = QComboBox()
+        for label, tag in categories:
+            if tag:
+                self.cat_combo.addItem(label, label)
+        self.cat_combo.addItem("Custom category...", None)
+        self.custom_edit = QLineEdit()
+        self.custom_edit.setPlaceholderText("New category name")
+        self.custom_edit.setVisible(self.cat_combo.currentData() is None)
+        self.cat_combo.currentIndexChanged.connect(
+            lambda _i: self.custom_edit.setVisible(self.cat_combo.currentData() is None))
+        form.addRow("Name", self.name_edit)
+        form.addRow("Link", self.link_edit)
+        form.addRow("Category", self.cat_combo)
+        form.addRow("", self.custom_edit)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Add")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def values(self):
+        cat = self.cat_combo.currentData()
+        if cat is None:
+            cat = self.custom_edit.text()
+        return self.name_edit.text(), self.link_edit.text(), cat
+
 def load_fan_games():
     """[(game_id, title, link, tags)] from the csv, one entry per Game Jolt game."""
     global _FAN_CACHE
     if _FAN_CACHE is not None:
         return _FAN_CACHE
     games, seen = [], set()
-    path = _fan_csv_path()
-    if path:
+    for path in (_fan_csv_path(), get_custom_fan_csv_path()):
+        if not path or not os.path.exists(path):
+            continue
         with open(path, encoding="utf-8-sig", newline="") as f:
             for row in _csv.DictReader(f):
                 name = (row.get("name") or "").strip()
@@ -9395,24 +9639,51 @@ class FanGamesPage(StorePage):
             lbl.setText("Fan Games")
         self.search_edit.setPlaceholderText("Search fan games")
 
-        # tag buttons: All / Undertale / FNF / FNaF / Bendy
+        # category buttons (All + built-in + any custom ones) and the Add Game button
         self._tag = ""
         self._tag_buttons = {}
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        for label, tag in (("All", ""), ("Undertale", "undertale"), ("FNF", "fnf"),
-                           ("FNaF", "fnaf"), ("Bendy", "bendy")):
+        self._tag_row = QHBoxLayout()
+        self._tag_row.setSpacing(8)
+        self._build_tag_buttons()
+        lay = self.layout()
+        lay.insertLayout(2, self._tag_row)
+        lay.insertSpacing(3, 10)
+
+    def _build_tag_buttons(self):
+        while self._tag_row.count():
+            w = self._tag_row.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self._tag_buttons = {}
+        for label, tag in get_fan_categories():
             b = QPushButton(label)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setFixedHeight(32)
+            b.setObjectName("Primary" if tag == self._tag else "")
             b.clicked.connect(lambda _c=False, t=tag: self._set_tag(t))
-            row.addWidget(b)
+            self._tag_row.addWidget(b)
             self._tag_buttons[tag] = b
-        row.addStretch()
-        self._tag_buttons[""].setObjectName("Primary")
-        lay = self.layout()
-        lay.insertLayout(2, row)
-        lay.insertSpacing(3, 10)
+        self._tag_row.addStretch()
+        add = QPushButton("+ Add Game")
+        add.setCursor(Qt.CursorShape.PointingHandCursor)
+        add.setFixedHeight(32)
+        add.clicked.connect(self._add_game)
+        self._tag_row.addWidget(add)
+
+    def _add_game(self):
+        dlg = AddFanGameDialog(self, get_fan_categories())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, link, cat = dlg.values()
+        err = add_custom_fan_game(name, link, cat)
+        if err:
+            QMessageBox.warning(self, "Add Fan Game", err)
+            return
+        games = reload_fan_games()                 # read the csv files again
+        self._links = {gid: l for gid, _t, l, _tg in games}
+        self._tag = cat.strip().lower()
+        self._build_tag_buttons()
+        self._set_tag(self._tag)
 
     def _set_tag(self, tag):
         self._tag = tag
@@ -9567,7 +9838,7 @@ def _fan_create_library_card(self, g):
     if sys.platform.startswith("linux"):
         menu.addAction("Switch Compatibility Tool").triggered.connect(lambda _c=False, i=gid: self._fan_compat_dialog(i))
     menu.addAction("Open Game Location").triggered.connect(
-        lambda _c=False, t=title_text: self.open_game_location(sanitize_folder_name(t)))
+        lambda _c=False, i=gid, t=title_text: self._fan_open_location(i, t))
     menu.addAction("Uninstall").triggered.connect(lambda _c=False, i=gid, t=title_text: self._fan_uninstall(i, t))
     menu.addSeparator()
     menu.addAction("Remove from Library").triggered.connect(lambda _c=False, i=gid: self._fan_remove(i))
@@ -9636,14 +9907,27 @@ AdaptiveApp._fan_view = _fan_view
 _fan_prev_apply_filter = AdaptiveApp.apply_filter
 
 def _fan_apply_filter(self, text=""):
-    _fan_prev_apply_filter(self, text)
+    _fan_prev_apply_filter(self, text)          # lays out the normal (steam / custom / NCZ) cards
     if not hasattr(self, "fan_section"):
         return
     query = (text if isinstance(text, str) else self.search_edit.text()).strip().lower()
     cols = max(1, self.grid_columns())
-    n = self.grid.count()  # the normal cards, already laid out above
     while self.fan_grid.count():
         self.fan_grid.takeAt(0)
+    if getattr(self, "_lib_tab", "games") != "fan":
+        # Games tab: no fan cards
+        for card, _t in self.fan_lib_list:
+            card.hide()
+        self.fan_section.hide()
+        n = self.grid.count()
+        self.empty_label.setText("No games match your search.")
+        self.empty_label.setVisible(n == 0)
+        return
+    # Fan Games tab: no normal cards
+    while self.grid.count():
+        self.grid.takeAt(0)
+    for card, _t in self.cards:
+        card.hide()
     span_w = cols * (COVER_W + 18) + (cols - 1) * 24
     fan_cols = max(1, (span_w + 24) // (FAN_CARD_W + 24))
     shown = 0
@@ -9656,10 +9940,11 @@ def _fan_apply_filter(self, text=""):
             card.hide()
     self.fan_section.setVisible(shown > 0)
     if shown:
-        self.grid.addWidget(self.fan_section, (n + cols - 1) // cols, 0, 1, cols)
-    total = n + shown
-    self.count_label.setText(f"{total} game{'s' if total != 1 else ''}")
-    self.empty_label.setVisible(total == 0)
+        self.grid.addWidget(self.fan_section, 0, 0, 1, cols)
+    self.count_label.setText(f"{shown} fan game{'s' if shown != 1 else ''}")
+    self.empty_label.setText("No games match your search." if query else
+                             "No fan games yet. Add some from the Fan Games page.")
+    self.empty_label.setVisible(shown == 0)
 
 AdaptiveApp.apply_filter = _fan_apply_filter
 
@@ -9683,6 +9968,29 @@ def _fan_init(self):
         self.pages.setCurrentWidget(self.fan_detail_page)
 
     self._fan_build_library_section()
+    self.fan_section.layout().itemAt(0).widget().hide()      # the tab already says "Fan Games"
+    # Games / Fan Games switch under the Library header
+    self._lib_tab = "games"
+    tabs = QWidget()
+    tabs.setStyleSheet("QPushButton { padding: 6px 18px; border-radius: 8px; } "
+                       "QPushButton:checked { background: palette(highlight); color: #ffffff; font-weight: bold; }")
+    tl = QHBoxLayout(tabs)
+    tl.setContentsMargins(0, 0, 0, 14)
+    tl.setSpacing(8)
+    group = QButtonGroup(tabs)
+    group.setExclusive(True)
+    for key, label in (("games", "Games"), ("fan", "Fan Games")):
+        b = QPushButton(label)
+        b.setCheckable(True)
+        b.setChecked(key == "games")
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        group.addButton(b)
+        b.clicked.connect(lambda _c=False, k=key: (setattr(self, "_lib_tab", k),
+                                                   self.apply_filter(self.search_edit.text())))
+        tl.addWidget(b)
+    tl.addStretch()
+    self.library_tabs = tabs
+    self.search_edit.parentWidget().layout().insertWidget(2, tabs)
     self.fan_detail_page.add_requested.connect(self._fan_add)
     self.fan_page.fan_selected.connect(open_fan_game)
     self.fan_detail_page.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
@@ -9763,9 +10071,12 @@ def _gj_find_link(self, game_url, gid=None):
             got = {}
             page.on("download", lambda d: got.setdefault("d", d))
             context.on("page", lambda pg: pg.on("download", lambda d: got.setdefault("d", d)))
+            # skip images/fonts: the page only needs its scripts, and loading art + ads is what made this slow
+            context.route("**/*", lambda route: route.abort()
+                          if route.request.resource_type in ("image", "font") else route.continue_())
             self.status_update.emit("Opening Game Jolt page...")
-            page.goto(game_url, timeout=60000)
-            page.wait_for_timeout(3000)
+            # don't wait for the full "load" event (ads/trackers can take ages), the buttons are polled for below
+            page.goto(game_url, timeout=60000, wait_until="domcontentloaded")
 
             def wait_download(sec):
                 end = time.time() + sec
@@ -9803,11 +10114,13 @@ def _gj_find_link(self, game_url, gid=None):
             main_btns = [page.get_by_role("button", name=GJ_DOWNLOAD_BTN),
                          page.get_by_role("link", name=GJ_DOWNLOAD_BTN)]
             clicked_main = False
-            for _ in range(8):  # give the page a few seconds to render its buttons
+            for _ in range(60):  # up to ~15s, checked every 250ms so it reacts as soon as the button shows up
+                if self._is_cancelled:
+                    raise RuntimeError("CANCELLED")
                 if click_first(main_btns):
                     clicked_main = True
                     break
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(250)
             if not clicked_main:
                 raise RuntimeError("Game is unreleased")
             # Be patient: Game Jolt may show a builds list and/or a "download starts after the video" page.
@@ -9831,7 +10144,7 @@ def _gj_find_link(self, game_url, gid=None):
                                 self.status_update.emit("Waiting for the download to start (may play a video first)...")
                     except Exception:
                         pass
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(400)
             if "d" not in got:
                 raise RuntimeError("The download didn't start.")
             download = got["d"]
@@ -9901,20 +10214,24 @@ def _gj_install_file(path, game_dir):
     extract_archive(path, game_dir)
 
 class GameJoltDownloadWorker(FirebaseDownloadWorker):
-    def __init__(self, title, game_url, gid=None):
+    def __init__(self, title, game_url, gid=None, existing_zip_path=None):
         super().__init__(title, game_url, 0)
         self.game_url = game_url
         self.gid = gid
+        self.existing_zip_path = existing_zip_path
 
     def run(self):
         dest_path, fresh = None, False
         try:
-            url, headers = _gj_find_link(self, self.game_url, self.gid)
-            self.download_url = url
-            dest_path = _gj_stream(self, url, headers)
-            fresh = True
+            if self.existing_zip_path and os.path.exists(self.existing_zip_path):
+                dest_path = self.existing_zip_path   # user chose to reuse the file that's already downloaded
+            else:
+                url, headers = _gj_find_link(self, self.game_url, self.gid)
+                self.download_url = url
+                dest_path = _gj_stream(self, url, headers)
+                fresh = True
             if self._is_cancelled:
-                if os.path.exists(dest_path):
+                if fresh and os.path.exists(dest_path):   # never delete a file the user chose to keep
                     os.remove(dest_path)
                 self.failed.emit("CANCELLED")
                 return
@@ -9935,7 +10252,10 @@ def _fan_install(self, gid, title, cover_path, link):
     if not link:
         QMessageBox.warning(self, "Install", "This game has no Game Jolt link.")
         return
-    worker = GameJoltDownloadWorker(title, link, gid)
+    cancelled, existing = _ask_existing_archive(self, title)
+    if cancelled:
+        return
+    worker = GameJoltDownloadWorker(title, link, gid, existing)
     worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
     card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
     self.downloads_page.add_download_card(card)
@@ -9952,6 +10272,38 @@ def _gj_init(self):
 
 AdaptiveApp.__init__ = _gj_init
 
+
+
+# ---- "use existing file or download again" for steam + Game Jolt installs ----
+def find_existing_archive_for_title(title):
+    norm = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
+    nt = norm(title)
+    if len(nt) < 3 or not os.path.isdir(DOWNLOAD_DIR):
+        return None
+    for f in sorted(os.listdir(DOWNLOAD_DIR)):
+        if not f.lower().endswith((".zip", ".rar", ".7z")):
+            continue
+        nf = norm(os.path.splitext(f)[0])
+        i = nf.find(nt)
+        if i != -1 and not (i + len(nt) < len(nf) and nf[i + len(nt)].isdigit()):  # "portal" must not match "portal2"
+            return os.path.join(DOWNLOAD_DIR, f)
+    return None
+
+def _ask_existing_archive(parent, title):
+    """(cancelled, path_to_reuse_or_None). Asks only when a matching zip/rar is already in the downloads folder."""
+    existing = find_existing_archive_for_title(title)
+    if not existing:
+        return False, None
+    dlg = ExistingFileDialog(os.path.basename(existing), parent)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return True, None
+    if dlg.choice == "use":
+        return False, existing
+    try:
+        os.remove(existing)
+    except Exception:
+        pass
+    return False, None
 
 # ======================= QoL: pausable downloads, exe icons, desktop shortcuts, fan-game launching =======================
 def _wk_get_cancel(self):
@@ -9998,8 +10350,15 @@ def _find_game_exe(folder):
                 best, best_key = full, key
     return best
 
+def _fan_linked_exe(title):
+    """The exe you pointed an existing fan game at (Add Existing Fan Game), if it's still there."""
+    for g in load_fan_library():
+        if g.get("title") == title and g.get("exe_path") and os.path.exists(g["exe_path"]):
+            return g["exe_path"]
+    return None
+
 def _fan_installed_exe(title):
-    return _find_game_exe(installed_game_dir(sanitize_folder_name(title)))
+    return _fan_linked_exe(title) or _find_game_exe(installed_game_dir(sanitize_folder_name(title)))
 
 def _fan_update_btn(btn, title):
     btn.setText("Launch" if _fan_installed_exe(title) else "Install")
@@ -10028,8 +10387,9 @@ def _launch_exe(app, exe, compat_tool=""):
         if extra:
             os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
             env.update(extra)
+            apply_proton_d3d(env)
         elif sys.platform.startswith("linux") and argv[0] != exe:
-            env = system_env()
+            env = wine_game_env()
         subprocess.Popen(argv, cwd=cwd, env=env)
     except Exception as e:
         QMessageBox.warning(app, "Launch Error", f"Couldn't launch the game: {e}")
@@ -10116,7 +10476,7 @@ def _exe_icon_png(exe, name):
     except Exception:
         return ""
 
-def create_desktop_shortcut(app, title, exe, compat_tool="", fallback_icon=""):
+def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon=""):
     import shlex
     if not exe or not os.path.exists(exe):
         QMessageBox.warning(app, "Desktop Shortcut", "Couldn't find the game's executable. Is it installed?")
@@ -10168,7 +10528,7 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="")
     if not more or not more.menu():
         return
     more.menu().addAction("Create Desktop Shortcut").triggered.connect(
-        lambda _c=False: create_desktop_shortcut(app, title, exe_fn(), tool_fn(), cover))
+        lambda _c=False: create_game_shortcut(app, title, exe_fn(), tool_fn(), cover))
 
 # --- hook every kind of library card ---
 _sc_prev_game_card = AdaptiveApp.create_game_card
@@ -10203,6 +10563,183 @@ def _sc_create_custom_card(self, game_id, title_text, exe_path, cover_path, comp
                          lambda: exe_path, lambda: compat_tool, cover_path)
 AdaptiveApp.create_custom_card = _sc_create_custom_card
 
+# ---------------------------------------------------------------- Add Existing Fan Game
+from PyQt6.QtWidgets import QListWidget as _FanListWidget, QListWidgetItem
+
+class AddExistingFanGameDialog(QDialog):
+    """Pick a fan game from the list, then point it at the exe you already have."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Existing Fan Game")
+        self.setMinimumSize(460, 500)
+        self.result_data = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel("1. Choose the game"))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search fan games")
+        self.search.textChanged.connect(self._fill)
+        self.games = _FanListWidget()
+        lay.addWidget(self.search)
+        lay.addWidget(self.games, 1)
+        lay.addWidget(QLabel("2. Choose its executable"))
+        row = QHBoxLayout()
+        self.exe_edit = QLineEdit()
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.exe_edit, 1)
+        row.addWidget(browse)
+        lay.addLayout(row)
+        if sys.platform.startswith("linux"):
+            crow = QHBoxLayout()
+            crow.addWidget(QLabel("Compatibility Tool"))
+            self.compat_combo = QComboBox()
+            self.compat_combo.addItem("Default (System Wine / Native)", "")
+            for name, path in sorted(get_available_compatibility_tools().items()):
+                self.compat_combo.addItem(name, path)
+            crow.addWidget(self.compat_combo, 1)
+            lay.addLayout(crow)
+        else:
+            self.compat_combo = None
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Add to Library")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self._accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+        self._fill()
+
+    def _fill(self, _text=""):
+        term = self.search.text().strip().lower()
+        self.games.clear()
+        shown = 0
+        for gid, title, link, tags in load_fan_games():
+            if term in title.lower():
+                it = QListWidgetItem(title)
+                it.setData(Qt.ItemDataRole.UserRole, (gid, title, link, tags))
+                self.games.addItem(it)
+                shown += 1
+                if shown >= 80:
+                    break
+
+    def _browse(self):
+        flt = "Executables (*.exe);;All files (*)" if sys.platform.startswith(("win", "linux")) else "All files (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Select Executable", os.path.expanduser("~"), flt)
+        if path:
+            self.exe_edit.setText(path)
+
+    def _accept(self):
+        item = self.games.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "Add Existing Fan Game", "Pick a game from the list first.\n"
+                                "Not there? Add it first with \"+ Add Game\" on the Fan Games page.")
+            return
+        exe = self.exe_edit.text().strip()
+        if not exe or not os.path.exists(exe):
+            QMessageBox.warning(self, "Add Existing Fan Game", "Please provide a valid, existing executable path.")
+            return
+        gid, title, link, tags = item.data(Qt.ItemDataRole.UserRole)
+        self.result_data = {"id": gid, "title": title, "link": link, "tags": sorted(tags), "exe_path": exe,
+                            "compat_tool": self.compat_combo.currentData() if self.compat_combo else ""}
+        self.accept()
+
+def _fan_open_location(self, gid, title):
+    entry = next((g for g in load_fan_library() if g["id"] == gid), None)
+    exe = entry.get("exe_path") if entry else ""
+    if exe and os.path.exists(exe):
+        folder = os.path.dirname(exe)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception as e:
+            QMessageBox.warning(self, "Open Game Location", f"Couldn't open the folder: {e}")
+        return
+    self.open_game_location(sanitize_folder_name(title))
+
+def _fan_add_existing(self):
+    dlg = AddExistingFanGameDialog(self)
+    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+        return
+    d = dlg.result_data
+    gid, title, link, exe = d["id"], d["title"], d["link"], d["exe_path"]
+    if d["compat_tool"]:
+        cfg = load_compat_config()
+        cfg[f"fan-{gid}"] = d["compat_tool"]
+        save_compat_config(cfg)
+    lib = load_fan_library()
+    existing = next((g for g in lib if g["id"] == gid), None)
+    if existing is not None:               # already in the library: just link the exe
+        existing["exe_path"] = exe
+        save_fan_library(lib)
+        self._fan_refresh(gid)
+        QMessageBox.information(self, "Add Existing Fan Game",
+                                f"{title} was already in your library, so its executable was updated.")
+        return
+    saved_cover = ""
+    cached = os.path.join(get_fan_cover_dir(), f"{gid}.img")
+    if os.path.exists(cached):
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+            shutil.copyfile(cached, saved_cover)
+        except Exception:
+            saved_cover = cached
+    entry = {"id": gid, "title": title, "link": link, "tags": d["tags"], "cover": saved_cover, "exe_path": exe}
+    save_fan_library(lib + [entry])
+    self._fan_create_library_card(entry)
+    if self.fan_detail_page._appid == gid:
+        self.fan_detail_page.set_in_library(True)
+    # show it: switch the library to the Fan Games tab
+    self._lib_tab = "fan"
+    btns = self.library_tabs.findChildren(QPushButton) if hasattr(self, "library_tabs") else []
+    if len(btns) > 1:
+        btns[1].setChecked(True)
+    self.apply_filter(self.search_edit.text())
+    if saved_cover:
+        return
+    # no cover cached yet: fetch it from Game Jolt in the background
+    card = self.fan_lib_cards.get(gid)
+    label = card.findChildren(QLabel)[0] if card is not None else None
+    worker = TaskWorker(lambda: self.fan_page.loader._fetch(gid, link, "", title))
+    if not hasattr(self, "_fan_cover_workers"):
+        self._fan_cover_workers = []
+    self._fan_cover_workers.append(worker)
+
+    def got(path):
+        if worker in self._fan_cover_workers:
+            self._fan_cover_workers.remove(worker)
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            dest = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+            shutil.copyfile(path, dest)
+            lib2 = load_fan_library()
+            for g in lib2:
+                if g["id"] == gid:
+                    g["cover"] = dest
+            save_fan_library(lib2)
+            pix = rounded_cover_pixmap(dest, FAN_COVER_W, FAN_COVER_H, 8)
+            if label is not None and pix:
+                label.setText("")
+                label.setPixmap(pix)
+                label.setStyleSheet("background: transparent; border: none;")
+        except (OSError, RuntimeError):
+            pass
+    worker.done.connect(got)
+    worker.failed.connect(lambda _m: None)
+    worker.start()
+
+AdaptiveApp._fan_open_location = _fan_open_location
+AdaptiveApp._fan_add_existing = _fan_add_existing
+
 # --- fan games: shortcut, compat tool, uninstall, button state ---
 _sc_prev_fan_card = AdaptiveApp._fan_create_library_card
 def _sc_fan_card(self, g):
@@ -10230,6 +10767,16 @@ def _fan_compat_dialog(self, gid):
         QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
 
 def _fan_uninstall(self, gid, title):
+    lib = load_fan_library()
+    entry = next((g for g in lib if g["id"] == gid), None)
+    if entry and entry.get("exe_path"):
+        if QMessageBox.question(self, "Unlink", f"Unlink {title} from its existing files?\n"
+                                "Your game files won't be deleted.") != QMessageBox.StandardButton.Yes:
+            return
+        entry.pop("exe_path", None)
+        save_fan_library(lib)
+        self._fan_refresh(gid)
+        return
     d = installed_game_dir(sanitize_folder_name(title))
     if os.path.isdir(d):
         if QMessageBox.question(self, "Uninstall", f"Delete the installed files for {title}?") != QMessageBox.StandardButton.Yes:
@@ -10257,6 +10804,231 @@ def _fan_show_game(self, appid, title, *a, **k):
     _fan_prev_show_game(self, appid, title, *a, **k)
     _fan_update_btn(self.steam_btn, title)
 FanDetailPage.show_game = _fan_show_game
+
+# ---------------------------------------------------------------- drag to reorder the library
+# The three NCZ games stay first and can't be moved, and nothing can be dropped in front of them.
+from PyQt6.QtCore import QEvent as _QEvent, QMimeData as _QMimeData, QPoint as _QPoint, QRect as _QRect
+from PyQt6.QtWidgets import QAbstractButton as _QAB, QGraphicsOpacityEffect as _QGOE
+
+_CARD_MIME = "application/x-ncz-library-card"
+
+def get_library_order_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "library_order.json")
+
+def _load_library_order():
+    try:
+        with open(get_library_order_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+class _CardReorder(QObject):
+    """Press a library card, drag it onto another card and let go to put it in that spot.
+    Mouse-driven (a ghost card follows the cursor), so it doesn't depend on OS drag-and-drop."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.press = None          # (card, global pos) while the button is held on a movable card
+        self.card = None           # card being dragged
+        self.ghost = None          # (label, opacity effect)
+        self.cursor_set = False
+        QApplication.instance().installEventFilter(self)
+
+    def _lists(self):
+        return [self.app.cards, getattr(self.app, "fan_lib_list", [])]
+
+    def _fixed(self):
+        return getattr(self.app, "_fixed_cards", set())
+
+    def _rect(self, card):
+        return _QRect(card.mapTo(self.app.grid_container, _QPoint(0, 0)), card.size())
+
+    def _card_at(self, pos):
+        for lst in self._lists():
+            for card, _t in lst:
+                try:
+                    if card.isVisible() and self._rect(card).contains(pos):
+                        return card
+                except RuntimeError:
+                    continue
+        return None
+
+    def _card_for(self, widget):
+        """The movable card this widget sits in, or None (buttons and the fixed NCZ cards don't start a drag)."""
+        cards = {id(c): c for lst in self._lists() for c, _t in lst}
+        w = widget
+        while w is not None:
+            if isinstance(w, _QAB):
+                return None
+            if id(w) in cards:
+                return None if id(w) in self._fixed() else w
+            w = w.parentWidget()
+        return None
+
+    def _plan(self, pos):
+        """(list, from index, to index) for dropping the dragged card at pos, or None if not allowed."""
+        src = self.card
+        if src is None or id(src) in self._fixed():
+            return None
+        for lst in self._lists():
+            idx = next((i for i, (c, _t) in enumerate(lst) if c is src), None)
+            if idx is None:
+                continue
+            target = self._card_at(pos)
+            if target is not None:
+                if target is src or id(target) in self._fixed():
+                    return None
+                j = next((i for i, (c, _t) in enumerate(lst) if c is target), None)
+                return (lst, idx, j) if j is not None else None
+            # empty space: only counts as "move to the end" right after / below the last card of this list
+            shown = [c for c, _t in lst if c.isVisible()]
+            if not shown:
+                return None
+            r = self._rect(shown[-1])
+            fs = getattr(self.app, "fan_section", None)
+            if lst is self.app.cards and fs is not None and fs.isVisible() and pos.y() >= fs.geometry().top():
+                return None
+            if pos.y() > r.bottom() or (pos.y() >= r.top() and pos.x() > r.right()):
+                return (lst, idx, len(lst) - 1)
+            return None
+        return None
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t not in (_QEvent.Type.MouseButtonPress, _QEvent.Type.MouseMove, _QEvent.Type.MouseButtonRelease):
+            return False
+        if not isinstance(obj, QWidget):
+            return False
+        try:
+            return self._handle(obj, ev, t)
+        except RuntimeError:           # a card was deleted in the middle of a drag
+            self._cleanup()
+            return False
+
+    def _handle(self, obj, ev, t):
+        gpos = ev.globalPosition().toPoint()
+        if t == _QEvent.Type.MouseButtonPress:
+            if ev.button() == Qt.MouseButton.LeftButton and self.card is None and self.press is None:
+                card = self._card_for(obj)
+                if card is not None:
+                    self.press = (card, gpos)
+            return False
+        if t == _QEvent.Type.MouseMove:
+            if self.card is None:
+                if self.press is None:
+                    return False
+                if not (ev.buttons() & Qt.MouseButton.LeftButton):
+                    self.press = None
+                    return False
+                if (gpos - self.press[1]).manhattanLength() < QApplication.startDragDistance():
+                    return False
+                self._begin(self.press[0])
+            self._track(gpos)
+            return True
+        # button released
+        if self.card is not None:
+            plan = self._plan(self.app.grid_container.mapFromGlobal(gpos))
+            self._cleanup()
+            if plan:
+                lst, i, j = plan
+                lst.insert(j, lst.pop(i))
+                self.app.apply_filter(self.app.search_edit.text())
+                self.save()
+            return True
+        self.press = None
+        return False
+
+    def _begin(self, card):
+        self.card = card
+        self.press = None
+        pm = card.grab().scaledToWidth(130, Qt.TransformationMode.SmoothTransformation)
+        ghost = QLabel(self.app)
+        ghost.setPixmap(pm)
+        ghost.setFixedSize(pm.size())
+        ghost.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        eff = _QGOE(ghost)
+        ghost.setGraphicsEffect(eff)
+        ghost.show()
+        ghost.raise_()
+        self.ghost = (ghost, eff)
+        dim = _QGOE(card)
+        dim.setOpacity(0.35)
+        card.setGraphicsEffect(dim)
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        self.cursor_set = True
+
+    def _track(self, gpos):
+        ghost, eff = self.ghost
+        p = self.app.mapFromGlobal(gpos)
+        ghost.move(p.x() - ghost.width() // 2, p.y() - ghost.height() // 2)
+        pos = self.app.grid_container.mapFromGlobal(gpos)
+        self._autoscroll(pos)
+        eff.setOpacity(0.95 if self._plan(pos) else 0.5)
+
+    def _cleanup(self):
+        if self.ghost is not None:
+            self.ghost[0].deleteLater()
+            self.ghost = None
+        if self.cursor_set:
+            QApplication.restoreOverrideCursor()
+            self.cursor_set = False
+        if self.card is not None:
+            try:
+                self.card.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        self.card = None
+        self.press = None
+
+    def _autoscroll(self, pos):
+        view = self.app.grid_container.parentWidget()
+        scroll = view.parentWidget() if view is not None else None
+        bar = scroll.verticalScrollBar() if hasattr(scroll, "verticalScrollBar") else None
+        if bar is None:
+            return
+        y = pos.y() - bar.value()          # position inside the visible area
+        if y < 50:
+            bar.setValue(bar.value() - 24)
+        elif y > view.height() - 50:
+            bar.setValue(bar.value() + 24)
+
+    def save(self):
+        data = {"main": [t for c, t in self.app.cards if id(c) not in self._fixed()],
+                "fan": [t for c, t in getattr(self.app, "fan_lib_list", [])]}
+        try:
+            path = get_library_order_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+
+def _apply_saved_order(lst, saved, keep_first=0):
+    """Re-sorts lst in place by saved title order; unknown titles keep their place at the end."""
+    rank = {t: i for i, t in enumerate(saved)}
+    head, tail = lst[:keep_first], lst[keep_first:]
+    tail.sort(key=lambda it: rank.get(it[1], len(rank)))      # stable
+    lst[:] = head + tail
+
+
+_reorder_prev_init = AdaptiveApp.__init__
+
+def _reorder_init(self):
+    _reorder_prev_init(self)
+    # the three NCZ games are always the first three cards
+    self._fixed_cards = {id(c) for c, _t in self.cards[:3]}
+    saved = _load_library_order()
+    _apply_saved_order(self.cards, saved.get("main", []), keep_first=3)
+    _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
+    self._card_reorder = _CardReorder(self)
+    self.apply_filter()
+
+AdaptiveApp.__init__ = _reorder_init
+
 
 if __name__ == "__main__":
     main()
