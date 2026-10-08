@@ -1137,7 +1137,7 @@ class ExistingFileDialog(QDialog):
         self.accept()
 
 class DownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -2009,11 +2009,11 @@ class DownloadDialog(QDialog):
             self.progress_bar.setValue(percent)
             total_mb = total / (1024 * 1024)
             self.status_label.setText(f"Downloading... {percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | Progress: {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Progress: {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
 
     def on_finished(self, zip_path):
         self.zip_path = zip_path
@@ -3942,11 +3942,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -3976,8 +3976,14 @@ class DownloadCard(QFrame):
             pass
         self.action_btn.clicked.connect(lambda: QApplication.clipboard().setText(error_msg))
 
+def _fmt_dl(num_bytes):
+    """Sizes over 1 GB are shown in GB, everything else in MB."""
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f} GB"
+    return f"{num_bytes / 1024 ** 2:.1f} MB"
+
 class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -4815,7 +4821,7 @@ def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
 AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
 
 class GameDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -5488,11 +5494,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -6359,7 +6365,7 @@ def _patched_start_ncz2_install(self):
 AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
 
 class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -6569,11 +6575,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -6852,8 +6858,11 @@ FirebaseDownloadWorker.run = _new_fb_run
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
 PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
+PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
+PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
+PW_RELAY_BUTTONS = 'button.download, a.download, [onclick*="openLink"]'  # link buttons on the container page
 PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
-PW_HEADLESS = True                                    # False shows the browser window
+PW_HEADLESS = True                                     # True hides the browser; it only pops up while you solve a captcha
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
 
@@ -6863,8 +6872,8 @@ def pw_game_url(title):
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower().replace("'", "")).strip("-")
     return PW_BASE_URL.rstrip("/") + "/" + slug
 
-# True when the block around a DOWNLOAD HERE button (its label, logo, link...) mentions MegaDB.
-PW_MEGA_JS = r"""el => {
+# Describes the block around a DOWNLOAD HERE button (its label, logo, link...): which host does it mention?
+PW_LABEL_JS = r"""el => {
     const hits = n => ((n.innerText || "").toLowerCase().split("download here").length - 1);
     let node = el;
     for (let i = 0; i < 4; i++) {
@@ -6872,7 +6881,8 @@ PW_MEGA_JS = r"""el => {
         if (!p || p === document.body || hits(p) > 1) break;
         node = p;
     }
-    return /mega\s*-?db/i.test(node.outerHTML);
+    const h = node.outerHTML;
+    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h)};
 }"""
 
 def _pw_host_ok(url, hosts):
@@ -6881,9 +6891,88 @@ def _pw_host_ok(url, hosts):
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in hosts if h)
 
+def _pw_on(url, hosts):
+    """Strict version of _pw_host_ok: the page really is on one of these hosts (about:blank doesn't count)."""
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts if h)
+
+def _pw_captcha_shown(pg):
+    loc = pg.locator('iframe[src*="captcha"], .captcha, #captcha, [class*="captcha"], input[name*="captcha"]')
+    try:
+        return any(loc.nth(i).is_visible() for i in range(min(loc.count(), 10)))
+    except Exception:
+        return False
+
+def _pw_wait_captcha(self, pg):
+    self.status_update.emit("Solve the captcha in the browser window...")
+    try:
+        pg.bring_to_front()
+    except Exception:
+        pass
+    deadline = time.time() + 600
+    while _pw_captcha_shown(pg):
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+        if time.time() > deadline:
+            raise RuntimeError("The captcha wasn't solved in time.")
+        pg.wait_for_timeout(1000)
+    pg.wait_for_timeout(1500)
+
+def _pw_pick_link(self, context, tab):
+    """Presses the Download buttons on a container page until one reaches a file host; returns that tab."""
+    self.status_update.emit("Pressing Download...")
+    btns = tab.locator(PW_RELAY_BUTTONS)
+    if btns.count() == 0:  # fall back to anything that just says "Download"
+        btns = tab.get_by_text(re.compile(r"^\s*download\s*$", re.IGNORECASE))
+    for i in range(btns.count()):
+        try:
+            with context.expect_page(timeout=10000) as info:
+                btns.nth(i).click()
+            new = info.value
+            end = time.time() + 20
+            while time.time() < end and not new.is_closed():
+                if _pw_on(new.url, PW_ALLOWED_HOSTS):
+                    return new
+                new.wait_for_timeout(500)
+        except Exception:
+            tab.wait_for_timeout(500)
+    return None
+
+def _pw_through_relay(self, context, tab, p):
+    """Container page (filecrypt.cc): you solve the captcha, Download is pressed on that same page, and the
+    file-host link it opens is used. With PW_HEADLESS the captcha window is a temporary visible browser; once
+    the link is found it closes and the hidden browser carries on from there."""
+    tab.wait_for_timeout(3000)  # let the captcha load
+    if not _pw_captcha_shown(tab):
+        return _pw_pick_link(self, context, tab)
+    if not PW_HEADLESS:
+        _pw_wait_captcha(self, tab)
+        return _pw_pick_link(self, context, tab)
+    vb = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+    try:
+        vctx = vb.new_context(user_agent=PW_USER_AGENT)
+        vctx.add_cookies(context.cookies())
+        vtab = vctx.new_page()
+        _pw_guard(vctx, vtab)
+        vtab.goto(tab.url, timeout=60000)
+        vtab.wait_for_timeout(3000)
+        if _pw_captcha_shown(vtab):
+            _pw_wait_captcha(self, vtab)
+        found = _pw_pick_link(self, vctx, vtab)
+        if not found:
+            return None
+        final_url = found.url
+        context.add_cookies(vctx.cookies())
+    finally:
+        vb.close()
+    self.status_update.emit("Captcha solved, continuing in the background...")
+    page = context.new_page()
+    page.goto(final_url, timeout=60000)
+    return page
+
 def _pw_guard(context, page):
     """Watches every tab: a popup that lands anywhere unexpected is closed, the main tab is sent back."""
-    allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname,) + tuple(PW_ALLOWED_HOSTS)
+    allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname,) + tuple(PW_ALLOWED_HOSTS) + tuple(PW_RELAY_HOSTS)
     state = {"closed": 0, "blocked": []}  # extra tabs closed so far, and the blocked URLs
     def watch(pg):
         if pg is not page:
@@ -6931,7 +7020,7 @@ def _pw_find_link(self, start_url):
             page.goto(start_url, timeout=60000)
 
             target = None
-            idx, bad, checked = 0, set(), False  # idx = which DOWNLOAD HERE button to click; bad = MegaDB ones
+            idx, bad, order = 0, set(), None  # idx = which DOWNLOAD HERE button to click; bad = ones to skip (MegaDB)
             for attempt in range(1, 11):
                 if self._is_cancelled:
                     raise RuntimeError("CANCELLED")
@@ -6941,29 +7030,38 @@ def _pw_find_link(self, start_url):
                 try:
                     buttons = page.get_by_text(PW_BUTTON_TEXT, exact=False)
                     n = buttons.count()
-                    if n and not checked:  # first button labelled MegaDB -> go straight to the second
-                        checked = True
-                        if n > 1 and buttons.nth(0).evaluate(PW_MEGA_JS):
-                            bad.add(0)
-                            self.status_update.emit("First button is MegaDB, using the second one...")
-                    idx = next((i for i in range(n) if i not in bad), None) if n else 0  # first button, then the next unused one
+                    if n and order is None:  # BZZHR is preferred, then GoFile, then whatever is left; MegaDB is skipped
+                        flags = [buttons.nth(i).evaluate(PW_LABEL_JS) for i in range(n)]
+                        bad |= {i for i, f in enumerate(flags) if f["mega"]}
+                        order = ([i for i, f in enumerate(flags) if f["bzzhr"]] +
+                                 [i for i, f in enumerate(flags) if f["gofile"]] + list(range(n)))
+                        if any(f["bzzhr"] for f in flags):
+                            self.status_update.emit("Found a BZZHR button, using it...")
+                        elif any(f["gofile"] for f in flags):
+                            self.status_update.emit("No BZZHR button, using GoFile...")
+                    idx = next((i for i in (order or range(n)) if i not in bad), None) if n else 0
                     if idx is None:
                         raise RuntimeError("No other DOWNLOAD HERE button found.")
                     with context.expect_page(timeout=10000) as info:
                         buttons.nth(idx).click()
                     tab = info.value
                     tab.wait_for_load_state("domcontentloaded")
-                    if _pw_host_ok(tab.url, PW_ALLOWED_HOSTS):
+                    if _pw_on(tab.url, PW_RELAY_HOSTS):
+                        target = _pw_through_relay(self, context, tab, p)
+                        if target:
+                            break
+                    elif _pw_on(tab.url, PW_ALLOWED_HOSTS):
                         target = tab
                         break
-                    tab.close()
+                    if not tab.is_closed():
+                        tab.close()
                 except RuntimeError:
                     raise
                 except Exception:
                     page.wait_for_timeout(1000)
-                if any("megadb.net" in u for u in guard["blocked"][blocked_before:]) or \
-                        (tab is not None and "megadb.net" in (tab.url or "")):
-                    self.status_update.emit("Got megadb.net, trying a different DOWNLOAD HERE button...")
+                if any(h in u for u in guard["blocked"][blocked_before:] for h in PW_BLOCKED_HOSTS) or \
+                        (tab is not None and any(h in (tab.url or "") for h in PW_BLOCKED_HOSTS)):
+                    self.status_update.emit("Got a blocked site, trying a different DOWNLOAD HERE button...")
                     bad.add(idx)
             if not target:
                 raise RuntimeError("Couldn't reach a valid download link.")
@@ -7057,7 +7155,20 @@ def _fb_pw_run(self):
         extract_archive(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
         self.finished.emit(dest_path)
     except Exception as e:
-        self.failed.emit("CANCELLED" if self._is_cancelled or str(e) == "CANCELLED" else str(e))
+        if self._is_cancelled or str(e) == "CANCELLED":
+            self.failed.emit("CANCELLED")
+            return
+        msg = str(e)
+        try:  # keep the full traceback so customers can send it over
+            import traceback
+            log = os.path.join(os.path.dirname(get_launcher_settings_path()), "download_error.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} | {self.title} | Python {sys.version.split()[0]}\n")
+                f.write(traceback.format_exc() + "\n")
+            msg += f"\n\nFull details saved to:\n{log}"
+        except Exception:
+            pass
+        self.failed.emit(msg)
 
 FirebaseDownloadWorker.run = _fb_pw_run
 
@@ -11363,6 +11474,40 @@ def _ge_init(self):
     layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
 
 AdaptiveApp.__init__ = _ge_init
+
+# ---------------------------------------------------------------- H toggles the download browser window
+from PyQt6.QtCore import QObject as _QObject, QEvent as _QEvent, QRect as _QRect
+from PyQt6.QtWidgets import (QTextEdit as _QTextEdit, QPlainTextEdit as _QPlainTextEdit,
+                             QAbstractSpinBox as _QAbstractSpinBox, QToolTip as _QToolTip)
+from PyQt6.QtGui import QCursor as _QCursor
+
+class _PwHeadlessKey(_QObject):
+    """Pressing H (outside text fields) flips PW_HEADLESS. Applies from the next download."""
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == _QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_H
+                and ev.modifiers() == Qt.KeyboardModifier.NoModifier and not ev.isAutoRepeat()):
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, _QTextEdit, _QPlainTextEdit, _QAbstractSpinBox)) or \
+                    (isinstance(w, QComboBox) and w.isEditable()):
+                return False  # let people type the letter h
+            globals()["PW_HEADLESS"] = not globals()["PW_HEADLESS"]
+            state = "hidden" if globals()["PW_HEADLESS"] else "visible"
+            _QToolTip.showText(_QCursor.pos(), f"Download browser: {state} (next download)", self.window, _QRect(), 2500)
+            return True
+        return False
+
+_pwh_prev_init = AdaptiveApp.__init__
+
+def _pwh_init(self):
+    _pwh_prev_init(self)
+    self._pw_key_filter = _PwHeadlessKey(self)
+    QApplication.instance().installEventFilter(self._pw_key_filter)
+
+AdaptiveApp.__init__ = _pwh_init
 
 if __name__ == "__main__":
     main()
