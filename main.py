@@ -735,7 +735,16 @@ def get_launch_command():
         return sys.executable, [], os.path.dirname(os.path.abspath(sys.executable))
     script = os.path.abspath(__file__)
     exe = sys.executable
+    # Layout: launcher/source/main.py with the virtual environment in launcher/venv, so shortcuts use that Python.
+    venv = os.path.join(os.path.dirname(os.path.dirname(script)), "venv")
     if sys.platform.startswith("win"):
+        candidates = [os.path.join(venv, "Scripts", "pythonw.exe"), os.path.join(venv, "Scripts", "python.exe")]
+    else:
+        candidates = [os.path.join(venv, "bin", "python3"), os.path.join(venv, "bin", "python")]
+    venv_python = next((c for c in candidates if os.path.isfile(c)), None)
+    if venv_python:
+        exe = venv_python
+    elif sys.platform.startswith("win"):
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pythonw):
             exe = pythonw  # no console window
