@@ -4,6 +4,7 @@ import re
 import time
 import json
 import shutil
+import shlex
 import zipfile
 import subprocess
 import urllib.request
@@ -271,7 +272,7 @@ def load_launcher_settings():
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, encoding='utf-8') as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
                 mode = str(loaded.get("dark_mode", "system")).lower()
@@ -327,7 +328,7 @@ def get_installed_versions_path():
 
 def _load_installed_versions():
     try:
-        with open(get_installed_versions_path(), 'r', encoding='utf-8') as f:
+        with open(get_installed_versions_path(), encoding='utf-8') as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -465,7 +466,7 @@ def get_account_path():
 
 def load_account():
     try:
-        with open(get_account_path(), 'r', encoding='utf-8') as f:
+        with open(get_account_path(), encoding='utf-8') as f:
             acct = json.load(f)
         if isinstance(acct, dict) and acct.get("refresh_token") and acct.get("uid"):
             return acct
@@ -656,7 +657,7 @@ def load_profile_cache():
     if not acct:
         return "", None
     try:
-        with open(get_profile_cache_path(), 'r', encoding='utf-8') as f:
+        with open(get_profile_cache_path(), encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict) and data.get("uid") == acct["uid"]:
             avatar = get_avatar_cache_path()
@@ -1067,14 +1068,14 @@ class JsonEditorDialog(QDialog):
         new_data = {}
         for key, (line_edit, orig_type) in self.inputs.items():
             text_val = line_edit.text().strip()
-            if orig_type == bool:
+            if orig_type is bool:
                 val = text_val.lower() in ('true', '1', 'yes')
-            elif orig_type == int:
+            elif orig_type is int:
                 try:
                     val = int(text_val)
                 except ValueError:
                     val = text_val
-            elif orig_type == float:
+            elif orig_type is float:
                 try:
                     val = float(text_val)
                 except ValueError:
@@ -1136,6 +1137,44 @@ class ExistingFileDialog(QDialog):
         self.choice = "overwrite"
         self.accept()
 
+NET_TIMEOUT = 30  # seconds without data before a download request gives up
+
+def stream_download(response, dest_path, emit_progress, is_cancelled=lambda: False):
+    """Writes response to dest_path, reporting progress at most ~10 times a second
+    (one signal per 8 KB block flooded the GUI thread on large games)."""
+    total = int(response.headers.get('Content-Length') or 0)
+    downloaded, start, last_emit = 0, time.time(), 0.0
+    with open(dest_path, 'wb') as f:
+        while not is_cancelled():
+            buf = response.read(1 << 16)
+            if not buf:
+                break
+            f.write(buf)
+            downloaded += len(buf)
+            now = time.time()
+            if now - last_emit >= 0.1:
+                last_emit = now
+                emit_progress(downloaded, total, downloaded / max(now - start, 1e-6))
+    elapsed = max(time.time() - start, 1e-6)
+    emit_progress(downloaded, total, downloaded / elapsed)
+
+def linux_install_terminal(linux_cmd, project_root, dest_path):
+    """Starts the Linux conversion script in a terminal window and returns the process.
+    Paths are shell-quoted and no outer shell is used, so a server-supplied file name can't run commands."""
+    script_name = linux_cmd.rsplit("./", 1)[-1].strip() if "./" in linux_cmd else "installer.sh"
+    full_cmd = linux_cmd.replace(f"./{script_name}", f"echo {shlex.quote(GAMES_DIR)} | bash ./{script_name}")
+    inner_cmd = (f"cd {shlex.quote(project_root)} && {full_cmd}; "
+                 f"rm -f {shlex.quote(dest_path)}; "
+                 f'echo "Press ENTER to exit..."; read')
+    bash = ["bash", "-c", inner_cmd]
+    for term, prefix in (("kitty", []), ("alacritty", ["-e"]), ("foot", []), ("gnome-terminal", ["--"]),
+                         ("konsole", ["-e"]), ("xfce4-terminal", ["-x"]), ("tilix", None),
+                         ("xterm", ["-e"]), ("x-terminal-emulator", ["-e"])):
+        if shutil.which(term):
+            argv = [term, "-e", shlex.join(bash)] if prefix is None else [term, *prefix, *bash]  # tilix -e wants one string
+            return _RealPopen(argv, cwd=project_root)
+    return _RealPopen(bash, cwd=project_root)
+
 class DownloadWorker(QThread):
     progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
@@ -1160,7 +1199,7 @@ class DownloadWorker(QThread):
             else:
                 downloaded_here = True
                 req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req) as resp:
+                with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
                     content = resp.read().decode('utf-8')
                 self.remote_version = parse_remote_version(content)
 
@@ -1177,41 +1216,19 @@ class DownloadWorker(QThread):
 
                 if "mediafire.com" in download_url:
                     mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(mf_req) as mf_resp:
+                    with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT) as mf_resp:
                         mf_html = mf_resp.read().decode('utf-8')
                     match = re.search(r'href="(https?://download[^"]+)"', mf_html)
                     if match:
                         download_url = match.group(1)
 
                 dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(dl_req) as response:
-                    file_name = f"{self.game_name}.zip"
-                    cd = response.headers.get('Content-Disposition')
-                    if cd and 'filename=' in cd:
-                        file_name = cd.split('filename=')[-1].strip('"\'')
-                    else:
-                        url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                        possible_name = os.path.basename(url_path)
-                        if possible_name.lower().endswith('.zip'):
-                            file_name = possible_name
-
+                with urllib.request.urlopen(dl_req, timeout=NET_TIMEOUT) as response:
+                    # The server picks the name; strip path separators so it can't land outside DOWNLOAD_DIR.
+                    file_name = safe_filename_from_headers(response, self.game_name)
                     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
                     dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                    total_size = int(response.headers.get('Content-Length', 0))
-                    downloaded = 0
-                    block_size = 8192
-                    start_time = time.time()
-
-                    with open(dest_path, 'wb') as f:
-                        while True:
-                            buffer = response.read(block_size)
-                            if not buffer:
-                                break
-                            downloaded += len(buffer)
-                            f.write(buffer)
-                            elapsed = time.time() - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            self.progress.emit(downloaded, total_size, speed)
+                    stream_download(response, dest_path, self.progress.emit)
 
             if self.download_only:
                 self.finished.emit(dest_path)
@@ -1235,32 +1252,8 @@ class DownloadWorker(QThread):
             elif sys.platform.startswith("linux"):
                 self.status_update.emit("Linux Conversion Script Running...\nPlease complete installation in the new terminal window.")
 
-                project_root = os.path.abspath(DOWNLOAD_DIR)
                 os.makedirs(GAMES_DIR, exist_ok=True)
-                script_name = self.linux_cmd.rsplit("./", 1)[-1].strip() if "./" in self.linux_cmd else "installer.sh"
-
-                full_cmd = self.linux_cmd.replace(f"./{script_name}", f'echo "{GAMES_DIR}" | bash ./{script_name}')
-                inner_cmd = (
-                    f'cd "{project_root}" && {full_cmd}; '
-                    f'rm -f "{dest_path}"; '
-                    f'echo "Press ENTER to exit..."; read'
-                )
-
-                if shutil.which("x-terminal-emulator"):
-                    term_cmd = f'x-terminal-emulator -e bash -c \'{inner_cmd}\''
-                elif shutil.which("gnome-terminal"):
-                    term_cmd = f'gnome-terminal -- bash -c \'{inner_cmd}\''
-                elif shutil.which("konsole"):
-                    term_cmd = f'konsole -e bash -c \'{inner_cmd}\''
-                elif shutil.which("xfce4-terminal"):
-                    term_cmd = f'xfce4-terminal -e "bash -c \'{inner_cmd}\'"'
-                elif shutil.which("xterm"):
-                    term_cmd = f'xterm -e bash -c \'{inner_cmd}\''
-                else:
-                    term_cmd = f'bash -c \'{inner_cmd}\''
-
-                proc = subprocess.Popen(term_cmd, shell=True, cwd=project_root)
-                proc.wait()
+                linux_install_terminal(self.linux_cmd, os.path.abspath(DOWNLOAD_DIR), dest_path).wait()
             else:
                 self.status_update.emit("Extracting game files...")
                 extract_dir = installed_game_dir(self.game_name)
@@ -2348,7 +2341,7 @@ def get_library_cover_dir():
 def load_steam_library():
     """Store games the user added: [{'appid': int, 'title': str, 'cover': path}]."""
     try:
-        with open(get_steam_library_path(), "r", encoding="utf-8") as f:
+        with open(get_steam_library_path(), encoding="utf-8") as f:
             data = json.load(f)
         return [g for g in data if isinstance(g, dict) and isinstance(g.get("appid"), int) and g.get("title")]
     except Exception:
@@ -3853,241 +3846,6 @@ class DownloadsPage(QWidget):
         self.empty_label.hide()
         self.container_layout.insertWidget(self.container_layout.count() - 1, card)
 
-class DownloadCard(QFrame):
-    CARD_W, CARD_H = 60, 90
-
-    def __init__(self, title, download_url, expected_size=0, cover_path="", parent=None):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        self.setFixedHeight(120)
-        self.title = title
-        
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(14)
-
-        self.cover = QLabel()
-        self.cover.setObjectName("CoverPlaceholder")
-        self.cover.setFixedSize(self.CARD_W, self.CARD_H)
-        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if cover_path and os.path.exists(cover_path):
-            pix = rounded_cover_pixmap(cover_path, self.CARD_W, self.CARD_H, 6)
-            if pix:
-                self.cover.setPixmap(pix)
-            else:
-                self.cover.setText("No\nCover")
-        else:
-            self.cover.setText("No\nCover")
-        main_layout.addWidget(self.cover)
-
-        layout = QVBoxLayout()
-        layout.setSpacing(6)
-
-        top_row = QHBoxLayout()
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("RowTitle")
-        self.status_label = QLabel("Connecting...")
-        self.status_label.setObjectName("RowDesc")
-        top_row.addWidget(self.title_label, 1)
-        top_row.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignRight)
-        layout.addLayout(top_row)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        bottom_row = QHBoxLayout()
-        self.info_label = QLabel("Speed: 0 KB/s | 0 MB / 0 MB")
-        self.info_label.setObjectName("RowDesc")
-        bottom_row.addWidget(self.info_label, 1)
-        
-        self.action_btn = QPushButton("Cancel")
-        self.action_btn.setFixedSize(80, 28)
-        self.action_btn.clicked.connect(self.cancel_download)
-        bottom_row.addWidget(self.action_btn)
-        layout.addLayout(bottom_row)
-
-        main_layout.addLayout(layout, 1)
-
-        self.worker = FirebaseDownloadWorker(title, download_url, expected_size)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-    def cancel_download(self):
-        self.worker.cancel()
-        file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}.zip"
-        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        if os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception:
-                pass
-        self.setParent(None)
-        self.deleteLater()
-
-    def on_status_update(self, message):
-        self.status_label.setText(message)
-
-    def on_progress(self, downloaded, total, speed):
-        dl_mb = downloaded / (1024 * 1024)
-        speed_str = f"{speed / 1024:.1f} KB/s" if speed < 1024 * 1024 else f"{speed / (1024 * 1024):.2f} MB/s"
-
-        if total > 0:
-            percent = int((downloaded / total) * 100)
-            total_mb = total / (1024 * 1024)
-            self.progress_bar.setValue(percent)
-            self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
-        else:
-            self.progress_bar.setRange(0, 0)
-            self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
-
-    def on_finished(self, zip_path):
-        self.status_label.setText("Installed")
-        self.status_label.setStyleSheet(f"color: {GREEN};")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
-        self.action_btn.setText("Open Folder")
-        try:
-            self.action_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.action_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(GAMES_DIR)))
-
-    def on_failed(self, error_msg):
-        if error_msg == "CANCELLED":
-            self.setParent(None)
-            self.deleteLater()
-            return
-        self.status_label.setText("Failed")
-        self.status_label.setStyleSheet(f"color: {RED};")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.action_btn.setText("Copy Error")
-        try:
-            self.action_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.action_btn.clicked.connect(lambda: QApplication.clipboard().setText(error_msg))
-
-class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
-    status_update = pyqtSignal(str)
-    finished = pyqtSignal(str)
-    failed = pyqtSignal(str)
-
-    def __init__(self, title, download_url, expected_size=0):
-        super().__init__()
-        self.title = title
-        self.download_url = download_url
-        self.expected_size = expected_size
-        self._is_cancelled = False
-        self._response = None
-
-    def cancel(self):
-        self._is_cancelled = True
-        if self._response:
-            try:
-                self._response.close()
-            except Exception:
-                pass
-
-    def run(self):
-        dest_path = None
-        try:
-            total_size = self.expected_size
-            if total_size <= 0 and not self._is_cancelled:
-                try:
-                    head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(head_req, timeout=3) as head_resp:
-                        total_size = int(head_resp.headers.get('Content-Length', 0))
-                except Exception:
-                    pass
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Connecting...")
-            req = urllib.request.Request(self.download_url, headers={'User-Agent': 'Mozilla/5.0'})
-            
-            with urllib.request.urlopen(req, timeout=15) as response:
-                self._response = response
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}.zip"
-                cd = response.headers.get('Content-Disposition')
-                if cd and 'filename=' in cd:
-                    file_name = cd.split('filename=')[-1].strip('"\'')
-                else:
-                    url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                    possible_name = os.path.basename(url_path)
-                    if possible_name.lower().endswith('.zip'):
-                        file_name = possible_name
-
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                
-                if total_size <= 0:
-                    total_size = int(response.headers.get('Content-Length', 0))
-
-                downloaded = 0
-                block_size = 8192
-                start_time = time.time()
-
-                with open(dest_path, 'wb') as f:
-                    while not self._is_cancelled:
-                        buffer = response.read(block_size)
-                        if not buffer:
-                            break
-                        downloaded += len(buffer)
-                        f.write(buffer)
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        self.progress.emit(downloaded, total_size, speed)
-
-            if self._is_cancelled:
-                if dest_path and os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Extracting...")
-            extract_dir = installed_game_dir(self.title)
-            os.makedirs(extract_dir, exist_ok=True)
-            if zipfile.is_zipfile(dest_path):
-                with zipfile.ZipFile(dest_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
-            else:
-                raise ValueError("Downloaded file is not a valid ZIP archive.")
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.finished.emit(dest_path)
-        except Exception as e:
-            if self._is_cancelled:
-                if dest_path and os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                self.failed.emit("CANCELLED")
-            else:
-                self.failed.emit(str(e))
-
 def get_steam_download_link(appid):
     if not FIREBASE_DB_URL:
         return None, 0
@@ -4189,20 +3947,6 @@ def find_best_game_exe(root, title):
             best_score = score
             best_exe = exe
     return best_exe
-
-# Safely override FirebaseDownloadWorker run to use sanitized extraction paths
-_original_firebase_worker_run = FirebaseDownloadWorker.run
-
-def _patched_firebase_worker_run(self):
-    try:
-        safe_title = sanitize_folder_name(self.title)
-        extract_dir = installed_game_dir(safe_title)
-        os.makedirs(extract_dir, exist_ok=True)
-    except Exception:
-        pass
-    _original_firebase_worker_run(self)
-
-FirebaseDownloadWorker.run = _patched_firebase_worker_run
 
 _original_create_steam_card = AdaptiveApp.create_steam_card
 
@@ -4536,7 +4280,7 @@ COMPAT_CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "st
 def load_compat_config():
     if os.path.exists(COMPAT_CONFIG_FILE):
         try:
-            with open(COMPAT_CONFIG_FILE, 'r') as f:
+            with open(COMPAT_CONFIG_FILE) as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
@@ -4572,248 +4316,6 @@ def get_available_compatibility_tools():
                 pass
     return tools
 
-class CompatToolDialog(QDialog):
-    def __init__(self, current_tool, tools_dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Switch Compatibility Tool")
-        self.setFixedSize(350, 150)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-        
-        layout.addWidget(QLabel("Select Proton / Compatibility Tool:"))
-        
-        self.combo = QComboBox()
-        self.combo.addItem("Default (System Wine / Auto)", "")
-        
-        self.tools_map = tools_dict
-        sorted_tools = sorted(tools_dict.keys())
-        
-        idx = 0
-        for i, name in enumerate(sorted_tools):
-            self.combo.addItem(name, tools_dict[name])
-            if tools_dict[name] == current_tool:
-                idx = i + 1
-        self.combo.setCurrentIndex(idx)
-        layout.addWidget(self.combo)
-        
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_selected(self):
-        return self.combo.currentData()
-
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
-AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
-
-def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
-    AdaptiveApp._original_create_steam_card_compat(self, appid, title_text, cover_path)
-    card = self.steam_cards.get(appid)
-    if card:
-        btn_play = card.findChild(QPushButton, "Primary")
-        
-        def update_compat_launch():
-            game_dir = _safe_installed_game_dir(title_text)
-            exe_path = find_best_game_exe(game_dir, title_text)
-            installed = bool(exe_path and os.path.exists(exe_path))
-            
-            try:
-                btn_play.clicked.disconnect()
-            except Exception:
-                pass
-
-            if installed:
-                def launch_game_compat():
-                    if sys.platform.startswith("win"):
-                        try:
-                            subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-                    elif sys.platform.startswith("linux"):
-                        compat_config = load_compat_config()
-                        proton_bin = compat_config.get(str(appid), "")
-                        
-                        if proton_bin and os.path.exists(proton_bin):
-                            compat_data_path = os.path.join(game_dir, "compat_data")
-                            os.makedirs(compat_data_path, exist_ok=True)
-                            env = os.environ.copy()
-                            env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                            try:
-                                subprocess.Popen([proton_bin, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                        elif self.wine:
-                            wine_path, _ = self.wine
-                            try:
-                                subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                        else:
-                            QMessageBox.warning(self, "Compatibility Tool Required", "No valid compatibility tool or Wine found.")
-                    else:
-                        QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
-
-                btn_play.clicked.connect(launch_game_compat)
-
-        update_compat_launch()
-
-        more_btn = card.findChild(QPushButton, "MoreButton")
-        if more_btn and more_btn.menu():
-            menu = more_btn.menu()
-            
-            def open_compat_dialog():
-                tools = get_available_compatibility_tools()
-                if not tools:
-                    QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-                    return
-                compat_config = load_compat_config()
-                current_tool = compat_config.get(str(appid), "")
-                
-                dlg = CompatToolDialog(current_tool, tools, self)
-                if dlg.exec() == int(QDialog.DialogCode.Accepted):
-                    selected = dlg.get_selected()
-                    config = load_compat_config()
-                    if selected:
-                        config[str(appid)] = selected
-                    else:
-                        config.pop(str(appid), None)
-                    save_compat_config(config)
-                    QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
-
-            menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
-
-AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
-
-class CompatToolDialog(QDialog):
-    def __init__(self, current_tool, tools_dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Switch Compatibility Tool")
-        self.setFixedSize(350, 150)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-        
-        layout.addWidget(QLabel("Select Proton / Compatibility Tool:"))
-        
-        self.combo = QComboBox()
-        self.combo.addItem("Default (System Wine / Auto)", "")
-        
-        self.tools_map = tools_dict
-        sorted_tools = sorted(tools_dict.keys())
-        
-        idx = 0
-        for i, name in enumerate(sorted_tools):
-            self.combo.addItem(name, tools_dict[name])
-            if tools_dict[name] == current_tool:
-                idx = i + 1
-        self.combo.setCurrentIndex(idx)
-        layout.addWidget(self.combo)
-        
-        btn_layout = QHBoxLayout()
-        btn_ok = QPushButton("OK")
-        btn_ok.setObjectName("Primary")
-        btn_cancel = QPushButton("Cancel")
-        btn_ok.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_cancel)
-        btn_layout.addWidget(btn_ok)
-        layout.addLayout(btn_layout)
-
-    def get_selected(self):
-        return self.combo.currentData()
-
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
-AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
-
-def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
-    AdaptiveApp._original_create_steam_card_compat(self, appid, title_text, cover_path)
-    card = self.steam_cards.get(appid)
-    if card:
-        btn_play = card.findChild(QPushButton, "Primary")
-        
-        def update_compat_launch():
-            game_dir = _safe_installed_game_dir(title_text)
-            exe_path = find_best_game_exe(game_dir, title_text)
-            installed = bool(exe_path and os.path.exists(exe_path))
-            
-            try:
-                btn_play.clicked.disconnect()
-            except Exception:
-                pass
-
-            if installed:
-                def launch_game_compat():
-                    if sys.platform.startswith("win"):
-                        try:
-                            subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-                    elif sys.platform.startswith("linux"):
-                        compat_config = load_compat_config()
-                        proton_bin = compat_config.get(str(appid), "")
-                        
-                        if proton_bin and os.path.exists(proton_bin):
-                            compat_data_path = os.path.join(game_dir, "compat_data")
-                            os.makedirs(compat_data_path, exist_ok=True)
-                            env = os.environ.copy()
-                            env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                            try:
-                                subprocess.Popen([proton_bin, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                        elif self.wine:
-                            wine_path, _ = self.wine
-                            try:
-                                subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                        else:
-                            QMessageBox.warning(self, "Compatibility Tool Required", "No valid compatibility tool or Wine found.")
-                    else:
-                        QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
-
-                btn_play.clicked.connect(launch_game_compat)
-
-        update_compat_launch()
-
-        more_btn = card.findChild(QPushButton, "MoreButton")
-        if more_btn and more_btn.menu():
-            menu = more_btn.menu()
-            
-            def open_compat_dialog():
-                tools = get_available_compatibility_tools()
-                if not tools:
-                    QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-                    return
-                compat_config = load_compat_config()
-                current_tool = compat_config.get(str(appid), "")
-                
-                dlg = CompatToolDialog(current_tool, tools, self)
-                if dlg.exec() == int(QDialog.DialogCode.Accepted):
-                    selected = dlg.get_selected()
-                    config = load_compat_config()
-                    if selected:
-                        config[str(appid)] = selected
-                    else:
-                        config.pop(str(appid), None)
-                    save_compat_config(config)
-                    QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
-
-            menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
-
-AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
-
 class GameDownloadWorker(QThread):
     progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
@@ -4841,563 +4343,13 @@ class GameDownloadWorker(QThread):
             except Exception:
                 pass
 
-    def run(self):
-        dest_path = self.existing_zip_path
-        try:
-            downloaded_here = False
-            if not dest_path or not os.path.exists(dest_path):
-                downloaded_here = True
-                self.status_update.emit("Checking version...")
-                req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    content = resp.read().decode('utf-8')
-                self.remote_version = parse_remote_version(content)
+    # run() is _new_game_worker_run, assigned further down
 
-                download_url = None
-                for line in content.splitlines():
-                    if 'download_link_windows' in line:
-                        parts = line.split('=', 1)
-                        if len(parts) == 2:
-                            download_url = parts[1].strip().strip('"').strip("'")
-                            break
-
-                if not download_url:
-                    raise ValueError("Could not find download_link_windows in version file")
-
-                if "mediafire.com" in download_url:
-                    self.status_update.emit("Resolving MediaFire link...")
-                    mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(mf_req, timeout=15) as mf_resp:
-                        mf_html = mf_resp.read().decode('utf-8')
-                    match = re.search(r'href="(https?://download[^"]+)"', mf_html)
-                    if match:
-                        download_url = match.group(1)
-
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                self.status_update.emit("Connecting...")
-                dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                
-                with urllib.request.urlopen(dl_req, timeout=15) as response:
-                    self._response = response
-                    if self._is_cancelled:
-                        self.failed.emit("CANCELLED")
-                        return
-
-                    file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}.zip"
-                    cd = response.headers.get('Content-Disposition')
-                    if cd and 'filename=' in cd:
-                        file_name = cd.split('filename=')[-1].strip('"\'')
-                    else:
-                        url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                        possible_name = os.path.basename(url_path)
-                        if possible_name.lower().endswith('.zip'):
-                            file_name = possible_name
-
-                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                    dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                    total_size = int(response.headers.get('Content-Length', 0))
-                    
-                    downloaded = 0
-                    block_size = 8192
-                    start_time = time.time()
-
-                    with open(dest_path, 'wb') as f:
-                        while not self._is_cancelled:
-                            buffer = response.read(block_size)
-                            if not buffer:
-                                break
-                            downloaded += len(buffer)
-                            f.write(buffer)
-                            elapsed = time.time() - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            self.progress.emit(downloaded, total_size, speed)
-
-            if self._is_cancelled:
-                if downloaded_here and dest_path and os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                self.failed.emit("CANCELLED")
-                return
-
-            if self.download_only:
-                self.finished.emit(dest_path)
-                return
-
-            if self.wine_extract_dir:
-                self.status_update.emit("Extracting game files...")
-                part_dir = self.wine_extract_dir + ".part"
-                shutil.rmtree(part_dir, ignore_errors=True)
-                os.makedirs(part_dir, exist_ok=True)
-                with zipfile.ZipFile(dest_path, 'r') as zip_ref:
-                    zip_ref.extractall(part_dir)
-                shutil.rmtree(self.wine_extract_dir, ignore_errors=True)
-                os.rename(part_dir, self.wine_extract_dir)
-                if downloaded_here:
-                    try:
-                        os.remove(dest_path)
-                    except OSError:
-                        pass
-            elif sys.platform.startswith("linux"):
-                self.status_update.emit("Running Linux conversion script...")
-                project_root = os.path.abspath(DOWNLOAD_DIR)
-                os.makedirs(GAMES_DIR, exist_ok=True)
-                script_name = self.linux_cmd.rsplit("./", 1)[-1].strip() if "./" in self.linux_cmd else "installer.sh"
-
-                full_cmd = self.linux_cmd.replace(f"./{script_name}", f'echo "{GAMES_DIR}" | bash ./{script_name}')
-                inner_cmd = (
-                    f'cd "{project_root}" && {full_cmd}; '
-                    f'rm -f "{dest_path}"; '
-                    f'echo "Press ENTER to exit..."; read'
-                )
-
-                if shutil.which("x-terminal-emulator"):
-                    term_cmd = f'x-terminal-emulator -e bash -c \'{inner_cmd}\''
-                elif shutil.which("gnome-terminal"):
-                    term_cmd = f'gnome-terminal -- bash -c \'{inner_cmd}\''
-                elif shutil.which("konsole"):
-                    term_cmd = f'konsole -e bash -c \'{inner_cmd}\''
-                elif shutil.which("xfce4-terminal"):
-                    term_cmd = f'xfce4-terminal -e "bash -c \'{inner_cmd}\'"'
-                elif shutil.which("xterm"):
-                    term_cmd = f'xterm -e bash -c \'{inner_cmd}\''
-                else:
-                    term_cmd = f'bash -c \'{inner_cmd}\''
-
-                proc = subprocess.Popen(term_cmd, shell=True, cwd=project_root)
-                proc.wait()
-            else:
-                self.status_update.emit("Extracting game files...")
-                extract_dir = installed_game_dir(self.title)
-                os.makedirs(extract_dir, exist_ok=True)
-                with zipfile.ZipFile(dest_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
-
-            if downloaded_here and self.remote_version and not self.wine_extract_dir:
-                record_installed_version(self.title, self.remote_version)
-            
-            self.finished.emit(dest_path)
-        except Exception as e:
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-            else:
-                self.failed.emit(str(e))
-
-class GameDownloadCard(DownloadCard):
-    def __init__(self, game_id, title, version_url, linux_cmd, expected_size=0, cover_path="", parent=None, existing_zip_path=None, wine_extract_dir=None):
-        super().__init__(title, version_url, expected_size, cover_path, parent)
-        # Disconnect parent worker and replace with GameDownloadWorker
-        self.worker.cancel()
-        self.worker = GameDownloadWorker(game_id, title, version_url, linux_cmd, existing_zip_path, wine_extract_dir)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-# Override installation methods for AE and NCZ2 to use downloads tab
-def _patched_start_ae_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    ]
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    ]
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
-
-class GameDownloadCard(DownloadCard):
-    def __init__(self, game_id, title, version_url, linux_cmd, expected_size=0, cover_path="", parent=None, existing_zip_path=None, wine_extract_dir=None):
-        super().__init__(title, version_url, expected_size, cover_path, parent)
-        self.worker.cancel()
-        self.worker = GameDownloadWorker(game_id, title, version_url, linux_cmd, existing_zip_path, wine_extract_dir)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-def _patched_start_ae_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    ]
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    ]
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
-
-class GameDownloadCard(DownloadCard):
-    def __init__(self, game_id, title, version_url, linux_cmd, expected_size=0, cover_path="", parent=None, existing_zip_path=None, wine_extract_dir=None):
-        super().__init__(title, "", expected_size, cover_path, parent)
-        self.worker.cancel()
-        self.worker = GameDownloadWorker(game_id, title, version_url, linux_cmd, existing_zip_path, wine_extract_dir)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-def _patched_start_ae_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    ]
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    ]
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
 
 class DownloadCard(QFrame):
     CARD_W, CARD_H = 60, 90
 
-    def __init__(self, title, download_url, expected_size=0, cover_path="", parent=None, start_worker=True):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        self.setFixedHeight(120)
-        self.title = title
-        
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(14)
-
-        self.cover = QLabel()
-        self.cover.setObjectName("CoverPlaceholder")
-        self.cover.setFixedSize(self.CARD_W, self.CARD_H)
-        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if cover_path and os.path.exists(cover_path):
-            pix = rounded_cover_pixmap(cover_path, self.CARD_W, self.CARD_H, 6)
-            if pix:
-                self.cover.setPixmap(pix)
-            else:
-                self.cover.setText("No\nCover")
-        else:
-            self.cover.setText("No\nCover")
-        main_layout.addWidget(self.cover)
-
-        layout = QVBoxLayout()
-        layout.setSpacing(6)
-
-        top_row = QHBoxLayout()
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("RowTitle")
-        self.status_label = QLabel("Connecting...")
-        self.status_label.setObjectName("RowDesc")
-        top_row.addWidget(self.title_label, 1)
-        top_row.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignRight)
-        layout.addLayout(top_row)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        bottom_row = QHBoxLayout()
-        self.info_label = QLabel("Speed: 0 KB/s | 0 MB / 0 MB")
-        self.info_label.setObjectName("RowDesc")
-        bottom_row.addWidget(self.info_label, 1)
-        
-        self.action_btn = QPushButton("Cancel")
-        self.action_btn.setFixedSize(80, 28)
-        self.action_btn.clicked.connect(self.cancel_download)
-        bottom_row.addWidget(self.action_btn)
-        layout.addLayout(bottom_row)
-
-        main_layout.addLayout(layout, 1)
-
-        self.worker = FirebaseDownloadWorker(title, download_url, expected_size)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        if start_worker:
-            self.worker.start()
-
-class GameDownloadCard(DownloadCard):
-    def __init__(self, game_id, title, version_url, linux_cmd, expected_size=0, cover_path="", parent=None, existing_zip_path=None, wine_extract_dir=None):
-        super().__init__(title, version_url, expected_size, cover_path, parent, start_worker=False)
-        self.worker = GameDownloadWorker(game_id, title, version_url, linux_cmd, existing_zip_path, wine_extract_dir)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-def _patched_start_ae_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    ]
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    ]
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
-
-class DownloadCard(QFrame):
-    CARD_W, CARD_H = 60, 90
-
-    def __init__(self, title, download_url, expected_size=0, cover_path="", parent=None, worker=None):
+    def __init__(self, title, download_url, expected_size=0, cover_path="", parent=None, worker=None, existing_zip_path=None):
         super().__init__(parent)
         self.setObjectName("Panel")
         self.setFixedHeight(120)
@@ -5455,7 +4407,7 @@ class DownloadCard(QFrame):
         if worker is not None:
             self.worker = worker
         else:
-            self.worker = FirebaseDownloadWorker(title, download_url, expected_size)
+            self.worker = FirebaseDownloadWorker(title, download_url, expected_size, existing_zip_path=existing_zip_path)
             
         self.worker.progress.connect(self.on_progress)
         self.worker.status_update.connect(self.on_status_update)
@@ -5527,86 +4479,12 @@ class GameDownloadCard(DownloadCard):
         worker = GameDownloadWorker(game_id, title, version_url, linux_cmd, existing_zip_path, wine_extract_dir)
         super().__init__(title, "", expected_size, cover_path, parent, worker=worker)
 
-def _patched_start_ae_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    ]
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_zips = [
-        f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-        if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    ]
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_zips:
-        file_name = existing_zips[0]
-        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = full_path
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
-
 def get_custom_games_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "custom_games.json")
 
 def load_custom_games():
     try:
-        with open(get_custom_games_path(), "r", encoding="utf-8") as f:
+        with open(get_custom_games_path(), encoding="utf-8") as f:
             data = json.load(f)
         return [g for g in data if isinstance(g, dict) and g.get("exe_path")]
     except Exception:
@@ -5833,34 +4711,6 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
 
 AdaptiveApp.create_custom_card = _patched_create_custom_card
 
-_original_build_library_page_header_custom = AdaptiveApp.build_library_page
-
-def _patched_build_library_page_header_custom(self):
-    widget = _original_build_library_page_header_custom(self)
-    
-    main_layout = widget.layout()
-    if main_layout and main_layout.count() > 0:
-        header_item = main_layout.itemAt(0)
-        if header_item and header_item.layout():
-            header_layout = header_item.layout()
-            
-            add_btn = QPushButton("+")
-            add_btn.setFixedSize(28, 28)
-            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setToolTip("Add custom game")
-            add_btn.setStyleSheet("font-size: 18px; font-weight: bold; border-radius: 14px; padding: 0px;")
-            add_btn.clicked.connect(self.open_add_custom_game_dialog)
-            
-            header_layout.insertWidget(2, add_btn)
-
-    for game in load_custom_games():
-        self.create_custom_card(game.get("id"), game.get("title"), game.get("exe_path"), game.get("cover_path"), game.get("compat_tool"))
-        
-    self.apply_filter()
-    return widget
-
-AdaptiveApp.build_library_page = _patched_build_library_page_header_custom
-
 class CompatToolDialog(QDialog):
     def __init__(self, current_tool, tools_dict, parent=None):
         super().__init__(parent)
@@ -5900,118 +4750,6 @@ class CompatToolDialog(QDialog):
 
     def get_selected(self):
         return self.combo.currentData()
-
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
-AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
-
-def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
-    AdaptiveApp._original_create_steam_card_compat(self, appid, title_text, cover_path)
-    card = self.steam_cards.get(appid)
-    if card:
-        btn_play = card.findChild(QPushButton, "Primary")
-        status_label = card.findChild(QLabel, "CardStatus")
-        
-        def update_compat_launch():
-            game_dir = _safe_installed_game_dir(title_text)
-            exe_path = find_best_game_exe(game_dir, title_text)
-            installed = bool(exe_path and os.path.exists(exe_path))
-            
-            try:
-                btn_play.clicked.disconnect()
-            except Exception:
-                pass
-
-            if installed:
-                btn_play.setText("Launch")
-                if status_label:
-                    status_label.setText("● Installed")
-                    status_label.setStyleSheet(f"color: {GREEN};")
-
-                def launch_game_compat():
-                    if sys.platform.startswith("win"):
-                        try:
-                            subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-                    elif sys.platform.startswith("linux"):
-                        compat_config = load_compat_config()
-                        proton_bin = compat_config.get(str(appid), "")
-                        
-                        if proton_bin and os.path.exists(proton_bin):
-                            compat_data_path = os.path.join(game_dir, "compat_data")
-                            os.makedirs(compat_data_path, exist_ok=True)
-                            env = os.environ.copy()
-                            env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                            try:
-                                subprocess.Popen([proton_bin, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                        elif self.wine:
-                            wine_path, _ = self.wine
-                            try:
-                                subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                        else:
-                            QMessageBox.warning(self, "Compatibility Tool Required", "No valid compatibility tool or Wine found.")
-                    else:
-                        QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
-
-                btn_play.clicked.connect(launch_game_compat)
-            else:
-                btn_play.setText("Install")
-                if status_label:
-                    status_label.setText("Steam game")
-                    status_label.setStyleSheet("")
-
-                def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
-                    link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
-                    card_widget = DownloadCard(t, link, expected_size, p, self)
-                    
-                    def on_dl_finished(_path):
-                        update_compat_launch()
-                    card_widget.worker.finished.connect(on_dl_finished)
-                    
-                    self.downloads_page.add_download_card(card_widget)
-                    self.nav_group.button(6).setChecked(True)
-                    self.pages.setCurrentWidget(self.downloads_page)
-
-                btn_play.clicked.connect(on_steam_install)
-
-        update_compat_launch()
-
-        more_btn = card.findChild(QPushButton, "MoreButton")
-        if more_btn and more_btn.menu():
-            menu = more_btn.menu()
-            
-            def open_compat_dialog():
-                tools = get_available_compatibility_tools()
-                if not tools:
-                    QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-                    return
-                compat_config = load_compat_config()
-                current_tool = compat_config.get(str(appid), "")
-                
-                dlg = CompatToolDialog(current_tool, tools, self)
-                if dlg.exec() == int(QDialog.DialogCode.Accepted):
-                    selected = dlg.get_selected()
-                    config = load_compat_config()
-                    if selected:
-                        config[str(appid)] = selected
-                    else:
-                        config.pop(str(appid), None)
-                    save_compat_config(config)
-                    QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
-
-            # Avoid adding duplicate menu actions if patched multiple times
-            has_compat_action = any("Compatibility Tool" in action.text() for action in menu.actions())
-            if not has_compat_action:
-                menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
-
-AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
 
 def find_existing_archive(prefixes):
     if not os.path.isdir(DOWNLOAD_DIR):
@@ -6060,236 +4798,6 @@ def extract_archive(dest_path, extract_dir):
         raise ValueError("RAR archive detected, but no extraction tool ('7z' or 'unrar') or 'rarfile' module is available.")
     
     raise ValueError("Downloaded file is neither a valid ZIP nor a supported RAR archive.")
-
-# --- Update FirebaseDownloadWorker extraction ---
-_original_firebase_run = FirebaseDownloadWorker.run
-
-def _patched_firebase_run(self):
-    # Override zip check in worker run by intercepting extraction
-    pass  # We handle extraction cleanly via extract_archive in custom workers
-
-# Patch FirebaseDownloadWorker to support archives
-def _new_firebase_worker_run(self):
-    dest_path = None
-    try:
-        total_size = self.expected_size
-        if total_size <= 0 and not self._is_cancelled:
-            try:
-                head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(head_req, timeout=5) as head_resp:
-                    total_size = int(head_resp.headers.get('Content-Length', 0))
-            except Exception:
-                pass
-
-        if self._is_cancelled:
-            self.failed.emit("CANCELLED")
-            return
-
-        self.status_update.emit("Connecting...")
-        req = urllib.request.Request(self.download_url, headers={'User-Agent': 'Mozilla/5.0'})
-        
-        with urllib.request.urlopen(req, timeout=20) as response:
-            self._response = response
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            ext = ".zip"
-            cd = response.headers.get('Content-Disposition')
-            if cd and 'filename=' in cd:
-                file_name = cd.split('filename=')[-1].strip('"\'')
-            else:
-                url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                possible_name = os.path.basename(url_path)
-                if possible_name.lower().endswith(('.zip', '.rar')):
-                    file_name = possible_name
-                    ext = os.path.splitext(possible_name)[1]
-                else:
-                    file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}{ext}"
-
-            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-            
-            if total_size <= 0:
-                total_size = int(response.headers.get('Content-Length', 0))
-
-            downloaded = 0
-            block_size = 8192
-            start_time = time.time()
-
-            with open(dest_path, 'wb') as f:
-                while not self._is_cancelled:
-                    buffer = response.read(block_size)
-                    if not buffer:
-                        break
-                    downloaded += len(buffer)
-                    f.write(buffer)
-                    elapsed = time.time() - start_time
-                    speed = downloaded / elapsed if elapsed > 0 else 0
-                    self.progress.emit(downloaded, total_size, speed)
-
-        if self._is_cancelled:
-            if dest_path and os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            self.failed.emit("CANCELLED")
-            return
-
-        self.status_update.emit("Extracting...")
-        safe_title = sanitize_folder_name(self.title)
-        extract_dir = installed_game_dir(safe_title)
-        extract_archive(dest_path, extract_dir)
-
-        if self._is_cancelled:
-            self.failed.emit("CANCELLED")
-            return
-
-        self.finished.emit(dest_path)
-    except Exception as e:
-        if self._is_cancelled:
-            if dest_path and os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            self.failed.emit("CANCELLED")
-        else:
-            self.failed.emit(str(e))
-
-FirebaseDownloadWorker.run = _new_firebase_worker_run
-
-# --- Update GameDownloadWorker extraction for AE / NCZ2 ---
-def _new_game_worker_run(self):
-    dest_path = self.existing_zip_path
-    try:
-        downloaded_here = False
-        if not dest_path or not os.path.exists(dest_path):
-            downloaded_here = True
-            self.status_update.emit("Checking version...")
-            req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                content = resp.read().decode('utf-8')
-            self.remote_version = parse_remote_version(content)
-
-            download_url = None
-            for line in content.splitlines():
-                if 'download_link_windows' in line:
-                    parts = line.split('=', 1)
-                    if len(parts) == 2:
-                        download_url = parts[1].strip().strip('"').strip("'")
-                        break
-
-            if not download_url:
-                raise ValueError("Could not find download_link_windows in version file")
-
-            if "mediafire.com" in download_url:
-                self.status_update.emit("Resolving MediaFire link...")
-                mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(mf_req, timeout=20) as mf_resp:
-                    mf_html = mf_resp.read().decode('utf-8')
-                match = re.search(r'href="(https?://download[^"]+)"', mf_html)
-                if match:
-                    download_url = match.group(1)
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Connecting...")
-            dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-            
-            with urllib.request.urlopen(dl_req, timeout=20) as response:
-                self._response = response
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                ext = ".zip"
-                cd = response.headers.get('Content-Disposition')
-                if cd and 'filename=' in cd:
-                    file_name = cd.split('filename=')[-1].strip('"\'')
-                    if file_name.lower().endswith('.rar'):
-                        ext = '.rar'
-                else:
-                    url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                    possible_name = os.path.basename(url_path)
-                    if possible_name.lower().endswith(('.zip', '.rar')):
-                        file_name = possible_name
-                        ext = os.path.splitext(possible_name)[1]
-                    else:
-                        file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}{ext}"
-
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                total_size = int(response.headers.get('Content-Length', 0))
-                
-                downloaded = 0
-                block_size = 8192
-                start_time = time.time()
-
-                with open(dest_path, 'wb') as f:
-                    while not self._is_cancelled:
-                        buffer = response.read(block_size)
-                        if not buffer:
-                            break
-                        downloaded += len(buffer)
-                        f.write(buffer)
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        self.progress.emit(downloaded, total_size, speed)
-
-        if self._is_cancelled:
-            if downloaded_here and dest_path and os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            self.failed.emit("CANCELLED")
-            return
-
-        if self.download_only:
-            self.finished.emit(dest_path)
-            return
-
-        if self.wine_extract_dir:
-            self.status_update.emit("Extracting game files...")
-            part_dir = self.wine_extract_dir + ".part"
-            shutil.rmtree(part_dir, ignore_errors=True)
-            extract_archive(dest_path, part_dir)
-            shutil.rmtree(self.wine_extract_dir, ignore_errors=True)
-            os.rename(part_dir, self.wine_extract_dir)
-            if downloaded_here:
-                try:
-                    os.remove(dest_path)
-                except OSError:
-                    pass
-        elif sys.platform.startswith("linux"):
-            # If it's a rar file on Linux and no bash script is designed for it, extract directly or run conversion
-            self.status_update.emit("Extracting / converting game archive...")
-            extract_archive(dest_path, installed_game_dir(self.title))
-            if downloaded_here:
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-        else:
-            self.status_update.emit("Extracting game files...")
-            extract_dir = installed_game_dir(self.title)
-            extract_archive(dest_path, extract_dir)
-
-        if downloaded_here and self.remote_version and not self.wine_extract_dir:
-            record_installed_version(self.title, self.remote_version)
-        
-        self.finished.emit(dest_path)
-    except Exception as e:
-        if self._is_cancelled:
-            self.failed.emit("CANCELLED")
-        else:
-            self.failed.emit(str(e))
-
-GameDownloadWorker.run = _new_game_worker_run
 
 # --- Update install triggers to check for existing .rar archives ---
 def _patched_start_ae_install(self):
@@ -6381,361 +4889,8 @@ class FirebaseDownloadWorker(QThread):
             except Exception:
                 pass
 
-    def run(self):
-        dest_path = self.existing_zip_path
-        try:
-            downloaded_here = False
-            if not dest_path or not os.path.exists(dest_path):
-                downloaded_here = True
-                total_size = self.expected_size
-                if total_size <= 0 and not self._is_cancelled:
-                    try:
-                        head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(head_req, timeout=10) as head_resp:
-                            total_size = int(head_resp.headers.get('Content-Length', 0))
-                    except Exception:
-                        pass
+    # run() is assigned further down (FirebaseDownloadWorker.run = ...)
 
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                self.status_update.emit("Connecting...")
-                req = urllib.request.Request(self.download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                
-                with urllib.request.urlopen(req, timeout=20) as response:
-                    self._response = response
-                    if self._is_cancelled:
-                        self.failed.emit("CANCELLED")
-                        return
-
-                    ext = ".zip"
-                    cd = response.headers.get('Content-Disposition')
-                    if cd and 'filename=' in cd:
-                        file_name = cd.split('filename=')[-1].strip('"\'')
-                        if file_name.lower().endswith('.rar'):
-                            ext = '.rar'
-                    else:
-                        url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                        possible_name = os.path.basename(url_path)
-                        if possible_name.lower().endswith(('.zip', '.rar')):
-                            file_name = possible_name
-                            ext = os.path.splitext(possible_name)[1]
-                        else:
-                            file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}{ext}"
-
-                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                    dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                    
-                    if total_size <= 0:
-                        total_size = int(response.headers.get('Content-Length', 0))
-
-                    downloaded = 0
-                    block_size = 8192
-                    start_time = time.time()
-
-                    with open(dest_path, 'wb') as f:
-                        while not self._is_cancelled:
-                            buffer = response.read(block_size)
-                            if not buffer:
-                                break
-                            downloaded += len(buffer)
-                            f.write(buffer)
-                            elapsed = time.time() - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            self.progress.emit(downloaded, total_size, speed)
-
-            if self._is_cancelled:
-                if downloaded_here and dest_path and os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Extracting...")
-            safe_title = sanitize_folder_name(self.title)
-            extract_dir = installed_game_dir(safe_title)
-            extract_archive(dest_path, extract_dir)
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.finished.emit(dest_path)
-        except Exception as e:
-            if self._is_cancelled:
-                if dest_path and os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                self.failed.emit("CANCELLED")
-            else:
-                self.failed.emit(str(e))
-
-class DownloadCard(QFrame):
-    CARD_W, CARD_H = 60, 90
-
-    def __init__(self, title, download_url, expected_size=0, cover_path="", parent=None, worker=None, existing_zip_path=None):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        self.setFixedHeight(120)
-        self.title = title
-        
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(14)
-
-        self.cover = QLabel()
-        self.cover.setObjectName("CoverPlaceholder")
-        self.cover.setFixedSize(self.CARD_W, self.CARD_H)
-        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if cover_path and os.path.exists(cover_path):
-            pix = rounded_cover_pixmap(cover_path, self.CARD_W, self.CARD_H, 6)
-            if pix:
-                self.cover.setPixmap(pix)
-            else:
-                self.cover.setText("No\nCover")
-        else:
-            self.cover.setText("No\nCover")
-        main_layout.addWidget(self.cover)
-
-        layout = QVBoxLayout()
-        layout.setSpacing(6)
-
-        top_row = QHBoxLayout()
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("RowTitle")
-        self.status_label = QLabel("Connecting...")
-        self.status_label.setObjectName("RowDesc")
-        top_row.addWidget(self.title_label, 1)
-        top_row.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignRight)
-        layout.addLayout(top_row)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        bottom_row = QHBoxLayout()
-        self.info_label = QLabel("Speed: 0 KB/s | 0 MB / 0 MB")
-        self.info_label.setObjectName("RowDesc")
-        bottom_row.addWidget(self.info_label, 1)
-        
-        self.action_btn = QPushButton("Cancel")
-        self.action_btn.setFixedSize(80, 28)
-        self.action_btn.clicked.connect(self.cancel_download)
-        bottom_row.addWidget(self.action_btn)
-        layout.addLayout(bottom_row)
-
-        main_layout.addLayout(layout, 1)
-
-        if worker is not None:
-            self.worker = worker
-        else:
-            self.worker = FirebaseDownloadWorker(title, download_url, expected_size, existing_zip_path=existing_zip_path)
-            
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status_update.connect(self.on_status_update)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
-
-    def cancel_download(self):
-        if hasattr(self.worker, "cancel"):
-            self.worker.cancel()
-        file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}.zip"
-        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        if os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception:
-                pass
-        self.setParent(None)
-        self.deleteLater()
-
-    def on_status_update(self, message):
-        self.status_label.setText(message)
-
-    def on_progress(self, downloaded, total, speed):
-        dl_mb = downloaded / (1024 * 1024)
-        speed_str = f"{speed / 1024:.1f} KB/s" if speed < 1024 * 1024 else f"{speed / (1024 * 1024):.2f} MB/s"
-
-        if total > 0:
-            percent = int((downloaded / total) * 100)
-            total_mb = total / (1024 * 1024)
-            self.progress_bar.setValue(percent)
-            self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
-        else:
-            self.progress_bar.setRange(0, 0)
-            self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
-
-    def on_finished(self, zip_path):
-        self.status_label.setText("Installed")
-        self.status_label.setStyleSheet(f"color: {GREEN};")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
-        self.action_btn.setText("Open Folder")
-        try:
-            self.action_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.action_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(GAMES_DIR)))
-
-    def on_failed(self, error_msg):
-        if error_msg == "CANCELLED":
-            self.setParent(None)
-            self.deleteLater()
-            return
-        self.status_label.setText("Failed")
-        self.status_label.setStyleSheet(f"color: {RED};")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.action_btn.setText("Copy Error")
-        try:
-            self.action_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.action_btn.clicked.connect(lambda: QApplication.clipboard().setText(error_msg))
-
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
-AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
-
-def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
-    AdaptiveApp._original_create_steam_card_compat(self, appid, title_text, cover_path)
-    card = self.steam_cards.get(appid)
-    if card:
-        btn_play = card.findChild(QPushButton, "Primary")
-        status_label = card.findChild(QLabel, "CardStatus")
-        
-        def update_compat_launch():
-            game_dir = _safe_installed_game_dir(title_text)
-            exe_path = find_best_game_exe(game_dir, title_text)
-            installed = bool(exe_path and os.path.exists(exe_path))
-            
-            try:
-                btn_play.clicked.disconnect()
-            except Exception:
-                pass
-
-            if installed:
-                btn_play.setText("Launch")
-                if status_label:
-                    status_label.setText("● Installed")
-                    status_label.setStyleSheet(f"color: {GREEN};")
-
-                def launch_game_compat():
-                    if sys.platform.startswith("win"):
-                        try:
-                            subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-                    elif sys.platform.startswith("linux"):
-                        compat_config = load_compat_config()
-                        proton_bin = compat_config.get(str(appid), "")
-                        
-                        if proton_bin and os.path.exists(proton_bin):
-                            compat_data_path = os.path.join(game_dir, "compat_data")
-                            os.makedirs(compat_data_path, exist_ok=True)
-                            env = os.environ.copy()
-                            env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                            try:
-                                subprocess.Popen([proton_bin, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                        elif self.wine:
-                            wine_path, _ = self.wine
-                            try:
-                                subprocess.Popen([wine_path, exe_path], cwd=os.path.dirname(exe_path), env=system_env())
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                        else:
-                            QMessageBox.warning(self, "Compatibility Tool Required", "No valid compatibility tool or Wine found.")
-                    else:
-                        QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
-
-                btn_play.clicked.connect(launch_game_compat)
-            else:
-                btn_play.setText("Install")
-                if status_label:
-                    status_label.setText("Steam game")
-                    status_label.setStyleSheet("")
-
-                def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
-                    link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
-                    
-                    safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', t)
-                    existing_file = None
-                    if os.path.isdir(DOWNLOAD_DIR):
-                        for f in os.listdir(DOWNLOAD_DIR):
-                            if f.lower().startswith(safe_title.lower()) and f.lower().endswith(('.zip', '.rar')):
-                                existing_file = f
-                                break
-
-                    existing_zip_path = None
-                    if existing_file:
-                        full_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, existing_file))
-                        dlg = ExistingFileDialog(existing_file, self)
-                        if dlg.exec() == QDialog.DialogCode.Accepted:
-                            if dlg.choice == "use":
-                                existing_zip_path = full_path
-                            elif dlg.choice == "overwrite":
-                                try:
-                                    os.remove(full_path)
-                                except Exception:
-                                    pass
-                        else:
-                            return
-
-                    card_widget = DownloadCard(t, link, expected_size, p, self, existing_zip_path=existing_zip_path)
-                    
-                    def on_dl_finished(_path):
-                        update_compat_launch()
-                    card_widget.worker.finished.connect(on_dl_finished)
-                    
-                    self.downloads_page.add_download_card(card_widget)
-                    self.nav_group.button(6).setChecked(True)
-                    self.pages.setCurrentWidget(self.downloads_page)
-
-                btn_play.clicked.connect(on_steam_install)
-
-        update_compat_launch()
-
-        more_btn = card.findChild(QPushButton, "MoreButton")
-        if more_btn and more_btn.menu():
-            menu = more_btn.menu()
-            has_compat_action = any("Compatibility Tool" in action.text() for action in menu.actions())
-            if not has_compat_action:
-                def open_compat_dialog():
-                    tools = get_available_compatibility_tools()
-                    if not tools:
-                        QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-                        return
-                    compat_config = load_compat_config()
-                    current_tool = compat_config.get(str(appid), "")
-                    
-                    dlg = CompatToolDialog(current_tool, tools, self)
-                    if dlg.exec() == int(QDialog.DialogCode.Accepted):
-                        selected = dlg.get_selected()
-                        config = load_compat_config()
-                        if selected:
-                            config[str(appid)] = selected
-                        else:
-                            config.pop(str(appid), None)
-                        save_compat_config(config)
-                        QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
-
-                menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
-
-AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
 
 def safe_filename_from_headers(response, fallback_title, ext=".zip"):
     cd = response.headers.get('Content-Disposition')
@@ -6761,13 +4916,6 @@ def safe_filename_from_headers(response, fallback_title, ext=".zip"):
     
     # Final cleanup of illegal Windows characters
     return re.sub(r'[<>:"/\\|?*]', '_', raw_name).strip()
-
-# --- Patch FirebaseDownloadWorker filename parsing ---
-_original_firebase_run_fn = FirebaseDownloadWorker.run
-
-def _patched_firebase_run_with_safe_name(self):
-    # We override the filename resolution step inside the run method via monkeypatch or wrapper
-    pass
 
 # Let's cleanly patch FirebaseDownloadWorker.run to use safe_filename_from_headers
 def _new_fb_run(self):
@@ -6850,7 +4998,7 @@ FirebaseDownloadWorker.run = _new_fb_run
 # Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
 # Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
-PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
+PW_BASE_URL = "https://example.com/"                   # <-- change this
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
@@ -7167,149 +5315,6 @@ def _fb_pw_run(self):
 FirebaseDownloadWorker.run = _fb_pw_run
 
 
-
-# --- Patch GameDownloadWorker filename parsing for AE / NCZ2 ---
-def _new_game_run(self):
-    dest_path = self.existing_zip_path
-    try:
-        downloaded_here = False
-        if not dest_path or not os.path.exists(dest_path):
-            downloaded_here = True
-            self.status_update.emit("Checking version...")
-            req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                content = resp.read().decode('utf-8')
-            self.remote_version = parse_remote_version(content)
-
-            download_url = None
-            for line in content.splitlines():
-                if 'download_link_windows' in line:
-                    parts = line.split('=', 1)
-                    if len(parts) == 2:
-                        download_url = parts[1].strip().strip('"').strip("'")
-                        break
-
-            if not download_url:
-                raise ValueError("Could not find download_link_windows in version file")
-
-            if "mediafire.com" in download_url:
-                self.status_update.emit("Resolving MediaFire link...")
-                mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(mf_req, timeout=20) as mf_resp:
-                    mf_html = mf_resp.read().decode('utf-8')
-                match = re.search(r'href="(https?://download[^"]+)"', mf_html)
-                if match:
-                    download_url = match.group(1)
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Connecting...")
-            dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-            
-            with urllib.request.urlopen(dl_req, timeout=20) as response:
-                self._response = response
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                file_name = safe_filename_from_headers(response, self.title, ".zip")
-
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                total_size = int(response.headers.get('Content-Length', 0))
-                
-                downloaded = 0
-                block_size = 8192
-                start_time = time.time()
-
-                with open(dest_path, 'wb') as f:
-                    while not self._is_cancelled:
-                        buffer = response.read(block_size)
-                        if not buffer:
-                            break
-                        downloaded += len(buffer)
-                        f.write(buffer)
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        self.progress.emit(downloaded, total_size, speed)
-
-        if self._is_cancelled:
-            if downloaded_here and dest_path and os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            self.failed.emit("CANCELLED")
-            return
-
-        if self.download_only:
-            self.finished.emit(dest_path)
-            return
-
-        if self.wine_extract_dir:
-            self.status_update.emit("Extracting game files...")
-            part_dir = self.wine_extract_dir + ".part"
-            shutil.rmtree(part_dir, ignore_errors=True)
-            extract_archive(dest_path, part_dir)
-            shutil.rmtree(self.wine_extract_dir, ignore_errors=True)
-            os.rename(part_dir, self.wine_extract_dir)
-            if downloaded_here:
-                try:
-                    os.remove(dest_path)
-                except OSError:
-                    pass
-        elif sys.platform.startswith("linux") and self.linux_cmd:
-            self.status_update.emit("Linux Conversion Script Running...\nPlease complete installation in the new terminal window.")
-            project_root = os.path.abspath(DOWNLOAD_DIR)
-            os.makedirs(GAMES_DIR, exist_ok=True)
-            script_name = self.linux_cmd.rsplit("./", 1)[-1].strip() if "./" in self.linux_cmd else "installer.sh"
-
-            full_cmd = self.linux_cmd.replace(f"./{script_name}", f'echo "{GAMES_DIR}" | bash ./{script_name}')
-            inner_cmd = (
-                f'cd "{project_root}" && {full_cmd}; '
-                f'rm -f "{dest_path}"; '
-                f'echo "Press ENTER to exit..."; read'
-            )
-
-            term_cmd = None
-            for term, args in [
-                ("kitty", f"bash -c {json.dumps(inner_cmd)}"),
-                ("alacritty", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("foot", f"bash -c {json.dumps(inner_cmd)}"),
-                ("gnome-terminal", f"-- bash -c {json.dumps(inner_cmd)}"),
-                ("konsole", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("xfce4-terminal", f'-e "bash -c {json.dumps(inner_cmd)}"'),
-                ("tilix", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("xterm", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("x-terminal-emulator", f"-e bash -c {json.dumps(inner_cmd)}"),
-            ]:
-                if shutil.which(term):
-                    term_cmd = f"{term} {args}"
-                    break
-
-            if not term_cmd:
-                term_cmd = f"bash -c {json.dumps(inner_cmd)}"
-
-            proc = subprocess.Popen(term_cmd, shell=True, cwd=project_root)
-            proc.wait()
-        else:
-            self.status_update.emit("Extracting game files...")
-            extract_dir = installed_game_dir(self.title)
-            extract_archive(dest_path, extract_dir)
-
-        if downloaded_here and self.remote_version and not self.wine_extract_dir:
-            record_installed_version(self.title, self.remote_version)
-        
-        self.finished.emit(dest_path)
-    except Exception as e:
-        if self._is_cancelled:
-            self.failed.emit("CANCELLED")
-        else:
-            self.failed.emit(str(e))
-
-GameDownloadWorker.run = _new_game_run
 def _new_game_worker_run(self):
     dest_path = self.existing_zip_path
     try:
@@ -7355,39 +5360,11 @@ def _new_game_worker_run(self):
                     self.failed.emit("CANCELLED")
                     return
 
-                ext = ".zip"
-                cd = response.headers.get('Content-Disposition')
-                if cd and 'filename=' in cd:
-                    file_name = cd.split('filename=')[-1].strip('"\'')
-                    if file_name.lower().endswith('.rar'):
-                        ext = '.rar'
-                else:
-                    url_path = urllib.parse.unquote(response.geturl().split('?')[0])
-                    possible_name = os.path.basename(url_path)
-                    if possible_name.lower().endswith(('.zip', '.rar')):
-                        file_name = possible_name
-                        ext = os.path.splitext(possible_name)[1]
-                    else:
-                        file_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', self.title)}{ext}"
-
+                # The server picks the name; strip path separators so it can't land outside DOWNLOAD_DIR.
+                file_name = safe_filename_from_headers(response, self.title)
                 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
                 dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                total_size = int(response.headers.get('Content-Length', 0))
-                
-                downloaded = 0
-                block_size = 8192
-                start_time = time.time()
-
-                with open(dest_path, 'wb') as f:
-                    while not self._is_cancelled:
-                        buffer = response.read(block_size)
-                        if not buffer:
-                            break
-                        downloaded += len(buffer)
-                        f.write(buffer)
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        self.progress.emit(downloaded, total_size, speed)
+                stream_download(response, dest_path, self.progress.emit, lambda: self._is_cancelled)
 
         if self._is_cancelled:
             if downloaded_here and dest_path and os.path.exists(dest_path):
@@ -7416,38 +5393,8 @@ def _new_game_worker_run(self):
                     pass
         elif sys.platform.startswith("linux") and self.linux_cmd:
             self.status_update.emit("Linux Conversion Script Running...\nPlease complete installation in the new terminal window.")
-            project_root = os.path.abspath(DOWNLOAD_DIR)
             os.makedirs(GAMES_DIR, exist_ok=True)
-            script_name = self.linux_cmd.rsplit("./", 1)[-1].strip() if "./" in self.linux_cmd else "installer.sh"
-
-            full_cmd = self.linux_cmd.replace(f"./{script_name}", f'echo "{GAMES_DIR}" | bash ./{script_name}')
-            inner_cmd = (
-                f'cd "{project_root}" && {full_cmd}; '
-                f'rm -f "{dest_path}"; '
-                f'echo "Press ENTER to exit..."; read'
-            )
-
-            term_cmd = None
-            for term, args in [
-                ("kitty", f"bash -c {json.dumps(inner_cmd)}"),
-                ("alacritty", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("foot", f"bash -c {json.dumps(inner_cmd)}"),
-                ("gnome-terminal", f"-- bash -c {json.dumps(inner_cmd)}"),
-                ("konsole", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("xfce4-terminal", f'-e "bash -c {json.dumps(inner_cmd)}"'),
-                ("tilix", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("xterm", f"-e bash -c {json.dumps(inner_cmd)}"),
-                ("x-terminal-emulator", f"-e bash -c {json.dumps(inner_cmd)}"),
-            ]:
-                if shutil.which(term):
-                    term_cmd = f"{term} {args}"
-                    break
-
-            if not term_cmd:
-                term_cmd = f"bash -c {json.dumps(inner_cmd)}"
-
-            proc = subprocess.Popen(term_cmd, shell=True, cwd=project_root)
-            proc.wait()
+            linux_install_terminal(self.linux_cmd, os.path.abspath(DOWNLOAD_DIR), dest_path).wait()
         else:
             self.status_update.emit("Extracting game files...")
             extract_dir = installed_game_dir(self.title)
@@ -7464,296 +5411,6 @@ def _new_game_worker_run(self):
             self.failed.emit(str(e))
 
 GameDownloadWorker.run = _new_game_worker_run
-class AddExistingGameConfigDialog(QDialog):
-    def __init__(self, appid, title, cover_path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Configure Existing Game: {title}")
-        self.setFixedSize(440, 260)
-        self.appid = appid
-        self.game_title = title
-        self.cover_path = cover_path
-        self.result_data = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        # Executable row
-        exe_layout = QHBoxLayout()
-        self.exe_edit = QLineEdit()
-        exe_btn = QPushButton("Browse...")
-        exe_btn.clicked.connect(self.browse_exe)
-        exe_layout.addWidget(self.exe_edit, 1)
-        exe_layout.addWidget(exe_btn)
-        form.addRow(QLabel("Executable"), exe_layout)
-
-        # Compatibility tool row (Linux only)
-        if sys.platform.startswith("linux"):
-            self.compat_combo = QComboBox()
-            self.compat_combo.addItem("Default (System Wine / Native)", "")
-            tools = get_available_compatibility_tools()
-            for name, path in sorted(tools.items()):
-                self.compat_combo.addItem(name, path)
-            form.addRow(QLabel("Compatibility Tool"), self.compat_combo)
-        else:
-            self.compat_combo = None
-
-        layout.addLayout(form)
-
-        btn_layout = QHBoxLayout()
-        btn_ok = QPushButton("Add to Library")
-        btn_ok.setObjectName("Primary")
-        btn_cancel = QPushButton("Cancel")
-        btn_ok.clicked.connect(self.accept_data)
-        btn_cancel.clicked.connect(self.reject)
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_cancel)
-        btn_layout.addWidget(btn_ok)
-        layout.addLayout(btn_layout)
-
-    def browse_exe(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Executable", os.path.expanduser("~"))
-        if path:
-            self.exe_edit.setText(path)
-
-    def accept_data(self):
-        exe = self.exe_edit.text().strip()
-        if not exe or not os.path.exists(exe):
-            QMessageBox.warning(self, "Invalid Input", "Please provide a valid, existing executable path.")
-            return
-        compat = self.compat_combo.currentData() if self.compat_combo else ""
-        self.result_data = {
-            "appid": self.appid,
-            "title": self.game_title,
-            "cover": self.cover_path,
-            "exe_path": exe,
-            "compat_tool": compat
-        }
-        self.accept()
-
-class SteamStorePickerDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select Steam Game")
-        self.resize(600, 500)
-        self.selected_game = None
-        self._workers = []
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-
-        search_layout = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search Steam store...")
-        self.search_edit.returnPressed.connect(self.do_search)
-        search_btn = QPushButton("Search")
-        search_btn.setObjectName("Primary")
-        search_btn.clicked.connect(self.do_search)
-        search_layout.addWidget(self.search_edit, 1)
-        search_layout.addWidget(search_btn)
-        layout.addLayout(search_layout)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.container = QWidget()
-        self.grid = QGridLayout(self.container)
-        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, 1)
-
-        self.loader = CoverLoader()
-        self.loader.set_key(get_steamgriddb_key())
-        self.loader.loaded.connect(self._on_cover_loaded)
-        self.cards = {}
-
-        self.do_search()
-
-    def do_search(self):
-        term = self.search_edit.text().strip()
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.cards = {}
-
-        def work():
-            try:
-                games, _ = fetch_steam_games(term, 0, 30)
-                return games
-            except Exception:
-                return []
-
-        worker = TaskWorker(work)
-        worker.done.connect(self._on_games_loaded)
-        self._workers.append(worker)
-        worker.start()
-
-    def _on_games_loaded(self, games):
-        cols = 3
-        for idx, (appid, title, img_base) in enumerate(games):
-            card = StoreCard(appid, title)
-            card.clicked.connect(lambda a=appid, t=title, c=card: self.on_card_clicked(a, t, c))
-            self.cards[appid] = card
-            self.grid.addWidget(card, idx // cols, idx % cols)
-            self.loader.request(appid, img_base, title)
-
-    def _on_cover_loaded(self, appid, path):
-        card = self.cards.get(appid)
-        if card:
-            card.set_cover(path)
-
-    def on_card_clicked(self, appid, title, card):
-        cover_path = card.cover_path
-        # Save cover permanently to library covers directory
-        saved_cover = cover_path
-        if cover_path and os.path.exists(cover_path):
-            try:
-                os.makedirs(get_library_cover_dir(), exist_ok=True)
-                saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
-                shutil.copyfile(cover_path, saved_cover)
-            except Exception:
-                pass
-
-        # Now open executable configuration dialog
-        cfg_dlg = AddExistingGameConfigDialog(appid, title, saved_cover, self)
-        if cfg_dlg.exec() == QDialog.DialogCode.Accepted and cfg_dlg.result_data:
-            self.selected_game = cfg_dlg.result_data
-            self.accept()
-
-def _open_add_existing_game_dialog(self):
-    dlg = SteamStorePickerDialog(self)
-    if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_game:
-        data = dlg.selected_game
-        appid = data["appid"]
-        title = data["title"]
-        cover_path = data["cover"]
-        exe_path = data["exe_path"]
-        compat_tool = data["compat_tool"]
-
-        # Save to steam library json
-        games = [g for g in load_steam_library() if g["appid"] != appid]
-        games.append({"appid": appid, "title": title, "cover": cover_path, "exe_path": exe_path})
-        save_steam_library(games)
-
-        # Save compatibility tool if specified
-        if compat_tool:
-            compat_config = load_compat_config()
-            compat_config[str(appid)] = compat_tool
-            save_compat_config(compat_config)
-
-        # Add card to library UI
-        self.create_steam_card(appid, title, cover_path)
-        self.apply_filter()
-
-AdaptiveApp.open_add_existing_game_dialog = _open_add_existing_game_dialog
-
-# --- Patch build_library_page to use a dropdown menu for the + button ---
-_original_build_library_page_menu_custom = AdaptiveApp.build_library_page
-
-def _patched_build_library_page_menu_custom(self):
-    widget = _original_build_library_page_menu_custom(self)
-    
-    main_layout = widget.layout()
-    if main_layout and main_layout.count() > 0:
-        header_item = main_layout.itemAt(0)
-        if header_item and header_item.layout():
-            header_layout = header_item.layout()
-            
-            add_btn = QPushButton("+")
-            add_btn.setFixedSize(28, 28)
-            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setToolTip("Add game")
-            add_btn.setStyleSheet("font-size: 18px; font-weight: bold; border-radius: 14px; padding: 0px;")
-            
-            menu = QMenu(add_btn)
-            menu.addAction("Add Custom Game").triggered.connect(self.open_add_custom_game_dialog)
-            menu.addAction("Add Existing Game").triggered.connect(self.open_add_existing_game_dialog)
-            add_btn.setMenu(menu)
-            
-            header_layout.insertWidget(2, add_btn)
-
-    for game in load_custom_games():
-        self.create_custom_card(game.get("id"), game.get("title"), game.get("exe_path"), game.get("cover_path"), game.get("compat_tool"))
-        
-    self.apply_filter()
-    return widget
-
-AdaptiveApp.build_library_page = _patched_build_library_page_menu_custom
-
-# --- Update Steam Card Launch Logic to respect custom existing game exe_paths ---
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
-AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
-
-def _patched_create_steam_card_existing(self, appid, title_text, cover_path):
-    AdaptiveApp._original_create_steam_card_compat(self, appid, title_text, cover_path)
-    card = self.steam_cards.get(appid)
-    if card:
-        btn_play = card.findChild(QPushButton, "Primary")
-        status_label = card.findChild(QLabel, "CardStatus")
-        
-        # Check if user specified a custom local exe path for this existing game
-        custom_exe = None
-        for g in load_steam_library():
-            if g.get("appid") == appid:
-                custom_exe = g.get("exe_path")
-                break
-
-        if custom_exe:
-            btn_play.setText("Launch")
-            if status_label:
-                status_label.setText("● Installed")
-                status_label.setStyleSheet(f"color: {GREEN};")
-
-            try:
-                btn_play.clicked.disconnect()
-            except Exception:
-                pass
-
-            def launch_existing_game():
-                if not os.path.exists(custom_exe):
-                    QMessageBox.warning(self, "Launch Error", f"Executable not found:\n{custom_exe}")
-                    return
-                if sys.platform.startswith("win"):
-                    try:
-                        subprocess.Popen([custom_exe], cwd=os.path.dirname(custom_exe))
-                    except Exception as e:
-                        QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-                elif sys.platform.startswith("linux"):
-                    compat_config = load_compat_config()
-                    proton_bin = compat_config.get(str(appid), "")
-                    if proton_bin and os.path.exists(proton_bin):
-                        compat_data_path = os.path.dirname(custom_exe) + "_compat_data"
-                        os.makedirs(compat_data_path, exist_ok=True)
-                        env = os.environ.copy()
-                        env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                        try:
-                            subprocess.Popen([proton_bin, "run", custom_exe], cwd=os.path.dirname(custom_exe), env=env)
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                    elif self.wine:
-                        wine_path, _ = self.wine
-                        try:
-                            subprocess.Popen([wine_path, custom_exe], cwd=os.path.dirname(custom_exe), env=system_env())
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                    else:
-                        try:
-                            subprocess.Popen([custom_exe], cwd=os.path.dirname(custom_exe))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Error", f"Couldn't launch executable: {e}")
-
-            btn_play.clicked.connect(launch_existing_game)
-
-AdaptiveApp.create_steam_card = _patched_create_steam_card_existing
-
 class AddExistingGameConfigDialog(QDialog):
     def __init__(self, appid, title, cover_path, parent=None):
         super().__init__(parent)
@@ -7934,150 +5591,6 @@ def _open_add_existing_game_dialog(self):
 
 AdaptiveApp.open_add_existing_game_dialog = _open_add_existing_game_dialog
 
-# --- Clean build_library_page patch preventing duplicate + buttons ---
-if hasattr(AdaptiveApp, "_original_build_library_page_final"):
-    AdaptiveApp.build_library_page = AdaptiveApp._original_build_library_page_final
-
-AdaptiveApp._original_build_library_page_final = AdaptiveApp.build_library_page
-
-def _patched_build_library_page_final(self):
-    widget = AdaptiveApp._original_build_library_page_final(self)
-    
-    main_layout = widget.layout()
-    if main_layout and main_layout.count() > 0:
-        header_item = main_layout.itemAt(0)
-        if header_item and header_item.layout():
-            header_layout = header_item.layout()
-            
-            # Check if button already exists to avoid duplicates
-            existing_btn = None
-            for i in range(header_layout.count()):
-                item = header_layout.itemAt(i)
-                if item and item.widget() and isinstance(item.widget(), QPushButton) and item.widget().text() == "+":
-                    existing_btn = item.widget()
-                    break
-            
-            if not existing_btn:
-                add_btn = QPushButton("+")
-                add_btn.setFixedSize(28, 28)
-                add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                add_btn.setToolTip("Add game")
-                add_btn.setStyleSheet("font-size: 18px; font-weight: bold; border-radius: 14px; padding: 0px;")
-                
-                menu = QMenu(add_btn)
-                menu.addAction("Add Custom Game").triggered.connect(self.open_add_custom_game_dialog)
-                menu.addAction("Add Existing Game").triggered.connect(self.open_add_existing_game_dialog)
-                add_btn.setMenu(menu)
-                
-                header_layout.insertWidget(2, add_btn)
-
-    for game in load_custom_games():
-        self.create_custom_card(game.get("id"), game.get("title"), game.get("exe_path"), game.get("cover_path"), game.get("compat_tool"))
-        
-    self.apply_filter()
-    return widget
-
-AdaptiveApp.build_library_page = _patched_build_library_page_final
-if not hasattr(AdaptiveApp, "_true_original_build_library_page"):
-    AdaptiveApp._true_original_build_library_page = AdaptiveApp.build_library_page
-
-def _unified_build_library_page(self):
-    widget = AdaptiveApp._true_original_build_library_page(self)
-    
-    main_layout = widget.layout()
-    if main_layout and main_layout.count() > 0:
-        header_item = main_layout.itemAt(0)
-        if header_item and header_item.layout():
-            header_layout = header_item.layout()
-            
-            # Remove ALL existing '+' buttons left over from previous patches
-            buttons_to_remove = []
-            for i in range(header_layout.count()):
-                item = header_layout.itemAt(i)
-                if item and item.widget() and isinstance(item.widget(), QPushButton):
-                    if item.widget().text() == "+":
-                        buttons_to_remove.append(item.widget())
-            
-            for btn in buttons_to_remove:
-                header_layout.removeWidget(btn)
-                btn.setParent(None)
-                btn.deleteLater()
-            
-            # Add exactly ONE clean dropdown '+' button
-            add_btn = QPushButton("+")
-            add_btn.setFixedSize(28, 28)
-            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setToolTip("Add game")
-            add_btn.setStyleSheet("font-size: 18px; font-weight: bold; border-radius: 14px; padding: 0px;")
-            
-            menu = QMenu(add_btn)
-            menu.addAction("Add Custom Game").triggered.connect(self.open_add_custom_game_dialog)
-            menu.addAction("Add Existing Game").triggered.connect(self.open_add_existing_game_dialog)
-            add_btn.setMenu(menu)
-            
-            header_layout.insertWidget(2, add_btn)
-
-    for game in load_custom_games():
-        self.create_custom_card(game.get("id"), game.get("title"), game.get("exe_path"), game.get("cover_path"), game.get("compat_tool"))
-        
-    self.apply_filter()
-    return widget
-
-AdaptiveApp.build_library_page = _unified_build_library_page
-
-if not hasattr(AdaptiveApp, "_true_original_build_library_page"):
-    AdaptiveApp._true_original_build_library_page = AdaptiveApp.build_library_page
-
-def _unified_build_library_page(self):
-    widget = AdaptiveApp._true_original_build_library_page(self)
-    
-    main_layout = widget.layout()
-    if main_layout and main_layout.count() > 0:
-        header_item = main_layout.itemAt(0)
-        if header_item and header_item.layout():
-            header_layout = header_item.layout()
-            
-            # Remove ALL existing '+' buttons left over from previous patches
-            buttons_to_remove = []
-            for i in range(header_layout.count()):
-                item = header_layout.itemAt(i)
-                if item and item.widget() and isinstance(item.widget(), QPushButton):
-                    if item.widget().text() == "+":
-                        buttons_to_remove.append(item.widget())
-            
-            for btn in buttons_to_remove:
-                header_layout.removeWidget(btn)
-                btn.setParent(None)
-                btn.deleteLater()
-            
-            # Add exactly ONE clean '+' button with no dropdown arrow indicator
-            add_btn = QPushButton("+")
-            add_btn.setFixedSize(28, 28)
-            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setToolTip("Add game")
-            add_btn.setStyleSheet("font-size: 18px; font-weight: bold; border-radius: 14px; padding: 0px;")
-            
-            menu = QMenu(add_btn)
-            menu.addAction("Add Custom Game").triggered.connect(self.open_add_custom_game_dialog)
-            menu.addAction("Add Existing Game").triggered.connect(self.open_add_existing_game_dialog)
-            
-            def show_menu():
-                menu.exec(add_btn.mapToGlobal(QPoint(0, add_btn.height() + 4)))
-                
-            add_btn.clicked.connect(show_menu)
-            header_layout.insertWidget(2, add_btn)
-
-    for game in load_custom_games():
-        self.create_custom_card(game.get("id"), game.get("title"), game.get("exe_path"), game.get("cover_path"), game.get("compat_tool"))
-        
-    self.apply_filter()
-    return widget
-
-AdaptiveApp.build_library_page = _unified_build_library_page
-
-if hasattr(AdaptiveApp, "_original_create_steam_card_compat"):
-    AdaptiveApp.create_steam_card = AdaptiveApp._original_create_steam_card_compat
-
 AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
 
 def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
@@ -8169,8 +5682,8 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
 
 AdaptiveApp.create_steam_card = _patched_create_steam_card_combined
 
-if not hasattr(AdaptiveApp, "_true_original_build_library_page"):
-    AdaptiveApp._true_original_build_library_page = AdaptiveApp.build_library_page
+# Every custom-card patch before this one was removed; wrap the plain library page.
+AdaptiveApp._true_original_build_library_page = AdaptiveApp.build_library_page
 
 def _unified_build_library_page(self):
     widget = AdaptiveApp._true_original_build_library_page(self)
@@ -8242,7 +5755,7 @@ def friend_code_cached():
     if not acct:
         return ""
     try:
-        with open(_friends_cache_path(), "r", encoding="utf-8") as f:
+        with open(_friends_cache_path(), encoding="utf-8") as f:
             data = json.load(f)
         if data.get("uid") == acct["uid"]:
             return str(data.get("code") or "")
@@ -8334,7 +5847,7 @@ def _track_playing(name, proc):
     name = pretty_game_name(name)
     _running[name] = proc
     _now_playing["name"] = name
-    for cb in list(_playing_listeners):
+    for cb in _playing_listeners:
         cb()
     def wait():
         try:
@@ -8345,7 +5858,7 @@ def _track_playing(name, proc):
             del _running[name]
         if _now_playing["name"] == name:
             _now_playing["name"] = next(iter(_running), None)
-            for cb in list(_playing_listeners):
+            for cb in _playing_listeners:
                 cb()
     threading.Thread(target=wait, daemon=True).start()
 
@@ -8705,7 +6218,18 @@ class FriendsPage(QWidget):
         QTimer.singleShot(3000, self.heartbeat)
 
     # -- helpers
-    def _run(self, fn, cb):
+    def _run(self, fn, cb, key=None):
+        """Runs fn on a thread, then cb(result, error) on the GUI thread. With a key, a call is
+        skipped while the previous one with that key is still running, so slow networks don't pile up threads."""
+        if key is not None:
+            busy = self.__dict__.setdefault("_busy_keys", set())
+            if key in busy:
+                return
+            busy.add(key)
+            done_cb = cb
+            def cb(res, err):
+                busy.discard(key)
+                done_cb(res, err)
         def work():
             try:
                 res, err = fn(), None
@@ -8810,7 +6334,7 @@ class FriendsPage(QWidget):
             cloud_publish_presence()
             friends = cloud_fetch_friends()
             return code, friends, cloud_fetch_requests(), cloud_fetch_last_messages(list(friends))
-        self._run(work, self._on_fetched)
+        self._run(work, self._on_fetched, key="refresh")
 
     def _on_fetched(self, res, err):
         if err:
@@ -9112,7 +6636,7 @@ class FriendsPage(QWidget):
                 return
             self._last_msg_key = last_key
             self.chat_view.set_messages(me, msgs)
-        self._run(lambda: cloud_get_messages(uid), done)
+        self._run(lambda: cloud_get_messages(uid), done, key=("messages", uid))
 
     def send_message(self):
         text = self.chat_input.text().strip()
@@ -9494,7 +7018,7 @@ def _lib_init(self):
             _library_covers.clear()
             _library_covers.update(covers)
             if not first:
-                for cb in list(_playing_listeners):
+                for cb in _playing_listeners:
                     cb()
     self._lib_timer = QTimer(self)
     self._lib_timer.setInterval(3000)
@@ -9514,13 +7038,13 @@ def _tracked_webbrowser_open(url, *a, **k):
         if str(url).rstrip("/") == NCZFRONT_URL.rstrip("/"):
             _web_until["t"] = time.time() + 1800
             _now_playing["name"] = "NCZFront"
-            for cb in list(_playing_listeners):
+            for cb in _playing_listeners:
                 cb()
             def expire():
                 time.sleep(1805)
                 if time.time() >= _web_until["t"] and _now_playing["name"] == "NCZFront":
                     _now_playing["name"] = next(iter(_running), None)
-                    for cb in list(_playing_listeners):
+                    for cb in _playing_listeners:
                         cb()
             threading.Thread(target=expire, daemon=True).start()
     except Exception:
@@ -9917,7 +7441,9 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
     def log(self, text, kind="info"):
         color = {"ok": GREEN, "warn": "#eab308", "error": RED}.get(kind)
         esc = html_lib.escape(text)
-        self.log_view.append(f'<span style="color:{color}">{esc}</span>' if color else esc)
+        # Always wrap in a tag: append() guesses the format, and a bare escaped line counts as
+        # plain text, which showed &quot; literally.
+        self.log_view.append(f'<span style="color:{color}">{esc}</span>' if color else f"<span>{esc}</span>")
 
     def browse_workshop(self):
         start = self.path_edit.text() or os.path.expanduser("~")
@@ -10101,7 +7627,7 @@ def _ws_cfg_path():
 
 def _ws_cfg_load():
     try:
-        with open(_ws_cfg_path(), "r", encoding="utf-8") as f:
+        with open(_ws_cfg_path(), encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -10125,7 +7651,7 @@ def ws_downloads_path():
 
 def ws_load_downloads():
     try:
-        with open(ws_downloads_path(), "r", encoding="utf-8") as f:
+        with open(ws_downloads_path(), encoding="utf-8") as f:
             data = json.load(f)
         return [d for d in data if isinstance(d, dict) and d.get("id") and d.get("appid")]
     except Exception:
@@ -11167,7 +8693,6 @@ def _ws_init(self):
 AdaptiveApp.__init__ = _ws_init
 
 # ---------------------------------------------------------------- GE Proton tab (Linux only)
-import hashlib as _hashlib
 
 GE_API = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=30"
 
