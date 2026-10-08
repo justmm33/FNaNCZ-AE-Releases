@@ -9526,7 +9526,7 @@ class GmodAddonManagerPage(QWidget):
         row.setSpacing(8)
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("Choose your Workshop addons folder")
-        self.path_edit.setText(load_launcher_settings().get("gmod_workshop_path", ""))
+        self.path_edit.setText(ws_cfg_get("gmod_workshop_path", ""))
         browse = QPushButton("Browse")
         browse.clicked.connect(self.browse_workshop)
         row.addWidget(self.path_edit, 1)
@@ -9610,14 +9610,10 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
         path = QFileDialog.getExistingDirectory(self, "Workshop addons folder", start)
         if path:
             self.path_edit.setText(path)
-            s = load_launcher_settings()
-            s["gmod_workshop_path"] = path
-            save_launcher_settings(s)
+            ws_cfg_set("gmod_workshop_path", path)
 
     def clear_path_cache(self):
-        s = load_launcher_settings()
-        s.pop("gmod_workshop_path", None)
-        save_launcher_settings(s)
+        ws_cfg_set("gmod_workshop_path", None)
         self.path_edit.clear()
         self.log("Deleted all path cache", "warn")
 
@@ -9628,9 +9624,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
         if not os.path.isdir(workshop):
             QMessageBox.warning(self, "Workshop path", "Workshop path is invalid.")
             return
-        s = load_launcher_settings()
-        s["gmod_workshop_path"] = workshop
-        save_launcher_settings(s)
+        ws_cfg_set("gmod_workshop_path", workshop)
         os.makedirs(self.addons_dir(), exist_ok=True)
         self.log_view.clear()
         self.extract_btn.setEnabled(False)
@@ -9777,6 +9771,993 @@ def _gmod_init(self):
         lambda _i: self.gmod_page.refresh_addons() if self.pages.currentWidget() is self.gmod_page else None)
 
 AdaptiveApp.__init__ = _gmod_init
+
+# ---------------------------------------------------------------- Steam Workshop tab
+import io as _io
+import tarfile as _tarfile
+
+STEAMCMD_WIN_URL = "https://client-update.steamstatic.com/installer/steamcmd.zip"
+STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+WS_SORTS = (("Trending", "trend"), ("Most Recent", "mostrecent"),
+            ("Most Subscribed", "totaluniquesubscribers"), ("Recently Updated", "lastupdated"))
+
+# The launcher's load_launcher_settings() drops unknown keys, so these tabs keep their own small file.
+def _ws_cfg_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "workshop_tools.json")
+
+def _ws_cfg_load():
+    try:
+        with open(_ws_cfg_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def ws_cfg_get(key, default=""):
+    return _ws_cfg_load().get(key, default)
+
+def ws_cfg_set(key, value):
+    data = _ws_cfg_load()
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    os.makedirs(os.path.dirname(_ws_cfg_path()), exist_ok=True)
+    with open(_ws_cfg_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+def ws_downloads_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "workshop_downloads.json")
+
+def ws_load_downloads():
+    try:
+        with open(ws_downloads_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [d for d in data if isinstance(d, dict) and d.get("id") and d.get("appid")]
+    except Exception:
+        return []
+
+def ws_save_downloads(items):
+    os.makedirs(os.path.dirname(ws_downloads_path()), exist_ok=True)
+    with open(ws_downloads_path(), "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=4)
+
+def steamcmd_dir():
+    return os.path.join(SCRIPT_DIR, "steamcmd")
+
+def steamcmd_exe():
+    return os.path.join(steamcmd_dir(), "steamcmd.exe" if sys.platform.startswith("win") else "steamcmd.sh")
+
+def workshop_dir():
+    return os.path.join(SCRIPT_DIR, "workshop")
+
+def workshop_item_dir(appid, item_id):
+    return os.path.join(workshop_dir(), "steamapps", "workshop", "content", str(appid), str(item_id))
+
+def ensure_steamcmd(status):
+    exe = steamcmd_exe()
+    if os.path.exists(exe):
+        return exe
+    os.makedirs(steamcmd_dir(), exist_ok=True)
+    win = sys.platform.startswith("win")
+    status("Downloading SteamCMD...")
+    data = _http_get(STEAMCMD_WIN_URL if win else STEAMCMD_LINUX_URL, timeout=120)
+    status("Extracting SteamCMD...")
+    if win:
+        with zipfile.ZipFile(_io.BytesIO(data)) as z:
+            z.extractall(steamcmd_dir())
+    else:
+        with _tarfile.open(fileobj=_io.BytesIO(data), mode="r:gz") as t:
+            try:
+                t.extractall(steamcmd_dir(), filter="data")
+            except TypeError:
+                t.extractall(steamcmd_dir())
+        try:
+            os.chmod(exe, 0o755)
+        except OSError:
+            pass
+    if not os.path.exists(exe):
+        raise RuntimeError("SteamCMD could not be extracted")
+    return exe
+
+_WS_ID_RE = re.compile(r'data-publishedfileid="(\d+)"')
+_WS_TITLE_RE = re.compile(r'class="workshopItemTitle[^"]*"[^>]*>(.*?)</div>', re.S)
+_WS_AUTHOR_RE = re.compile(r'class="workshopItemAuthorName[^"]*"[^>]*>(.*?)</div>', re.S)
+
+def _ws_text(fragment):
+    text = html_lib.unescape(re.sub(r"<[^>]+>", "", fragment or "")).replace("\xa0", " ").strip()
+    return re.sub(r"\s+", " ", text)
+
+def parse_workshop_items(page):
+    """Turns a Steam Workshop browse page into [{'id', 'title', 'preview', 'author'}]."""
+    starts, seen = [], set()
+    for m in _WS_ID_RE.finditer(page):
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            starts.append((m.start(), m.group(1)))
+    items = []
+    for i, (pos, fid) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(page)
+        chunk = page[pos:end]
+        title = _WS_TITLE_RE.search(chunk)
+        img = _IMG_RE.search(chunk)
+        author = _WS_AUTHOR_RE.search(chunk)
+        author_text = re.sub(r"^by\s+", "", _ws_text(author.group(1)) if author else "", flags=re.I)
+        items.append({"id": fid, "title": _ws_text(title.group(1)) if title else f"Item {fid}",
+                      "preview": html_lib.unescape(img.group(1)) if img else "", "author": author_text})
+    return items
+
+def _ws_installed_games():
+    out = []
+    for g in load_steam_library():
+        exe = g.get("exe_path")
+        installed = bool(exe and os.path.exists(exe))
+        if not installed:
+            installed = bool(find_best_game_exe(_safe_installed_game_dir(g["title"]), g["title"]))
+        if installed:
+            out.append(g)
+    return out
+
+def _ws_fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+def _ws_dir_size(path):
+    total = 0
+    for folder, _d, names in os.walk(path):
+        for n in names:
+            try:
+                total += os.path.getsize(os.path.join(folder, n))
+            except OSError:
+                pass
+    return total
+
+def _ws_crop_round(pm, w, h, radius=8):
+    scale = 2
+    scaled = pm.scaled(w * scale, h * scale, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                       Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(w * scale, h * scale)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, w * scale, h * scale), radius * scale, radius * scale)
+    p.setClipPath(clip)
+    p.drawPixmap((w * scale - scaled.width()) // 2, (h * scale - scaled.height()) // 2, scaled)
+    p.end()
+    out.setDevicePixelRatio(scale)
+    return out
+
+class _WsImages(QObject):
+    loaded = pyqtSignal(str, bytes)
+
+    def __init__(self):
+        super().__init__()
+        self.pool = ThreadPoolExecutor(max_workers=4)
+        self.cache, self.pending = {}, {}
+        self.loaded.connect(self._on_loaded)
+        QApplication.instance().aboutToQuit.connect(lambda: self.pool.shutdown(wait=False, cancel_futures=True))
+
+    def request(self, url, setter):
+        if not url:
+            return
+        if url in self.cache:
+            setter(self.cache[url])
+        elif url in self.pending:
+            self.pending[url].append(setter)
+        else:
+            self.pending[url] = [setter]
+            self.pool.submit(self._fetch, url)
+
+    def _fetch(self, url):
+        try:
+            data = _http_get(url, timeout=15)
+        except Exception:
+            data = b""
+        self.loaded.emit(url, data)
+
+    def _on_loaded(self, url, data):
+        setters = self.pending.pop(url, [])
+        pm = QPixmap()
+        if not data or not pm.loadFromData(data):
+            return
+        self.cache[url] = pm
+        for s in setters:
+            try:
+                s(pm)
+            except RuntimeError:  # the label was deleted meanwhile
+                pass
+
+class WorkshopFetchWorker(QThread):
+    done = pyqtSignal(int, list, str)
+
+    def __init__(self, token, appid, query, sort, page, parent=None):
+        super().__init__(parent)
+        self.token, self.appid, self.query, self.sort, self.page = token, appid, query, sort, page
+
+    def run(self):
+        try:
+            params = {"appid": self.appid, "searchtext": self.query, "childpublishedfileid": 0,
+                      "browsesort": self.sort, "section": "readytouseitems", "p": self.page,
+                      "numperpage": 30, "l": "english"}
+            if self.sort == "trend":
+                params["days"] = 7
+            url = "https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params)
+            page = _http_get(url, headers={"Accept-Language": "en-US,en;q=0.9",
+                                           "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"},
+                             timeout=20).decode("utf-8", "replace")
+            self.done.emit(self.token, parse_workshop_items(page), "")
+        except Exception as e:
+            self.done.emit(self.token, [], str(e))
+
+class SteamCmdWorker(QThread):
+    status = pyqtSignal(str)
+    progress = pyqtSignal(float)
+    finished_item = pyqtSignal(bool, str)
+
+    def __init__(self, appid, item_id, login, parent=None):
+        super().__init__(parent)
+        self.appid, self.item_id, self.login = appid, str(item_id), login or "anonymous"
+        self.proc = None
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+        try:
+            if self.proc:
+                self.proc.kill()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            exe = ensure_steamcmd(self.status.emit)
+            os.makedirs(workshop_dir(), exist_ok=True)
+            cmd = [exe, "+force_install_dir", workshop_dir(), "+login", self.login,
+                   "+workshop_download_item", str(self.appid), self.item_id, "+quit"]
+            kwargs = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+            ok, err = False, ""
+            for _attempt in range(2):  # the first run may self-update and exit before downloading
+                if self._cancel:
+                    break
+                self.status.emit("Downloading...")
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             stdin=subprocess.DEVNULL, text=True, errors="replace",
+                                             cwd=steamcmd_dir(), **kwargs)
+                for line in self.proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.search(r"progress:\s*([\d.]+)", line)
+                    if m:
+                        self.progress.emit(float(m.group(1)))
+                    if line.startswith("Success. Downloaded item"):
+                        ok = True
+                    elif "ERROR!" in line or line.startswith("Failure"):
+                        err = line
+                    self.status.emit(line[:100])
+                self.proc.wait()
+                if ok or err:
+                    break
+            if self._cancel:
+                self.finished_item.emit(False, "Cancelled")
+            elif ok and os.path.isdir(workshop_item_dir(self.appid, self.item_id)):
+                self.finished_item.emit(True, "")
+            else:
+                msg = err or "SteamCMD did not download the item"
+                if any(k in msg for k in ("Failure", "No subscription", "Access Denied", "not logged")):
+                    msg += " (this game's Workshop may need a Steam account that owns it)"
+                self.finished_item.emit(False, msg)
+        except Exception as e:
+            self.finished_item.emit(False, str(e))
+
+class _WsClickFrame(QFrame):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+class WorkshopPage(QWidget):
+    CARD_W = 200
+    GAME_W = 170
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QProgressBar, QSizePolicy
+        self._QProgressBar, self._QSizePolicy = QProgressBar, QSizePolicy
+        self.img = _WsImages()
+        self.appid = None
+        self.game_title = ""
+        self.queue = []
+        self.worker = None
+        self._fetchers = []
+        self.token = 0
+        self.page_num = 1
+        self.seen_ids = set()
+        self.cards = {}        # item id -> (frame, download button)
+        self.card_list = []
+        self.game_cards = []
+        self.dl_rows = []
+        self._cols = (0, 0)
+        self.setObjectName("Content")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(36, 28, 36, 20)
+        outer.setSpacing(0)
+        head = QHBoxLayout()
+        head.setSpacing(0)
+        title = QLabel("Steam Workshop")
+        title.setObjectName("PageTitle")
+        self.game_label = QLabel()
+        self.game_label.setObjectName("PageCount")
+        self.back_btn = QPushButton("< Choose another game")
+        self.back_btn.setFlat(True)
+        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_btn.clicked.connect(self.show_picker)
+        head.addWidget(title)
+        head.addWidget(self.game_label, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addStretch()
+        head.addWidget(self.back_btn)
+        outer.addLayout(head)
+        outer.addSpacing(18)
+        self.stack = QStackedWidget()
+        outer.addWidget(self.stack, 1)
+
+        # ---------------- picker
+        pick = QWidget()
+        pl = QVBoxLayout(pick)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(10)
+        hint = QLabel("Choose a game you've downloaded to browse its Steam Workshop.")
+        hint.setObjectName("RowDesc")
+        pl.addWidget(hint)
+        sc = self._scroll()
+        self.games_container = QWidget()
+        self.games_container.setObjectName("GridContainer")
+        self.games_grid = QGridLayout(self.games_container)
+        self.games_grid.setContentsMargins(0, 6, 12, 24)
+        self.games_grid.setSpacing(14)
+        self.games_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        sc.setWidget(self.games_container)
+        pl.addWidget(sc, 1)
+        self.games_empty = QLabel("No downloaded Steam games yet.\nInstall a game from the Library or "
+                                  "use Add Existing Game, then come back.")
+        self.games_empty.setObjectName("EmptyState")
+        self.games_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pl.addWidget(self.games_empty)
+        self.stack.addWidget(pick)
+
+        # ---------------- game view
+        gv = QWidget()
+        gl = QVBoxLayout(gv)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(0)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(8)
+        self.tab_group = QButtonGroup(self)
+        self.tab_btns = []
+        for i, text in enumerate(("Browse", "Queue", "Downloaded")):
+            b = QPushButton(text)
+            b.setObjectName("WsTab")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.tab_group.addButton(b, i)
+            self.tab_btns.append(b)
+            tabs.addWidget(b)
+        tabs.addStretch()
+        self.tab_btns[0].setChecked(True)
+        gl.addLayout(tabs)
+        gl.addSpacing(14)
+        self.inner = QStackedWidget()
+        gl.addWidget(self.inner, 1)
+        self.tab_group.idClicked.connect(self.inner.setCurrentIndex)
+
+        # browse
+        br = QWidget()
+        bl = QVBoxLayout(br)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(12)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("Search")
+        self.search_edit.setPlaceholderText("Search the Workshop")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setFixedHeight(36)
+        self.search_edit.returnPressed.connect(self.search)
+        self.sort_combo = QComboBox()
+        self.sort_combo.setFixedHeight(36)
+        for label, key in WS_SORTS:
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.currentIndexChanged.connect(lambda _i: self.search())
+        go = QPushButton("Search")
+        go.setObjectName("Primary")
+        go.setFixedHeight(36)
+        go.clicked.connect(self.search)
+        bar.addWidget(self.search_edit, 1)
+        bar.addWidget(self.sort_combo)
+        bar.addWidget(go)
+        bl.addLayout(bar)
+        sc2 = self._scroll()
+        self.browse_container = QWidget()
+        self.browse_container.setObjectName("GridContainer")
+        bc = QVBoxLayout(self.browse_container)
+        bc.setContentsMargins(0, 0, 12, 20)
+        bc.setSpacing(12)
+        self.browse_grid = QGridLayout()
+        self.browse_grid.setSpacing(14)
+        self.browse_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        bc.addLayout(self.browse_grid)
+        self.status_label = QLabel()
+        self.status_label.setObjectName("EmptyState")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        bc.addWidget(self.status_label)
+        self.more_btn = QPushButton("Load more")
+        self.more_btn.setFixedHeight(38)
+        self.more_btn.clicked.connect(lambda: self._fetch(self.page_num + 1))
+        bc.addWidget(self.more_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        bc.addStretch()
+        sc2.setWidget(self.browse_container)
+        bl.addWidget(sc2, 1)
+        self.inner.addWidget(br)
+
+        # queue
+        qw = QWidget()
+        ql = QVBoxLayout(qw)
+        ql.setContentsMargins(0, 0, 0, 0)
+        ql.setSpacing(12)
+        qbar = QHBoxLayout()
+        qbar.setSpacing(8)
+        self.cmd_label = QLabel()
+        self.cmd_label.setObjectName("RowDesc")
+        self.login_edit = QLineEdit()
+        self.login_edit.setPlaceholderText("Steam login: anonymous")
+        self.login_edit.setToolTip("Leave empty for anonymous downloads. To use an account, run steamcmd once "
+                                   "from the steamcmd folder and log in so it remembers you.")
+        self.login_edit.setFixedWidth(220)
+        self.login_edit.setText(ws_cfg_get("steam_login", ""))
+        self.login_edit.editingFinished.connect(
+            lambda: ws_cfg_set("steam_login", self.login_edit.text().strip() or None))
+        clear = QPushButton("Clear finished")
+        clear.clicked.connect(self.clear_finished)
+        qbar.addWidget(self.cmd_label, 1)
+        qbar.addWidget(self.login_edit)
+        qbar.addWidget(clear)
+        ql.addLayout(qbar)
+        sc3 = self._scroll()
+        self.queue_container = QWidget()
+        self.queue_container.setObjectName("GridContainer")
+        self.queue_layout = QVBoxLayout(self.queue_container)
+        self.queue_layout.setContentsMargins(0, 0, 12, 16)
+        self.queue_layout.setSpacing(8)
+        self.queue_layout.addStretch()
+        sc3.setWidget(self.queue_container)
+        ql.addWidget(sc3, 1)
+        self.queue_empty = QLabel("The queue is empty.\nPress Download on a Workshop item to add it.")
+        self.queue_empty.setObjectName("EmptyState")
+        self.queue_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ql.addWidget(self.queue_empty)
+        self.inner.addWidget(qw)
+
+        # downloaded
+        dw = QWidget()
+        dl = QVBoxLayout(dw)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(12)
+        sc4 = self._scroll()
+        self.dl_container = QWidget()
+        self.dl_container.setObjectName("GridContainer")
+        self.dl_layout = QVBoxLayout(self.dl_container)
+        self.dl_layout.setContentsMargins(0, 0, 12, 16)
+        self.dl_layout.setSpacing(8)
+        self.dl_layout.addStretch()
+        sc4.setWidget(self.dl_container)
+        dl.addWidget(sc4, 1)
+        self.dl_empty = QLabel("Nothing downloaded for this game yet.")
+        self.dl_empty.setObjectName("EmptyState")
+        self.dl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dl.addWidget(self.dl_empty)
+        self.inner.addWidget(dw)
+
+        self.stack.addWidget(gv)
+        self.back_btn.hide()
+        self._apply_css()
+        self._rebuild_games()
+        QApplication.instance().aboutToQuit.connect(self._shutdown)
+
+    # ------------------------------------------------------------ helpers
+    def _scroll(self):
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return sc
+
+    def _apply_css(self):
+        dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        t = THEMES["dark" if dark else "light"]
+        self.setStyleSheet(f"""
+QPushButton#WsTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
+    border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
+QPushButton#WsTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
+QPushButton#WsTab:checked {{ background: {t['accent']}; color: #0b0b0d; border: 1px solid {t['accent']}; }}
+QFrame#WsCard {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 12px; }}
+QFrame#WsCard:hover {{ border: 1px solid {t['accent']}; }}
+QFrame#WsRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
+QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t['subtext']}; }}
+""")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_css()
+        self.cmd_label.setText("SteamCMD is ready" if os.path.exists(steamcmd_exe())
+                               else "SteamCMD will be downloaded on your first download")
+        if self.stack.currentIndex() == 0:
+            self._rebuild_games()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cols = (self._calc_cols(self.GAME_W), self._calc_cols(self.CARD_W))
+        if cols != self._cols:
+            self._cols = cols
+            self._layout_grid(self.games_grid, self.game_cards, cols[0])
+            self._layout_grid(self.browse_grid, self.card_list, cols[1])
+
+    def _calc_cols(self, card_w):
+        return max(1, (max(self.width() - 72 - 16, card_w) + 14) // (card_w + 14))
+
+    def _layout_grid(self, grid, widgets, cols):
+        while grid.count():
+            grid.takeAt(0)
+        for i, w in enumerate(widgets):
+            grid.addWidget(w, i // cols, i % cols)
+
+    def _clear_layout_rows(self, layout, rows):
+        for r in rows:
+            r["frame"].setParent(None)
+            r["frame"].deleteLater()
+        rows.clear()
+
+    def _shutdown(self):
+        try:
+            if self.worker and self.worker.isRunning():
+                self.worker.cancel()
+                self.worker.wait(2000)
+            for w in list(self._fetchers):
+                w.wait(1000)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ game picker
+    def _rebuild_games(self):
+        for w in self.game_cards:
+            w.setParent(None)
+            w.deleteLater()
+        self.game_cards = []
+        games = _ws_installed_games()
+        for g in games:
+            self.game_cards.append(self._make_game_card(g))
+        self.games_empty.setVisible(not games)
+        self._cols = (self._calc_cols(self.GAME_W), self._calc_cols(self.CARD_W))
+        self._layout_grid(self.games_grid, self.game_cards, self._cols[0])
+
+    def _make_game_card(self, g):
+        card = _WsClickFrame()
+        card.setObjectName("WsCard")
+        card.setFixedWidth(self.GAME_W)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(8, 8, 8, 10)
+        v.setSpacing(8)
+        cover = QLabel()
+        cover.setFixedSize(self.GAME_W - 16, 216)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pm = rounded_cover_pixmap(g["cover"], self.GAME_W - 16, 216, 8) if g.get("cover") else None
+        if pm:
+            cover.setPixmap(pm)
+        else:
+            cover.setObjectName("WsPlaceholder")
+            cover.setText("No\nCover")
+        name = QLabel(g["title"])
+        name.setObjectName("RowTitle")
+        name.setWordWrap(True)
+        v.addWidget(cover)
+        v.addWidget(name)
+        v.addStretch()
+        card.clicked.connect(lambda g=g: self.open_game(g))
+        return card
+
+    def show_picker(self):
+        self.appid = None
+        self.token += 1
+        self.stack.setCurrentIndex(0)
+        self.back_btn.hide()
+        self.game_label.setText("")
+        self._rebuild_games()
+
+    def open_game(self, g):
+        self.appid, self.game_title = g["appid"], g["title"]
+        self.game_label.setText(self.game_title)
+        self.back_btn.show()
+        self.search_edit.clear()
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.setCurrentIndex(0)
+        self.sort_combo.blockSignals(False)
+        self.tab_btns[0].setChecked(True)
+        self.inner.setCurrentIndex(0)
+        self.stack.setCurrentIndex(1)
+        self.search()
+        self._rebuild_downloaded()
+        self._refresh_tab_titles()
+
+    # ------------------------------------------------------------ browse
+    def search(self, *_):
+        if self.appid is None:
+            return
+        for frame, _btn in self.cards.values():
+            frame.setParent(None)
+            frame.deleteLater()
+        self.cards, self.card_list, self.seen_ids = {}, [], set()
+        self._fetch(1)
+
+    def _fetch(self, page):
+        self.token += 1
+        self.page_num = page
+        self.more_btn.hide()
+        self.status_label.setText("Loading...")
+        self.status_label.show()
+        w = WorkshopFetchWorker(self.token, self.appid, self.search_edit.text().strip(),
+                                self.sort_combo.currentData(), page, self)
+        w.done.connect(self._on_fetched)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _on_fetched(self, token, items, err):
+        if token != self.token:
+            return
+        if err:
+            self.status_label.setText(f"Couldn't load the Workshop: {err}")
+            return
+        new = [it for it in items if it["id"] not in self.seen_ids]
+        for it in new:
+            self.seen_ids.add(it["id"])
+            card = self._make_item_card(it)
+            self.card_list.append(card)
+        self._layout_grid(self.browse_grid, self.card_list, self._calc_cols(self.CARD_W))
+        self._refresh_card_states()
+        if not self.card_list:
+            self.status_label.setText("No Workshop items found for this game.")
+        else:
+            self.status_label.hide()
+        self.more_btn.setVisible(len(items) >= 9 and bool(new))
+
+    def _make_item_card(self, it):
+        card = QFrame()
+        card.setObjectName("WsCard")
+        card.setFixedWidth(self.CARD_W)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(8, 8, 8, 10)
+        v.setSpacing(6)
+        prev = QLabel()
+        prev.setObjectName("WsPlaceholder")
+        prev.setFixedSize(self.CARD_W - 16, 104)
+        prev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img.request(it["preview"], lambda pm, l=prev: l.setPixmap(_ws_crop_round(pm, self.CARD_W - 16, 104)))
+        title = QLabel(it["title"])
+        title.setObjectName("RowTitle")
+        title.setWordWrap(True)
+        title.setFixedHeight(40)
+        title.setToolTip(it["title"])
+        author = QLabel(("by " + it["author"]) if it["author"] else "")
+        author.setObjectName("RowDesc")
+        author.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        btn = QPushButton("Download")
+        btn.setObjectName("Primary")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _c=False, it=it: self.enqueue(it))
+        view = QPushButton("View")
+        view.setFlat(True)
+        view.setCursor(Qt.CursorShape.PointingHandCursor)
+        view.clicked.connect(lambda _c=False, i=it["id"]: QDesktopServices.openUrl(
+            QUrl(f"https://steamcommunity.com/sharedfiles/filedetails/?id={i}")))
+        row.addWidget(btn, 1)
+        row.addWidget(view)
+        v.addWidget(prev)
+        v.addWidget(title)
+        v.addWidget(author)
+        v.addLayout(row)
+        self.cards[it["id"]] = (card, btn)
+        return card
+
+    def _refresh_card_states(self):
+        done = {d["id"] for d in self._downloads_for_game()}
+        active = {q["id"]: q["status"] for q in self.queue
+                  if q["appid"] == self.appid and q["status"] in ("queued", "downloading")}
+        for item_id, (_f, btn) in self.cards.items():
+            if item_id in active:
+                btn.setText("Downloading..." if active[item_id] == "downloading" else "Queued")
+                btn.setEnabled(False)
+            elif item_id in done:
+                btn.setText("Downloaded")
+                btn.setEnabled(False)
+            else:
+                btn.setText("Download")
+                btn.setEnabled(True)
+
+    # ------------------------------------------------------------ queue
+    def _refresh_tab_titles(self):
+        active = sum(1 for q in self.queue if q["status"] in ("queued", "downloading"))
+        self.tab_btns[1].setText(f"Queue ({active})" if active else "Queue")
+        n = len(self._downloads_for_game())
+        self.tab_btns[2].setText(f"Downloaded ({n})" if n else "Downloaded")
+
+    def enqueue(self, it):
+        if any(q["id"] == it["id"] and q["appid"] == self.appid and q["status"] in ("queued", "downloading")
+               for q in self.queue):
+            return
+        self.queue.append({"appid": self.appid, "game": self.game_title, "id": it["id"], "title": it["title"],
+                           "preview": it["preview"], "author": it.get("author", ""),
+                           "status": "queued", "msg": "", "line": "", "pct": None, "w": None})
+        self._rebuild_queue()
+        self._refresh_card_states()
+        self._refresh_tab_titles()
+        self._pump()
+
+    def _pump(self):
+        if self.worker and self.worker.isRunning():
+            return
+        nxt = next((q for q in self.queue if q["status"] == "queued"), None)
+        if not nxt:
+            return
+        nxt["status"], nxt["line"], nxt["pct"] = "downloading", "Starting...", None
+        self._update_queue_row(nxt)
+        self._refresh_card_states()
+        w = SteamCmdWorker(nxt["appid"], nxt["id"], ws_cfg_get("steam_login", ""), self)
+        w.status.connect(lambda t, e=nxt: self._on_status(e, t))
+        w.progress.connect(lambda p, e=nxt: self._on_progress(e, p))
+        w.finished_item.connect(lambda ok, msg, e=nxt: self._on_item_done(e, ok, msg))
+        w.finished.connect(self._pump)
+        self.worker = w
+        w.start()
+
+    def _on_status(self, e, text):
+        e["line"] = text
+        self._update_queue_row(e)
+
+    def _on_progress(self, e, pct):
+        e["pct"] = pct
+        self._update_queue_row(e)
+
+    def _on_item_done(self, e, ok, msg):
+        if e["status"] != "cancelled":
+            if ok:
+                e["status"] = "done"
+                downloads = [d for d in ws_load_downloads()
+                             if not (d["id"] == e["id"] and d["appid"] == e["appid"])]
+                downloads.append({"appid": e["appid"], "id": e["id"], "title": e["title"], "game": e["game"],
+                                  "preview": e["preview"], "author": e["author"], "time": int(time.time())})
+                ws_save_downloads(downloads)
+            else:
+                e["status"], e["msg"] = "failed", msg
+        self._update_queue_row(e)
+        self._refresh_card_states()
+        self._refresh_tab_titles()
+        if self.appid is not None:
+            self._rebuild_downloaded()
+
+    def _rebuild_queue(self):
+        while self.queue_layout.count() > 1:
+            item = self.queue_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+        for e in self.queue:
+            self._make_queue_row(e)
+        self.queue_empty.setVisible(not self.queue)
+
+    def _make_queue_row(self, e):
+        frame = QFrame()
+        frame.setObjectName("WsRow")
+        frame.setFixedHeight(68)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(12, 0, 12, 0)
+        h.setSpacing(12)
+        thumb = QLabel()
+        thumb.setObjectName("WsPlaceholder")
+        thumb.setFixedSize(80, 45)
+        self.img.request(e["preview"], lambda pm, l=thumb: l.setPixmap(_ws_crop_round(pm, 80, 45, 6)))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        name = QLabel(e["title"])
+        name.setObjectName("RowTitle")
+        name.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        sub = QLabel()
+        sub.setObjectName("RowDesc")
+        sub.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        bar = self._QProgressBar()
+        bar.setTextVisible(False)
+        col.addStretch()
+        col.addWidget(name)
+        col.addWidget(sub)
+        col.addWidget(bar)
+        col.addStretch()
+        btn = QPushButton()
+        btn.setFixedHeight(30)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _c=False, e=e: self._queue_action(e))
+        h.addWidget(thumb)
+        h.addLayout(col, 1)
+        h.addWidget(btn)
+        e["w"] = {"frame": frame, "sub": sub, "bar": bar, "btn": btn}
+        self.queue_layout.insertWidget(self.queue_layout.count() - 1, frame)
+        self._update_queue_row(e)
+
+    def _update_queue_row(self, e):
+        w = e.get("w")
+        if not w:
+            return
+        try:
+            st = e["status"]
+            text = {"queued": f"Queued · {e['game']}", "downloading": e["line"] or "Downloading...",
+                    "done": f"Downloaded · {e['game']}", "failed": e["msg"] or "Failed",
+                    "cancelled": "Cancelled"}[st]
+            w["sub"].setText(text)
+            w["sub"].setStyleSheet({"done": f"color: {GREEN};", "failed": f"color: {RED};"}.get(st, ""))
+            w["bar"].setVisible(st == "downloading")
+            if st == "downloading":
+                if e["pct"] is None:
+                    w["bar"].setRange(0, 0)
+                else:
+                    w["bar"].setRange(0, 100)
+                    w["bar"].setValue(int(e["pct"]))
+            label = {"queued": "Remove", "downloading": "Cancel", "failed": "Retry", "cancelled": "Retry"}.get(st)
+            w["btn"].setVisible(bool(label))
+            if label:
+                w["btn"].setText(label)
+        except RuntimeError:
+            pass
+
+    def _queue_action(self, e):
+        st = e["status"]
+        if st == "queued":
+            self.queue.remove(e)
+            self._rebuild_queue()
+        elif st == "downloading":
+            e["status"] = "cancelled"
+            if self.worker:
+                self.worker.cancel()
+            self._update_queue_row(e)
+        elif st in ("failed", "cancelled"):
+            e["status"], e["msg"] = "queued", ""
+            self._update_queue_row(e)
+            self._pump()
+        self._refresh_card_states()
+        self._refresh_tab_titles()
+
+    def clear_finished(self):
+        self.queue = [q for q in self.queue if q["status"] in ("queued", "downloading")]
+        self._rebuild_queue()
+
+    # ------------------------------------------------------------ downloaded
+    def _downloads_for_game(self):
+        return [d for d in ws_load_downloads()
+                if d["appid"] == self.appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))]
+
+    def _rebuild_downloaded(self):
+        while self.dl_layout.count() > 1:
+            item = self.dl_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+        entries = sorted(self._downloads_for_game(), key=lambda d: d.get("time", 0), reverse=True)
+        for d in entries:
+            self._make_downloaded_row(d)
+        self.dl_empty.setVisible(not entries)
+        self._refresh_tab_titles()
+
+    def _make_downloaded_row(self, d):
+        path = workshop_item_dir(d["appid"], d["id"])
+        frame = QFrame()
+        frame.setObjectName("WsRow")
+        frame.setFixedHeight(68)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(12, 0, 12, 0)
+        h.setSpacing(12)
+        thumb = QLabel()
+        thumb.setObjectName("WsPlaceholder")
+        thumb.setFixedSize(80, 45)
+        self.img.request(d.get("preview", ""), lambda pm, l=thumb: l.setPixmap(_ws_crop_round(pm, 80, 45, 6)))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        name = QLabel(d["title"])
+        name.setObjectName("RowTitle")
+        name.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        when = time.strftime("%Y-%m-%d", time.localtime(d.get("time", 0)))
+        sub = QLabel(f"ID {d['id']} · {_ws_fmt_size(_ws_dir_size(path))} · {when}")
+        sub.setObjectName("RowDesc")
+        col.addStretch()
+        col.addWidget(name)
+        col.addWidget(sub)
+        col.addStretch()
+        h.addWidget(thumb)
+        h.addLayout(col, 1)
+        if d["appid"] == 4000:
+            inst = QPushButton("Install to Garry's Mod")
+            inst.setObjectName("Primary")
+            inst.setFixedHeight(30)
+            inst.clicked.connect(lambda _c=False, d=d: self._install_to_gmod(d))
+            h.addWidget(inst)
+        op = QPushButton("Open folder")
+        op.setFixedHeight(30)
+        op.clicked.connect(lambda _c=False, p=path: self._open_folder(p))
+        rm = QPushButton("Delete")
+        rm.setFixedHeight(30)
+        rm.clicked.connect(lambda _c=False, d=d: self._delete_download(d))
+        h.addWidget(op)
+        h.addWidget(rm)
+        self.dl_layout.insertWidget(self.dl_layout.count() - 1, frame)
+
+    def _open_folder(self, path):
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif not QDesktopServices.openUrl(QUrl.fromLocalFile(path)) and shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "Open folder", f"Couldn't open the folder:\n{e}")
+
+    def _delete_download(self, d):
+        if QMessageBox.question(self, "Delete download", f"Delete \"{d['title']}\" from disk?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(workshop_item_dir(d["appid"], d["id"]), ignore_errors=True)
+        ws_save_downloads([x for x in ws_load_downloads()
+                           if not (x["id"] == d["id"] and x["appid"] == d["appid"])])
+        self._rebuild_downloaded()
+        self._refresh_card_states()
+
+    def _install_to_gmod(self, d):
+        root = find_gmod_root()
+        if not root:
+            QMessageBox.information(self, "Garry's Mod", "Garry's Mod isn't installed in the launcher.")
+            return
+        msgs = []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            addons = os.path.join(root, "garrysmod", "addons")
+            os.makedirs(addons, exist_ok=True)
+            extract_workshop_folder(workshop_item_dir(d["appid"], d["id"]), addons,
+                                    lambda t, k: msgs.append(t), lambda a, b: None)
+        except Exception as e:
+            msgs.append(f"Error: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Install to Garry's Mod", "\n".join(msgs[:-1][-5:] or msgs))
+
+_ws_prev_init = AdaptiveApp.__init__
+
+def _ws_init(self):
+    _ws_prev_init(self)
+    self.workshop_page = WorkshopPage()
+    self.pages.addWidget(self.workshop_page)
+    idx = self.pages.indexOf(self.workshop_page)
+    btn = self.make_nav_button("Steam Workshop", checkable=True)
+    self.nav_group.addButton(btn, idx)
+    layout = self.nav_group.button(0).parent().layout()
+    anchor = getattr(self, "gmod_btn", None) or self.nav_group.button(1)
+    layout.insertWidget(layout.indexOf(anchor), btn)
+
+AdaptiveApp.__init__ = _ws_init
 
 if __name__ == "__main__":
     main()
