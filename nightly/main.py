@@ -3790,6 +3790,8 @@ class AdaptiveApp(QMainWindow):
         self.move(x, y)
 
 def main():
+    import traceback
+    sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
 
@@ -11021,7 +11023,7 @@ class GeProtonPage(QWidget):
         if not self.loaded:
             self.load()
         else:
-            self.render()
+            self.render_rows()
 
     def load(self):
         if self.fetcher and self.fetcher.isRunning():
@@ -11041,9 +11043,9 @@ class GeProtonPage(QWidget):
         self.status.setVisible(not releases)
         if not releases:
             self.status.setText("No GE Proton releases found.")
-        self.render()
+        self.render_rows()
 
-    def render(self):
+    def render_rows(self):
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
             if item.widget():
@@ -11114,7 +11116,7 @@ class GeProtonPage(QWidget):
         w.progress.connect(lambda p, n=name: self._on_progress(n, p))
         w.result.connect(lambda ok, msg, n=name: self._on_result(n, ok, msg))
         w.start()
-        self.render()
+        self.render_rows()
 
     def _on_progress(self, name, pct):
         row = self.rows.get(name)
@@ -11126,19 +11128,19 @@ class GeProtonPage(QWidget):
 
     def _on_result(self, name, ok, msg):
         self.workers.pop(name, None)
-        self.render()
+        self.render_rows()
         if not ok:
             QMessageBox.warning(self, "GE Proton", f"Couldn't install {name}:\n{msg}")
 
     def uninstall(self, name):
         path = ge_installed_paths().get(name)
         if not path:
-            self.render()
+            self.render_rows()
             return
         if QMessageBox.question(self, "GE Proton", f"Uninstall {name}?") != QMessageBox.StandardButton.Yes:
             return
         shutil.rmtree(path, ignore_errors=True)
-        self.render()
+        self.render_rows()
 
 _ge_prev_init = AdaptiveApp.__init__
 
