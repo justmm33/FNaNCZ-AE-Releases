@@ -9860,6 +9860,33 @@ def ensure_steamcmd(status):
         raise RuntimeError("SteamCMD could not be extracted")
     return exe
 
+def _ws_has_files(path):
+    if not os.path.isdir(path):
+        return False
+    for _folder, _dirs, names in os.walk(path):
+        if names:
+            return True
+    return False
+
+def locate_workshop_item(appid, item_id):
+    """Path of a downloaded Workshop item, or None. Also rescues items SteamCMD put in its own folder."""
+    canon = workshop_item_dir(appid, item_id)
+    if _ws_has_files(canon):
+        return canon
+    alt = os.path.join(steamcmd_dir(), "steamapps", "workshop", "content", str(appid), str(item_id))
+    if _ws_has_files(alt):
+        try:
+            shutil.rmtree(canon, ignore_errors=True)
+            os.makedirs(os.path.dirname(canon), exist_ok=True)
+            shutil.move(alt, canon)
+            return canon
+        except Exception:
+            return None
+    return None
+
+def ws_steamcmd_log_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "workshop_steamcmd.log")
+
 _WS_ID_RE = re.compile(r'data-publishedfileid="(\d+)"')
 _WS_TITLE_RE = re.compile(r'class="workshopItemTitle[^"]*"[^>]*>(.*?)</div>', re.S)
 _WS_AUTHOR_RE = re.compile(r'class="workshopItemAuthorName[^"]*"[^>]*>(.*?)</div>', re.S)
@@ -10065,44 +10092,52 @@ class SteamCmdWorker(QThread):
             pass
 
     def run(self):
+        log = []
         try:
             exe = ensure_steamcmd(self.status.emit)
             os.makedirs(workshop_dir(), exist_ok=True)
             cmd = [exe, "+force_install_dir", workshop_dir(), "+login", self.login,
                    "+workshop_download_item", str(self.appid), self.item_id, "+quit"]
             kwargs = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
-            ok, err = False, ""
-            for _attempt in range(2):  # the first run may self-update and exit before downloading
+            err, rc = "", None
+            for attempt in range(3):  # the first run(s) may self-update and exit before downloading
                 if self._cancel:
                     break
-                self.status.emit("Downloading...")
+                self.status.emit("Downloading..." if attempt == 0 else "Retrying...")
+                log.append(f"--- attempt {attempt + 1}: {' '.join(cmd)}")
                 self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              stdin=subprocess.DEVNULL, text=True, errors="replace",
                                              cwd=steamcmd_dir(), **kwargs)
-                for line in self.proc.stdout:
-                    line = line.strip()
+                for raw in self.proc.stdout:
+                    line = raw.strip()
                     if not line:
                         continue
+                    log.append(line)
                     m = re.search(r"progress:\s*([\d.]+)", line)
                     if m:
                         self.progress.emit(float(m.group(1)))
-                    if line.startswith("Success. Downloaded item"):
-                        ok = True
-                    elif "ERROR!" in line or line.startswith("Failure"):
+                    if re.search(r"ERROR!|^Failure|Login Failure", line):
                         err = line
                     self.status.emit(line[:100])
-                self.proc.wait()
-                if ok or err:
+                rc = self.proc.wait()
+                if locate_workshop_item(self.appid, self.item_id) or (err and attempt >= 1):
                     break
+            try:
+                with open(ws_steamcmd_log_path(), "w", encoding="utf-8") as f:
+                    f.write("\n".join(log))
+            except OSError:
+                pass
             if self._cancel:
                 self.finished_item.emit(False, "Cancelled")
-            elif ok and os.path.isdir(workshop_item_dir(self.appid, self.item_id)):
+            elif locate_workshop_item(self.appid, self.item_id):
                 self.finished_item.emit(True, "")
             else:
-                msg = err or "SteamCMD did not download the item"
+                tail = [l for l in log if not l.startswith("---")][-3:]
+                msg = err or ("SteamCMD finished without downloading the item. Last output: " + " | ".join(tail)
+                              if tail else f"SteamCMD printed nothing (exit code {rc})")
                 if any(k in msg for k in ("Failure", "No subscription", "Access Denied", "not logged")):
                     msg += " (this game's Workshop may need a Steam account that owns it)"
-                self.finished_item.emit(False, msg)
+                self.finished_item.emit(False, f"{msg} [log: {ws_steamcmd_log_path()}]")
         except Exception as e:
             self.finished_item.emit(False, str(e))
 
@@ -10664,6 +10699,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                     "done": f"Downloaded · {e['game']}", "failed": e["msg"] or "Failed",
                     "cancelled": "Cancelled"}[st]
             w["sub"].setText(text)
+            w["sub"].setToolTip(text)
             w["sub"].setStyleSheet({"done": f"color: {GREEN};", "failed": f"color: {RED};"}.get(st, ""))
             w["bar"].setVisible(st == "downloading")
             if st == "downloading":
