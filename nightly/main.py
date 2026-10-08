@@ -1176,7 +1176,7 @@ def linux_install_terminal(linux_cmd, project_root, dest_path):
     return _RealPopen(bash, cwd=project_root)
 
 class DownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -2002,11 +2002,11 @@ class DownloadDialog(QDialog):
             self.progress_bar.setValue(percent)
             total_mb = total / (1024 * 1024)
             self.status_label.setText(f"Downloading... {percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | Progress: {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Progress: {_fmt_size(downloaded)} / {_fmt_size(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_size(downloaded)}")
 
     def on_finished(self, zip_path):
         self.zip_path = zip_path
@@ -4317,7 +4317,7 @@ def get_available_compatibility_tools():
     return tools
 
 class GameDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -4440,11 +4440,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | {_fmt_size(downloaded)} / {_fmt_size(total)}")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_size(downloaded)}")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -4867,7 +4867,7 @@ def _patched_start_ncz2_install(self):
 AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
 
 class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(int, int, float)
+    progress = pyqtSignal(object, object, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -4998,7 +4998,7 @@ FirebaseDownloadWorker.run = _new_fb_run
 # Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
 # Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
-PW_BASE_URL = "https://example.com/"                   # <-- change this
+PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
@@ -5864,19 +5864,19 @@ def _track_playing(name, proc):
 
 _RealPopen = subprocess.Popen
 
-def _tracked_popen(*a, **k):
-    proc = _RealPopen(*a, **k)
-    try:
-        args = a[0] if a else k.get("args")
-        if isinstance(args, (list, tuple)):
-            name = _game_name_for_args(args)
-            if name:
-                _track_playing(name, proc)
-    except Exception:
-        pass
-    return proc
+class _TrackedPopen(_RealPopen):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        try:
+            args = a[0] if a else k.get("args")
+            if isinstance(args, (list, tuple)):
+                name = _game_name_for_args(args)
+                if name:
+                    _track_playing(name, self)
+        except Exception:
+            pass
 
-subprocess.Popen = _tracked_popen
+subprocess.Popen = _TrackedPopen
 
 import hashlib as _hashlib
 
@@ -7803,6 +7803,13 @@ def _ws_installed_games():
         if installed:
             out.append(g)
     return out
+
+def _fmt_size(n):
+    """Format a byte count: MB below 1 GB, GB from 1 GB up."""
+    n = float(n)
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
 def _ws_fmt_size(n):
     for unit in ("B", "KB", "MB", "GB"):
