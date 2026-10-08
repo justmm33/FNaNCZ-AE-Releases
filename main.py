@@ -3818,7 +3818,15 @@ class DownloadsPage(QWidget):
 
         title = QLabel("Downloads")
         title.setObjectName("PageTitle")
-        layout.addWidget(title)
+        head_row = QHBoxLayout()
+        head_row.addWidget(title, 1)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFixedHeight(32)
+        self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_btn.setToolTip("Remove finished and failed downloads (running and paused ones stay)")
+        self.clear_btn.clicked.connect(self.clear_finished)
+        head_row.addWidget(self.clear_btn)
+        layout.addLayout(head_row)
         layout.addSpacing(22)
 
         self.scroll = QScrollArea()
@@ -3841,6 +3849,14 @@ class DownloadsPage(QWidget):
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.empty_label)
         self.empty_label.hide()
+
+    def clear_finished(self):
+        for i in reversed(range(self.container_layout.count())):
+            w = self.container_layout.itemAt(i).widget()
+            if isinstance(w, DownloadCard) and getattr(w, "state", "active") != "active":
+                self.container_layout.removeWidget(w)
+                w.setParent(None)
+                w.deleteLater()
 
     def add_download_card(self, card):
         self.empty_label.hide()
@@ -4396,6 +4412,12 @@ class DownloadCard(QFrame):
         self.info_label.setObjectName("RowDesc")
         bottom_row.addWidget(self.info_label, 1)
         
+        self.state = "active"   # active (incl. paused) / done / failed
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setFixedSize(80, 28)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        bottom_row.addWidget(self.pause_btn)
+
         self.action_btn = QPushButton("Cancel")
         self.action_btn.setFixedSize(80, 28)
         self.action_btn.clicked.connect(self.cancel_download)
@@ -4409,11 +4431,24 @@ class DownloadCard(QFrame):
         else:
             self.worker = FirebaseDownloadWorker(title, download_url, expected_size, existing_zip_path=existing_zip_path)
             
+        if not hasattr(self.worker, "pause"):
+            self.pause_btn.hide()
         self.worker.progress.connect(self.on_progress)
         self.worker.status_update.connect(self.on_status_update)
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
+
+    def toggle_pause(self):
+        if not hasattr(self.worker, "pause"):
+            return
+        if getattr(self.worker, "_paused", False):
+            self.worker.resume()
+            self.pause_btn.setText("Pause")
+        else:
+            self.worker.pause()
+            self.pause_btn.setText("Resume")
+            self.status_label.setText("Paused")
 
     def cancel_download(self):
         if hasattr(self.worker, "cancel"):
@@ -4447,6 +4482,8 @@ class DownloadCard(QFrame):
             self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_size(downloaded)}")
 
     def on_finished(self, zip_path):
+        self.state = "done"
+        self.pause_btn.hide()
         self.status_label.setText("Installed")
         self.status_label.setStyleSheet(f"color: {GREEN};")
         self.progress_bar.setRange(0, 100)
@@ -4463,7 +4500,9 @@ class DownloadCard(QFrame):
             self.setParent(None)
             self.deleteLater()
             return
-        self.status_label.setText("Failed")
+        self.state = "failed"
+        self.pause_btn.hide()
+        self.status_label.setText("Game is unreleased" if error_msg.strip() == "Game is unreleased" else "Failed")
         self.status_label.setStyleSheet(f"color: {RED};")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -5003,7 +5042,7 @@ PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
 PW_RELAY_BUTTONS = 'button.download, a.download, [onclick*="openLink"]'  # link buttons on the container page
-PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
+PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to", "pixeldrain.com")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
 PW_HEADLESS = True                                     # True hides the browser; it only pops up while you solve a captcha
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
@@ -5011,7 +5050,16 @@ PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 _fb_direct_run = FirebaseDownloadWorker.run  # previous behaviour, still used for the NCZ games
 
 def pw_game_url(title):
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower().replace("'", "")).strip("-")
+    t = title.lower().replace("'", "")
+    plain = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", t)).strip()
+    # special cases
+    if re.search(r"\bdying light (2|two)\b", plain):          # any edition of Dying Light 2
+        return PW_BASE_URL.rstrip("/") + "/dying-l-two-stay-human"
+    if re.fullmatch(r"dying light( the following)?( enhanced edition)?", plain):
+        return PW_BASE_URL.rstrip("/") + "/dying-light-the-following"
+    if re.search(r"\brisk of rain (2|two)\b", plain):
+        return PW_BASE_URL.rstrip("/") + "/risk-of-rain-two"
+    slug = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
     return PW_BASE_URL.rstrip("/") + "/" + slug
 
 # Describes the block around a DOWNLOAD HERE button (its label, logo, link...): which host does it mention?
@@ -5024,7 +5072,7 @@ PW_LABEL_JS = r"""el => {
         node = p;
     }
     const h = node.outerHTML;
-    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h)};
+    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h), pixeldrain: /pixel\s*-?drain/i.test(h)};
 }"""
 
 def _pw_host_ok(url, hosts):
@@ -5176,11 +5224,14 @@ def _pw_find_link(self, start_url):
                         flags = [buttons.nth(i).evaluate(PW_LABEL_JS) for i in range(n)]
                         bad |= {i for i, f in enumerate(flags) if f["mega"]}
                         order = ([i for i, f in enumerate(flags) if f["bzzhr"]] +
+                                 [i for i, f in enumerate(flags) if f["pixeldrain"]] +
                                  [i for i, f in enumerate(flags) if f["gofile"]] + list(range(n)))
                         if any(f["bzzhr"] for f in flags):
                             self.status_update.emit("Found a BZZHR button, using it...")
+                        elif any(f["pixeldrain"] for f in flags):
+                            self.status_update.emit("No BZZHR button, using Pixeldrain...")
                         elif any(f["gofile"] for f in flags):
-                            self.status_update.emit("No BZZHR button, using GoFile...")
+                            self.status_update.emit("No BZZHR or Pixeldrain button, using GoFile...")
                     idx = next((i for i in (order or range(n)) if i not in bad), None) if n else 0
                     if idx is None:
                         raise RuntimeError("No other DOWNLOAD HERE button found.")
@@ -5209,7 +5260,7 @@ def _pw_find_link(self, start_url):
                 raise RuntimeError("Couldn't reach a valid download link.")
 
             self.status_update.emit("Getting file link...")
-            if "gofile.io" in target.url:
+            if "gofile.io" in target.url or "pixeldrain.com" in target.url:
                 btn = target.get_by_role("button", name=re.compile("Download", re.IGNORECASE)).first
             else:
                 btn = target.get_by_text("Download File", exact=False).first
@@ -9034,6 +9085,1178 @@ def _pwh_init(self):
     QApplication.instance().installEventFilter(self._pw_key_filter)
 
 AdaptiveApp.__init__ = _pwh_init
+
+
+# ---------------------------------------------------------------- Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store)
+import csv as _csv
+
+def _fan_csv_path():
+    names = ("fan_games.csv", "gamejolt_by_tag.csv")
+    dirs = [os.path.dirname(os.path.abspath(__file__))]
+    for getter in (_bundled_dir, _writable_dir):
+        try:
+            dirs.append(getter())
+        except Exception:
+            pass
+    for d in dirs:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.exists(p):
+                return p
+    return ""
+
+_FAN_CACHE = None
+
+def load_fan_games():
+    """[(game_id, title, link, tags)] from the csv, one entry per Game Jolt game."""
+    global _FAN_CACHE
+    if _FAN_CACHE is not None:
+        return _FAN_CACHE
+    games, seen = [], set()
+    path = _fan_csv_path()
+    if path:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for row in _csv.DictReader(f):
+                name = (row.get("name") or "").strip()
+                link = (row.get("link") or "").strip()
+                m = re.search(r"/games/[^/]+/(\d+)", link)
+                if not (name and m):
+                    continue
+                gid = int(m.group(1))
+                if gid in seen:
+                    continue
+                seen.add(gid)
+                tags = {t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()}
+                games.append((gid, name, link, tags))
+    _FAN_CACHE = games
+    return games
+
+def get_fan_cover_dir():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_covers")
+
+def _find_cover_url(payload):
+    """Looks through Game Jolt's JSON for the first image url."""
+    if isinstance(payload, dict):
+        for key in ("img_thumbnail", "img_url", "mediaserver_url"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        for v in payload.values():
+            found = _find_cover_url(v)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for v in payload:
+            found = _find_cover_url(v)
+            if found:
+                return found
+    return ""
+
+def fetch_fan_overview(gid):
+    """Game Jolt's own site api (the same one its pages use). Returns the page data as one dict."""
+    data = json.loads(_http_get(f"https://gamejolt.com/site-api/web/discover/games/overview/{gid}?ignore", timeout=15))
+    payload = data.get("payload") or {}
+    merged = dict(payload)
+    for src in (data.get("game"), payload.get("game")):
+        if isinstance(src, dict):
+            merged.update(src)
+    return merged
+
+def _microdata(game):
+    md = game.get("microdata")
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except Exception:
+            md = None
+    if isinstance(md, list):
+        md = next((m for m in md if isinstance(m, dict)), None)
+    return md if isinstance(md, dict) else {}
+
+def _url_of(v):
+    if isinstance(v, str) and v.startswith("http"):
+        return v
+    if isinstance(v, list):
+        for x in v:
+            u = _url_of(x)
+            if u:
+                return u
+    if isinstance(v, dict):
+        for k in ("url", "contentUrl", "img_url", "mediaserver_url"):
+            u = _url_of(v.get(k))
+            if u:
+                return u
+    return ""
+
+def fan_cover_from_game(game):
+    for key in ("thumbnail_media_item", "header_media_item"):
+        u = _url_of(game.get(key))
+        if u:
+            return u
+    u = _url_of(game.get("img_thumbnail")) or _url_of(_microdata(game).get("image"))
+    if u:
+        return u
+    for item in game.get("mediaItems") or []:
+        u = _url_of(item)
+        if u:
+            return u
+    return ""
+
+def _rich_text(node):
+    if isinstance(node, str):
+        try:
+            node = json.loads(node)
+        except Exception:
+            return node
+    parts = []
+    def walk(n):
+        if isinstance(n, dict):
+            if isinstance(n.get("text"), str):
+                parts.append(n["text"])
+            for v in n.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+            if n.get("type") in ("paragraph", "hardBreak", "heading"):
+                parts.append("\n")
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(node)
+    return "".join(parts)
+
+def fan_description(game):
+    candidates = [game.get(k) for k in ("description_markdown", "description_compiled", "description_content", "description")]
+    candidates += [game.get("metaDescription"), _microdata(game).get("description")]
+    for i, v in enumerate(candidates):
+        if not v:
+            continue
+        if i == 2:
+            text = _rich_text(v)
+        elif i == 1:
+            text = html_lib.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"</p>|<br\s*/?>", "\n", str(v))))
+        else:
+            text = str(v)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+        if text:
+            return text[:1200]
+    return ""
+
+def fan_developer(game):
+    dev = game.get("developer")
+    if isinstance(dev, dict):
+        name = dev.get("display_name") or dev.get("username")
+        if name:
+            return name
+    author = _microdata(game).get("author")
+    if isinstance(author, list) and author:
+        author = author[0]
+    if isinstance(author, dict):
+        return author.get("name") or ""
+    return author if isinstance(author, str) else ""
+
+_OG_RES = (re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', re.I),
+           re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', re.I))
+
+class FanCoverLoader(CoverLoader):
+    """Same loader as the Store, but gets each cover from the game's Game Jolt page."""
+    def _fetch(self, appid, img_base, key, title):
+        folder = get_fan_cover_dir()
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{appid}.img")
+        marker = os.path.join(folder, f"{appid}-none3")
+        if os.path.exists(path):
+            return path
+        if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 3 * 24 * 3600:
+            return ""
+        url = ""
+        try:  # 1) Game Jolt's site api
+            url = fan_cover_from_game(fetch_fan_overview(appid))
+        except Exception:
+            pass
+        if not url:
+            try:  # 2) the page's own preview image
+                page = _http_get(img_base, timeout=15).decode("utf-8", errors="replace")
+                for rx in _OG_RES:
+                    m = rx.search(page)
+                    if m:
+                        url = html_lib.unescape(m.group(1))
+                        break
+            except Exception:
+                pass
+        if url:
+            try:
+                data = _http_get(url, timeout=15)
+                if data:
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    return path
+            except Exception:
+                pass
+        open(marker, "w").close()
+        return ""
+
+_OGD_RES = (re.compile(r'<meta[^>]+(?:property|name)=["\']og:description["\'][^>]+content=["\']([^"\']*)', re.I),
+            re.compile(r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']og:description["\']', re.I),
+            re.compile(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', re.I))
+_FAN_TAG_NAMES = {"undertale": "Undertale", "fnf": "FNF", "fnaf": "FNaF", "bendy": "Bendy"}
+
+class FanDetailPage(StoreDetailPage):
+    """Same details page as the Store, for Game Jolt fan games."""
+    DETAIL_W, DETAIL_H = 480, 270   # horizontal cover
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._link = ""
+        for b in self.findChildren(QPushButton):
+            if b.text().startswith("< Back"):
+                b.setText("< Back to Fan Games")
+        self.price_label.hide()
+        self.install_cb = None  # set by the app: (id, title, cover, link)
+        self.steam_btn.setText("Install")
+        self.steam_btn.clicked.disconnect()
+        self.steam_btn.clicked.connect(
+            lambda: self.install_cb and self.install_cb(self._appid, self._title, self._cover_path, self._link))
+
+    def show_game(self, appid, title, cover_path, link="", tags=()):
+        self._appid = appid
+        self._title = title
+        self._link = link
+        self._cover_path = cover_path or ""
+        self.title_label.setText(title)
+        self.meta_label.setText("Fan game  \u2022  Game Jolt")
+        self.desc_label.setText("Loading details...")
+        self._clear(self.chips_row)
+        self._clear(self.shots_row)
+        self._set_extras_visible(False)
+        for t in sorted(tags):
+            chip = QLabel(_FAN_TAG_NAMES.get(t, t.title()))
+            chip.setStyleSheet(self.CHIP_STYLE)
+            self.chips_row.addWidget(chip)
+        self.chips_row.addStretch()
+        pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 12) if cover_path else None
+        if pix:
+            self.cover.setText("")
+            self.cover.setPixmap(pix)
+        else:
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("No\ncover")
+
+        def work():
+            desc, dev = "", ""
+            try:
+                game = fetch_fan_overview(appid)
+                desc, dev = fan_description(game), fan_developer(game)
+            except Exception:
+                pass
+            if not desc:
+                try:
+                    page = _http_get(link, timeout=15).decode("utf-8", errors="replace")
+                    for rx in _OGD_RES:
+                        m = rx.search(page)
+                        if m and m.group(1).strip():
+                            desc = html_lib.unescape(m.group(1)).strip()
+                            break
+                except Exception:
+                    pass
+            return (appid, desc, dev)
+
+        worker = TaskWorker(work)
+        worker.done.connect(self._on_fan_details)
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+
+    def _on_fan_details(self, result):
+        appid, desc, dev = result
+        if appid != self._appid:
+            return
+        if dev:
+            self.meta_label.setText(f"by {dev}  \u2022  Game Jolt fan game")
+        self.desc_label.setText(desc or "No description available. Open the game on Game Jolt for more.")
+
+FAN_COVER_W, FAN_COVER_H = 220, 124   # horizontal covers
+FAN_CARD_W = FAN_COVER_W + 18
+
+class FanGamesPage(StorePage):
+    fan_selected = pyqtSignal(int, str, str)  # id, title, cover path
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        try:  # this page has no "Activated Games" view
+            self.activated_btn.hide()
+        except Exception:
+            pass
+        self.loader.shutdown()
+        self.loader = FanCoverLoader()
+        self.loader.loaded.connect(self._on_cover_loaded)
+        self._links = {gid: link for gid, _t, link, _tg in load_fan_games()}
+        lbl = self.findChild(QLabel, "PageTitle")
+        if lbl:
+            lbl.setText("Fan Games")
+        self.search_edit.setPlaceholderText("Search fan games")
+
+        # tag buttons: All / Undertale / FNF / FNaF / Bendy
+        self._tag = ""
+        self._tag_buttons = {}
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for label, tag in (("All", ""), ("Undertale", "undertale"), ("FNF", "fnf"),
+                           ("FNaF", "fnaf"), ("Bendy", "bendy")):
+            b = QPushButton(label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedHeight(32)
+            b.clicked.connect(lambda _c=False, t=tag: self._set_tag(t))
+            row.addWidget(b)
+            self._tag_buttons[tag] = b
+        row.addStretch()
+        self._tag_buttons[""].setObjectName("Primary")
+        lay = self.layout()
+        lay.insertLayout(2, row)
+        lay.insertSpacing(3, 10)
+
+    def _set_tag(self, tag):
+        self._tag = tag
+        for t, b in self._tag_buttons.items():
+            b.setObjectName("Primary" if t == tag else "")
+            b.style().unpolish(b)
+            b.style().polish(b)
+        self._start_search()
+
+    def showEvent(self, event):
+        QWidget.showEvent(self, event)
+        if not self._loaded_once:
+            self._loaded_once = True
+            self._start_search()
+        else:
+            QTimer.singleShot(100, self._maybe_load_more)
+
+    def _update_banner(self):
+        self.banner.hide()
+
+    def _columns(self):
+        available = self.width() - 36 - 24 - 12
+        return max(1, (available + STORE_GRID_GAP) // (FAN_CARD_W + STORE_GRID_GAP))
+
+    def _set_fan_cover(self, card, path):
+        card.cover_path = path or ""
+        pix = rounded_cover_pixmap(path, FAN_COVER_W, FAN_COVER_H, 8) if path else None
+        if pix:
+            card.cover.setText("")
+            card.cover.setPixmap(pix)
+            card.cover.setStyleSheet("background: transparent; border: none;")
+        else:
+            card.cover.setText("No\ncover")
+
+    def _load_page(self):
+        if self._exhausted:
+            return
+        self._loading = True
+        term = self._term.lower()
+        games = [g for g in load_fan_games() if term in g[1].lower() and (not self._tag or self._tag in g[3])]
+        start = self._next_start
+        chunk = [(gid, title, link) for gid, title, link, _tg in games[start:start + STORE_PAGE_SIZE]]
+        self._on_page((self._request_id, start, chunk, len(games), ""))
+        if not load_fan_games():
+            self._set_status("No fan_games.csv found next to main.py.")
+
+    def _on_page(self, result):
+        StorePage._on_page(self, result)
+        for card in self._cards:
+            if getattr(card, "_fan", False):
+                continue
+            card._fan = True
+            card.setFixedWidth(FAN_CARD_W)
+            card.cover.setFixedSize(FAN_COVER_W, FAN_COVER_H)
+            card.set_cover = lambda path, c=card: self._set_fan_cover(c, path)
+            card.setToolTip(f"{card.title}\nClick for details")
+            def press(event, c=card):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.fan_selected.emit(c.appid, c.title, c.cover_path)
+            card.mousePressEvent = press
+
+# ---------------------------------------------------------------- fan games in the Library (bottom section, horizontal cards)
+def get_fan_library_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_library.json")
+
+def load_fan_library():
+    try:
+        with open(get_fan_library_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return [g for g in data if isinstance(g, dict) and isinstance(g.get("id"), int) and g.get("title")]
+    except Exception:
+        return []
+
+def save_fan_library(games):
+    path = get_fan_library_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(games, f, indent=4)
+
+def _fan_build_library_section(self):
+    self.fan_lib_cards = {}
+    self.fan_lib_list = []
+    self.fan_section = QWidget(self.grid_container)
+    lay = QVBoxLayout(self.fan_section)
+    lay.setContentsMargins(0, 16, 0, 0)
+    lay.setSpacing(12)
+    head = QLabel("Fan Games")
+    head.setStyleSheet("font-size: 16px; font-weight: bold;")
+    lay.addWidget(head)
+    holder = QWidget()
+    self.fan_grid = QGridLayout(holder)
+    self.fan_grid.setContentsMargins(0, 0, 0, 0)
+    self.fan_grid.setHorizontalSpacing(24)
+    self.fan_grid.setVerticalSpacing(24)
+    self.fan_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    lay.addWidget(holder)
+    self.fan_section.hide()
+    for g in load_fan_library():
+        self._fan_create_library_card(g)
+
+def _fan_create_library_card(self, g):
+    gid, title_text, link = g["id"], g["title"], g.get("link", "")
+    cover_path = g.get("cover", "")
+    card = QFrame(self.fan_section)
+    card.setObjectName("GameCard")
+    card.setFixedWidth(FAN_CARD_W)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(8, 8, 8, 10)
+    layout.setSpacing(0)
+
+    cover = QLabel()
+    cover.setFixedSize(FAN_COVER_W, FAN_COVER_H)
+    cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    pix = rounded_cover_pixmap(cover_path, FAN_COVER_W, FAN_COVER_H, 8) if cover_path and os.path.exists(cover_path) else None
+    if pix:
+        cover.setPixmap(pix)
+    else:
+        cover.setObjectName("CoverPlaceholder")
+        cover.setText("No\ncover")
+    layout.addWidget(cover)
+    layout.addSpacing(10)
+
+    title = QLabel(title_text)
+    title.setObjectName("CardTitle")
+    title.setWordWrap(True)
+    title.setFixedHeight(38)
+    title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    layout.addWidget(title)
+
+    status = QLabel("Fan game")
+    status.setObjectName("CardStatus")
+    layout.addWidget(status)
+    layout.addSpacing(12)
+
+    actions = QHBoxLayout()
+    actions.setSpacing(6)
+    btn_open = QPushButton("Install")
+    btn_open.setObjectName("Primary")
+    btn_open.setFixedHeight(38)
+    btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn_open.clicked.connect(lambda _c=False, i=gid, t=title_text, c=cover_path, u=link: self._fan_install(i, t, c, u))
+    card._fan_btn = btn_open
+    _fan_update_btn(btn_open, title_text)
+    more_btn = QPushButton("\u2022\u2022\u2022")
+    more_btn.setObjectName("MoreButton")
+    more_btn.setFixedSize(42, 38)
+    more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    menu = QMenu(more_btn)
+    more_btn.setMenu(menu)
+    menu.addAction("View Details").triggered.connect(lambda _c=False, i=gid: self._fan_view(i))
+    menu.addAction("Open on Game Jolt").triggered.connect(lambda _c=False, u=link: webbrowser.open(u))
+    if sys.platform.startswith("linux"):
+        menu.addAction("Switch Compatibility Tool").triggered.connect(lambda _c=False, i=gid: self._fan_compat_dialog(i))
+    menu.addAction("Open Game Location").triggered.connect(
+        lambda _c=False, t=title_text: self.open_game_location(sanitize_folder_name(t)))
+    menu.addAction("Uninstall").triggered.connect(lambda _c=False, i=gid, t=title_text: self._fan_uninstall(i, t))
+    menu.addSeparator()
+    menu.addAction("Remove from Library").triggered.connect(lambda _c=False, i=gid: self._fan_remove(i))
+    actions.addWidget(btn_open, 1)
+    actions.addWidget(more_btn)
+    layout.addLayout(actions)
+
+    self.fan_lib_cards[gid] = card
+    self.fan_lib_list.append((card, title_text))
+
+def _fan_add(self, gid, title, cover_path):
+    if gid in self.fan_lib_cards:
+        return
+    link, tags = "", ()
+    for g in load_fan_games():
+        if g[0] == gid:
+            link, tags = g[2], g[3]
+            break
+    saved_cover = ""
+    if cover_path and os.path.exists(cover_path):
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+            shutil.copyfile(cover_path, saved_cover)
+        except Exception:
+            saved_cover = cover_path
+    entry = {"id": gid, "title": title, "link": link, "tags": sorted(tags), "cover": saved_cover}
+    save_fan_library([g for g in load_fan_library() if g["id"] != gid] + [entry])
+    self._fan_create_library_card(entry)
+    self.apply_filter()
+    self.fan_detail_page.set_in_library(True)
+
+def _fan_remove(self, gid):
+    card = self.fan_lib_cards.pop(gid, None)
+    if card is not None:
+        self.fan_lib_list = [(c, t) for c, t in self.fan_lib_list if c is not card]
+        card.hide()
+        card.setParent(None)
+        card.deleteLater()
+    save_fan_library([g for g in load_fan_library() if g["id"] != gid])
+    try:
+        os.remove(os.path.join(get_library_cover_dir(), f"fan-{gid}.img"))
+    except OSError:
+        pass
+    if getattr(self, "fan_detail_page", None) is not None and self.fan_detail_page._appid == gid:
+        self.fan_detail_page.set_in_library(False)
+    self.apply_filter()
+
+def _fan_view(self, gid):
+    g = next((x for x in load_fan_library() if x["id"] == gid), None)
+    if not g:
+        return
+    self.fan_detail_page.show_game(gid, g["title"], g.get("cover", ""), g.get("link", ""), tuple(g.get("tags", [])))
+    self.fan_detail_page.set_in_library(True)
+    btn = self.nav_group.button(self.pages.indexOf(self.fan_page))
+    if btn:
+        btn.setChecked(True)
+    self.pages.setCurrentWidget(self.fan_detail_page)
+
+AdaptiveApp._fan_build_library_section = _fan_build_library_section
+AdaptiveApp._fan_create_library_card = _fan_create_library_card
+AdaptiveApp._fan_add = _fan_add
+AdaptiveApp._fan_remove = _fan_remove
+AdaptiveApp._fan_view = _fan_view
+
+_fan_prev_apply_filter = AdaptiveApp.apply_filter
+
+def _fan_apply_filter(self, text=""):
+    _fan_prev_apply_filter(self, text)
+    if not hasattr(self, "fan_section"):
+        return
+    query = (text if isinstance(text, str) else self.search_edit.text()).strip().lower()
+    cols = max(1, self.grid_columns())
+    n = self.grid.count()  # the normal cards, already laid out above
+    while self.fan_grid.count():
+        self.fan_grid.takeAt(0)
+    span_w = cols * (COVER_W + 18) + (cols - 1) * 24
+    fan_cols = max(1, (span_w + 24) // (FAN_CARD_W + 24))
+    shown = 0
+    for card, title in self.fan_lib_list:
+        if query in title.lower():
+            self.fan_grid.addWidget(card, shown // fan_cols, shown % fan_cols)
+            card.show()
+            shown += 1
+        else:
+            card.hide()
+    self.fan_section.setVisible(shown > 0)
+    if shown:
+        self.grid.addWidget(self.fan_section, (n + cols - 1) // cols, 0, 1, cols)
+    total = n + shown
+    self.count_label.setText(f"{total} game{'s' if total != 1 else ''}")
+    self.empty_label.setVisible(total == 0)
+
+AdaptiveApp.apply_filter = _fan_apply_filter
+
+_fan_prev_init = AdaptiveApp.__init__
+
+def _fan_init(self):
+    _fan_prev_init(self)
+    self.fan_page = FanGamesPage()
+    self.pages.addWidget(self.fan_page)
+    self.fan_detail_page = FanDetailPage()
+    self.pages.addWidget(self.fan_detail_page)
+
+    def open_fan_game(gid, title, cover):
+        link, tags = "", ()
+        for g in load_fan_games():
+            if g[0] == gid:
+                link, tags = g[2], g[3]
+                break
+        self.fan_detail_page.show_game(gid, title, cover, link, tags)
+        self.fan_detail_page.set_in_library(gid in self.fan_lib_cards)
+        self.pages.setCurrentWidget(self.fan_detail_page)
+
+    self._fan_build_library_section()
+    self.fan_detail_page.add_requested.connect(self._fan_add)
+    self.fan_page.fan_selected.connect(open_fan_game)
+    self.fan_detail_page.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
+    btn = self.make_nav_button("Fan Games", checkable=True)
+    self.nav_group.addButton(btn, self.pages.indexOf(self.fan_page))
+    layout = self.nav_group.button(0).parent().layout()
+    i = layout.indexOf(self.nav_group.button(4))
+    i = i + 1 if i >= 0 else layout.indexOf(self.nav_group.button(1))
+    layout.insertWidget(i, btn)
+    self.apply_filter()
+
+AdaptiveApp.__init__ = _fan_init
+
+
+# --- Game Jolt fan games: Playwright finds the real build link, the launcher downloads + extracts it ---
+GJ_DOWNLOAD_BTN = re.compile(r"^\s*(download|get\s*game|install)\b", re.IGNORECASE)
+
+GJ_API_JS = r"""async (gid) => {
+    const hdr = {'Content-Type': 'application/json'};
+    const r = await fetch(`/site-api/web/discover/games/overview/${gid}?ignore`, {credentials: 'include'});
+    const j = await r.json();
+    const found = [];
+    const walk = o => {
+        if (Array.isArray(o)) o.forEach(walk);
+        else if (o && typeof o === 'object') {
+            if (o.id && o.os_windows && (o.type === undefined || o.type === 'downloadable')) found.push(o);
+            Object.values(o).forEach(walk);
+        }
+    };
+    walk(j.payload || j);
+    // Windows-only builds first, then primary ones
+    found.sort((a, b) => (((a.os_linux || a.os_mac) ? 1 : 0) - ((b.os_linux || b.os_mac) ? 1 : 0)) ||
+                         ((b.primary ? 1 : 0) - (a.primary ? 1 : 0)));
+    for (const b of found) {
+        try {
+            const d = await fetch(`/site-api/web/discover/games/builds/get-download-url/${b.id}`,
+                                  {method: 'POST', credentials: 'include', headers: hdr, body: '{}'});
+            const dj = await d.json();
+            const u = (dj.payload || dj).downloadUrl;
+            if (u) return u;
+        } catch (e) {}
+    }
+    return null;
+}"""
+
+# finds buttons whose own row mentions windows (and not linux/mac), tags them for Playwright
+GJ_TAG_WIN_JS = r"""() => {
+    let n = 0;
+    document.querySelectorAll('[data-gjwin]').forEach(e => e.removeAttribute('data-gjwin'));
+    const els = [...document.querySelectorAll('button, a')].filter(e => /^\s*download\b/i.test(e.innerText || ''));
+    for (const el of els) {
+        let node = el;
+        for (let i = 0; i < 5 && node.parentElement; i++) {
+            const p = node.parentElement;
+            if (els.filter(e => p.contains(e)).length > 1) break;
+            node = p;
+        }
+        const t = (node.innerText || '').toLowerCase();
+        if (t.includes('windows') && !t.includes('linux') && !t.includes('mac')) {
+            el.setAttribute('data-gjwin', '1'); n++;
+        }
+    }
+    return n;
+}"""
+
+def _gj_find_link(self, game_url, gid=None):
+    """Opens the Game Jolt page, opens the builds list, clicks the (Windows) build's Download and copies the link."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
+    with sync_playwright() as p:
+        self.status_update.emit("Starting browser...")
+        browser = p.chromium.launch(headless=PW_HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+        try:
+            context = browser.new_context(user_agent=PW_USER_AGENT, accept_downloads=True)
+            page = context.new_page()
+            got = {}
+            page.on("download", lambda d: got.setdefault("d", d))
+            context.on("page", lambda pg: pg.on("download", lambda d: got.setdefault("d", d)))
+            self.status_update.emit("Opening Game Jolt page...")
+            page.goto(game_url, timeout=60000)
+            page.wait_for_timeout(3000)
+
+            def wait_download(sec):
+                end = time.time() + sec
+                while "d" not in got and time.time() < end:
+                    if self._is_cancelled:
+                        raise RuntimeError("CANCELLED")
+                    page.wait_for_timeout(300)
+
+            def click_first(loc_list):
+                for loc in loc_list:
+                    try:
+                        if loc.count():
+                            loc.first.click(timeout=5000)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            # 1) ask Game Jolt's own api (from inside the browser) for the Windows build's download url
+            if gid:
+                self.status_update.emit("Looking for the Windows build...")
+                try:
+                    api_url = page.evaluate(GJ_API_JS, gid)
+                except Exception:
+                    api_url = None
+                if api_url:
+                    cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(api_url))
+                    headers = {"User-Agent": PW_USER_AGENT, "Referer": game_url}
+                    if cookies:
+                        headers["Cookie"] = cookies
+                    return api_url, headers
+
+            # 2) fallback: click through the page, Windows build only
+            self.status_update.emit("Opening download options...")
+            main_btns = [page.get_by_role("button", name=GJ_DOWNLOAD_BTN),
+                         page.get_by_role("link", name=GJ_DOWNLOAD_BTN)]
+            clicked_main = False
+            for _ in range(8):  # give the page a few seconds to render its buttons
+                if click_first(main_btns):
+                    clicked_main = True
+                    break
+                page.wait_for_timeout(1000)
+            if not clicked_main:
+                raise RuntimeError("Game is unreleased")
+            # Be patient: Game Jolt may show a builds list and/or a "download starts after the video" page.
+            # Poll for up to 5 minutes; click a Windows build if a list shows up, otherwise just wait.
+            self.status_update.emit("Waiting for the download to start (may play a video first)...")
+            end, clicked, saw_list = time.time() + 300, False, False
+            while "d" not in got and time.time() < end:
+                if self._is_cancelled:
+                    raise RuntimeError("CANCELLED")
+                for pg in list(context.pages):
+                    try:
+                        if pg.is_closed():
+                            continue
+                        n = pg.evaluate(GJ_TAG_WIN_JS)
+                        if n:
+                            saw_list = True
+                            if not clicked:
+                                self.status_update.emit("Picking the Windows build...")
+                                pg.locator("[data-gjwin]").first.click(timeout=5000)
+                                clicked = True
+                                self.status_update.emit("Waiting for the download to start (may play a video first)...")
+                    except Exception:
+                        pass
+                page.wait_for_timeout(1000)
+            if "d" not in got:
+                raise RuntimeError("The download didn't start.")
+            download = got["d"]
+            url = download.url
+            cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(url))
+            try:
+                download.cancel()  # the launcher downloads it itself
+            except Exception:
+                pass
+            headers = {"User-Agent": PW_USER_AGENT, "Referer": game_url}
+            if cookies:
+                headers["Cookie"] = cookies
+            return url, headers
+        finally:
+            browser.close()
+
+
+def _gj_stream(self, url, headers):
+    """Like _fb_stream, but keeps the file's real name/extension (.exe, .zip, .rar, .7z...)."""
+    self.status_update.emit("Connecting...")
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        self._response = response
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+        name = ""
+        cd = response.headers.get("Content-Disposition") or ""
+        m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I) or re.search(r'filename="?([^";]+)"?', cd, re.I)
+        if m:
+            name = urllib.parse.unquote(m.group(1).strip().strip('"'))
+        if not name:
+            name = os.path.basename(urllib.parse.unquote(response.geturl().split("?")[0]))
+        name = re.sub(r'[<>:"/\\|?*]', "_", name).strip() or sanitize_folder_name(self.title) + ".bin"
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, name))
+        total = int(response.headers.get("Content-Length", 0) or 0)
+        downloaded, start = 0, time.time()
+        with open(dest_path, "wb") as f:
+            while not self._is_cancelled:
+                buf = response.read(8192)
+                if not buf:
+                    break
+                downloaded += len(buf)
+                f.write(buf)
+                el = time.time() - start
+                self.progress.emit(downloaded, total, downloaded / el if el > 0 else 0)
+    return dest_path
+
+def _gj_install_file(path, game_dir):
+    """Installs whatever Game Jolt gave us: archive -> extracted, lone .exe -> copied into the game folder."""
+    os.makedirs(game_dir, exist_ok=True)
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"MZ"):  # a Windows executable on its own
+        name = os.path.basename(path)
+        if not name.lower().endswith(".exe"):
+            name = os.path.splitext(name)[0] + ".exe"
+        shutil.move(path, os.path.join(game_dir, name))
+        return
+    if head.startswith(b"7z\xbc\xaf"):
+        for tool in ("7z", "7za", "7zz"):
+            if shutil.which(tool):
+                if subprocess.run([tool, "x", "-y", f"-o{game_dir}", path], capture_output=True).returncode == 0:
+                    return
+        raise ValueError("This is a .7z archive, but 7z isn't installed.")
+    if head.startswith((b"<!DO", b"<htm", b"<HTM")):
+        raise ValueError("Game Jolt returned a web page instead of a file (the download link expired?). Try again.")
+    extract_archive(path, game_dir)
+
+class GameJoltDownloadWorker(FirebaseDownloadWorker):
+    def __init__(self, title, game_url, gid=None):
+        super().__init__(title, game_url, 0)
+        self.game_url = game_url
+        self.gid = gid
+
+    def run(self):
+        dest_path, fresh = None, False
+        try:
+            url, headers = _gj_find_link(self, self.game_url, self.gid)
+            self.download_url = url
+            dest_path = _gj_stream(self, url, headers)
+            fresh = True
+            if self._is_cancelled:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                self.failed.emit("CANCELLED")
+                return
+            self.status_update.emit("Installing...")
+            _gj_install_file(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+            self.finished.emit(dest_path)
+        except Exception as e:
+            if self._is_cancelled or str(e) == "CANCELLED":
+                self.failed.emit("CANCELLED")
+                return
+            self.failed.emit(str(e))
+
+def _fan_install(self, gid, title, cover_path, link):
+    exe = _fan_installed_exe(title)
+    if exe:  # already installed: this button is "Launch"
+        _launch_exe(self, exe, load_compat_config().get(f"fan-{gid}", ""))
+        return
+    if not link:
+        QMessageBox.warning(self, "Install", "This game has no Game Jolt link.")
+        return
+    worker = GameJoltDownloadWorker(title, link, gid)
+    worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
+    card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
+    self.downloads_page.add_download_card(card)
+    self.nav_group.button(6).setChecked(True)
+    self.pages.setCurrentWidget(self.downloads_page)
+
+AdaptiveApp._fan_install = _fan_install
+
+_gj_prev_init = AdaptiveApp.__init__
+
+def _gj_init(self):
+    _gj_prev_init(self)
+    self.fan_detail_page.install_cb = lambda i, t, c, u: self._fan_install(i, t, c, u)
+
+AdaptiveApp.__init__ = _gj_init
+
+
+# ======================= QoL: pausable downloads, exe icons, desktop shortcuts, fan-game launching =======================
+def _wk_get_cancel(self):
+    while self.__dict__.get("_paused") and not self.__dict__.get("_cancel_flag"):
+        time.sleep(0.2)   # paused: every download loop that checks _is_cancelled just waits here
+    return self.__dict__.get("_cancel_flag", False)
+
+def _wk_set_cancel(self, v):
+    self.__dict__["_cancel_flag"] = v
+
+def _wk_pause(self):
+    self.__dict__["_paused"] = True
+
+def _wk_resume(self):
+    self.__dict__["_paused"] = False
+
+for _cls in (FirebaseDownloadWorker, GameDownloadWorker):
+    _cls._is_cancelled = property(_wk_get_cancel, _wk_set_cancel)
+    _cls.pause = _wk_pause
+    _cls.resume = _wk_resume
+    _cls._paused = property(lambda self: self.__dict__.get("_paused", False))
+
+_BAD_EXE_WORDS = ("unins", "uninstall", "crash", "redist", "vcredist", "dxsetup", "dxwebsetup", "setup", "updater",
+                  "helper", "notification_helper", "dotnet", "oalinst", "directx")
+
+def _find_game_exe(folder):
+    """Best guess at the game's .exe inside an install folder (shallow + big wins, installers/crash handlers skipped)."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    best, best_key = None, None
+    for root, _dirs, files in os.walk(folder):
+        depth = os.path.relpath(root, folder).count(os.sep) if root != folder else 0
+        if depth > 3:
+            continue
+        for f in files:
+            if not f.lower().endswith(".exe") or any(w in f.lower() for w in _BAD_EXE_WORDS):
+                continue
+            full = os.path.join(root, f)
+            try:
+                key = (-depth, os.path.getsize(full))
+            except OSError:
+                continue
+            if best_key is None or key > best_key:
+                best, best_key = full, key
+    return best
+
+def _fan_installed_exe(title):
+    return _find_game_exe(installed_game_dir(sanitize_folder_name(title)))
+
+def _fan_update_btn(btn, title):
+    btn.setText("Launch" if _fan_installed_exe(title) else "Install")
+
+def _launch_spec(app, exe, compat_tool=""):
+    """(argv, cwd, extra_env) for starting a game exe the same way the launcher does for its other games."""
+    cwd = os.path.dirname(exe)
+    if sys.platform.startswith("linux"):
+        if compat_tool and os.path.exists(compat_tool):
+            return ([compat_tool, "run", exe], cwd,
+                    {"STEAM_COMPAT_DATA_PATH": cwd + "_compat_data",
+                     "STEAM_COMPAT_CLIENT_INSTALL_PATH": os.path.expanduser("~/.local/share/Steam")})
+        if exe.lower().endswith(".sh"):
+            return (["bash", exe], cwd, {})
+        if exe.lower().endswith(".exe") and getattr(app, "wine", None):
+            return ([app.wine[0], exe], cwd, {})
+    return ([exe], cwd, {})
+
+def _launch_exe(app, exe, compat_tool=""):
+    if not exe or not os.path.exists(exe):
+        QMessageBox.warning(app, "Launch Error", f"Executable not found:\n{exe}")
+        return
+    argv, cwd, extra = _launch_spec(app, exe, compat_tool)
+    try:
+        env = os.environ.copy()
+        if extra:
+            os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
+            env.update(extra)
+        elif sys.platform.startswith("linux") and argv[0] != exe:
+            env = system_env()
+        subprocess.Popen(argv, cwd=cwd, env=env)
+    except Exception as e:
+        QMessageBox.warning(app, "Launch Error", f"Couldn't launch the game: {e}")
+
+# ---- icon of an .exe (reads the PE resource table; no extra libraries) ----
+def extract_exe_icon_ico(exe_path):
+    import struct
+    try:
+        with open(exe_path, "rb") as f:
+            d = f.read()
+        if d[:2] != b"MZ":
+            return None
+        pe = struct.unpack_from("<I", d, 0x3C)[0]
+        if d[pe:pe + 4] != b"PE\0\0":
+            return None
+        nsec = struct.unpack_from("<H", d, pe + 6)[0]
+        optsz = struct.unpack_from("<H", d, pe + 20)[0]
+        opt = pe + 24
+        magic = struct.unpack_from("<H", d, opt)[0]
+        dd = opt + (112 if magic == 0x20b else 96)
+        res_rva = struct.unpack_from("<II", d, dd + 16)[0]
+        if not res_rva:
+            return None
+        secs = []
+        for i in range(nsec):
+            vs, va, rs, ro = struct.unpack_from("<IIII", d, opt + optsz + i * 40 + 8)
+            secs.append((va, max(vs, rs), ro))
+
+        def off(rva):
+            for va, sz, ro in secs:
+                if va <= rva < va + sz:
+                    return rva - va + ro
+            raise ValueError("rva")
+        base = off(res_rva)
+
+        def entries(o):
+            named, ids = struct.unpack_from("<HH", d, base + o + 12)
+            return [struct.unpack_from("<II", d, base + o + 16 + i * 8) for i in range(named + ids)]
+
+        def leaf(o):
+            while o & 0x80000000:
+                o = entries(o & 0x7fffffff)[0][1]
+            rva, size = struct.unpack_from("<II", d, base + o)
+            fo = off(rva)
+            return d[fo:fo + size]
+        root = entries(0)
+        groups = [e for e in root if e[0] == 14 and e[1] & 0x80000000]
+        icons = [e for e in root if e[0] == 3 and e[1] & 0x80000000]
+        if not groups or not icons:
+            return None
+        icon_map = {nm: ofs for nm, ofs in entries(icons[0][1] & 0x7fffffff)}
+        grp = leaf(entries(groups[0][1] & 0x7fffffff)[0][1])
+        count = struct.unpack_from("<H", grp, 4)[0]
+        imgs = []
+        for i in range(count):
+            w, h, cc, _r, pl, bc, _br, iid = struct.unpack_from("<BBBBHHIH", grp, 6 + i * 14)
+            if iid in icon_map:
+                imgs.append((w or 256, h or 256, cc, pl, bc, leaf(icon_map[iid])))
+        if not imgs:
+            return None
+        imgs.sort(key=lambda x: (x[0], x[4]), reverse=True)   # biggest first
+        out = struct.pack("<HHH", 0, 1, len(imgs))
+        pos, body = 6 + 16 * len(imgs), b""
+        for w, h, cc, pl, bc, data in imgs:
+            out += struct.pack("<BBBBHHII", w % 256, h % 256, cc, 0, pl, bc, len(data), pos + len(body))
+            body += data
+        return out + body
+    except Exception:
+        return None
+
+def _exe_icon_png(exe, name):
+    ico = extract_exe_icon_ico(exe)
+    if not ico:
+        return ""
+    try:
+        from PyQt6.QtGui import QImage
+        img = QImage()
+        if not img.loadFromData(ico):
+            return ""
+        folder = os.path.expanduser("~/.local/share/icons/game-launcher")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, re.sub(r"[^A-Za-z0-9_-]+", "_", name) + ".png")
+        return path if img.save(path, "PNG") else ""
+    except Exception:
+        return ""
+
+def create_desktop_shortcut(app, title, exe, compat_tool="", fallback_icon=""):
+    import shlex
+    if not exe or not os.path.exists(exe):
+        QMessageBox.warning(app, "Desktop Shortcut", "Couldn't find the game's executable. Is it installed?")
+        return
+    from PyQt6.QtCore import QStandardPaths
+    desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation) or os.path.expanduser("~/Desktop")
+    os.makedirs(desktop, exist_ok=True)
+    safe = sanitize_folder_name(title) or "Game"
+    try:
+        if sys.platform.startswith("win"):
+            q = lambda t: t.replace("'", "''")
+            lnk = os.path.join(desktop, safe + ".lnk")
+            ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');"
+                  f"$s.TargetPath='{q(exe)}';$s.WorkingDirectory='{q(os.path.dirname(exe))}';"
+                  f"$s.IconLocation='{q(exe)},0';$s.Save()")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            target = lnk
+        else:
+            argv, cwd, extra = _launch_spec(app, exe, compat_tool)
+            if extra:
+                os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
+            script_dir = os.path.expanduser("~/.local/share/game-launcher/shortcuts")
+            os.makedirs(script_dir, exist_ok=True)
+            script = os.path.join(script_dir, re.sub(r"[^A-Za-z0-9_-]+", "_", safe) + ".sh")
+            cmd = " ".join(shlex.quote(a) for a in argv)
+            if extra:
+                cmd = "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in extra.items()) + " " + cmd
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(f"#!/bin/sh\ncd {shlex.quote(cwd)} || exit 1\nexec {cmd}\n")
+            os.chmod(script, 0o755)
+            icon = _exe_icon_png(exe, safe) or (fallback_icon if fallback_icon and os.path.exists(fallback_icon) else "")
+            target = os.path.join(desktop, safe + ".desktop")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        f"Name={title}\nExec=\"{script}\"\nPath={cwd}\n"
+                        + (f"Icon={icon}\n" if icon else "") + "Terminal=false\nCategories=Game;\n")
+            os.chmod(target, 0o755)
+            try:  # GNOME: mark it trusted so it launches on double-click
+                subprocess.run(["gio", "set", target, "metadata::trusted", "true"], capture_output=True, timeout=5)
+            except Exception:
+                pass
+        QMessageBox.information(app, "Desktop Shortcut", f"Shortcut created:\n{target}")
+    except Exception as e:
+        QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
+
+def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover=""):
+    more = card.findChild(QPushButton, "MoreButton") if card is not None else None
+    if not more or not more.menu():
+        return
+    more.menu().addAction("Create Desktop Shortcut").triggered.connect(
+        lambda _c=False: create_desktop_shortcut(app, title, exe_fn(), tool_fn(), cover))
+
+# --- hook every kind of library card ---
+_sc_prev_game_card = AdaptiveApp.create_game_card
+def _sc_create_game_card(self, title_text, image_filename, game_id):
+    _sc_prev_game_card(self, title_text, image_filename, game_id)
+    if game_id in ("ae", "ncz2"):
+        name = AE_GAME_NAME if game_id == "ae" else NCZ2_GAME_NAME
+        known = "FNaNCZ AE.exe" if game_id == "ae" else "FNANCZ 2.exe"
+        def exe_fn(n=name, k=known):
+            d = installed_game_dir(n)
+            direct = os.path.join(d, k)
+            return direct if os.path.exists(direct) else _find_game_exe(d)
+        _add_shortcut_action(self, self.cards[-1][0], title_text, exe_fn, cover=image_filename)
+AdaptiveApp.create_game_card = _sc_create_game_card
+
+_sc_prev_steam_card = AdaptiveApp.create_steam_card
+def _sc_create_steam_card(self, appid, title_text, cover_path):
+    _sc_prev_steam_card(self, appid, title_text, cover_path)
+    def exe_fn():
+        for g in load_steam_library():
+            if g.get("appid") == appid and g.get("exe_path"):
+                return g["exe_path"]
+        return _find_game_exe(_safe_installed_game_dir(title_text))
+    _add_shortcut_action(self, self.steam_cards.get(appid), title_text, exe_fn,
+                         lambda: load_compat_config().get(str(appid), ""), cover_path)
+AdaptiveApp.create_steam_card = _sc_create_steam_card
+
+_sc_prev_custom_card = AdaptiveApp.create_custom_card
+def _sc_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
+    _sc_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
+    _add_shortcut_action(self, getattr(self, "custom_cards", {}).get(game_id), title_text,
+                         lambda: exe_path, lambda: compat_tool, cover_path)
+AdaptiveApp.create_custom_card = _sc_create_custom_card
+
+# --- fan games: shortcut, compat tool, uninstall, button state ---
+_sc_prev_fan_card = AdaptiveApp._fan_create_library_card
+def _sc_fan_card(self, g):
+    _sc_prev_fan_card(self, g)
+    gid, title = g["id"], g["title"]
+    _add_shortcut_action(self, self.fan_lib_cards.get(gid), title, lambda: _fan_installed_exe(title),
+                         lambda: load_compat_config().get(f"fan-{gid}", ""), g.get("cover", ""))
+AdaptiveApp._fan_create_library_card = _sc_fan_card
+
+def _fan_compat_dialog(self, gid):
+    tools = get_available_compatibility_tools()
+    if not tools:
+        QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
+        return
+    key = f"fan-{gid}"
+    dlg = CompatToolDialog(load_compat_config().get(key, ""), tools, self)
+    if dlg.exec() == int(QDialog.DialogCode.Accepted):
+        selected = dlg.get_selected()
+        config = load_compat_config()
+        if selected:
+            config[key] = selected
+        else:
+            config.pop(key, None)
+        save_compat_config(config)
+        QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
+
+def _fan_uninstall(self, gid, title):
+    d = installed_game_dir(sanitize_folder_name(title))
+    if os.path.isdir(d):
+        if QMessageBox.question(self, "Uninstall", f"Delete the installed files for {title}?") != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(d, ignore_errors=True)
+    self._fan_refresh(gid)
+
+def _fan_refresh(self, gid):
+    card = self.fan_lib_cards.get(gid)
+    btn = getattr(card, "_fan_btn", None)
+    if btn is not None:
+        g = next((x for x in load_fan_library() if x["id"] == gid), None)
+        if g:
+            _fan_update_btn(btn, g["title"])
+    dp = self.fan_detail_page
+    if dp._appid == gid:
+        _fan_update_btn(dp.steam_btn, dp._title)
+
+AdaptiveApp._fan_compat_dialog = _fan_compat_dialog
+AdaptiveApp._fan_uninstall = _fan_uninstall
+AdaptiveApp._fan_refresh = _fan_refresh
+
+_fan_prev_show_game = FanDetailPage.show_game
+def _fan_show_game(self, appid, title, *a, **k):
+    _fan_prev_show_game(self, appid, title, *a, **k)
+    _fan_update_btn(self.steam_btn, title)
+FanDetailPage.show_game = _fan_show_game
 
 if __name__ == "__main__":
     main()
