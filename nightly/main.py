@@ -11159,3 +11159,4 @@ AdaptiveApp.__init__ = _ge_init
 
 if __name__ == "__main__":
     main()
+ 
