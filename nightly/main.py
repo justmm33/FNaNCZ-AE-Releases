@@ -10402,8 +10402,12 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
     def _layout_grid(self, grid, widgets, cols):
         while grid.count():
             grid.takeAt(0)
+        top_left = Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
         for i, w in enumerate(widgets):
-            grid.addWidget(w, i // cols, i % cols)
+            grid.addWidget(w, i // cols, i % cols, top_left)  # keep cards at their natural size
+        for r in range(grid.rowCount()):
+            grid.setRowStretch(r, 0)
+        grid.setRowStretch(len(widgets) // cols + 1, 1)  # spare space goes below the last row
 
     def _clear_layout_rows(self, layout, rows):
         for r in rows:
@@ -10456,7 +10460,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         name.setWordWrap(True)
         v.addWidget(cover)
         v.addWidget(name)
-        v.addStretch()
+        card.setSizePolicy(self._QSizePolicy.Policy.Fixed, self._QSizePolicy.Policy.Maximum)
         card.clicked.connect(lambda g=g: self.open_game(g))
         return card
 
