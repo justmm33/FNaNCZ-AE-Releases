@@ -4261,10 +4261,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                     status_label.setStyleSheet("")
                 
                 def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
-                    link, expected_size = get_steam_download_link(a)
-                    if not link:
-                        QMessageBox.information(self, "Link Unavailable", "Contact MM33 to give this game a link.")
-                        return
+                    link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
                     card_widget = DownloadCard(t, link, expected_size, p, self)
                     
                     def on_dl_finished(_path):
@@ -5971,10 +5968,7 @@ def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
                     status_label.setStyleSheet("")
 
                 def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
-                    link, expected_size = get_steam_download_link(a)
-                    if not link:
-                        QMessageBox.information(self, "Link Unavailable", "Contact MM33 to give this game a link.")
-                        return
+                    link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
                     card_widget = DownloadCard(t, link, expected_size, p, self)
                     
                     def on_dl_finished(_path):
@@ -6676,10 +6670,7 @@ def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
                     status_label.setStyleSheet("")
 
                 def on_steam_install(_c=False, a=appid, t=title_text, p=cover_path):
-                    link, expected_size = get_steam_download_link(a)
-                    if not link:
-                        QMessageBox.information(self, "Link Unavailable", "Contact MM33 to give this game a link.")
-                        return
+                    link, expected_size = pw_game_url(t), 0  # Playwright finds the real link
                     
                     safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', t)
                     existing_file = None
@@ -6854,6 +6845,222 @@ def _new_fb_run(self):
             self.failed.emit(str(e))
 
 FirebaseDownloadWorker.run = _new_fb_run
+
+# --- Firebase games: find the real file link with a hidden Playwright browser, then download it normally ---
+# Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
+# Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
+# cancels the browser's own download, and the launcher's normal downloader fetches that link.
+PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
+PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
+PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
+PW_HEADLESS = True                                    # False shows the browser window
+PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/124.0.0.0 Safari/537.36")
+
+_fb_direct_run = FirebaseDownloadWorker.run  # previous behaviour, still used for the NCZ games
+
+def pw_game_url(title):
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower().replace("'", "")).strip("-")
+    return PW_BASE_URL.rstrip("/") + "/" + slug
+
+# True when the block around a DOWNLOAD HERE button (its label, logo, link...) mentions MegaDB.
+PW_MEGA_JS = r"""el => {
+    const hits = n => ((n.innerText || "").toLowerCase().split("download here").length - 1);
+    let node = el;
+    for (let i = 0; i < 4; i++) {
+        const p = node.parentElement;
+        if (!p || p === document.body || hits(p) > 1) break;
+        node = p;
+    }
+    return /mega\s*-?db/i.test(node.outerHTML);
+}"""
+
+def _pw_host_ok(url, hosts):
+    if not url or url.startswith(("about:", "blob:", "data:")):
+        return True
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts if h)
+
+def _pw_guard(context, page):
+    """Watches every tab: a popup that lands anywhere unexpected is closed, the main tab is sent back."""
+    allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname,) + tuple(PW_ALLOWED_HOSTS)
+    state = {"closed": 0, "blocked": []}  # extra tabs closed so far, and the blocked URLs
+    def watch(pg):
+        if pg is not page:
+            pg.on("close", lambda _p=None: state.__setitem__("closed", state["closed"] + 1))
+        def on_nav(frame):
+            if frame != pg.main_frame or _pw_host_ok(frame.url, allowed):
+                return
+            state["blocked"].append(frame.url)
+            try:
+                if pg is page:
+                    pg.go_back()
+                else:
+                    pg.close()
+            except Exception:
+                pass
+        pg.on("framenavigated", on_nav)
+        if pg is not page and not _pw_host_ok(pg.url, allowed):  # popup that was already on a bad site
+            state["blocked"].append(pg.url)
+            try:
+                pg.close()
+            except Exception:
+                pass
+    watch(page)
+    context.on("page", watch)
+    return state
+
+def _pw_is_ncz(title):
+    t = title.lower()
+    return "five nights at ncz" in t or "nczfront" in t
+
+def _pw_find_link(self, start_url):
+    """Returns (download_url, headers) copied from the browser."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
+    with sync_playwright() as p:
+        self.status_update.emit("Starting browser...")
+        browser = p.chromium.launch(headless=PW_HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+        try:
+            context = browser.new_context(user_agent=PW_USER_AGENT)
+            page = context.new_page()
+            guard = _pw_guard(context, page)
+            self.status_update.emit("Opening download page...")
+            page.goto(start_url, timeout=60000)
+
+            target = None
+            idx, bad, checked = 0, set(), False  # idx = which DOWNLOAD HERE button to click; bad = MegaDB ones
+            for attempt in range(1, 11):
+                if self._is_cancelled:
+                    raise RuntimeError("CANCELLED")
+                self.status_update.emit(f"Finding download link (attempt {attempt})...")
+                blocked_before = len(guard["blocked"])
+                tab = None
+                try:
+                    buttons = page.get_by_text(PW_BUTTON_TEXT, exact=False)
+                    n = buttons.count()
+                    if n and not checked:  # first button labelled MegaDB -> go straight to the second
+                        checked = True
+                        if n > 1 and buttons.nth(0).evaluate(PW_MEGA_JS):
+                            bad.add(0)
+                            self.status_update.emit("First button is MegaDB, using the second one...")
+                    idx = next((i for i in range(n) if i not in bad), None) if n else 0  # first button, then the next unused one
+                    if idx is None:
+                        raise RuntimeError("No other DOWNLOAD HERE button found.")
+                    with context.expect_page(timeout=10000) as info:
+                        buttons.nth(idx).click()
+                    tab = info.value
+                    tab.wait_for_load_state("domcontentloaded")
+                    if _pw_host_ok(tab.url, PW_ALLOWED_HOSTS):
+                        target = tab
+                        break
+                    tab.close()
+                except RuntimeError:
+                    raise
+                except Exception:
+                    page.wait_for_timeout(1000)
+                if any("megadb.net" in u for u in guard["blocked"][blocked_before:]) or \
+                        (tab is not None and "megadb.net" in (tab.url or "")):
+                    self.status_update.emit("Got megadb.net, trying a different DOWNLOAD HERE button...")
+                    bad.add(idx)
+            if not target:
+                raise RuntimeError("Couldn't reach a valid download link.")
+
+            self.status_update.emit("Getting file link...")
+            if "gofile.io" in target.url:
+                btn = target.get_by_role("button", name=re.compile("Download", re.IGNORECASE)).first
+            else:
+                btn = target.get_by_text("Download File", exact=False).first
+            btn.wait_for(state="visible", timeout=30000)
+            if "bzzhr.to" in target.url:
+                # Ads open in new tabs and get closed; click Download File again every time one closes.
+                got = {}
+                target.on("download", lambda d: got.setdefault("d", d))
+                seen = guard["closed"]
+                btn.click()
+                deadline = time.time() + 90
+                while "d" not in got and time.time() < deadline:
+                    if self._is_cancelled:
+                        raise RuntimeError("CANCELLED")
+                    target.wait_for_timeout(300)
+                    if guard["closed"] > seen:
+                        seen = guard["closed"]
+                        self.status_update.emit("Ad tab closed, clicking Download File again...")
+                        try:
+                            btn.click()
+                        except Exception:
+                            pass
+                if "d" not in got:
+                    raise RuntimeError("The download didn't start.")
+                download = got["d"]
+            else:
+                with target.expect_download(timeout=60000) as dl_info:
+                    btn.click()
+                download = dl_info.value
+            url = download.url
+            cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(url))
+            try:
+                download.cancel()  # the launcher downloads it itself
+            except Exception:
+                pass
+            headers = {"User-Agent": PW_USER_AGENT, "Referer": target.url}
+            if cookies:
+                headers["Cookie"] = cookies
+            return url, headers
+        finally:
+            browser.close()
+
+def _fb_stream(self, url, headers):
+    total_size = self.expected_size
+    self.status_update.emit("Connecting...")
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        self._response = response
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+        ext = ".rar" if url.lower().split("?")[0].endswith(".rar") else ".zip"
+        file_name = safe_filename_from_headers(response, self.title, ext)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
+        if total_size <= 0:
+            total_size = int(response.headers.get('Content-Length', 0) or 0)
+        downloaded, start_time = 0, time.time()
+        with open(dest_path, 'wb') as f:
+            while not self._is_cancelled:
+                buf = response.read(8192)
+                if not buf:
+                    break
+                downloaded += len(buf)
+                f.write(buf)
+                elapsed = time.time() - start_time
+                self.progress.emit(downloaded, total_size, downloaded / elapsed if elapsed > 0 else 0)
+    return dest_path
+
+def _fb_pw_run(self):
+    if _pw_is_ncz(self.title):
+        return _fb_direct_run(self)
+    dest_path = self.existing_zip_path if self.existing_zip_path and os.path.exists(self.existing_zip_path) else None
+    fresh = False
+    try:
+        if not dest_path:
+            url, headers = _pw_find_link(self, pw_game_url(self.title))
+            self.download_url = url  # bridged: the copied link becomes this download's link
+            dest_path = _fb_stream(self, url, headers)
+            fresh = True
+        if self._is_cancelled:
+            if fresh and os.path.exists(dest_path):
+                os.remove(dest_path)
+            self.failed.emit("CANCELLED")
+            return
+        self.status_update.emit("Extracting...")
+        extract_archive(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+        self.finished.emit(dest_path)
+    except Exception as e:
+        self.failed.emit("CANCELLED" if self._is_cancelled or str(e) == "CANCELLED" else str(e))
+
+FirebaseDownloadWorker.run = _fb_pw_run
+
 
 
 # --- Patch GameDownloadWorker filename parsing for AE / NCZ2 ---
