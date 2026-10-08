@@ -735,16 +735,7 @@ def get_launch_command():
         return sys.executable, [], os.path.dirname(os.path.abspath(sys.executable))
     script = os.path.abspath(__file__)
     exe = sys.executable
-    # Layout: launcher/source/main.py with the virtual environment in launcher/venv, so shortcuts use that Python.
-    venv = os.path.join(os.path.dirname(os.path.dirname(script)), "venv")
     if sys.platform.startswith("win"):
-        candidates = [os.path.join(venv, "Scripts", "pythonw.exe"), os.path.join(venv, "Scripts", "python.exe")]
-    else:
-        candidates = [os.path.join(venv, "bin", "python3"), os.path.join(venv, "bin", "python")]
-    venv_python = next((c for c in candidates if os.path.isfile(c)), None)
-    if venv_python:
-        exe = venv_python
-    elif sys.platform.startswith("win"):
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pythonw):
             exe = pythonw  # no console window
@@ -1146,7 +1137,7 @@ class ExistingFileDialog(QDialog):
         self.accept()
 
 class DownloadWorker(QThread):
-    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
+    progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -2018,11 +2009,11 @@ class DownloadDialog(QDialog):
             self.progress_bar.setValue(percent)
             total_mb = total / (1024 * 1024)
             self.status_label.setText(f"Downloading... {percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | Progress: {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
+            self.info_label.setText(f"Speed: {speed_str} | Progress: {dl_mb:.1f} MB / {total_mb:.1f} MB")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
 
     def on_finished(self, zip_path):
         self.zip_path = zip_path
@@ -3951,11 +3942,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
+            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -3985,14 +3976,8 @@ class DownloadCard(QFrame):
             pass
         self.action_btn.clicked.connect(lambda: QApplication.clipboard().setText(error_msg))
 
-def _fmt_dl(num_bytes):
-    """Sizes over 1 GB are shown in GB, everything else in MB."""
-    if num_bytes >= 1024 ** 3:
-        return f"{num_bytes / 1024 ** 3:.2f} GB"
-    return f"{num_bytes / 1024 ** 2:.1f} MB"
-
 class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
+    progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -4830,7 +4815,7 @@ def _patched_create_steam_card_compat(self, appid, title_text, cover_path):
 AdaptiveApp.create_steam_card = _patched_create_steam_card_compat
 
 class GameDownloadWorker(QThread):
-    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
+    progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -5503,11 +5488,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
+            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -6374,7 +6359,7 @@ def _patched_start_ncz2_install(self):
 AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
 
 class FirebaseDownloadWorker(QThread):
-    progress = pyqtSignal(object, object, float)  # object: sizes over 2 GB overflow a C int
+    progress = pyqtSignal(int, int, float)
     status_update = pyqtSignal(str)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -6584,11 +6569,11 @@ class DownloadCard(QFrame):
             total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
-            self.info_label.setText(f"Speed: {speed_str} | {_fmt_dl(downloaded)} / {_fmt_dl(total)}")
+            self.info_label.setText(f"Speed: {speed_str} | {dl_mb:.1f} MB / {total_mb:.1f} MB")
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Downloading...")
-            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {_fmt_dl(downloaded)}")
+            self.info_label.setText(f"Speed: {speed_str} | Downloaded: {dl_mb:.1f} MB")
 
     def on_finished(self, zip_path):
         self.status_label.setText("Installed")
@@ -6865,7 +6850,7 @@ FirebaseDownloadWorker.run = _new_fb_run
 # Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
 # Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
-PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
+PW_BASE_URL = "https://example.com/"                   # <-- change this
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
