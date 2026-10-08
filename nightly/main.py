@@ -11155,5 +11155,488 @@ def _ge_init(self):
 
 AdaptiveApp.__init__ = _ge_init
 
+# ---------------------------------------------------------------- Minecraft Java instances tab
+# Lists instances from Prism Launcher / PolyMC / MultiMC and launches them through that launcher's CLI.
+MC_LOADER_UIDS = {
+    "net.fabricmc.fabric-loader": "Fabric",
+    "org.quiltmc.quilt-loader": "Quilt",
+    "net.neoforged": "NeoForge",
+    "net.minecraftforge": "Forge",
+    "com.mumfrey.liteloader": "LiteLoader",
+}
+
+def _mc_cfg_path():
+    # Kept out of launcher.json because load_launcher_settings() drops keys it doesn't know.
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "minecraft.json")
+
+def mc_load_cfg():
+    cfg = {"extra_roots": [], "launcher_path": ""}
+    try:
+        with open(_mc_cfg_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if isinstance(data.get("extra_roots"), list):
+                cfg["extra_roots"] = [r for r in data["extra_roots"] if isinstance(r, str)]
+            if isinstance(data.get("launcher_path"), str):
+                cfg["launcher_path"] = data["launcher_path"]
+    except Exception:
+        pass
+    return cfg
+
+def mc_save_cfg(cfg):
+    path = _mc_cfg_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4)
+
+def mc_default_sources():
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        return [("Prism Launcher", os.path.join(base, "PrismLauncher"), "prism"),
+                ("PolyMC", os.path.join(base, "PolyMC"), "polymc")]
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+        return [("Prism Launcher", os.path.join(base, "PrismLauncher"), "prism"),
+                ("PolyMC", os.path.join(base, "PolyMC"), "polymc")]
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    return [("Prism Launcher", os.path.join(data, "PrismLauncher"), "prism"),
+            ("Prism Launcher (Flatpak)",
+             os.path.join(home, ".var", "app", "org.prismlauncher.PrismLauncher", "data", "PrismLauncher"),
+             "prism-flatpak"),
+            ("PolyMC", os.path.join(data, "PolyMC"), "polymc"),
+            ("MultiMC", os.path.join(data, "multimc"), "multimc")]
+
+def mc_instances_dir(root):
+    # Prism/PolyMC/MultiMC let the user relocate the instances folder via InstanceDir in their .cfg.
+    for cfg_name in ("prismlauncher.cfg", "polymc.cfg", "multimc.cfg"):
+        try:
+            with open(os.path.join(root, cfg_name), "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("InstanceDir="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            return os.path.join(root, os.path.expanduser(val))
+        except OSError:
+            continue
+    return os.path.join(root, "instances")
+
+def _mc_has_instances(folder):
+    try:
+        return any(os.path.isfile(os.path.join(folder, n, "instance.cfg")) for n in os.listdir(folder))
+    except OSError:
+        return False
+
+def mc_custom_source(path):
+    """Accepts a launcher data folder (containing 'instances') or an instances folder itself."""
+    path = os.path.abspath(path)
+    inst_dir = mc_instances_dir(path)
+    root = path
+    if not _mc_has_instances(inst_dir):
+        if not _mc_has_instances(path):
+            return None
+        inst_dir, root = path, os.path.dirname(path)
+    label = os.path.basename(path.rstrip("/\\")) or path
+    return dict(label=label, root=root, inst_dir=inst_dir, kind="custom", custom=True, entry=path)
+
+def mc_collect_sources(cfg):
+    sources, seen = [], set()
+    def add(src):
+        key = os.path.realpath(src["inst_dir"])
+        if key not in seen:
+            seen.add(key)
+            sources.append(src)
+    for label, root, kind in mc_default_sources():
+        inst_dir = mc_instances_dir(root)
+        if os.path.isdir(inst_dir):
+            add(dict(label=label, root=root, inst_dir=inst_dir, kind=kind, custom=False, entry=""))
+    for path in cfg.get("extra_roots", []):
+        src = mc_custom_source(path)
+        if src:
+            add(src)
+    return sources
+
+def mc_read_instance(inst_path):
+    cfg_file = os.path.join(inst_path, "instance.cfg")
+    if not os.path.isfile(cfg_file):
+        return None
+    kv = {}
+    try:
+        with open(cfg_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.rstrip("\r\n")
+                if "=" in line and not line.startswith(("[", "#", ";")):
+                    k, v = line.split("=", 1)
+                    kv[k.strip()] = v.strip()
+    except OSError:
+        return None
+    mc_ver, loader = "", ""
+    try:
+        with open(os.path.join(inst_path, "mmc-pack.json"), "r", encoding="utf-8") as f:
+            pack = json.load(f)
+        for comp in pack.get("components", []):
+            uid = comp.get("uid", "")
+            ver = comp.get("version") or comp.get("cachedVersion") or ""
+            if uid == "net.minecraft":
+                mc_ver = ver
+            elif uid in MC_LOADER_UIDS and not loader:
+                loader = f"{MC_LOADER_UIDS[uid]} {ver}".strip()
+    except Exception:
+        pass
+    game_dir = os.path.join(inst_path, "minecraft")
+    for d in ("minecraft", ".minecraft"):
+        if os.path.isdir(os.path.join(inst_path, d)):
+            game_dir = os.path.join(inst_path, d)
+            break
+    mods = 0
+    try:
+        mods = sum(1 for n in os.listdir(os.path.join(game_dir, "mods")) if n.lower().endswith(".jar"))
+    except OSError:
+        pass
+    def num(key):
+        try:
+            return int(kv.get(key) or 0)
+        except ValueError:
+            return 0
+    last = num("lastLaunchTime")
+    if last > 10**11:  # stored in milliseconds
+        last //= 1000
+    folder = os.path.basename(inst_path)
+    return dict(id=folder, name=kv.get("name") or folder, path=inst_path, game_dir=game_dir,
+                mc=mc_ver, loader=loader, mods=mods, last=last, played=num("totalTimePlayed"))
+
+def mc_list_instances(sources):
+    out = []
+    for src in sources:
+        try:
+            names = sorted(os.listdir(src["inst_dir"]))
+        except OSError:
+            continue
+        for n in names:
+            if n.startswith((".", "_")):
+                continue
+            inst = mc_read_instance(os.path.join(src["inst_dir"], n))
+            if inst:
+                inst["source"] = src
+                out.append(inst)
+    out.sort(key=lambda i: (-i["last"], i["name"].lower()))
+    return out
+
+def mc_launcher_cmd(src, override=""):
+    """Returns the command prefix that starts the launcher owning this source, or None."""
+    kind = src["kind"]
+    if kind == "prism-flatpak" and shutil.which("flatpak"):
+        return ["flatpak", "run", "org.prismlauncher.PrismLauncher"]
+    names = {"prism": ("prismlauncher", "PrismLauncher"), "polymc": ("polymc",),
+             "multimc": ("multimc", "MultiMC"),
+             "custom": ("prismlauncher", "PrismLauncher", "polymc", "multimc", "MultiMC")}.get(kind, ())
+    for n in names:
+        found = shutil.which(n)
+        if found:
+            return [found]
+    extra = []
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        if kind in ("prism", "custom"):
+            extra += [os.path.join(local, "Programs", "PrismLauncher", "prismlauncher.exe"),
+                      os.path.join(pf, "PrismLauncher", "prismlauncher.exe")]
+        if kind in ("polymc", "custom"):
+            extra.append(os.path.join(local, "Programs", "PolyMC", "polymc.exe"))
+    elif sys.platform == "darwin" and kind in ("prism", "custom"):
+        extra.append("/Applications/Prism Launcher.app/Contents/MacOS/prismlauncher")
+    for path in extra:
+        if os.path.isfile(path):
+            return [path]
+    if override and os.path.isfile(override):
+        return [override]
+    return None
+
+class MinecraftPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Content")
+        self.cfg = mc_load_cfg()
+        self.sources, self.instances = [], []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(36, 28, 36, 20)
+        outer.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(0)
+        title = QLabel("Minecraft Java")
+        title.setObjectName("PageTitle")
+        self.count_label = QLabel()
+        self.count_label.setObjectName("PageCount")
+        head.addWidget(title)
+        head.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addStretch()
+        for text, slot in (("Refresh", self.reload), ("Add folder", self.add_folder),
+                           ("Launcher...", self.choose_launcher)):
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, s=slot: s())
+            head.addSpacing(8)
+            head.addWidget(b)
+        outer.addLayout(head)
+        outer.addSpacing(4)
+
+        desc = QLabel("Instances from Prism Launcher, PolyMC and MultiMC. Play starts the instance through "
+                      "the launcher that owns it, so accounts, mods and Java settings stay as you set them there.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        outer.addWidget(desc)
+        outer.addSpacing(14)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("Search")
+        self.search.setPlaceholderText("Search instances")
+        self.search.setClearButtonEnabled(True)
+        self.search.setFixedSize(240, 36)
+        self.search.textChanged.connect(lambda _t: self.render())
+        outer.addWidget(self.search)
+        outer.addSpacing(14)
+
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.container = QWidget()
+        self.container.setObjectName("GridContainer")
+        self.list_layout = QVBoxLayout(self.container)
+        self.list_layout.setContentsMargins(0, 0, 12, 16)
+        self.list_layout.setSpacing(8)
+        self.list_layout.addStretch()
+        sc.setWidget(self.container)
+        outer.addWidget(sc, 1)
+
+        self.empty = QLabel()
+        self.empty.setObjectName("EmptyState")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
+        outer.addWidget(self.empty)
+        self.empty.hide()
+
+        self.note = QLabel()
+        self.note.setObjectName("RowDesc")
+        outer.addWidget(self.note)
+        self.note.hide()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        t = THEMES["dark" if dark else "light"]
+        self.setStyleSheet(f"QFrame#McRow {{ background: {t['panel']}; border: 1px solid {t['border']}; "
+                           f"border-radius: 10px; }} QFrame#McRow:hover {{ border: 1px solid {t['accent']}; }}")
+        self.reload()
+
+    # ---------------------------------------------------------------- data
+    def reload(self):
+        self.cfg = mc_load_cfg()
+        self.sources = mc_collect_sources(self.cfg)
+        self.instances = mc_list_instances(self.sources)
+        self.render()
+
+    def render(self):
+        while self.list_layout.count() > 1:
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+        query = self.search.text().strip().lower()
+        shown = [i for i in self.instances
+                 if not query or query in " ".join((i["name"], i["mc"], i["loader"])).lower()]
+        for inst in shown:
+            self._add_row(inst)
+        n = len(self.instances)
+        self.count_label.setText(f"{n} instance{'s' if n != 1 else ''}" if n else "")
+        if shown:
+            self.empty.hide()
+        else:
+            if self.instances:
+                self.empty.setText("No instances match your search.")
+            else:
+                self.empty.setText("No Minecraft instances found.\n\nThe launcher looks for Prism Launcher, PolyMC "
+                                   "and MultiMC instances. If yours are somewhere else, click \"Add folder\" and "
+                                   "pick that launcher's data folder.")
+            self.empty.show()
+
+    @staticmethod
+    def _fmt_hours(seconds):
+        return f"{seconds / 3600:.1f} h" if seconds >= 360 else f"{max(1, seconds // 60)} min"
+
+    def _add_row(self, inst):
+        frame = QFrame()
+        frame.setObjectName("McRow")
+        frame.setFixedHeight(68)
+        frame.setToolTip(inst["path"])
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(18, 0, 12, 0)
+        h.setSpacing(10)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        title = QLabel(inst["name"])
+        title.setObjectName("RowTitle")
+        parts = [inst["mc"] or "Unknown version", inst["loader"] or "Vanilla"]
+        if inst["mods"]:
+            parts.append(f"{inst['mods']} mod{'s' if inst['mods'] != 1 else ''}")
+        if inst["last"]:
+            played = time.strftime("%Y-%m-%d", time.localtime(inst["last"]))
+            if inst["played"]:
+                played += f" ({self._fmt_hours(inst['played'])} played)"
+            parts.append(f"Last played {played}")
+        else:
+            parts.append("Never played")
+        parts.append(inst["source"]["label"])
+        sub = QLabel(" · ".join(parts))
+        sub.setObjectName("RowDesc")
+        col.addStretch()
+        col.addWidget(title)
+        col.addWidget(sub)
+        col.addStretch()
+        h.addLayout(col, 1)
+
+        play = QPushButton("Play")
+        play.setObjectName("Primary")
+        play.setFixedHeight(32)
+        play.setMinimumWidth(90)
+        play.setCursor(Qt.CursorShape.PointingHandCursor)
+        play.clicked.connect(lambda _c=False, i=inst: self.launch(i))
+        h.addWidget(play)
+
+        more = QPushButton("More")
+        more.setFixedHeight(32)
+        more.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = QMenu(more)
+        for text, path in (("Open instance folder", inst["path"]),
+                           ("Open mods folder", os.path.join(inst["game_dir"], "mods")),
+                           ("Open worlds folder", os.path.join(inst["game_dir"], "saves"))):
+            act = menu.addAction(text)
+            act.triggered.connect(lambda _c=False, p=path: self._open(p))
+        menu.addSeparator()
+        if inst["source"]["custom"]:
+            act = menu.addAction("Stop listing this folder")
+            act.triggered.connect(lambda _c=False, e=inst["source"]["entry"]: self.remove_folder(e))
+        act = menu.addAction("Delete instance...")
+        act.triggered.connect(lambda _c=False, i=inst: self.delete_instance(i))
+        more.setMenu(menu)
+        h.addWidget(more)
+        self.list_layout.insertWidget(self.list_layout.count() - 1, frame)
+
+    # ---------------------------------------------------------------- actions
+    def _say(self, text):
+        self.note.setText(text)
+        self.note.show()
+        QTimer.singleShot(6000, self.note.hide)
+
+    def _open(self, path):
+        if not os.path.exists(path):
+            QMessageBox.information(self, "Minecraft Java",
+                                    "That folder doesn't exist yet. The game creates it the first time the instance runs.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif not QDesktopServices.openUrl(QUrl.fromLocalFile(path)) and shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "Minecraft Java", f"Couldn't open the folder:\n{e}")
+
+    def launch(self, inst):
+        src = inst["source"]
+        prefix = mc_launcher_cmd(src, self.cfg.get("launcher_path", ""))
+        if not prefix:
+            ask = QMessageBox.question(
+                self, "Minecraft Java",
+                f"Couldn't find the launcher that manages \"{inst['name']}\" ({src['label']}).\n\n"
+                "Choose its executable now?")
+            if ask == QMessageBox.StandardButton.Yes and self.choose_launcher():
+                self.launch(inst)
+            return
+        cmd = prefix + (["-d", src["root"]] if src["custom"] else []) + ["-l", inst["id"]]
+        kwargs = dict(env=system_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL)
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen(cmd, **kwargs)
+            self._say(f"Launching {inst['name']}...")
+        except Exception as e:
+            QMessageBox.warning(self, "Minecraft Java", f"Couldn't start the launcher:\n{e}")
+
+    def choose_launcher(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose your launcher executable (Prism Launcher, PolyMC or MultiMC)")
+        if not path:
+            return False
+        self.cfg["launcher_path"] = path
+        try:
+            mc_save_cfg(self.cfg)
+        except OSError as e:
+            QMessageBox.warning(self, "Minecraft Java", f"Couldn't save the setting:\n{e}")
+            return False
+        self._say("Launcher saved. It's used when the launcher isn't found automatically.")
+        return True
+
+    def add_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Choose a launcher data folder or an instances folder")
+        if not path:
+            return
+        src = mc_custom_source(path)
+        if not src:
+            QMessageBox.information(self, "Minecraft Java",
+                                    "No instances found in that folder. Pick the launcher's data folder "
+                                    "(the one that contains \"instances\") or the instances folder itself.")
+            return
+        roots = self.cfg.setdefault("extra_roots", [])
+        if src["entry"] not in roots:
+            roots.append(src["entry"])
+            try:
+                mc_save_cfg(self.cfg)
+            except OSError as e:
+                QMessageBox.warning(self, "Minecraft Java", f"Couldn't save the folder:\n{e}")
+        self.reload()
+
+    def remove_folder(self, entry):
+        self.cfg["extra_roots"] = [r for r in self.cfg.get("extra_roots", []) if r != entry]
+        try:
+            mc_save_cfg(self.cfg)
+        except OSError as e:
+            QMessageBox.warning(self, "Minecraft Java", f"Couldn't save the change:\n{e}")
+        self.reload()
+
+    def delete_instance(self, inst):
+        path = inst["path"]
+        if not os.path.isfile(os.path.join(path, "instance.cfg")):
+            return
+        ask = QMessageBox.question(
+            self, "Delete instance",
+            f"Permanently delete \"{inst['name']}\"?\n\nThis removes its worlds, mods and settings from disk "
+            "and can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if ask != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(path)
+        except OSError as e:
+            QMessageBox.warning(self, "Minecraft Java", f"Couldn't delete the instance:\n{e}")
+        self.reload()
+
+_mc_prev_init = AdaptiveApp.__init__
+
+def _mc_init(self):
+    _mc_prev_init(self)
+    self.mc_page = MinecraftPage()
+    self.pages.addWidget(self.mc_page)
+    btn = self.make_nav_button("Minecraft Java", checkable=True)
+    self.nav_group.addButton(btn, self.pages.indexOf(self.mc_page))
+    layout = self.nav_group.button(0).parent().layout()
+    layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
+
+AdaptiveApp.__init__ = _mc_init
+
 if __name__ == "__main__":
     main()
