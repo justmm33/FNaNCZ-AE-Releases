@@ -6850,7 +6850,7 @@ FirebaseDownloadWorker.run = _new_fb_run
 # Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
 # Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
-PW_BASE_URL = "https://example.com/"                   # <-- change this
+PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
