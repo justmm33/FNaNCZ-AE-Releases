@@ -9868,8 +9868,8 @@ def _ws_text(fragment):
     text = html_lib.unescape(re.sub(r"<[^>]+>", "", fragment or "")).replace("\xa0", " ").strip()
     return re.sub(r"\s+", " ", text)
 
-def parse_workshop_items(page):
-    """Turns a Steam Workshop browse page into [{'id', 'title', 'preview', 'author'}]."""
+def _parse_workshop_items_legacy(page):
+    """Old Workshop markup (data-publishedfileid attributes)."""
     starts, seen = [], set()
     for m in _WS_ID_RE.finditer(page):
         if m.group(1) not in seen:
@@ -9886,6 +9886,45 @@ def parse_workshop_items(page):
         items.append({"id": fid, "title": _ws_text(title.group(1)) if title else f"Item {fid}",
                       "preview": html_lib.unescape(img.group(1)) if img else "", "author": author_text})
     return items
+
+_WS_A_RE = re.compile(r'<a\b([^>]*)>(.*?)</a>', re.S)
+_WS_HREF_RE = re.compile(r'\bhref="([^"]*)"')
+_WS_FILE_RE = re.compile(r'filedetails/\?id=(\d+)')
+_WS_ALT_RE = re.compile(r'<img\b[^>]*?\balt="([^"]*)"', re.S)
+
+def parse_workshop_items(page):
+    """Reads Workshop items from the links Steam renders: each item is a link to
+    sharedfiles/filedetails/?id=ID (image + title) followed by an author link."""
+    order, info, current = [], {}, None
+    for m in _WS_A_RE.finditer(page):
+        hm = _WS_HREF_RE.search(m.group(1))
+        if not hm:
+            continue
+        href, inner = html_lib.unescape(hm.group(1)), m.group(2)
+        fm = _WS_FILE_RE.search(href)
+        if fm:
+            fid = fm.group(1)
+            if fid not in info:
+                info[fid] = {"id": fid, "title": "", "preview": "", "author": ""}
+                order.append(fid)
+            current = info[fid]
+            img = _IMG_RE.search(inner)
+            if img and not current["preview"]:
+                current["preview"] = re.sub(r"(imw|imh)=\d+", r"\1=288", html_lib.unescape(img.group(1)))
+            text = _ws_text(inner)
+            if not text:
+                alt = _WS_ALT_RE.search(inner)
+                text = html_lib.unescape(alt.group(1)).strip() if alt else ""
+            if text and not current["title"]:
+                current["title"] = text
+        elif "myworkshopfiles" in href and current is not None and not current["author"]:
+            current["author"] = re.sub(r"^by\s+", "", _ws_text(inner), flags=re.I)
+    items = []
+    for fid in order:
+        d = info[fid]
+        d["title"] = d["title"] or f"Item {fid}"
+        items.append(d)
+    return items or _parse_workshop_items_legacy(page)
 
 def _ws_installed_games():
     out = []
@@ -9984,11 +10023,25 @@ class WorkshopFetchWorker(QThread):
                       "numperpage": 30, "l": "english"}
             if self.sort == "trend":
                 params["days"] = 7
+            headers = {"Accept-Language": "en-US,en;q=0.9", "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"}
             url = "https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params)
-            page = _http_get(url, headers={"Accept-Language": "en-US,en;q=0.9",
-                                           "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"},
-                             timeout=20).decode("utf-8", "replace")
-            self.done.emit(self.token, parse_workshop_items(page), "")
+            page = _http_get(url, headers=headers, timeout=20).decode("utf-8", "replace")
+            items = parse_workshop_items(page)
+            if not items and self.page == 1 and not self.query:  # fall back to the game's Workshop hub page
+                page = _http_get(f"https://steamcommunity.com/app/{self.appid}/workshop/?l=english",
+                                 headers=headers, timeout=20).decode("utf-8", "replace")
+                items = parse_workshop_items(page)
+            if not items and not self.query:
+                dump = os.path.join(os.path.dirname(get_launcher_settings_path()), "workshop_debug.html")
+                try:
+                    os.makedirs(os.path.dirname(dump), exist_ok=True)
+                    with open(dump, "w", encoding="utf-8") as f:
+                        f.write(page)
+                except OSError:
+                    pass
+                self.done.emit(self.token, [], f"Steam's page had no items I could read (saved a copy to {dump})")
+                return
+            self.done.emit(self.token, items, "")
         except Exception as e:
             self.done.emit(self.token, [], str(e))
 
