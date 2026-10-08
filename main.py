@@ -9037,3 +9037,4 @@ AdaptiveApp.__init__ = _pwh_init
 
 if __name__ == "__main__":
     main()
+#anyone who uses this launcher admits that The Strokes is the best band ever
