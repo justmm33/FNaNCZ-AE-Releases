@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy
 )
 from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QDesktopServices, QImage
+from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage
 
 def _bundled_dir():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -978,18 +978,18 @@ THEMES = {
     # Black + red, flat and rounded (Epic Games feel) with Steam's top navigation bar.
     "dark": dict(
         bg="#0d0d0f", sidebar="#050506", panel="#151518", input="#0a0a0c", border="#26262b",
-        text="#f2f2f4", subtext="#8d8d96", accent="#e11d2e", accent_hover="#ff3b4a", accent_press="#b3121f",
+        text="#f2f2f4", subtext="#8d8d96", accent="#a666ff", accent_hover="#bb85ff", accent_press="#8444e0",
         button="#222226", button_hover="#2f2f35", disabled_bg="#18181b", disabled_text="#55555c",
         handle="#34343a", hover="#1c1c20",
-        red="#e11d2e", red_hover="#ff3b4a", red_press="#b3121f",
+        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
         nav_text="#a0a0a8", nav_active="#ffffff",
     ),
     "light": dict(
         bg="#f2f2f4", sidebar="#0a0a0c", panel="#ffffff", input="#ffffff", border="#d9d9de",
-        text="#141416", subtext="#6a6a72", accent="#e11d2e", accent_hover="#ff3b4a", accent_press="#b3121f",
+        text="#141416", subtext="#6a6a72", accent="#a666ff", accent_hover="#bb85ff", accent_press="#8444e0",
         button="#e4e4e8", button_hover="#d6d6db", disabled_bg="#ececef", disabled_text="#a4a4ab",
         handle="#c4c4cb", hover="#e9e9ed",
-        red="#e11d2e", red_hover="#ff3b4a", red_press="#b3121f",
+        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
         nav_text="#a0a0a8", nav_active="#ffffff",
     ),
 }
@@ -1015,7 +1015,7 @@ QPushButton#NavButton:hover { background: rgba(255,255,255,0.05); color: $nav_ac
 QPushButton#NavButton:checked { background: transparent; color: $nav_active; border-bottom: 3px solid $red; }
 QPushButton#ProfileButton { background: rgba(255,255,255,0.05); border: 1px solid transparent; border-radius: 22px; padding: 0; text-align: left; }
 QPushButton#ProfileButton:hover { background: rgba(255,255,255,0.10); }
-QPushButton#ProfileButton:checked { background: rgba(225,29,46,0.18); border: 1px solid $red; }
+QPushButton#ProfileButton:checked { background: rgba(166,102,255,0.18); border: 1px solid $red; }
 QPushButton#ProfileButton QLabel { color: $nav_active; }
 QLabel#Avatar { background: $accent; color: #ffffff; border-radius: 18px; font-size: 15px; font-weight: bold; }
 QLabel#AvatarLarge { background: $accent; color: #ffffff; border-radius: 40px; font-size: 32px; font-weight: bold; }
@@ -1082,7 +1082,7 @@ QMenu::separator { height: 1px; background: $border; margin: 6px 8px; }
 /* ---- progress + scrollbars ---- */
 QProgressBar { background: $button; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff3b4a, stop:1 #b3121f); border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #bb85ff, stop:1 #8444e0); border-radius: 3px;
 }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: $handle; border-radius: 5px; min-height: 30px; }
@@ -1121,10 +1121,40 @@ def build_palette(t):
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
     return palette
 
+_app_font_family = {"name": None}
+
+def load_app_font():
+    """Registers assets/ubuntu.ttf with Qt and returns its family name (None if it can't be loaded)."""
+    if _app_font_family["name"]:
+        return _app_font_family["name"]
+    # ubuntu.ttf first (it decides the family name), then any other weights next to it
+    # (ubuntu-bold.ttf, ubuntu-medium.ttf, ...) so bold text uses the real bold, not a smeared fake one.
+    paths = [asset_path("ubuntu.ttf")]
+    try:
+        for f in sorted(os.listdir(ASSETS_DIR)):
+            if f.lower().startswith("ubuntu") and f.lower().endswith((".ttf", ".otf")) and f.lower() != "ubuntu.ttf":
+                paths.append(os.path.join(ASSETS_DIR, f))
+    except OSError:
+        pass
+    for path in paths:
+        if os.path.isfile(path):
+            font_id = QFontDatabase.addApplicationFont(path)
+            if font_id != -1 and not _app_font_family["name"]:
+                families = QFontDatabase.applicationFontFamilies(font_id)
+                if families:
+                    _app_font_family["name"] = families[0]
+    return _app_font_family["name"]
+
 def build_app_font():
     font = QFont()
-    font.setFamilies(["Segoe UI", "Noto Sans", "Helvetica Neue", "Arial"])
+    family = load_app_font()
+    if family:
+        font.setFamily(family)
+    else:
+        font.setFamilies(["Segoe UI", "Noto Sans", "Helvetica Neue", "Arial"])
     font.setPointSize(10)
+    font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)  # no pixel-snapping, so thin strokes aren't "eaten"
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     return font
 
 def system_prefers_dark():
@@ -1144,7 +1174,9 @@ def apply_dark_mode(mode):
     theme = THEMES["dark" if use_dark else "light"]
     app.setPalette(build_palette(theme))
     app.setFont(build_app_font())
-    app.setStyleSheet(STYLE_TEMPLATE.substitute(theme))
+    family = load_app_font()
+    force_font = f'* {{ font-family: "{family}"; }}\n' if family else ""
+    app.setStyleSheet(force_font + STYLE_TEMPLATE.substitute(theme))
 
 class JsonEditorDialog(QDialog):
     def __init__(self, file_path, title="Edit Save File", parent=None):
@@ -3976,6 +4008,13 @@ class AdaptiveApp(QMainWindow):
 def main():
     import traceback
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
+    if sys.platform.startswith("win"):
+        # Without its own AppUserModelID, Windows groups the window under python.exe and shows Python's icon.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NCZ.GamesLauncher")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
 
@@ -6536,7 +6575,7 @@ class ChatView(QScrollArea):
             bubble.setMaximumWidth(380)
             bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if mine:
-                bubble.setStyleSheet("background:#e11d2e; color:#ffffff; border-radius:12px; padding:8px 12px;")
+                bubble.setStyleSheet("background:#a666ff; color:#ffffff; border-radius:12px; padding:8px 12px;")
             else:
                 bubble.setStyleSheet("background:rgba(128,128,128,0.28); border-radius:12px; padding:8px 12px;")
             ts = m.get("ts")
@@ -8394,6 +8433,30 @@ class _WsClickFrame(QFrame):
             self.clicked.emit()
         super().mouseReleaseEvent(e)
 
+_WS_MOD_COUNTS = {}   # appid -> number of Workshop items (only successful lookups are cached)
+WS_MIN_MODS = 3       # a game is listed in the Workshop picker only with MORE than 2 mods
+
+class WorkshopCountWorker(QThread):
+    done = pyqtSignal(int, int)   # appid, count (-1 = lookup failed)
+
+    def __init__(self, appid, parent=None):
+        super().__init__(parent)
+        self.appid = appid
+
+    def run(self):
+        try:
+            params = {"appid": self.appid, "searchtext": "", "childpublishedfileid": 0,
+                      "browsesort": "trend", "section": "readytouseitems", "p": 1,
+                      "numperpage": 30, "l": "english", "days": 7}
+            headers = {"Accept-Language": "en-US,en;q=0.9", "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"}
+            url = "https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params)
+            page = _http_get(url, headers=headers, timeout=20).decode("utf-8", "replace")
+            m = re.search(r"of\s+([\d,\.]+)\s+entries", page)
+            count = int(re.sub(r"[^\d]", "", m.group(1))) if m else len(parse_workshop_items(page))
+            self.done.emit(self.appid, count)
+        except Exception:
+            self.done.emit(self.appid, -1)
+
 class WorkshopPage(QWidget):
     CARD_W = 200
     GAME_W = 170
@@ -8672,14 +8735,46 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
 
     # ------------------------------------------------------------ game picker
     def _rebuild_games(self):
+        games = _ws_installed_games()
+        if not hasattr(self, "_counting"):
+            self._counting = set()
+        for g in games:
+            aid = g["appid"]
+            if aid in _WS_MOD_COUNTS or aid in self._counting:
+                continue
+            self._counting.add(aid)
+            w = WorkshopCountWorker(aid, self)
+            w.done.connect(self._on_mod_count)
+            self._fetchers.append(w)
+            w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+            w.start()
+        self._render_games(games)
+
+    def _on_mod_count(self, appid, count):
+        self._counting.discard(appid)
+        if count >= 0:
+            _WS_MOD_COUNTS[appid] = count
+        if self.stack.currentIndex() == 0:
+            self._render_games()
+
+    def _render_games(self, games=None):
         for w in self.game_cards:
             w.setParent(None)
             w.deleteLater()
         self.game_cards = []
-        games = _ws_installed_games()
-        for g in games:
+        games = games if games is not None else _ws_installed_games()
+        shown = [g for g in games if _WS_MOD_COUNTS.get(g["appid"], 0) >= WS_MIN_MODS]
+        for g in shown:
             self.game_cards.append(self._make_game_card(g))
-        self.games_empty.setVisible(not games)
+        checking = any(g["appid"] in self._counting for g in games)
+        if not games:
+            self.games_empty.setText("No downloaded Steam games yet.\nInstall a game from the Library or "
+                                     "use Add Existing Game, then come back.")
+        elif checking and not shown:
+            self.games_empty.setText("Checking which games have Workshop mods...")
+        else:
+            self.games_empty.setText("No games with more than 2 Workshop mods found.")
+        self.games_empty.setVisible(not shown)
         self._cols = (self._calc_cols(self.GAME_W), self._calc_cols(self.CARD_W))
         self._layout_grid(self.games_grid, self.game_cards, self._cols[0])
 
@@ -12283,6 +12378,80 @@ def _desk_build_library_page(self):
     return widget
 
 AdaptiveApp.build_library_page = _desk_build_library_page
+
+
+# ================================================================ frameless window: exit button + draggable top bar
+from PyQt6.QtCore import QEvent
+
+class _TitleBarDrag(QObject):
+    """Makes the top nav bar act as the title bar: drag to move, double-click to maximize / restore."""
+    def __init__(self, window, bar):
+        super().__init__(bar)
+        self._window = window
+        self._last_press = 0.0
+        bar.installEventFilter(self)
+
+    def _toggle_maximized(self):
+        if self._window.isMaximized():
+            self._window.showNormal()
+        else:
+            self._window.showMaximized()
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        left = hasattr(event, "button") and event.button() == Qt.MouseButton.LeftButton
+        if et == QEvent.Type.MouseButtonDblClick and left:
+            self._last_press = 0.0
+            self._toggle_maximized()
+            return True
+        if et == QEvent.Type.MouseButtonPress and left:
+            now = time.monotonic()
+            if now - self._last_press < QApplication.doubleClickInterval() / 1000.0:
+                self._last_press = 0.0
+                self._toggle_maximized()
+                return True
+            self._last_press = now
+            handle = self._window.windowHandle()
+            if handle is not None and not self._window.isMaximized():
+                handle.startSystemMove()
+            return True
+        return False
+
+_frameless_prev_init = AdaptiveApp.__init__
+
+def _frameless_init(self):
+    _frameless_prev_init(self)
+    self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)  # no OS title bar / border
+
+    bar = self.findChild(QFrame, "Sidebar")
+    if bar is None or bar.layout() is None:
+        return
+    _TitleBarDrag(self, bar)
+
+    exit_btn = QPushButton("\u2715")
+    exit_btn.setObjectName("ExitButton")
+    exit_btn.setToolTip("Exit")
+    exit_btn.setFixedSize(40, 32)
+    exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    exit_btn.setStyleSheet(
+        "QPushButton { background: transparent; color: #a0a0a8; border: none; border-radius: 6px;"
+        " font-size: 15px; font-weight: bold; padding: 0; }"
+        "QPushButton:hover { background: #e5484d; color: #ffffff; }"
+        "QPushButton:pressed { background: #c93a3f; color: #ffffff; }")
+
+    def exit_launcher():
+        # Really quit (the normal close button only hides the launcher to the tray).
+        self._really_quit = True
+        tray = getattr(self, "_tray", None)
+        if tray is not None:
+            tray.hide()
+        QApplication.instance().quit()
+
+    exit_btn.clicked.connect(exit_launcher)
+    bar.layout().addSpacing(8)
+    bar.layout().addWidget(exit_btn)
+
+AdaptiveApp.__init__ = _frameless_init
 
 
 if __name__ == "__main__":
