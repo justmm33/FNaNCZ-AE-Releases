@@ -99,8 +99,10 @@ WINE_D3D_MODES = {
 _D3D_DLLS = "d3d8,d3d9,d3d10core,d3d11,dxgi"
 _D3D12_DLLS = "d3d12,d3d12core"
 
+_d3d_override = {"mode": ""}   # set by _launch_exe while starting a game that has its own renderer
+
 def get_wine_d3d_mode():
-    mode = load_launcher_settings().get("wine_d3d", "default")
+    mode = _d3d_override["mode"] or load_launcher_settings().get("wine_d3d", "default")
     return mode if mode in WINE_D3D_MODES else "default"
 
 def _wine_prefix():
@@ -190,6 +192,51 @@ def find_wine():
             continue
         if out:
             return path, out.split()[0]
+    return None
+
+# ---------------------------------------------------------------- Wine builds + compatibility tools (Linux)
+def wine_builds_dir():
+    # Wine builds downloaded in the Wine tab live here, one folder per build.
+    return os.path.expanduser("~/.local/share/NCZ_Games_Launcher/wine")
+
+def _wine_bin_in(build_dir):
+    for name in ("wine", "wine64"):
+        path = os.path.join(build_dir, "bin", name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+def wine_installed_builds():
+    """{build name: path of its wine binary} for the builds installed from the Wine tab."""
+    found = {}
+    if not sys.platform.startswith("linux"):
+        return found
+    base = wine_builds_dir()
+    try:
+        for name in sorted(os.listdir(base)):
+            if name.startswith("."):
+                continue
+            binary = _wine_bin_in(os.path.join(base, name))
+            if binary:
+                found[name] = binary
+    except OSError:
+        pass
+    return found
+
+def compat_tool_kind(path):
+    """'proton' for a Proton tool (its `proton` script), 'wine' for a wine binary, None if unset or missing."""
+    if not path or not os.path.exists(path):
+        return None
+    return "proton" if os.path.basename(path) == "proton" else "wine"
+
+def default_wine_path(app=None):
+    """The wine used when a game has no tool picked: system wine, else the newest build from the Wine tab."""
+    system = getattr(app, "wine", None)
+    if system:
+        return system[0]
+    builds = wine_installed_builds()
+    if builds:
+        return max(builds.values(), key=lambda p: os.path.getmtime(p))
     return None
 
 def find_game_exe(root, exe_name):
@@ -3279,10 +3326,26 @@ class AdaptiveApp(QMainWindow):
                 os.chmod(sh_path, 0o755)
                 subprocess.Popen(["bash", sh_path], cwd=game_dir)
 
-    def launch_with_wine(self, game_id):
-        if not self.wine:
+    def switch_compat_tool(self, key):
+        config = load_compat_config()
+        picked = prompt_compat_tool(self, config.get(key, ""), _d3d_for(key))
+        if picked is None:
             return
-        wine_path, _version = self.wine
+        chosen, d3d = picked
+        if chosen:
+            config[key] = chosen
+        else:
+            config.pop(key, None)
+        save_compat_config(config)
+        save_game_d3d(key, d3d)
+        QMessageBox.information(self, "Compatibility Tool", "Compatibility settings updated for this game.")
+
+    def launch_with_wine(self, game_id):
+        tool = load_compat_config().get(game_id, "")
+        if not compat_tool_kind(tool) and not default_wine_path(self):
+            QMessageBox.warning(self, "Wine Required",
+                                "Wine wasn't found. Install it, or download a build in the Wine tab.")
+            return
         cfg = GAME_INFO[game_id]
         wine_dir = wine_game_dir(cfg["name"])
         exe_path = find_game_exe(wine_dir, cfg["exe"])
@@ -3302,10 +3365,7 @@ class AdaptiveApp(QMainWindow):
                                     f"Couldn't find {cfg['exe']} in the extracted files.")
                 return
 
-        try:
-            launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
-        except Exception as e:
-            QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
+        _launch_exe(self, exe_path, load_compat_config().get(game_id, ""), _d3d_for(game_id))
 
     def refresh_wine_uninstall(self, game_id):
         action = self.wine_uninstall_buttons.get(game_id)
@@ -3744,10 +3804,14 @@ class AdaptiveApp(QMainWindow):
             btn_cloud_sync.setToolTip("Download your account's save and settings to this device")
             menu.addSeparator()
             game_name = AE_GAME_NAME if game_id == "ae" else NCZ2_GAME_NAME
-            if self.wine:
-                btn_wine = menu.addAction(f"Launch using wine ({self.wine[1]})")
+            if self.wine or wine_installed_builds():
+                btn_wine = menu.addAction(f"Launch using wine ({self.wine[1]})" if self.wine else "Launch using wine")
                 btn_wine.setToolTip("Extract the Windows build (no Linux conversion) and run it with wine")
                 btn_wine.triggered.connect(lambda _checked=False, g=game_id: self.launch_with_wine(g))
+            if sys.platform.startswith("linux"):
+                btn_tool = menu.addAction("Switch Compatibility Tool")
+                btn_tool.setToolTip("Which Wine / Proton the Windows build runs with (used by \"Launch using wine\")")
+                btn_tool.triggered.connect(lambda _checked=False, g=game_id: self.switch_compat_tool(g))
             btn_open_location = menu.addAction("Open Game Location")
             btn_open_location.triggered.connect(lambda _checked=False, n=game_name: self.open_game_location(n))
             self.open_location_buttons[game_id] = btn_open_location
@@ -4113,14 +4177,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                         except Exception as e:
                             QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
                     elif sys.platform.startswith("linux"):
-                        if self.wine:
-                            wine_path, _ = self.wine
-                            try:
-                                launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
-                            except Exception as e:
-                                QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                        else:
-                            QMessageBox.warning(self, "Wine Required", "Wine was not found on your system to run this Windows game.")
+                        _launch_exe(self, exe_path, load_compat_config().get(str(appid), ""), _d3d_for(str(appid)))
                     else:
                         QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
                 
@@ -4444,6 +4501,8 @@ def get_available_compatibility_tools():
                             tools[entry] = proton_bin
             except Exception:
                 pass
+    for name, wine_bin in wine_installed_builds().items():
+        tools[f"{name} (Wine)"] = wine_bin
     return tools
 
 class GameDownloadWorker(QThread):
@@ -4756,6 +4815,13 @@ def _open_add_custom_game_dialog(self):
 
 AdaptiveApp.open_add_custom_game_dialog = _open_add_custom_game_dialog
 
+def _custom_tool(game_id, fallback=""):
+    """The compatibility tool currently saved for a custom game (it can change after the card was built)."""
+    for g in load_custom_games():
+        if g.get("id") == game_id:
+            return g.get("compat_tool", "")
+    return fallback
+
 def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
     card = QFrame(self.grid_container)
     card.setObjectName("GameCard")
@@ -4805,33 +4871,7 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
             except Exception as e:
                 QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
         elif sys.platform.startswith("linux"):
-            if compat_tool and os.path.exists(compat_tool):
-                compat_data_path = os.path.dirname(exe_path) + "_compat_data"
-                os.makedirs(compat_data_path, exist_ok=True)
-                env = os.environ.copy()
-                env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                apply_proton_d3d(env)
-                try:
-                    subprocess.Popen([compat_tool, "run", exe_path], cwd=os.path.dirname(exe_path), env=env)
-                except Exception as e:
-                    QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-            elif exe_path.lower().endswith(('.sh', '.py')):
-                try:
-                    subprocess.Popen(["bash" if exe_path.endswith('.sh') else "python3", exe_path], cwd=os.path.dirname(exe_path))
-                except Exception as e:
-                    QMessageBox.warning(self, "Launch Error", f"Couldn't start script: {e}")
-            elif self.wine:
-                wine_path, _ = self.wine
-                try:
-                    launch_wine(wine_path, exe_path, os.path.dirname(exe_path))
-                except Exception as e:
-                    QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-            else:
-                try:
-                    subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-                except Exception as e:
-                    QMessageBox.warning(self, "Launch Error", f"Couldn't launch executable: {e}")
+            _launch_exe(self, exe_path, _custom_tool(game_id, compat_tool), _d3d_for(f"custom-{game_id}"))
 
     btn_play.clicked.connect(launch_custom)
 
@@ -4851,6 +4891,21 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
         self.cards = [(c, t) for c, t in self.cards if c is not card]
         self.apply_filter()
 
+    def switch_custom_tool():
+        games = load_custom_games()
+        entry = next((g for g in games if g.get("id") == game_id), None)
+        if entry is None:
+            return
+        picked = prompt_compat_tool(self, entry.get("compat_tool", ""), _d3d_for(f"custom-{game_id}"))
+        if picked is None:
+            return
+        entry["compat_tool"], d3d = picked
+        save_custom_games(games)
+        save_game_d3d(f"custom-{game_id}", d3d)
+        QMessageBox.information(self, "Compatibility Tool", "Compatibility settings updated for this game.")
+
+    if sys.platform.startswith("linux"):
+        menu.addAction("Switch Compatibility Tool").triggered.connect(switch_custom_tool)
     menu.addAction("Remove from Library").triggered.connect(remove_custom_game)
     menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(os.path.dirname(exe_path)))
 
@@ -4866,16 +4921,16 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
 AdaptiveApp.create_custom_card = _patched_create_custom_card
 
 class CompatToolDialog(QDialog):
-    def __init__(self, current_tool, tools_dict, parent=None):
+    def __init__(self, current_tool, tools_dict, parent=None, current_d3d=""):
         super().__init__(parent)
         self.setWindowTitle("Switch Compatibility Tool")
-        self.setFixedSize(350, 150)
+        self.setFixedSize(460, 230)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
         
-        layout.addWidget(QLabel("Select Proton / Compatibility Tool:"))
+        layout.addWidget(QLabel("Select Proton / Wine Tool:"))
         
         self.combo = QComboBox()
         self.combo.addItem("Default (System Wine / Auto)", "")
@@ -4890,6 +4945,15 @@ class CompatToolDialog(QDialog):
                 idx = i + 1
         self.combo.setCurrentIndex(idx)
         layout.addWidget(self.combo)
+
+        layout.addWidget(QLabel("Direct3D renderer (Wine / Proton):"))
+        self.d3d_combo = QComboBox()
+        self.d3d_combo.addItem("Launcher setting", "")
+        for mode, label in WINE_D3D_MODES.items():
+            if mode != "default":
+                self.d3d_combo.addItem(label, mode)
+        self.d3d_combo.setCurrentIndex(max(0, self.d3d_combo.findData(current_d3d)))
+        layout.addWidget(self.d3d_combo)
         
         btn_layout = QHBoxLayout()
         btn_ok = QPushButton("OK")
@@ -4904,6 +4968,25 @@ class CompatToolDialog(QDialog):
 
     def get_selected(self):
         return self.combo.currentData()
+
+    def get_d3d(self):
+        return self.d3d_combo.currentData() or ""
+
+def prompt_compat_tool(app, current="", current_d3d=""):
+    """Asks which compatibility tool and Direct3D renderer to use.
+    Returns (tool path or '' for default, renderer or '' for the launcher setting), or None if cancelled."""
+    dlg = CompatToolDialog(current, get_available_compatibility_tools(), app, current_d3d)
+    if dlg.exec() != int(QDialog.DialogCode.Accepted):
+        return None
+    return dlg.get_selected() or "", dlg.get_d3d()
+
+def save_game_d3d(key, mode):
+    config = load_compat_config()
+    if mode:
+        config["d3d:" + key] = mode
+    else:
+        config.pop("d3d:" + key, None)
+    save_compat_config(config)
 
 def find_existing_archive(prefixes):
     if not os.path.isdir(DOWNLOAD_DIR):
@@ -5353,12 +5436,14 @@ def _pw_through_relay(self, context, tab, p):
 def _pw_guard(context, page):
     """Watches every tab: a popup that lands anywhere unexpected is closed, the main tab is sent back."""
     allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname,) + tuple(PW_ALLOWED_HOSTS) + tuple(PW_RELAY_HOSTS)
-    state = {"closed": 0, "blocked": []}  # extra tabs closed so far, and the blocked URLs
+    state = {"closed": 0, "blocked": [], "allow": set()}  # extra tabs closed so far, the blocked URLs, hosts allowed later
+    def ok(url):
+        return _pw_host_ok(url, allowed + tuple(state["allow"]))
     def watch(pg):
         if pg is not page:
             pg.on("close", lambda _p=None: state.__setitem__("closed", state["closed"] + 1))
         def on_nav(frame):
-            if frame != pg.main_frame or _pw_host_ok(frame.url, allowed):
+            if frame != pg.main_frame or ok(frame.url):
                 return
             state["blocked"].append(frame.url)
             try:
@@ -5369,7 +5454,7 @@ def _pw_guard(context, page):
             except Exception:
                 pass
         pg.on("framenavigated", on_nav)
-        if pg is not page and not _pw_host_ok(pg.url, allowed):  # popup that was already on a bad site
+        if pg is not page and not ok(pg.url):  # popup that was already on a bad site
             state["blocked"].append(pg.url)
             try:
                 pg.close()
@@ -5378,6 +5463,68 @@ def _pw_guard(context, page):
     watch(page)
     context.on("page", watch)
     return state
+
+PW_MEGADB = ("megadb.net",)
+
+def _pw_find_visible(pg, rx):
+    """First visible button / link / plain text on the page (any frame) whose text matches rx, else None."""
+    for fr in pg.frames:
+        for loc in (fr.get_by_role("button", name=rx), fr.get_by_role("link", name=rx), fr.get_by_text(rx)):
+            try:
+                for i in range(min(loc.count(), 10)):
+                    if loc.nth(i).is_visible():
+                        return loc.nth(i)
+            except Exception:
+                continue
+    return None
+
+def _pw_visible_labels(pg):
+    out = []
+    try:
+        loc = pg.locator("button, a, input[type=submit], input[type=button]")
+        for i in range(min(loc.count(), 40)):
+            el = loc.nth(i)
+            if el.is_visible():
+                t = (el.inner_text() or el.get_attribute("value") or "").strip().replace("\n", " ")
+                if t:
+                    out.append(t[:30])
+    except Exception:
+        pass
+    return out[:10]
+
+def _pw_press(el):
+    try:
+        el.click(timeout=5000)
+    except Exception:
+        try:
+            el.click(timeout=3000, force=True)   # something (an ad overlay) is on top of it
+        except Exception:
+            el.evaluate("e => e.click()")
+
+def _pw_megadb_button(self, pg, guard):
+    """MegaDB page: press DOWNLOAD, then return the DOWNLOAD NOW button once it shows up."""
+    first_rx = re.compile(r"^\s*(free\s+)?download\s*$", re.IGNORECASE)
+    now_rx = re.compile(r"^\s*(free\s+)?download\s*now\s*$", re.IGNORECASE)
+    self.status_update.emit("MegaDB: looking for the DOWNLOAD button...")
+    deadline = time.time() + 60
+    pressed, seen_closed = False, guard["closed"]
+    while True:
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+        now = _pw_find_visible(pg, now_rx)
+        if now is not None:
+            return now
+        if time.time() > deadline:
+            raise RuntimeError(f"Couldn't find the MegaDB download button on {pg.url}. "
+                               f"Buttons on the page: {', '.join(_pw_visible_labels(pg)) or 'none'}")
+        if not pressed or guard["closed"] > seen_closed:  # first time, or an ad tab ate the click
+            seen_closed = guard["closed"]
+            first = _pw_find_visible(pg, first_rx)
+            if first is not None:
+                self.status_update.emit("MegaDB: pressing DOWNLOAD...")
+                _pw_press(first)
+                pressed = True
+        pg.wait_for_timeout(500)
 
 def _pw_is_ncz(title):
     t = title.lower()
@@ -5401,6 +5548,7 @@ def _pw_find_link(self, start_url):
 
             target = None
             idx, bad, order = 0, set(), None  # idx = which DOWNLOAD HERE button to click; bad = ones to skip (MegaDB)
+            mega_only = False                 # every DOWNLOAD HERE button is MegaDB, so MegaDB is used after all
             for attempt in range(1, 11):
                 if self._is_cancelled:
                     raise RuntimeError("CANCELLED")
@@ -5412,7 +5560,12 @@ def _pw_find_link(self, start_url):
                     n = buttons.count()
                     if n and order is None:  # BZZHR is preferred, then GoFile, then whatever is left; MegaDB is skipped
                         flags = [buttons.nth(i).evaluate(PW_LABEL_JS) for i in range(n)]
-                        bad |= {i for i, f in enumerate(flags) if f["mega"]}
+                        if all(f["mega"] for f in flags):
+                            mega_only = True
+                            guard["allow"].update(PW_MEGADB)
+                            self.status_update.emit("MegaDB is the only option, using it...")
+                        else:
+                            bad |= {i for i, f in enumerate(flags) if f["mega"]}
                         order = ([i for i, f in enumerate(flags) if f["bzzhr"]] +
                                  [i for i, f in enumerate(flags) if f["pixeldrain"]] +
                                  [i for i, f in enumerate(flags) if f["gofile"]] + list(range(n)))
@@ -5436,26 +5589,37 @@ def _pw_find_link(self, start_url):
                     elif _pw_on(tab.url, PW_ALLOWED_HOSTS):
                         target = tab
                         break
+                    elif mega_only:
+                        end = time.time() + 15
+                        while time.time() < end and not tab.is_closed() and not _pw_on(tab.url, PW_MEGADB):
+                            tab.wait_for_timeout(500)
+                        if _pw_on(tab.url, PW_MEGADB):
+                            target = tab
+                            break
                     if not tab.is_closed():
                         tab.close()
                 except RuntimeError:
                     raise
                 except Exception:
                     page.wait_for_timeout(1000)
-                if any(h in u for u in guard["blocked"][blocked_before:] for h in PW_BLOCKED_HOSTS) or \
-                        (tab is not None and any(h in (tab.url or "") for h in PW_BLOCKED_HOSTS)):
+                blocked_hosts = () if mega_only else PW_BLOCKED_HOSTS
+                if any(h in u for u in guard["blocked"][blocked_before:] for h in blocked_hosts) or \
+                        (tab is not None and any(h in (tab.url or "") for h in blocked_hosts)):
                     self.status_update.emit("Got a blocked site, trying a different DOWNLOAD HERE button...")
                     bad.add(idx)
             if not target:
                 raise RuntimeError("Couldn't reach a valid download link.")
 
             self.status_update.emit("Getting file link...")
-            if "gofile.io" in target.url or "pixeldrain.com" in target.url:
+            mega = _pw_on(target.url, PW_MEGADB)
+            if mega:
+                btn = _pw_megadb_button(self, target, guard)
+            elif "gofile.io" in target.url or "pixeldrain.com" in target.url:
                 btn = target.get_by_role("button", name=re.compile("Download", re.IGNORECASE)).first
             else:
                 btn = target.get_by_text("Download File", exact=False).first
             btn.wait_for(state="visible", timeout=30000)
-            if "bzzhr.to" in target.url:
+            if "bzzhr.to" in target.url or mega:
                 # Ads open in new tabs and get closed; click Download File again every time one closes.
                 got = {}
                 target.on("download", lambda d: got.setdefault("d", d))
@@ -5868,30 +6032,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
                     except Exception as e:
                         QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
                 elif sys.platform.startswith("linux"):
-                    compat_config = load_compat_config()
-                    proton_bin = compat_config.get(str(appid), "")
-                    if proton_bin and os.path.exists(proton_bin):
-                        compat_data_path = os.path.dirname(custom_exe) + "_compat_data"
-                        os.makedirs(compat_data_path, exist_ok=True)
-                        env = os.environ.copy()
-                        env["STEAM_COMPAT_DATA_PATH"] = compat_data_path
-                        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
-                        apply_proton_d3d(env)
-                        try:
-                            subprocess.Popen([proton_bin, "run", custom_exe], cwd=os.path.dirname(custom_exe), env=env)
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Error", f"Couldn't start Proton: {e}")
-                    elif self.wine:
-                        wine_path, _ = self.wine
-                        try:
-                            launch_wine(wine_path, custom_exe, os.path.dirname(custom_exe))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch using wine", f"Couldn't start wine: {e}")
-                    else:
-                        try:
-                            subprocess.Popen([custom_exe], cwd=os.path.dirname(custom_exe))
-                        except Exception as e:
-                            QMessageBox.warning(self, "Launch Error", f"Couldn't launch executable: {e}")
+                    _launch_exe(self, custom_exe, load_compat_config().get(str(appid), ""), _d3d_for(str(appid)))
 
             btn_play.clicked.connect(launch_existing_game)
 
@@ -5902,23 +6043,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
                 has_compat_action = any("Compatibility Tool" in action.text() for action in menu.actions())
                 if not has_compat_action:
                     def open_compat_dialog():
-                        tools = get_available_compatibility_tools()
-                        if not tools:
-                            QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-                            return
-                        compat_config = load_compat_config()
-                        current_tool = compat_config.get(str(appid), "")
-                        
-                        dlg = CompatToolDialog(current_tool, tools, self)
-                        if dlg.exec() == int(QDialog.DialogCode.Accepted):
-                            selected = dlg.get_selected()
-                            config = load_compat_config()
-                            if selected:
-                                config[str(appid)] = selected
-                            else:
-                                config.pop(str(appid), None)
-                            save_compat_config(config)
-                            QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
+                        self.switch_compat_tool(str(appid))
 
                     menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
 
@@ -9255,6 +9380,348 @@ def _ge_init(self):
 
 AdaptiveApp.__init__ = _ge_init
 
+# ---------------------------------------------------------------- Wine tab (Linux only)
+# Plain Wine builds from Kron4ek's Wine-Builds. Installed builds show up in every game's
+# "Switch Compatibility Tool" picker next to the Proton tools.
+
+WINE_API = "https://api.github.com/repos/Kron4ek/Wine-Builds/releases?per_page=40"
+WINE_ARCH_PREFERENCE = ("amd64-wow64", "amd64")   # wow64 runs 32-bit games without 32-bit system libraries
+_WINE_ASSET = re.compile(r"wine-(?P<ver>\d+(?:\.\d+)*(?:-rc\d+)?)(?P<staging>-staging)?-(?P<arch>amd64-wow64|amd64)\.tar\.xz")
+
+def parse_wine_releases(data):
+    out = []
+    for r in data if isinstance(data, list) else []:
+        if r.get("draft"):
+            continue
+        hashes = {name.strip("`*"): h.lower()
+                  for h, name in re.findall(r"\b([0-9a-fA-F]{64})\s+(\S+)", r.get("body") or "")}
+        best = {}   # staging? -> (arch rank, asset, match): one build per flavor per release
+        for a in r.get("assets") or []:
+            m = _WINE_ASSET.fullmatch(a.get("name", ""))
+            if not m:
+                continue
+            staging = bool(m.group("staging"))
+            rank = WINE_ARCH_PREFERENCE.index(m.group("arch"))
+            if staging not in best or rank < best[staging][0]:
+                best[staging] = (rank, a, m)
+        for staging, (_rank, a, m) in best.items():
+            digest = a.get("digest") or ""
+            sha = digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else hashes.get(a["name"], "")
+            out.append({"name": a["name"][:-len(".tar.xz")], "version": m.group("ver"), "staging": staging,
+                        "date": (r.get("published_at") or "")[:10], "size": a.get("size", 0),
+                        "url": a["browser_download_url"], "sha": sha})
+    return out
+
+class WineFetchWorker(QThread):
+    done = pyqtSignal(list, str)
+
+    def run(self):
+        try:
+            data = json.loads(_http_get(WINE_API, headers={"Accept": "application/vnd.github+json"}, timeout=20))
+            self.done.emit(parse_wine_releases(data), "")
+        except Exception as e:
+            self.done.emit([], str(e))
+
+class WineInstallWorker(QThread):
+    progress = pyqtSignal(int)
+    result = pyqtSignal(bool, str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+
+    def run(self):
+        tmp = stage = None
+        try:
+            dest = wine_builds_dir()
+            os.makedirs(dest, exist_ok=True)
+            name = self.info["name"]
+            tmp = os.path.join(dest, "." + name + ".tar.xz.part")
+            digest = _hashlib.sha256()
+            req = urllib.request.Request(self.info["url"], headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or self.info["size"] or 0)
+                got = 0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    digest.update(chunk)
+                    got += len(chunk)
+                    if total:
+                        self.progress.emit(int(got * 80 / total))
+            expected = self.info.get("sha", "")
+            if expected and digest.hexdigest() != expected:
+                raise RuntimeError("Checksum mismatch, the download was corrupted. Try again.")
+            self.progress.emit(85)
+            stage = os.path.join(dest, "." + name + ".tmp")
+            shutil.rmtree(stage, ignore_errors=True)
+            os.makedirs(stage)
+            with _tarfile.open(tmp, "r:xz") as t:
+                try:
+                    t.extractall(stage, filter="tar")
+                except TypeError:  # Python without extraction filters
+                    root = os.path.abspath(stage)
+                    for m in t.getmembers():
+                        if not os.path.abspath(os.path.join(root, m.name)).startswith(root + os.sep):
+                            raise RuntimeError("Unsafe path in archive")
+                    t.extractall(stage)
+            folders = [d for d in os.listdir(stage) if os.path.isdir(os.path.join(stage, d))]
+            top = os.path.join(stage, folders[0]) if len(folders) == 1 else stage
+            if not _wine_bin_in(top):
+                raise RuntimeError("The download doesn't contain a wine binary.")
+            final = os.path.join(dest, name)
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(top, final)
+            self.progress.emit(100)
+            self.result.emit(True, "")
+        except Exception as e:
+            self.result.emit(False, str(e))
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if stage:
+                shutil.rmtree(stage, ignore_errors=True)
+
+class WinePage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.releases, self.workers, self.rows = [], {}, {}
+        self.loaded = False
+        self.fetcher = None
+        self.system_wine = None
+        self.setObjectName("Content")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(36, 28, 36, 20)
+        outer.setSpacing(0)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("Wine")
+        title.setObjectName("PageTitle")
+        self.count_label = QLabel()
+        self.count_label.setObjectName("PageCount")
+        self.flavor = QComboBox()
+        self.flavor.addItem("Wine", False)
+        self.flavor.addItem("Wine Staging", True)
+        self.flavor.currentIndexChanged.connect(self.render_rows)
+        refresh = QPushButton("Refresh")
+        refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh.clicked.connect(self.load)
+        head.addWidget(title)
+        head.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addStretch()
+        head.addWidget(self.flavor)
+        head.addWidget(refresh)
+        outer.addLayout(head)
+        outer.addSpacing(4)
+        desc = QLabel("Plain Wine builds. Installed builds appear in each game's Switch Compatibility Tool "
+                      "menu, so you can run any game, fan games included, with a specific Wine version.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        outer.addWidget(desc)
+        outer.addSpacing(6)
+        self.system_label = QLabel()
+        self.system_label.setObjectName("RowDesc")
+        self.system_label.setWordWrap(True)
+        outer.addWidget(self.system_label)
+        outer.addSpacing(16)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.container = QWidget()
+        self.container.setObjectName("GridContainer")
+        self.list_layout = QVBoxLayout(self.container)
+        self.list_layout.setContentsMargins(0, 0, 12, 16)
+        self.list_layout.setSpacing(8)
+        self.list_layout.addStretch()
+        sc.setWidget(self.container)
+        outer.addWidget(sc, 1)
+        self.status = QLabel()
+        self.status.setObjectName("EmptyState")
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
+        outer.addWidget(self.status)
+        self.status.hide()
+        QApplication.instance().aboutToQuit.connect(self._shutdown)
+
+    def _shutdown(self):
+        for w in list(self.workers.values()) + ([self.fetcher] if self.fetcher else []):
+            try:
+                w.wait(1500)
+            except Exception:
+                pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        t = THEMES["dark" if dark else "light"]
+        self.setStyleSheet(f"QFrame#WineRow {{ background: {t['panel']}; border: 1px solid {t['border']}; "
+                           f"border-radius: 10px; }} QFrame#WineRow:hover {{ border: 1px solid {t['accent']}; }}")
+        if self.system_wine is None:
+            self.system_wine = find_wine() or ()
+        if self.system_wine:
+            self.system_label.setText(f"System Wine: {self.system_wine[1]} ({self.system_wine[0]}). "
+                                      "It's what games use when no tool is picked.")
+        else:
+            self.system_label.setText("System Wine: not found. Install a build below and games will use it.")
+        if not self.loaded:
+            self.load()
+        else:
+            self.render_rows()
+
+    def load(self):
+        if self.fetcher and self.fetcher.isRunning():
+            return
+        self.status.setText("Loading versions...")
+        self.status.show()
+        self.fetcher = WineFetchWorker(self)
+        self.fetcher.done.connect(self._on_loaded)
+        self.fetcher.start()
+
+    def _on_loaded(self, releases, err):
+        if err:
+            self.status.setText(f"Couldn't load Wine versions: {err}")
+            self.render_rows()
+            return
+        self.loaded = True
+        self.releases = releases
+        self.status.setVisible(not releases)
+        if not releases:
+            self.status.setText("No Wine builds found.")
+        self.render_rows()
+
+    def _section(self, text):
+        label = QLabel(text)
+        label.setObjectName("RowDesc")
+        label.setStyleSheet("font-weight: 600;")
+        self.list_layout.insertWidget(self.list_layout.count() - 1, label)
+
+    def render_rows(self, *_):
+        while self.list_layout.count() > 1:
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+        self.rows = {}
+        installed = wine_installed_builds()
+        if installed:
+            self._section("Installed")
+            for name in installed:
+                self._add_row({"name": name}, True, False)
+        staging = bool(self.flavor.currentData())
+        available = [r for r in self.releases if r["staging"] == staging and r["name"] not in installed]
+        if available:
+            self._section("Available")
+            for i, info in enumerate(available):
+                self._add_row(info, False, i == 0)
+        total = len([r for r in self.releases if r["staging"] == staging])
+        self.count_label.setText(f"{len(installed)} installed" + (f", {total} available" if total else ""))
+
+    def _add_row(self, info, installed, latest):
+        name = info["name"]
+        frame = QFrame()
+        frame.setObjectName("WineRow")
+        frame.setFixedHeight(64)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(18, 0, 12, 0)
+        h.setSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        title = QLabel(name)
+        title.setObjectName("RowTitle")
+        parts = [] if installed else [info.get("date", ""), _ws_fmt_size(info["size"]) if info.get("size") else "",
+                                      "Latest" if latest else ""]
+        sub = QLabel(" · ".join(x for x in parts if x))
+        sub.setObjectName("RowDesc")
+        bar = QProgressBar()
+        bar.setTextVisible(False)
+        bar.setRange(0, 100)
+        bar.setVisible(False)
+        col.addStretch()
+        col.addWidget(title)
+        if sub.text():
+            col.addWidget(sub)
+        col.addWidget(bar)
+        col.addStretch()
+        btn = QPushButton()
+        btn.setFixedHeight(32)
+        btn.setMinimumWidth(110)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        h.addLayout(col, 1)
+        if name in self.workers:
+            btn.setText("Installing...")
+            btn.setEnabled(False)
+            bar.setVisible(True)
+        elif installed:
+            btn.setText("Uninstall")
+            btn.clicked.connect(lambda _c=False, n=name: self.uninstall(n))
+        else:
+            btn.setText("Install")
+            btn.setObjectName("Primary")
+            btn.clicked.connect(lambda _c=False, i=info: self.install(i))
+        h.addWidget(btn)
+        self.rows[name] = {"bar": bar, "btn": btn}
+        self.list_layout.insertWidget(self.list_layout.count() - 1, frame)
+
+    def install(self, info):
+        name = info["name"]
+        if name in self.workers:
+            return
+        w = WineInstallWorker(info, self)
+        self.workers[name] = w
+        w.progress.connect(lambda p, n=name: self._on_progress(n, p))
+        w.result.connect(lambda ok, msg, n=name: self._on_result(n, ok, msg))
+        w.start()
+        self.render_rows()
+
+    def _on_progress(self, name, pct):
+        row = self.rows.get(name)
+        if row:
+            try:
+                row["bar"].setValue(pct)
+            except RuntimeError:
+                pass
+
+    def _on_result(self, name, ok, msg):
+        self.workers.pop(name, None)
+        self.render_rows()
+        if not ok:
+            QMessageBox.warning(self, "Wine", f"Couldn't install {name}:\n{msg}")
+
+    def uninstall(self, name):
+        path = os.path.dirname(os.path.dirname(wine_installed_builds().get(name, "")))
+        if not path or not os.path.isdir(path):
+            self.render_rows()
+            return
+        if QMessageBox.question(self, "Wine", f"Uninstall {name}?\nGames set to use it will fall back to the default wine.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(path, ignore_errors=True)
+        self.render_rows()
+
+_wine_prev_init = AdaptiveApp.__init__
+
+def _wine_init(self):
+    _wine_prev_init(self)
+    if not sys.platform.startswith("linux"):
+        return
+    self.wine_page = WinePage()
+    self.pages.addWidget(self.wine_page)
+    btn = self.make_nav_button("Wine", checkable=True)
+    self.nav_group.addButton(btn, self.pages.indexOf(self.wine_page))
+    layout = self.nav_group.button(0).parent().layout()
+    ge_btn = self.nav_group.button(self.pages.indexOf(self.ge_page)) if hasattr(self, "ge_page") else None
+    at = layout.indexOf(ge_btn) + 1 if ge_btn is not None else layout.indexOf(self.nav_group.button(1))
+    layout.insertWidget(at, btn)
+
+AdaptiveApp.__init__ = _wine_init
+
 # ---------------------------------------------------------------- H toggles the download browser window
 from PyQt6.QtCore import QObject as _QObject, QEvent as _QEvent, QRect as _QRect
 from PyQt6.QtWidgets import (QTextEdit as _QTextEdit, QPlainTextEdit as _QPlainTextEdit,
@@ -10305,7 +10772,7 @@ class GameJoltDownloadWorker(FirebaseDownloadWorker):
 def _fan_install(self, gid, title, cover_path, link):
     exe = _fan_installed_exe(title)
     if exe:  # already installed: this button is "Launch"
-        _launch_exe(self, exe, load_compat_config().get(f"fan-{gid}", ""))
+        _launch_exe(self, exe, load_compat_config().get(f"fan-{gid}", ""), _d3d_for(f"fan-{gid}"))
         return
     if not link:
         QMessageBox.warning(self, "Install", "This game has no Game Jolt link.")
@@ -10425,32 +10892,55 @@ def _launch_spec(app, exe, compat_tool=""):
     """(argv, cwd, extra_env) for starting a game exe the same way the launcher does for its other games."""
     cwd = os.path.dirname(exe)
     if sys.platform.startswith("linux"):
-        if compat_tool and os.path.exists(compat_tool):
+        kind = compat_tool_kind(compat_tool)
+        if kind == "proton":
             return ([compat_tool, "run", exe], cwd,
                     {"STEAM_COMPAT_DATA_PATH": cwd + "_compat_data",
                      "STEAM_COMPAT_CLIENT_INSTALL_PATH": os.path.expanduser("~/.local/share/Steam")})
+        if kind == "wine" and exe.lower().endswith(".exe"):
+            return ([compat_tool, exe], cwd, {})
         if exe.lower().endswith(".sh"):
             return (["bash", exe], cwd, {})
-        if exe.lower().endswith(".exe") and getattr(app, "wine", None):
-            return ([app.wine[0], exe], cwd, {})
+        if exe.lower().endswith(".py"):
+            return (["python3", exe], cwd, {})
+        if exe.lower().endswith(".exe"):
+            wine = default_wine_path(app)
+            if wine:
+                return ([wine, exe], cwd, {})
     return ([exe], cwd, {})
 
-def _launch_exe(app, exe, compat_tool=""):
+def _d3d_for(key):
+    """The Direct3D renderer picked for one game ('' = use the launcher setting)."""
+    mode = load_compat_config().get("d3d:" + key, "")
+    return mode if mode in WINE_D3D_MODES else ""
+
+def _launch_exe(app, exe, compat_tool="", d3d=""):
     if not exe or not os.path.exists(exe):
         QMessageBox.warning(app, "Launch Error", f"Executable not found:\n{exe}")
         return
     argv, cwd, extra = _launch_spec(app, exe, compat_tool)
+    linux = sys.platform.startswith("linux")
+    is_exe = exe.lower().endswith(".exe")
+    if linux and is_exe and argv[0] == exe:
+        QMessageBox.warning(app, "Wine Required",
+                            "Wine wasn't found to run this Windows game.\nInstall it, or download a build in the Wine tab.")
+        return
+    _d3d_override["mode"] = d3d if d3d in WINE_D3D_MODES else ""
     try:
-        env = os.environ.copy()
-        if extra:
+        if extra:  # Proton
+            env = os.environ.copy()
             os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
             env.update(extra)
             apply_proton_d3d(env)
-        elif sys.platform.startswith("linux") and argv[0] != exe:
-            env = wine_game_env()
-        subprocess.Popen(argv, cwd=cwd, env=env)
+            subprocess.Popen(argv, cwd=cwd, env=env)
+        elif linux and is_exe:  # wine (system or a Wine tab build): applies the chosen D3D renderer
+            launch_wine(argv[0], exe, cwd)
+        else:
+            subprocess.Popen(argv, cwd=cwd, env=os.environ.copy())
     except Exception as e:
         QMessageBox.warning(app, "Launch Error", f"Couldn't launch the game: {e}")
+    finally:
+        _d3d_override["mode"] = ""
 
 # ---- icon of an .exe (reads the PE resource table; no extra libraries) ----
 def extract_exe_icon_ico(exe_path):
@@ -10618,7 +11108,7 @@ _sc_prev_custom_card = AdaptiveApp.create_custom_card
 def _sc_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
     _sc_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
     _add_shortcut_action(self, getattr(self, "custom_cards", {}).get(game_id), title_text,
-                         lambda: exe_path, lambda: compat_tool, cover_path)
+                         lambda: exe_path, lambda: _custom_tool(game_id, compat_tool), cover_path)
 AdaptiveApp.create_custom_card = _sc_create_custom_card
 
 # ---------------------------------------------------------------- Add Existing Fan Game
@@ -10808,21 +11298,7 @@ def _sc_fan_card(self, g):
 AdaptiveApp._fan_create_library_card = _sc_fan_card
 
 def _fan_compat_dialog(self, gid):
-    tools = get_available_compatibility_tools()
-    if not tools:
-        QMessageBox.information(self, "No Tools Found", "No custom Proton or GE-Proton tools were found in your Steam directories.")
-        return
-    key = f"fan-{gid}"
-    dlg = CompatToolDialog(load_compat_config().get(key, ""), tools, self)
-    if dlg.exec() == int(QDialog.DialogCode.Accepted):
-        selected = dlg.get_selected()
-        config = load_compat_config()
-        if selected:
-            config[key] = selected
-        else:
-            config.pop(key, None)
-        save_compat_config(config)
-        QMessageBox.information(self, "Compatibility Tool", "Compatibility tool updated successfully for this game.")
+    self.switch_compat_tool(f"fan-{gid}")
 
 def _fan_uninstall(self, gid, title):
     lib = load_fan_library()
@@ -11088,5 +11564,707 @@ def _reorder_init(self):
 AdaptiveApp.__init__ = _reorder_init
 
  
+# ================================================================ Auto-Add Desktop Games
+# "+" menu -> "Auto-Add Desktop Games": scans the Desktop for game shortcuts / exes / folders, matches them
+# against Steam to get covers (SteamGridDB first if you set a key, Steam's own art otherwise, then the exe's
+# own icon as a last resort), lets you untick anything that isn't a game, and adds the rest to the library.
+from PyQt6.QtCore import QFileInfo as _DeskFileInfo, QStandardPaths as _DeskStdPaths
+from PyQt6.QtGui import QTextOption as _DeskTextOption
+from PyQt6.QtWidgets import (QFileIconProvider as _DeskIconProvider, QListWidget as _DeskList,
+                             QListWidgetItem as _DeskItem)
+
+_DESK_GAME_PATHS = (
+    "/steamapps/common/", "/epic games/", "/gog games/", "/gog galaxy/games/", "/riot games/",
+    "/ubisoft game launcher/games/", "/electronic arts/", "/ea games/", "/origin games/", "/xboxgames/",
+    "/rockstar games/", "/games/", "/itch/apps/", "/battle.net/",
+)
+_DESK_EXE_IGNORE = re.compile(
+    r"(unins|uninst|setup|install|crash|report|redist|vcredist|vc_redist|dxsetup|dotnet|directx|"
+    r"helper|updater|cefsubprocess|notification_helper|easyanticheat|battleye|anticheat)", re.I)
+_DESK_LAUNCH_EXTS = (".exe", ".bat", ".cmd")
+_DESK_URL_RE = re.compile(r"steam://(?:rungameid|run)/(\d+)", re.I)
+
+def _desk_clean_title(name):
+    name = re.sub(r"\s*[-\u2013]\s*shortcut$", "", name, flags=re.I)
+    name = re.sub(r"\s*\(\d+\)$", "", name)
+    name = name.replace("_", " ").replace("\u2122", "").replace("\u00ae", "")
+    return re.sub(r"\s+", " ", name).strip()
+
+def _desk_looks_like_game_path(path):
+    p = "/" + str(path).replace("\\", "/").lower().lstrip("/")
+    return any(m in p for m in _DESK_GAME_PATHS)
+
+def _desk_norm_path(path):
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except Exception:
+        return str(path)
+
+def _desktop_dirs():
+    """Every Desktop folder that exists (user, OneDrive-redirected, public). Call from the GUI thread."""
+    dirs = []
+    try:
+        dirs += _DeskStdPaths.standardLocations(_DeskStdPaths.StandardLocation.DesktopLocation)
+    except Exception:
+        pass
+    if sys.platform.startswith("win"):
+        for root in (os.environ.get("USERPROFILE"), os.environ.get("PUBLIC")):
+            if root:
+                dirs.append(os.path.join(root, "Desktop"))
+        for var in ("OneDrive", "OneDriveConsumer"):
+            if os.environ.get(var):
+                dirs.append(os.path.join(os.environ[var], "Desktop"))
+    else:
+        found = _linux_desktop_dir()
+        if found:
+            dirs.append(found)
+        dirs.append(os.path.expanduser("~/Desktop"))
+    out, seen = [], set()
+    for d in dirs:
+        try:
+            key = os.path.normcase(os.path.realpath(d))
+        except Exception:
+            continue
+        if os.path.isdir(d) and key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+def _desk_parse_lnk(path):
+    """Reads a Windows .lnk file directly (MS-SHLLINK): (target, arguments, working dir), or None if unreadable.
+    Target may be '' for shortcuts that only point at a shell item (Store apps etc.)."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+        if len(d) < 76 or struct.unpack_from("<I", d, 0)[0] != 0x4C:
+            return None
+        flags = struct.unpack_from("<I", d, 0x14)[0]
+        uni = bool(flags & 0x80)
+        ansi = "mbcs" if sys.platform.startswith("win") else "cp1252"
+        pos, target = 76, ""
+        if flags & 0x01:                                   # LinkTargetIDList
+            pos += 2 + struct.unpack_from("<H", d, pos)[0]
+        if flags & 0x02:                                   # LinkInfo
+            base = pos
+            size, hdr, li_flags = struct.unpack_from("<III", d, base)
+            if li_flags & 0x01:
+                def cstr(off, wide):
+                    if wide:
+                        end = base + off
+                        while end + 1 < len(d) and d[end:end + 2] != b"\x00\x00":
+                            end += 2
+                        return d[base + off:end].decode("utf-16le", "replace")
+                    end = d.index(b"\x00", base + off)
+                    return d[base + off:end].decode(ansi, "replace")
+                lb_off, = struct.unpack_from("<I", d, base + 0x10)
+                cs_off, = struct.unpack_from("<I", d, base + 0x18)
+                if hdr >= 0x24:
+                    lbu, csu = struct.unpack_from("<II", d, base + 0x1C)
+                    local = cstr(lbu, True) if lbu else cstr(lb_off, False)
+                    suffix = cstr(csu, True) if csu else (cstr(cs_off, False) if cs_off else "")
+                else:
+                    local = cstr(lb_off, False)
+                    suffix = cstr(cs_off, False) if cs_off else ""
+                target = os.path.join(local, suffix) if suffix else local
+            pos = base + size
+        strings = {}
+        for bit, key in ((0x04, "name"), (0x08, "rel"), (0x10, "work"), (0x20, "args"), (0x40, "icon")):
+            if flags & bit:
+                n = struct.unpack_from("<H", d, pos)[0]
+                pos += 2
+                if uni:
+                    strings[key] = d[pos:pos + n * 2].decode("utf-16le", "replace")
+                    pos += n * 2
+                else:
+                    strings[key] = d[pos:pos + n].decode(ansi, "replace")
+                    pos += n
+        while not target and pos + 8 <= len(d):            # extra data: environment-variable target block
+            bsize, sig = struct.unpack_from("<II", d, pos)
+            if bsize < 4:
+                break
+            if sig == 0xA0000001 and bsize >= 0x314:
+                raw = d[pos + 268:pos + 268 + 520].decode("utf-16le", "replace")
+                target = raw.split("\x00")[0]
+            pos += bsize
+        if not target and strings.get("rel"):
+            target = os.path.normpath(os.path.join(os.path.dirname(path), strings["rel"]))
+            if not os.path.exists(target):
+                target = ""
+        target = os.path.expandvars(target)
+        work = os.path.expandvars(strings.get("work", ""))
+        return target, strings.get("args", ""), work
+    except Exception:
+        return None
+
+
+def _resolve_lnks(paths):
+    """{lnk path: (target, arguments, working dir)}. Built-in parser first; PowerShell for any it couldn't resolve."""
+    out = {}
+    for p in paths:
+        info = _desk_parse_lnk(p)
+        if info:
+            out[p] = info
+    missing = [p for p in paths if not (out.get(p) or ("",))[0]]
+    out.update(_resolve_lnks_powershell(missing))
+    return out
+
+def _resolve_lnks_powershell(paths):
+    """Same thing through one PowerShell call (Windows only)."""
+    if not paths or not sys.platform.startswith("win"):
+        return {}
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    data = []
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(paths, f)
+        script = (
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+            f"$paths=@(Get-Content -Raw -Encoding UTF8 -LiteralPath {_ps_quote(tmp)}|ConvertFrom-Json);"
+            "$sh=New-Object -ComObject WScript.Shell;$out=@();"
+            "foreach($p in $paths){try{$s=$sh.CreateShortcut($p);"
+            "$out+=[pscustomobject]@{p=[string]$p;t=[string]$s.TargetPath;a=[string]$s.Arguments;"
+            "w=[string]$s.WorkingDirectory}}catch{}};"
+            "ConvertTo-Json -InputObject @($out) -Compress")
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, timeout=60, creationflags=0x08000000)
+        text = res.stdout.decode("utf-8", errors="replace").strip().lstrip("\ufeff")
+        data = json.loads(text) if text else []
+    except Exception:
+        data = []
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if isinstance(data, dict):
+        data = [data]
+    return {d["p"]: (d.get("t") or "", d.get("a") or "", d.get("w") or "")
+            for d in data if isinstance(d, dict) and d.get("p")}
+
+def _desk_split_args(text):
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        return [t.strip('"') for t in shlex.split(text, posix=False)]
+    except ValueError:
+        return [text]
+
+def _desk_read_ini(path):
+    """Key/value pairs of a .url / .desktop file (first occurrence of each key wins)."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith(("#", ";", "[")):
+                    k, v = line.split("=", 1)
+                    out.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    return out
+
+def _desk_best_exe(folder, title):
+    """Most likely game exe inside a folder: best name match, then biggest file. None if nothing fits."""
+    tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    want = _norm_title(title)
+    best, best_key = None, None
+    base_depth = folder.rstrip("\\/").count(os.sep)
+    for root, dirs, files in os.walk(folder):
+        if root.count(os.sep) - base_depth >= 3:
+            dirs[:] = []
+        for f in files:
+            if not f.lower().endswith(".exe") or _DESK_EXE_IGNORE.search(f):
+                continue
+            stem = os.path.splitext(f)[0].lower()
+            score = len(tokens & set(re.findall(r"[a-z0-9]+", stem)))
+            n = _norm_title(stem)
+            if n and (n in want or want in n):
+                score += 5
+            full = os.path.join(root, f)
+            try:
+                key = (score, os.path.getsize(full))
+            except OSError:
+                continue
+            if best_key is None or key > best_key:
+                best, best_key = full, key
+    return best
+
+def _desk_candidate_from(path, lnk_info):
+    """One Desktop entry -> candidate dict, or None when it isn't something we can launch."""
+    name = os.path.basename(path)
+    low = name.lower()
+    stem = os.path.splitext(name)[0] if os.path.isfile(path) else name
+    title = _desk_clean_title(stem)
+    if not title:
+        return None
+    cand = dict(title=title, exe_path="", launch_url="", launch_file="", args="", launch_args=[], launch_cmd=[], workdir="",
+                appid=0, img_base="", likely=False, source=path)
+
+    if low.endswith(".lnk"):
+        target, args, workdir = lnk_info.get(path, ("", "", ""))
+        tlow = os.path.basename(target).lower()
+        m = _DESK_URL_RE.search(args) or re.search(r"-applaunch\s+(\d+)", args)
+        if tlow == "steam.exe" and m:
+            cand.update(appid=int(m.group(1)), launch_url=f"steam://rungameid/{m.group(1)}",
+                        exe_path=path, likely=True)
+            return cand
+        exe = ""
+        if target and os.path.isdir(target):
+            exe = _desk_best_exe(target, title) or ""
+        elif target and os.path.isfile(target):
+            exe = target
+        # The shortcut itself is what gets launched (keeps its arguments, run-as-admin and Store-app targets);
+        # the exe is only used for the icon and "Open Game Location". Unresolvable ones still work this way.
+        cand.update(exe_path=exe or path, launch_file=path, args=args.strip(),
+                    workdir=workdir if workdir and os.path.isdir(workdir) else "")
+        cand["likely"] = bool(exe) and _desk_looks_like_game_path(exe)
+        return cand
+
+    if low.endswith(".url"):
+        info = _desk_read_ini(path)
+        url = info.get("URL", "")
+        m = _DESK_URL_RE.search(url)
+        if m:
+            cand.update(appid=int(m.group(1)), launch_url=f"steam://rungameid/{m.group(1)}",
+                        exe_path=path, likely=True)
+            return cand
+        if url and not url.lower().startswith(("http://", "https://", "file:")) and "://" in url:
+            # Epic / GOG / Ubisoft ... protocol shortcuts: launched through the OS handler
+            cand.update(launch_url=url, exe_path=path,
+                        likely=any(k in url.lower() for k in ("epicgames", "gog", "uplay", "ubisoft")))
+            return cand
+        return None
+
+    if low.endswith(".desktop"):
+        info = _desk_read_ini(path)
+        if info.get("Type", "Application") != "Application" or info.get("Hidden", "").lower() == "true":
+            return None
+        title = _desk_clean_title(info.get("Name") or title) or title
+        exec_line = re.sub(r"%[fFuUdDnNickvm]", "", info.get("Exec", "")).strip()
+        if not exec_line:
+            return None
+        cand["title"] = title
+        m = _DESK_URL_RE.search(exec_line)
+        is_game = "game" in info.get("Categories", "").lower()
+        if m:
+            cand.update(appid=int(m.group(1)), launch_url=f"steam://rungameid/{m.group(1)}",
+                        exe_path=path, likely=True)
+            return cand
+        try:
+            cmd = shlex.split(exec_line)
+        except ValueError:
+            return None
+        cand.update(launch_cmd=cmd, exe_path=path, likely=is_game)
+        return cand
+
+    if os.path.isfile(path) and low.endswith(".exe"):
+        cand.update(exe_path=path, likely=_desk_looks_like_game_path(path))
+        return cand
+
+    if os.path.isdir(path):
+        exe = _desk_best_exe(path, title)
+        if not exe:
+            return None
+        cand.update(exe_path=exe, workdir=os.path.dirname(exe))
+        return cand
+    return None
+
+def _desk_steam_lookup(title):
+    """(appid, title, image base) for the Steam game whose name matches this shortcut, else None.
+    Exact name first, then a close one (one name contains the other, or all its words appear in the Steam title)."""
+    games, _total = fetch_steam_games(title, 0, 8)
+    want = _norm_title(title)
+    for appid, steam_title, base in games:
+        if _norm_title(steam_title) == want:
+            return appid, steam_title, base
+    tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    for appid, steam_title, base in games:
+        n = _norm_title(steam_title)
+        if want and n and (want in n or n in want) and min(len(n), len(want)) / max(len(n), len(want)) >= 0.4:
+            return appid, steam_title, base
+        if len(want) >= 4 and tokens and tokens <= set(re.findall(r"[a-z0-9]+", steam_title.lower())):
+            return appid, steam_title, base      # e.g. "FC 26" -> "EA SPORTS FC 26"
+    return None
+
+def scan_desktop_games(dirs, known_titles, known_exes, known_urls, known_appids, steam_lookup=_desk_steam_lookup):
+    """Background-thread scan. Returns candidate dicts for desktop entries that look launchable and aren't
+    in the library yet. Entries whose name matches a Steam game come back with appid set (used for Steam covers); all of them are added by default."""
+    entries = []
+    for d in dirs:
+        try:
+            entries += [os.path.join(d, n) for n in sorted(os.listdir(d)) if not n.startswith(".")]
+        except OSError:
+            continue
+    lnks = _resolve_lnks([p for p in entries if p.lower().endswith(".lnk")])
+    me = _desk_norm_path(sys.executable)
+    found, seen_keys = [], set()
+    for p in entries:
+        try:
+            cand = _desk_candidate_from(p, lnks)
+        except Exception:
+            cand = None
+        if not cand:
+            continue
+        exe_key = _desk_norm_path(cand["exe_path"]) if cand["exe_path"] else ""
+        if exe_key == me:
+            continue
+        # An exe only identifies a game when the shortcut passes no arguments (several games can share one launcher exe).
+        ident_exe = exe_key if (cand["exe_path"] and not cand["launch_url"] and not cand["args"]) else ""
+        keys = {k for k in (ident_exe, cand["launch_url"], _norm_title(cand["title"])) if k}
+        if keys & seen_keys:
+            continue
+        seen_keys |= keys
+        if (_norm_title(cand["title"]) in known_titles or (ident_exe and ident_exe in known_exes)
+                or (cand["launch_url"] and cand["launch_url"] in known_urls)
+                or (cand["appid"] and cand["appid"] in known_appids)):
+            continue
+        found.append(cand)
+    found = found[:80]
+
+    def match(cand):
+        if cand["appid"]:
+            return
+        try:
+            hit = steam_lookup(cand["title"])
+        except Exception:
+            hit = None
+        if hit:
+            cand.update(appid=hit[0], img_base=hit[2], likely=True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(match, found))
+    found.sort(key=lambda c: (not c["likely"], c["title"].lower()))
+    return found
+
+# ---- Qt part
+def _desk_icon_cover(icon_source, title, out_path):
+    """Last-resort cover: the exe's own icon centred on a dark 2:3 card with the title under it."""
+    try:
+        pm = _DeskIconProvider().icon(_DeskFileInfo(icon_source)).pixmap(256, 256)
+        if pm.isNull():
+            return ""
+        canvas = QPixmap(600, 900)
+        canvas.fill(QColor("#202024"))
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        scaled = pm.scaled(340, 340, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        painter.drawPixmap((600 - scaled.width()) // 2, 190, scaled)
+        font = QFont()
+        font.setPointSize(30)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#f5f5f7"))
+        opt = _DeskTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        opt.setWrapMode(_DeskTextOption.WrapMode.WordWrap)
+        painter.drawText(QRectF(40, 580, 520, 260), title, opt)
+        painter.end()
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        return out_path if canvas.save(out_path, "PNG") else ""
+    except Exception:
+        return ""
+
+def _desk_sgdb_search(title, key):
+    """Search SteamGridDB by the shortcut's name; take the exact match, else its top result, then that game's
+    best portrait cover (image bytes or None)."""
+    found = _sgdb_get_json("/search/autocomplete/" + urllib.parse.quote(title, safe=""), key)
+    games = [g for g in (found or {}).get("data") or [] if isinstance(g, dict) and g.get("id")]
+    if not games:
+        return None
+    want = _norm_title(title)
+    pick = next((g for g in games if _norm_title(g.get("name")) == want), games[0])
+    return _first_grid_image(_sgdb_get_json(
+        f"/grids/game/{pick['id']}?dimensions={SGDB_PORTRAIT_SIZES}&types=static", key))
+
+def _desk_find_cover(cand, key, loader):
+    """Network part of the cover lookup (runs on a worker thread). Returns a file path or ''.
+    Matched on Steam: SteamGridDB by Steam id, else Steam's CDN art (loader._fetch does both).
+    Then, with an API key, a SteamGridDB search by name. Without a key a non-Steam game gets its exe icon."""
+    if cand.get("appid"):
+        try:
+            path = loader._fetch(cand["appid"], cand.get("img_base", ""), key, cand["title"])
+            if path:
+                return path
+        except Exception:
+            pass
+    if key:
+        try:
+            data = _desk_sgdb_search(cand["title"], key)
+            if data:
+                out = os.path.join(get_library_cover_dir(), f"desk-{_cover_key(cand['title'])}.img")
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with open(out, "wb") as f:
+                    f.write(data)
+                return out
+        except Exception:
+            pass
+    return ""
+
+class DesktopGamesDialog(QDialog):
+    cover_ready = pyqtSignal(int, str)
+
+    def __init__(self, cands, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Auto-Add Desktop Games")
+        self.resize(560, 640)
+        self.cands = cands
+        self.chosen = []
+        self._covers = {}
+        self._pending = len(cands)
+        self._key = get_steamgriddb_key()
+        self._loader = CoverLoader()
+        self._loader.set_key(self._key)
+        self._pool = ThreadPoolExecutor(max_workers=4)
+        self.cover_ready.connect(self._on_cover)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(10)
+        matched = sum(1 for c in cands if c["appid"])
+        head = QLabel(f"Found {len(cands)} game{'s' if len(cands) != 1 else ''} on your desktop "
+                      f"({matched} matched on Steam, so they get Steam covers). Everything is ticked, "
+                      f"so untick anything that isn't a game.")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.list = _DeskList()
+        self.list.setIconSize(QSize(60, 90))
+        self.list.setSpacing(2)
+        for i, c in enumerate(cands):
+            if c["appid"]:
+                sub = "Matched on Steam"
+            else:
+                sub = "Custom game"
+            item = _DeskItem(f"{c['title']}\n{sub}  \u2022  {os.path.basename(c['source'])}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            item.setSizeHint(QSize(0, 100))
+            self.list.addItem(item)
+        self.list.itemChanged.connect(lambda _it: self._refresh_buttons())
+        lay.addWidget(self.list, 1)
+
+        self.status = QLabel("")
+        self.status.setObjectName("RowDesc")
+        lay.addWidget(self.status)
+
+        row = QHBoxLayout()
+        all_btn = QPushButton("Select All")
+        none_btn = QPushButton("Select None")
+        all_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        none_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.add_btn = QPushButton("Add Selected")
+        self.add_btn.setObjectName("Primary")
+        self.add_btn.clicked.connect(self._accept)
+        row.addWidget(all_btn)
+        row.addWidget(none_btn)
+        row.addStretch()
+        row.addWidget(cancel)
+        row.addWidget(self.add_btn)
+        lay.addLayout(row)
+
+        self._refresh_buttons()
+        for i, c in enumerate(cands):
+            self._pool.submit(self._work, i, c)
+
+    def _work(self, i, cand):
+        try:
+            path = _desk_find_cover(cand, self._key, self._loader)
+        except Exception:
+            path = ""
+        try:
+            self.cover_ready.emit(i, path)
+        except RuntimeError:
+            pass  # dialog already closed
+
+    def _on_cover(self, i, path):
+        cand = self.cands[i]
+        if not path:
+            source = cand["exe_path"] if os.path.exists(cand["exe_path"]) else cand["source"]
+            out = os.path.join(get_library_cover_dir(), f"desk-{_cover_key(cand['title'])}.png")
+            path = _desk_icon_cover(source, cand["title"], out)
+        self._covers[i] = path
+        item = self.list.item(i)
+        pix = rounded_cover_pixmap(path, 60, 90, 6) if path else None
+        if item is not None and pix:
+            item.setIcon(QIcon(pix))
+        self._pending -= 1
+        self._refresh_buttons()
+
+    def _checked(self):
+        return [self.list.item(r).data(Qt.ItemDataRole.UserRole) for r in range(self.list.count())
+                if self.list.item(r).checkState() == Qt.CheckState.Checked]
+
+    def _set_all(self, state):
+        self.list.blockSignals(True)
+        for r in range(self.list.count()):
+            self.list.item(r).setCheckState(state)
+        self.list.blockSignals(False)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        n = len(self._checked())
+        self.add_btn.setText(f"Add Selected ({n})")
+        loading = self._pending > 0
+        self.add_btn.setEnabled(n > 0 and not loading)
+        done = len(self.cands) - self._pending
+        self.status.setText(f"Loading covers... {done}/{len(self.cands)}" if loading else "Covers ready.")
+
+    def _accept(self):
+        self.chosen = [dict(self.cands[i], cover_path=self._covers.get(i, "")) for i in self._checked()]
+        self.accept()
+
+    def done(self, result):
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._pool.shutdown(wait=False)
+        self._loader.shutdown()
+        super().done(result)
+
+def _desk_known(self):
+    """What the library already has, so nothing gets added twice."""
+    titles = {_norm_title(t) for _c, t in self.cards}
+    exes, urls, appids = set(), set(), set()
+    for g in load_custom_games():
+        titles.add(_norm_title(g.get("title")))
+        if g.get("exe_path"):
+            exes.add(_desk_norm_path(g["exe_path"]))
+        if g.get("launch_url"):
+            urls.add(g["launch_url"])
+    for g in load_steam_library():
+        titles.add(_norm_title(g.get("title")))
+        appids.add(g.get("appid"))
+        if g.get("exe_path"):
+            exes.add(_desk_norm_path(g["exe_path"]))
+    try:
+        for g in load_fan_library():
+            if g.get("exe_path"):
+                exes.add(_desk_norm_path(g["exe_path"]))
+    except Exception:
+        pass
+    titles.discard("")
+    return titles, exes, urls, appids
+
+def _auto_add_desktop_games(self):
+    dirs = _desktop_dirs()
+    if not dirs:
+        QMessageBox.information(self, "Auto-Add Desktop Games", "Couldn't find your Desktop folder.")
+        return
+    titles, exes, urls, appids = _desk_known(self)
+    ok, cands, error = BusyDialog(
+        "Scanning your desktop for games...",
+        lambda: scan_desktop_games(dirs, titles, exes, urls, appids), self).run()
+    if not ok:
+        QMessageBox.warning(self, "Auto-Add Desktop Games", f"The scan failed:\n\n{error}")
+        return
+    if not cands:
+        QMessageBox.information(self, "Auto-Add Desktop Games",
+                                "No new games found on your desktop.\n\nShortcuts (.lnk / .url / .desktop), "
+                                ".exe files and game folders are checked. Games already in your library are skipped.")
+        return
+    dlg = DesktopGamesDialog(cands, self)
+    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.chosen:
+        return
+
+    games = load_custom_games()
+    added = 0
+    stamp = int(time.time() * 1000)
+    for n, c in enumerate(dlg.chosen):
+        gid = f"custom_{stamp}_{n}"
+        cover = c.get("cover_path") or ""
+        if cover and os.path.exists(cover):
+            try:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                dest = os.path.join(get_library_cover_dir(), f"{gid}.img")
+                shutil.copyfile(cover, dest)
+                cover = dest
+            except Exception:
+                pass
+        entry = {"id": gid, "title": c["title"], "exe_path": c["exe_path"], "cover_path": cover, "compat_tool": ""}
+        if c.get("launch_file"):
+            try:
+                folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
+                os.makedirs(folder, exist_ok=True)
+                keep = os.path.join(folder, f"{gid}.lnk")
+                shutil.copyfile(c["launch_file"], keep)
+                c["launch_file"] = keep
+            except Exception:
+                pass
+        for k in ("launch_url", "launch_file", "launch_args", "launch_cmd", "workdir"):
+            if c.get(k):
+                entry[k] = c[k]
+        games.append(entry)
+        save_custom_games(games)  # saved per game so a crash half way doesn't lose the earlier ones
+        self.create_custom_card(gid, entry["title"], entry["exe_path"], cover, "")
+        added += 1
+    self.apply_filter()
+    QMessageBox.information(self, "Auto-Add Desktop Games",
+                            f"Added {added} game{'s' if added != 1 else ''} to your library.")
+
+AdaptiveApp.auto_add_desktop_games = _auto_add_desktop_games
+
+def _desk_launch(win, entry):
+    """Launch for entries that aren't a plain exe: steam:// / epic:// links, shortcut arguments, .desktop Exec."""
+    try:
+        if entry.get("launch_url"):
+            QDesktopServices.openUrl(QUrl(entry["launch_url"]))
+            return
+        if entry.get("launch_file") and os.path.exists(entry["launch_file"]):
+            if sys.platform.startswith("win"):
+                os.startfile(entry["launch_file"])
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(entry["launch_file"]))
+            return
+        exe = entry.get("exe_path", "")
+        cmd = entry.get("launch_cmd") or ([exe] + list(entry.get("launch_args") or []))
+        cwd = entry.get("workdir") or os.path.dirname(exe) or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
+        subprocess.Popen(cmd, cwd=cwd)
+    except Exception as e:
+        QMessageBox.warning(win, "Launch Game", f"Couldn't launch game: {e}")
+
+_desk_prev_custom_card = AdaptiveApp.create_custom_card
+
+def _desk_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
+    _desk_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
+    entry = next((g for g in load_custom_games() if g.get("id") == game_id), None)
+    if not entry or not (entry.get("launch_url") or entry.get("launch_file") or entry.get("launch_args")
+                         or entry.get("launch_cmd")):
+        return
+    card = getattr(self, "custom_cards", {}).get(game_id)
+    btn = card.findChild(QPushButton, "Primary") if card is not None else None
+    if btn is None:
+        return
+    try:
+        btn.clicked.disconnect()
+    except Exception:
+        pass
+    btn.clicked.connect(lambda _c=False, e=entry: _desk_launch(self, e))
+
+AdaptiveApp.create_custom_card = _desk_create_custom_card
+
+_desk_prev_build_library_page = AdaptiveApp.build_library_page
+
+def _desk_build_library_page(self):
+    widget = _desk_prev_build_library_page(self)
+    for btn in widget.findChildren(QPushButton):
+        if btn.text() == "+":
+            menu = btn.findChild(QMenu)
+            if menu is not None and not any(a.text().startswith("Auto-Add Desktop") for a in menu.actions()):
+                menu.addSeparator()
+                menu.addAction("Auto-Add Desktop Games").triggered.connect(
+                    lambda _c=False: self.auto_add_desktop_games())
+    return widget
+
+AdaptiveApp.build_library_page = _desk_build_library_page
+
+
 if __name__ == "__main__":
     main()
