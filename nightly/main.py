@@ -4913,6 +4913,82 @@ def find_existing_archive(prefixes):
             return os.path.join(DOWNLOAD_DIR, f)
     return None
 
+# ---------------------------------------------------------------- finding archive tools (7-Zip / WinRAR aren't on PATH on Windows)
+def find_tool(*names):
+    """Full path of the first tool found: on PATH, next to the launcher, or in the usual Windows install folders."""
+    for n in names:
+        found = shutil.which(n)
+        if found:
+            return found
+    folders = []
+    for getter in (_bundled_dir, _writable_dir):
+        try:
+            folders.append(getter())
+        except Exception:
+            pass
+    folders += [ASSETS_DIR, os.path.join(SCRIPT_DIR, "tools")]
+    if sys.platform.startswith("win"):
+        roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")]
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            roots.append(os.path.join(local, "Programs"))
+        for root in filter(None, roots):
+            for sub in ("7-Zip", "7-Zip-Zstandard", "WinRAR", "NanaZip", "PeaZip", os.path.join("PeaZip", "res", "bin", "7z")):
+                folders.append(os.path.join(root, sub))
+        try:
+            import winreg
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for key in (r"SOFTWARE\7-Zip", r"SOFTWARE\WOW6432Node\7-Zip", r"SOFTWARE\WinRAR", r"SOFTWARE\WOW6432Node\WinRAR"):
+                    for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0)):
+                        try:
+                            with winreg.OpenKey(hive, key, 0, winreg.KEY_READ | view) as k:
+                                for val in ("Path64", "Path", "exe64", "exe32"):
+                                    try:
+                                        v = winreg.QueryValueEx(k, val)[0]
+                                    except OSError:
+                                        continue
+                                    folders.append(v if os.path.isdir(v) else os.path.dirname(v))
+                        except OSError:
+                            pass
+        except ImportError:
+            pass
+    for folder in folders:
+        for n in names:
+            for cand in (n, n + ".exe"):
+                path = os.path.join(folder, cand)
+                if os.path.isfile(path):
+                    return path
+    return None
+
+def _extract_with_tools(path, out_dir, rar=True):
+    """Tries every extractor we can find. Returns True on success."""
+    os.makedirs(out_dir, exist_ok=True)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    attempts = []
+    for exe in filter(None, [find_tool("7z", "7za", "7zz", "7zr")]):
+        attempts.append([exe, "x", "-y", f"-o{out_dir}", path])
+    if rar:
+        unrar = find_tool("unrar", "UnRAR")
+        if unrar:
+            attempts.append([unrar, "x", "-y", path, out_dir + os.sep])
+        winrar = find_tool("WinRAR")
+        if winrar:
+            attempts.append([winrar, "x", "-y", "-ibck", path, out_dir + os.sep])
+    unar = find_tool("unar")
+    if unar:
+        attempts.append([unar, "-f", "-o", out_dir, path])
+    tar = find_tool("bsdtar", "tar")   # Windows 10+ ships a tar.exe that can read rar and 7z
+    if tar:
+        attempts.append([tar, "-xf", path, "-C", out_dir])
+    for cmd in attempts:
+        try:
+            res = subprocess.run(cmd, capture_output=True, timeout=3600, creationflags=flags)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
 def extract_archive(dest_path, extract_dir):
     os.makedirs(extract_dir, exist_ok=True)
     if zipfile.is_zipfile(dest_path):
@@ -4930,42 +5006,26 @@ def extract_archive(dest_path, extract_dir):
             pass
 
     if is_rar:
-        for tool in ['7z', '7za', 'unrar']:
-            if shutil.which(tool):
-                try:
-                    if tool == 'unrar':
-                        cmd = [tool, 'x', '-y', dest_path, extract_dir + os.sep]
-                    else:
-                        cmd = [tool, 'x', '-y', f'-o{extract_dir}', dest_path]
-                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                    if res.returncode == 0:
-                        return
-                except Exception:
-                    continue
-        try:
+        if _extract_with_tools(dest_path, extract_dir):
+            return
+        try:  # last resort: the rarfile package, pointed at whatever extractor we found
             import rarfile
-        except ImportError:
-            # no rarfile package: install it into the environment the launcher runs in, then ask for a restart
-            if getattr(sys, "frozen", False):
-                raise ValueError("RAR support needs the 'rarfile' package, which can't be installed into a packaged build. "
-                                 "Install 7-Zip or unrar instead.")
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install", "rarfile"], capture_output=True, text=True,
-                               timeout=300, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            except Exception:
-                raise ValueError("RAR archive detected but the 'rarfile' package is missing, and installing it automatically "
-                                 "failed. Run:  pip install rarfile  (or install 7-Zip / unrar).")
-            raise ValueError("The 'rarfile' package was just installed. Please restart the launcher, then run the "
-                             "download again (the archive is already downloaded).")
-        try:
+            for attr, names in (("UNRAR_TOOL", ("unrar", "UnRAR")), ("SEVENZIP_TOOL", ("7z", "7za", "7zz")),
+                                ("UNAR_TOOL", ("unar",)), ("BSDTAR_TOOL", ("bsdtar", "tar"))):
+                found = find_tool(*names)
+                if found and hasattr(rarfile, attr):
+                    setattr(rarfile, attr, found)
             with rarfile.RarFile(dest_path) as rf:
                 rf.extractall(extract_dir)
             return
         except Exception:
             pass
-        raise ValueError("RAR archive detected, but no extraction tool ('7z' or 'unrar') is available for rarfile to use. "
-                         "Install 7-Zip or unrar.")
-    
+        if sys.platform.startswith("win"):
+            hint = "Install 7-Zip (7-zip.org) or WinRAR, then try again. If it's already installed, reinstall it so it's registered."
+        else:
+            hint = "Install 7-Zip (p7zip) or unrar."
+        raise ValueError("RAR archive detected, but no extraction tool could open it. " + hint)
+
     raise ValueError("Downloaded file is neither a valid ZIP nor a supported RAR archive.")
 
 # --- Update install triggers to check for existing .rar archives ---
@@ -10204,11 +10264,9 @@ def _gj_install_file(path, game_dir):
         shutil.move(path, os.path.join(game_dir, name))
         return
     if head.startswith(b"7z\xbc\xaf"):
-        for tool in ("7z", "7za", "7zz"):
-            if shutil.which(tool):
-                if subprocess.run([tool, "x", "-y", f"-o{game_dir}", path], capture_output=True).returncode == 0:
-                    return
-        raise ValueError("This is a .7z archive, but 7z isn't installed.")
+        if _extract_with_tools(path, game_dir, rar=False):
+            return
+        raise ValueError("This is a .7z archive, but 7-Zip couldn't be found. Install 7-Zip (7-zip.org) and try again.")
     if head.startswith((b"<!DO", b"<htm", b"<HTM")):
         raise ValueError("Game Jolt returned a web page instead of a file (the download link expired?). Try again.")
     extract_archive(path, game_dir)
