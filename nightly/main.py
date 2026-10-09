@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QMenu, QButtonGroup, QStackedWidget,
     QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
-    QFileDialog, QInputDialog, QTextEdit
+    QFileDialog, QInputDialog, QTextEdit, QSizePolicy
 )
 from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QDesktopServices, QImage
@@ -975,17 +975,22 @@ def create_desktop_shortcut():
     raise RuntimeError("Desktop shortcuts aren't supported on this platform yet.")
 
 THEMES = {
+    # Black + red, flat and rounded (Epic Games feel) with Steam's top navigation bar.
     "dark": dict(
-        bg="#121214", sidebar="#1a1a1e", panel="#202024", input="#121214", border="#2e2e33",
-        text="#f5f5f7", subtext="#9a9aa3", accent="#10eb73", accent_hover="#40ef8f", accent_press="#0dbc5c",
-        button="#2c2c31", button_hover="#3a3a40", disabled_bg="#26262a", disabled_text="#66666d",
-        handle="#3a3a40", hover="#25252a",
+        bg="#0d0d0f", sidebar="#050506", panel="#151518", input="#0a0a0c", border="#26262b",
+        text="#f2f2f4", subtext="#8d8d96", accent="#e11d2e", accent_hover="#ff3b4a", accent_press="#b3121f",
+        button="#222226", button_hover="#2f2f35", disabled_bg="#18181b", disabled_text="#55555c",
+        handle="#34343a", hover="#1c1c20",
+        red="#e11d2e", red_hover="#ff3b4a", red_press="#b3121f",
+        nav_text="#a0a0a8", nav_active="#ffffff",
     ),
     "light": dict(
-        bg="#f3f3f5", sidebar="#ffffff", panel="#ffffff", input="#f3f3f5", border="#d9d9de",
-        text="#18181b", subtext="#6b6b73", accent="#10eb73", accent_hover="#40ef8f", accent_press="#0dbc5c",
-        button="#e6e6ea", button_hover="#d9d9df", disabled_bg="#ececef", disabled_text="#a4a4ab",
-        handle="#c4c4cb", hover="#ebebef",
+        bg="#f2f2f4", sidebar="#0a0a0c", panel="#ffffff", input="#ffffff", border="#d9d9de",
+        text="#141416", subtext="#6a6a72", accent="#e11d2e", accent_hover="#ff3b4a", accent_press="#b3121f",
+        button="#e4e4e8", button_hover="#d6d6db", disabled_bg="#ececef", disabled_text="#a4a4ab",
+        handle="#c4c4cb", hover="#e9e9ed",
+        red="#e11d2e", red_hover="#ff3b4a", red_press="#b3121f",
+        nav_text="#a0a0a8", nav_active="#ffffff",
     ),
 }
 
@@ -993,33 +998,35 @@ STYLE_TEMPLATE = Template("""
 QMainWindow, QWidget#Content, QWidget#GridContainer { background: $bg; }
 QDialog, QMessageBox { background: $panel; }
 QLabel { color: $text; background: transparent; }
-QToolTip { background: $panel; color: $text; border: 1px solid $border; padding: 4px 6px; }
+QToolTip { background: #ffffff; color: #0a0a0c; border: none; padding: 5px 8px; }
 
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget#qt_scrollarea_viewport { background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 
-/* ---- sidebar ---- */
-QFrame#Sidebar { background: $sidebar; border-right: 1px solid $border; }
-QLabel#Brand { font-size: 17px; font-weight: bold; color: $text; }
+/* ---- top navigation bar ---- */
+QFrame#Sidebar { background: $sidebar; border-bottom: 1px solid #1e1e22; }
+QLabel#Brand { font-size: 15px; font-weight: bold; color: #ffffff; }
 QPushButton#NavButton {
-    background: transparent; color: $subtext; border: none; border-left: 3px solid transparent;
-    border-radius: 0; text-align: left; padding: 13px 22px; font-size: 14px; font-weight: 600;
+    background: transparent; color: $nav_text; border: none; border-bottom: 3px solid transparent;
+    border-radius: 0; text-align: center; padding: 0px 15px; font-size: 12px; font-weight: bold;
 }
-QPushButton#NavButton:hover { background: $hover; color: $text; }
-QPushButton#NavButton:checked { background: $hover; color: $text; border-left: 3px solid $accent; }
-QPushButton#ProfileButton { background: transparent; border: none; border-radius: 8px; padding: 0; text-align: left; }
-QPushButton#ProfileButton:hover, QPushButton#ProfileButton:checked { background: $hover; }
+QPushButton#NavButton:hover { background: rgba(255,255,255,0.05); color: $nav_active; }
+QPushButton#NavButton:checked { background: transparent; color: $nav_active; border-bottom: 3px solid $red; }
+QPushButton#ProfileButton { background: rgba(255,255,255,0.05); border: 1px solid transparent; border-radius: 22px; padding: 0; text-align: left; }
+QPushButton#ProfileButton:hover { background: rgba(255,255,255,0.10); }
+QPushButton#ProfileButton:checked { background: rgba(225,29,46,0.18); border: 1px solid $red; }
+QPushButton#ProfileButton QLabel { color: $nav_active; }
 QLabel#Avatar { background: $accent; color: #ffffff; border-radius: 18px; font-size: 15px; font-weight: bold; }
 QLabel#AvatarLarge { background: $accent; color: #ffffff; border-radius: 40px; font-size: 32px; font-weight: bold; }
 QLabel#ProfileName { font-size: 13px; font-weight: 600; }
-QLabel#ProfileSub { color: $subtext; font-size: 11px; }
+QLabel#ProfileSub { color: $nav_text; font-size: 11px; }
 
 /* ---- library page ---- */
-QLabel#PageTitle { font-size: 28px; font-weight: bold; }
-QLabel#PageCount { color: $subtext; font-size: 13px; padding-left: 12px; padding-bottom: 6px; }
+QLabel#PageTitle { font-size: 26px; font-weight: bold; }
+QLabel#PageCount { color: $subtext; font-size: 13px; padding-left: 12px; padding-bottom: 5px; }
 QLabel#EmptyState { color: $subtext; font-size: 14px; padding: 40px; }
-QLineEdit#Search { background: $panel; border: 1px solid $border; border-radius: 16px; padding: 0px 16px; font-size: 13px; }
+QLineEdit#Search { background: $panel; border: 1px solid $border; border-radius: 18px; padding: 0px 16px; font-size: 13px; }
 QLineEdit#Search:focus { border: 1px solid $accent; }
 
 /* ---- settings / credits ---- */
@@ -1029,34 +1036,36 @@ QLabel#RowDesc { color: $subtext; font-size: 12px; }
 
 /* ---- game cards ---- */
 QFrame#GameCard { background: transparent; border: 1px solid transparent; border-radius: 12px; }
-QFrame#GameCard:hover { background: $panel; border: 1px solid $border; }
+QFrame#GameCard:hover { background: $panel; border: 1px solid $accent; }
 QLabel#CardTitle { font-size: 14px; font-weight: 600; padding-left: 2px; }
 QLabel#CardStatus { color: $subtext; font-size: 12px; padding-left: 2px; }
 QLabel#CoverPlaceholder { background: $panel; border: 1px dashed $border; border-radius: 8px; color: $subtext; }
 
 /* ---- buttons ---- */
 QPushButton {
-    background: $button; color: $text; border: none; border-radius: 4px;
-    padding: 8px 18px; font-weight: 600;
+    background: $button; color: $text; border: none; border-radius: 6px;
+    padding: 9px 20px; font-weight: 600;
 }
-QPushButton:hover, QPushButton:pressed { background: $button_hover; }
+QPushButton:hover, QPushButton:pressed { background: $button_hover; color: #ffffff; }
 QPushButton:disabled { background: $disabled_bg; color: $disabled_text; }
-QPushButton:flat { background: transparent; color: $accent; padding: 4px; }
-QPushButton:flat:hover { background: transparent; color: $accent_hover; }
-QPushButton#Primary { background: $accent; color: #ffffff; }
+QPushButton:flat { background: transparent; color: $accent_hover; padding: 4px; }
+QPushButton:flat:hover { background: transparent; color: #ffffff; }
+QPushButton#Primary { background: $accent; color: #ffffff; font-weight: bold; }
 QPushButton#Primary:hover { background: $accent_hover; }
 QPushButton#Primary:pressed { background: $accent_press; }
 QPushButton#Primary:disabled { background: $disabled_bg; color: $disabled_text; }
+QPushButton#Danger, QPushButton#Uninstall { background: transparent; color: $red_hover; border: 1px solid $red; }
+QPushButton#Danger:hover, QPushButton#Uninstall:hover { background: $red; color: #ffffff; }
 QPushButton#MoreButton { padding: 0; font-size: 11px; }
 QPushButton#MoreButton::menu-indicator { image: none; width: 0px; }
 
 /* ---- inputs ---- */
 QLineEdit {
-    background: $input; color: $text; border: 1px solid $border; border-radius: 4px;
+    background: $input; color: $text; border: 1px solid $border; border-radius: 6px;
     padding: 8px 10px; selection-background-color: $accent; selection-color: #ffffff;
 }
 QLineEdit:focus { border: 1px solid $accent; }
-QComboBox { background: $input; color: $text; border: 1px solid $border; border-radius: 4px; padding: 6px 10px; }
+QComboBox { background: $input; color: $text; border: 1px solid $border; border-radius: 6px; padding: 6px 10px; }
 QComboBox:hover { border: 1px solid $accent; }
 QComboBox QAbstractItemView {
     background: $panel; color: $text; border: 1px solid $border; outline: none;
@@ -1064,21 +1073,25 @@ QComboBox QAbstractItemView {
 }
 
 /* ---- menus ---- */
-QMenu { background: $panel; color: $text; border: 1px solid $border; padding: 6px; }
-QMenu::item { padding: 9px 30px 9px 14px; border-radius: 4px; background: transparent; }
-QMenu::item:selected { background: $hover; }
+QMenu { background: $panel; color: $text; border: 1px solid $border; border-radius: 8px; padding: 6px; }
+QMenu::item { padding: 9px 30px 9px 14px; border-radius: 5px; background: transparent; }
+QMenu::item:selected { background: $accent; color: #ffffff; }
 QMenu::item:disabled { color: $disabled_text; }
 QMenu::separator { height: 1px; background: $border; margin: 6px 8px; }
 
 /* ---- progress + scrollbars ---- */
 QProgressBar { background: $button; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; }
-QProgressBar::chunk { background: $accent; border-radius: 3px; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff3b4a, stop:1 #b3121f); border-radius: 3px;
+}
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: $handle; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: $accent; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
 QScrollBar::handle:horizontal { background: $handle; border-radius: 5px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: $accent; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
@@ -3019,8 +3032,8 @@ class AdaptiveApp(QMainWindow):
         self.card_status = {}
 
         self._grid_cols = 0
-        self.resize(1040, 640)
-        self.setMinimumSize(QSize(760, 640))
+        self.resize(1220, 720)
+        self.setMinimumSize(QSize(1000, 640))
         self.setWindowTitle("NCZ Games Launcher")
 
         icon_path = asset_path("icon.png")
@@ -3031,7 +3044,7 @@ class AdaptiveApp(QMainWindow):
 
         root = QWidget()
         self.setCentralWidget(root)
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(self.build_sidebar())
@@ -3062,8 +3075,11 @@ class AdaptiveApp(QMainWindow):
 
     # ------------------------------------------------------------ sidebar
     def make_nav_button(self, text, checkable=False):
-        btn = QPushButton(text)
+        short = {"Garry's Mod Addon Manager": "GMod Addons"}.get(text, text)
+        btn = QPushButton(short.upper())
+        btn.setToolTip(text)
         btn.setObjectName("NavButton")
+        btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         btn.setCheckable(checkable)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         return btn
@@ -3071,13 +3087,13 @@ class AdaptiveApp(QMainWindow):
     def build_sidebar(self):
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(230)
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 24, 0, 16)
-        layout.setSpacing(2)
+        sidebar.setFixedHeight(56)
+        layout = QHBoxLayout(sidebar)
+        layout.setContentsMargins(0, 0, 12, 0)
+        layout.setSpacing(0)
 
         brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(22, 0, 22, 0)
+        brand_row.setContentsMargins(18, 0, 18, 0)
         brand_row.setSpacing(10)
         logo_pix = CreditsPage.circular_pixmap(asset_path("icon.png"), 64)
         if logo_pix:
@@ -3091,7 +3107,7 @@ class AdaptiveApp(QMainWindow):
         brand_row.addWidget(brand)
         brand_row.addStretch()
         layout.addLayout(brand_row)
-        layout.addSpacing(28)
+        layout.addSpacing(14)
 
         self.nav_group = QButtonGroup(self)
         for index, label in ((0, "Library"), (4, "Store"), (1, "Settings"), (2, "Credits")):
@@ -3103,7 +3119,7 @@ class AdaptiveApp(QMainWindow):
         layout.addStretch()
 
         profile_wrap = QHBoxLayout()
-        profile_wrap.setContentsMargins(12, 0, 12, 0)
+        profile_wrap.setContentsMargins(8, 0, 0, 0)
         profile_wrap.addWidget(self.build_profile_button())
         layout.addLayout(profile_wrap)
         return sidebar
@@ -3111,7 +3127,7 @@ class AdaptiveApp(QMainWindow):
     def build_profile_button(self):
         btn = QPushButton()
         btn.setObjectName("ProfileButton")
-        btn.setFixedHeight(56)
+        btn.setFixedSize(176, 44)
         btn.setCheckable(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.nav_group.addButton(btn, 3)
@@ -3221,8 +3237,8 @@ class AdaptiveApp(QMainWindow):
         return page
 
     def grid_columns(self):
-        # window width minus the sidebar (230) and the library page / grid margins (36 + 24 + 12)
-        available = self.width() - 230 - 36 - 24 - 12
+        # window width minus the library page / grid margins (36 + 24 + 12); the nav bar is on top now
+        available = self.width() - 36 - 24 - 12
         card_w, gap = COVER_W + 18, 24
         return max(1, (available + gap) // (card_w + gap))
 
@@ -5322,16 +5338,19 @@ PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 
 _fb_direct_run = FirebaseDownloadWorker.run  # previous behaviour, still used for the NCZ games
 
+# Games whose page on PW_BASE_URL doesn't match their title: (regex on the lowercase title, slug to use instead).
+PW_SLUG_OVERRIDES = (
+    (r"dying light (2|two)\b.*", "dying-l-two-stay-human"),                    # any edition of Dying Light 2
+    (r"dying light( the following)?( enhanced edition)?", "dying-light-the-following"),
+    (r"risk of rain (2|two)\b.*", "risk-of-rain-two"),
+)
+
 def pw_game_url(title):
     t = title.lower().replace("'", "")
     plain = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", t)).strip()
-    # special cases
-    if re.search(r"\bdying light (2|two)\b", plain):          # any edition of Dying Light 2
-        return PW_BASE_URL.rstrip("/") + "/dying-l-two-stay-human"
-    if re.fullmatch(r"dying light( the following)?( enhanced edition)?", plain):
-        return PW_BASE_URL.rstrip("/") + "/dying-light-the-following"
-    if re.search(r"\brisk of rain (2|two)\b", plain):
-        return PW_BASE_URL.rstrip("/") + "/risk-of-rain-two"
+    for pattern, slug in PW_SLUG_OVERRIDES:
+        if re.fullmatch(pattern, plain):
+            return PW_BASE_URL.rstrip("/") + "/" + slug
     slug = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
     return PW_BASE_URL.rstrip("/") + "/" + slug
 
@@ -6517,7 +6536,7 @@ class ChatView(QScrollArea):
             bubble.setMaximumWidth(380)
             bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if mine:
-                bubble.setStyleSheet("background:#10eb73; color:#ffffff; border-radius:12px; padding:8px 12px;")
+                bubble.setStyleSheet("background:#e11d2e; color:#ffffff; border-radius:12px; padding:8px 12px;")
             else:
                 bubble.setStyleSheet("background:rgba(128,128,128,0.28); border-radius:12px; padding:8px 12px;")
             ts = m.get("ts")
@@ -7785,13 +7804,13 @@ class GmodAddonManagerPage(QWidget):
 QPushButton#GmodTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
     border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
 QPushButton#GmodTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
-QPushButton#GmodTab:checked {{ background: {t['accent']}; color: #0b0b0d; border: 1px solid {t['accent']}; }}
+QPushButton#GmodTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
 QFrame#GmodRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
 QFrame#GmodRow:hover {{ border: 1px solid {t['accent']}; }}
 QPushButton#GmodToggle {{ background: {t['button']}; color: {t['subtext']}; border-radius: 13px;
     padding: 0 14px; min-width: 70px; font-size: 12px; }}
 QPushButton#GmodToggle:hover {{ background: {t['button_hover']}; }}
-QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: #0b0b0d; }}
+QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: #ffffff; }}
 QPushButton#GmodToggle:checked:hover {{ background: {t['accent_hover']}; }}
 QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px solid {t['border']};
     border-radius: 10px; padding: 10px; font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 12px; }}
@@ -7970,7 +7989,7 @@ def _gmod_init(self):
     self.nav_group.addButton(self.gmod_btn, idx)
     sidebar_layout = self.nav_group.button(0).parent().layout()
     sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
-    self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 13px 8px 13px 22px; font-size: 13px; }")
+    self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 0px 10px; }")
     self.gmod_btn.hide()
 
     def refresh_gmod():
@@ -8599,7 +8618,7 @@ class WorkshopPage(QWidget):
 QPushButton#WsTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
     border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
 QPushButton#WsTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
-QPushButton#WsTab:checked {{ background: {t['accent']}; color: #0b0b0d; border: 1px solid {t['accent']}; }}
+QPushButton#WsTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
 QFrame#WsCard {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 12px; }}
 QFrame#WsCard:hover {{ border: 1px solid {t['accent']}; }}
 QFrame#WsRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
