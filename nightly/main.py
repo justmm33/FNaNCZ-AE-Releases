@@ -11086,12 +11086,12 @@ class LaunchOptionsDialog(QDialog):
         layout.addWidget(label)
 
         self.edit = QLineEdit(get_launch_options(key))
-        self.edit.setPlaceholderText("e.g. -windowed -fps 60")
+        self.edit.setPlaceholderText("")
         self.edit.setClearButtonEnabled(True)
         self.edit.returnPressed.connect(self.save_and_close)
         layout.addWidget(self.edit)
 
-        hint = QLabel("Use quotes around values with spaces. Leave empty for no extra arguments.")
+        hint = QLabel("")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
         layout.addWidget(hint)
