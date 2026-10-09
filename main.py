@@ -45,7 +45,7 @@ GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
 DOWNLOAD_DIR = SCRIPT_DIR + "/games/"
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
-NCZFRONT_URL = "https://desktopsob7i.tail441aca.ts.net/"
+NCZFRONT_URL = "https://occultist-tattling-elevation.ngrok-free.dev/"
 
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
 FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
