@@ -7459,6 +7459,17 @@ COMPANION_FILES = [  # (file name in the repo, local path, is it a python file?)
     ("overlay_hook.dll", lambda: asset_path("overlay_hook.dll"), False),
 ]
 
+def _companion_names_on_disk():
+    """File names listed in COMPANION_FILES of the main.py currently on disk (it may be newer than the running one)."""
+    try:
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            src = f.read()
+        blk = src[src.index("COMPANION_FILES = ["):]
+        blk = blk[:blk.index("\n]")]
+        return re.findall(r'^\s*\("([\w.\-]+)",', blk, re.M)
+    except Exception:
+        return []
+
 def companion_update_check():
     """Updates overlay.py / controller_input.py / overlay_hook.dll. True if anything changed."""
     if os.environ.get("NCZ_NO_UPDATE"):
@@ -7469,7 +7480,18 @@ def companion_update_check():
     base = (SELF_UPDATE_NIGHTLY_URL if nightly else SELF_UPDATE_STABLE_URL).rsplit("/", 1)[0] + "/"
     norm = lambda b: b.replace(b"\r\n", b"\n").strip()
     changed = False
-    for name, local_fn, is_py in COMPANION_FILES:
+    # The list in THIS (possibly older) running code may lack files that the main.py we just downloaded knows about.
+    # Read the names from the new main.py on disk too, so one pass fetches everything and one restart is enough.
+    items = list(COMPANION_FILES)
+    known = {n for n, _f, _p in items}
+    for n in _companion_names_on_disk():
+        if n not in known:
+            known.add(n)
+            if n.endswith(".py"):
+                items.append((n, (lambda n=n: os.path.join(os.path.dirname(os.path.abspath(__file__)), n)), True))
+            else:
+                items.append((n, (lambda n=n: asset_path(n)), False))
+    for name, local_fn, is_py in items:
         try:
             if (is_py and frozen) or (name.endswith(".dll") and not sys.platform.startswith("win")):
                 continue

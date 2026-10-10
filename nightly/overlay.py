@@ -15,7 +15,7 @@ W, H = 400, 110
 SCALE = 2 / 3   # overall size; 1.0 = original, lower = smaller
 SW, SH = int(W * SCALE), int(H * SCALE)
 GAP = 8         # vertical gap between stacked toasts
-MAX_STACK = 5
+MAX_STACK = 8
 MARGIN = 20     # gap to the screen edge; the window spans toast + margin so it never leaves the screen
 BAR_W = 29
 SLIDE_MS = 350
@@ -262,15 +262,20 @@ def _send_worker():
     global _send_running
     import os, time, tempfile
     path = os.path.join(tempfile.gettempdir(), "ncz_overlay.txt")
+    one = lambda s: " ".join(str(s).split())
     while _send_q:
-        user, game, prefix = _send_q.pop(0)
+        time.sleep(0.15)                       # notifications that arrive together go out as one batch
+        batch = _send_q[:8]
+        del _send_q[:8]
+        body = "".join(f"{one(u)}\n{p}\n{one(g)}\n" for u, g, p in
+                       ((u, g, p) for u, g, p in batch))
         try:
             with open(path + ".tmp", "w", encoding="utf-8") as f:
-                f.write(f"{time.time_ns()}\n{user}\n{prefix}\n{game}\n")   # line 1 changes -> DLL shows a new toast
+                f.write(f"{time.time_ns()}\n{body}")      # line 1 changes -> the DLL shows every toast in the file
             os.replace(path + ".tmp", path)
         except OSError:
             pass
-        time.sleep(0.7)                        # the DLL polls every 0.5 s: give each toast its own tick
+        time.sleep(0.7)                        # the DLL polls every 0.5 s: give each batch its own tick
     _send_running = False
 
 
