@@ -14,6 +14,8 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPixmap, QPen, QP
 W, H = 400, 110
 SCALE = 2 / 3   # overall size; 1.0 = original, lower = smaller
 SW, SH = int(W * SCALE), int(H * SCALE)
+GAP = 8         # vertical gap between stacked toasts
+MAX_STACK = 5
 MARGIN = 20     # gap to the screen edge; the window spans toast + margin so it never leaves the screen
 BAR_W = 29
 SLIDE_MS = 350
@@ -55,17 +57,27 @@ class PlayingToast(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(SW + MARGIN, SH)
         self.duration_ms = duration_ms
+        self.slot, self.on_close = 0, None   # slot 0 = bottom; higher slots stack upwards
         self._off = float(SW + MARGIN)   # how far the toast is pushed right (hidden = SW + MARGIN)
 
     def _set_off(self, v):
         self._off = float(v)
         self.update()
 
+    def set_slot(self, i):
+        self.slot = i
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.move(scr.right() + 1 - (SW + MARGIN), scr.bottom() - SH - MARGIN - i * (SH + GAP))
+
+    def _done(self):
+        self.close()
+        if self.on_close:
+            self.on_close()
+
     def popup(self):
         """Slides in from the right screen edge, waits, then slides back out. The window itself stays
         put (it never moves off the monitor); only the drawing inside it slides."""
-        scr = QApplication.primaryScreen().availableGeometry()
-        self.move(scr.right() + 1 - (SW + MARGIN), scr.bottom() - SH - MARGIN)
+        self.set_slot(self.slot)
         hidden = float(SW + MARGIN)
         self.show()
         a_in = QVariantAnimation(self)
@@ -84,7 +96,7 @@ class PlayingToast(QWidget):
         grp.addAnimation(a_in)
         grp.addPause(self.duration_ms)
         grp.addAnimation(a_out)
-        grp.finished.connect(self.close)
+        grp.finished.connect(self._done)
         grp.start()
         self._anim = grp  # keep alive
 
@@ -149,9 +161,18 @@ class OverlayManager:
         if self.mode == "off":
             return
         # "inject" backend is a later phase; use the window backend for now.
+        live = [x for x in self._toasts if x.isVisible()]
+        while len(live) >= MAX_STACK:          # keep the stack on screen: drop the oldest
+            live.pop(0).close()
         t = PlayingToast(user, game, avatar_path, prefix=prefix)
-        self._toasts = [x for x in self._toasts if x.isVisible()] + [t]
+        t.slot = len(live)                     # new toasts stack on top of the ones still showing
+        t.on_close = self._relayout
+        self._toasts = live + [t]
         t.popup()
+
+    def _relayout(self):
+        for i, x in enumerate([x for x in self._toasts if x.isVisible()]):
+            x.set_slot(i)
 
 
 overlay = OverlayManager()
@@ -233,20 +254,40 @@ def inject_overlay(exe_path, dll_path):
     return False
 
 
-def send_to_injected(user, game, prefix="is playing "):
-    """Hands a toast to the injected DLL. True if a game with the overlay is still running."""
+_send_q = []
+_send_running = False
+
+
+def _send_worker():
+    global _send_running
     import os, time, tempfile
+    path = os.path.join(tempfile.gettempdir(), "ncz_overlay.txt")
+    while _send_q:
+        user, game, prefix = _send_q.pop(0)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.write(f"{time.time_ns()}\n{user}\n{prefix}\n{game}\n")   # line 1 changes -> DLL shows a new toast
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+        time.sleep(0.7)                        # the DLL polls every 0.5 s: give each toast its own tick
+    _send_running = False
+
+
+def send_to_injected(user, game, prefix="is playing "):
+    """Queues a toast for the injected DLL. True if a game with the overlay is still running."""
+    global _send_running
+    import threading
     alive = {n: p for n, p in _injected.items() if _find_pid(n) == p}
     _injected.clear()
     _injected.update(alive)
     if not alive:
         return False
-    try:
-        with open(os.path.join(tempfile.gettempdir(), "ncz_overlay.txt"), "w", encoding="utf-8") as f:
-            f.write(f"{time.time_ns()}\n{user}\n{prefix}\n{game}\n")   # line 1 changes -> DLL shows a new toast
-        return True
-    except OSError:
-        return False
+    _send_q.append((user, game, prefix))
+    if not _send_running:
+        _send_running = True
+        threading.Thread(target=_send_worker, daemon=True).start()
+    return True
 
 
 def has_injected():
