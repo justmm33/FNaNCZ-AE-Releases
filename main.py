@@ -7261,6 +7261,7 @@ def _tray_init(self):
 
     def notify(name, msg, uid):
         self.friends_page.notify_uid = uid
+        return   # system notifications are muted for good: the overlay toasts replace them
         try:
             icon_path, pic = friend_picture(uid)
         except Exception:
@@ -7287,10 +7288,7 @@ def _tray_close_event(self, event):
     if tray is not None and tray.isVisible() and not getattr(self, "_really_quit", False):
         event.ignore()
         self.hide()
-        if not self._tray_hint_shown:
-            self._tray_hint_shown = True
-            tray.showMessage("NCZ Games Launcher", "Still running in the background. "
-                             "Right-click the tray icon to quit.", self.windowIcon(), 4000)
+        self._tray_hint_shown = True     # no "still running in the background" popup (notifications muted)
     else:
         event.accept()
 
@@ -7441,6 +7439,62 @@ def self_update_check():
     os.replace(tmp, path)
     return True
 
+# files that update from the same repo + channel (stable / nightly) as main.py
+COMPANION_FILES = [  # (file name in the repo, local path, is it a python file?)
+    ("overlay.py", lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay.py"), True),
+    ("controller_input.py", lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "controller_input.py"), True),
+    ("overlay_hook.dll", lambda: asset_path("overlay_hook.dll"), False),
+]
+
+def companion_update_check():
+    """Updates overlay.py / controller_input.py / overlay_hook.dll. True if anything changed."""
+    if os.environ.get("NCZ_NO_UPDATE"):
+        return False
+    frozen = getattr(sys, "frozen", False)
+    acct = load_account()
+    nightly = bool(acct and acct.get("uid") in NIGHTLY_UIDS)
+    base = (SELF_UPDATE_NIGHTLY_URL if nightly else SELF_UPDATE_STABLE_URL).rsplit("/", 1)[0] + "/"
+    norm = lambda b: b.replace(b"\r\n", b"\n").strip()
+    changed = False
+    for name, local_fn, is_py in COMPANION_FILES:
+        try:
+            if (is_py and frozen) or (name.endswith(".dll") and not sys.platform.startswith("win")):
+                continue
+            req = urllib.request.Request(f"{base}{name}?t={int(time.time())}",
+                                         headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                remote = resp.read()
+            path = local_fn()
+            if is_py:
+                if len(remote) < 200:
+                    continue
+                compile(remote, path, "exec")                     # refuse a broken download
+            elif len(remote) < 10000 or remote[:2] != b"MZ":      # not a real DLL
+                continue
+            try:
+                with open(path, "rb") as f:
+                    local = f.read()
+            except OSError:
+                local = None
+            if local is not None and ((norm(remote) == norm(local)) if is_py else (remote == local)):
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".update"
+            with open(tmp, "wb") as f:
+                f.write(remote)
+            try:
+                os.replace(tmp, path)
+            except OSError:                                       # e.g. the DLL is loaded in a running game
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                continue
+            changed = True
+        except Exception:
+            continue        # not in the repo yet (404), offline, ...
+    return changed
+
 class _SelfUpdateSignal(QObject):
     updated = pyqtSignal()
 
@@ -7455,10 +7509,15 @@ def _selfupdate_init(self):
         "Please restart the tool to apply the update."))
     def work():
         try:
-            if self_update_check():
-                self._selfupdate_sig.updated.emit()
+            updated = self_update_check()
+        except Exception:
+            updated = False
+        try:
+            updated = companion_update_check() or updated
         except Exception:
             pass
+        if updated:
+            self._selfupdate_sig.updated.emit()
     QTimer.singleShot(1500, lambda: threading.Thread(target=work, daemon=True).start())
 
 AdaptiveApp.__init__ = _selfupdate_init
@@ -12553,6 +12612,976 @@ def _frameless_init(self):
     bar.layout().addWidget(exit_btn)
 
 AdaptiveApp.__init__ = _frameless_init
+
+
+# ================================================================ in-game overlay (toast + settings)
+try:
+    from overlay import overlay as _overlay
+except Exception:
+    _overlay = None
+
+OVERLAY_MODES = {
+    "window": "Overlay window (default)",
+    "inject": "In-game injection (Windows, D3D11 games)",
+    "off": "Off",
+}
+
+def _overlay_settings_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "overlay_settings.json")
+
+def get_overlay_mode():
+    try:
+        with open(_overlay_settings_path(), encoding="utf-8") as f:
+            mode = json.load(f).get("mode")
+        if mode in OVERLAY_MODES:
+            return mode
+    except Exception:
+        pass
+    return "window"
+
+def set_overlay_mode(mode):
+    try:
+        os.makedirs(os.path.dirname(_overlay_settings_path()), exist_ok=True)
+        with open(_overlay_settings_path(), "w", encoding="utf-8") as f:
+            json.dump({"mode": mode}, f)
+    except Exception:
+        pass
+
+def _overlay_game_launched(exe):
+    """In inject mode, puts the overlay DLL into the game we just started."""
+    if _overlay is None or get_overlay_mode() != "inject":
+        return
+    from overlay import inject_overlay
+    inject_overlay(exe, asset_path("overlay_hook.dll"))
+
+def _overlay_classify(text):
+    """Launcher friend notification text -> (line-2 prefix, highlighted part)."""
+    if text.startswith("is now playing "):
+        return "is playing ", text[len("is now playing "):]
+    if text == "is now online":
+        return "is ", "online"
+    if text == "sent you a friend request":
+        return "sent you a ", "friend request"
+    # anything else from the friends page is a chat message: show the message itself (one line, shortened)
+    msg = " ".join(text.split())
+    if len(msg) > 32:
+        msg = msg[:29] + "..."
+    return msg, ""
+
+def _overlay_friend_event(page, name, text, uid):
+    """Every friend notification (playing / online / friend request / message) -> overlay toast."""
+    if _overlay is None:
+        return
+    mode = get_overlay_mode()
+    if mode == "off":
+        return
+    prefix, hl = _overlay_classify(text)
+    if mode == "inject":
+        from overlay import send_to_injected
+        if send_to_injected(name, hl, prefix):
+            return                       # shown inside the game
+    info = (page.friends.get(uid) or page.requests.get(uid) or {})
+    avatar = _friend_avatar_file(uid, info.get("photo"))
+    _overlay.set_mode("window")          # no injected game running: use the window toast
+    _overlay.notify_playing(name, hl, avatar, prefix)
+
+_ov_prev_launch_exe = _launch_exe
+
+def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
+    _ov_prev_launch_exe(app, exe, compat_tool, d3d, args)
+    if exe and os.path.exists(exe):
+        QTimer.singleShot(1500, lambda: _overlay_game_launched(exe))
+
+_ov_prev_friends_init = FriendsPage.__init__
+
+def _ov_friends_init(self, *a, **k):
+    _ov_prev_friends_init(self, *a, **k)
+    self.friend_event.connect(lambda n, t, u: _overlay_friend_event(self, n, t, u))
+
+FriendsPage.__init__ = _ov_friends_init
+
+_ov_prev_settings_init = SettingsPage.__init__
+
+def _ov_settings_init(self, *a, **k):
+    _ov_prev_settings_init(self, *a, **k)
+    layout = self.layout()
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    name = QLabel("Game Overlay")
+    name.setObjectName("RowTitle")
+    desc = QLabel("Shows \"FRIEND is playing GAME\" when a friend starts a game. Overlay window works over "
+                  "borderless/windowed games; injection (Windows, D3D11 only) also works in exclusive fullscreen; if it fails it falls back to the window. Don't use it with anti-cheat games.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    text.addWidget(name)
+    text.addWidget(desc)
+    combo = QComboBox()
+    combo.setFixedWidth(240)
+    for key, label in OVERLAY_MODES.items():
+        combo.addItem(label, key)
+    combo.setCurrentIndex(max(combo.findData(get_overlay_mode()), 0))
+    combo.currentIndexChanged.connect(lambda _i: set_overlay_mode(combo.currentData()))
+    row.addLayout(text, 1)
+    row.addWidget(combo)
+    pl.addLayout(row)
+    idx = max(layout.count() - 1, 0)   # just before the trailing stretch
+    layout.insertSpacing(idx, 12)
+    layout.insertWidget(idx + 1, panel)
+
+SettingsPage.__init__ = _ov_settings_init
+
+
+# ================================================================ second instance with separate data (NCZ_PROFILE=name)
+_ncz_profile = re.sub(r"[^A-Za-z0-9_-]", "_", os.environ.get("NCZ_PROFILE", "").strip())
+if _ncz_profile:
+    _ncz_base_settings_path = get_launcher_settings_path
+
+    def get_launcher_settings_path():
+        # settings, account, profile, friends cache, overlay settings... all live next to this file
+        base = os.path.dirname(_ncz_base_settings_path())
+        return os.path.join(f"{base}_{_ncz_profile}", "launcher.json")
+
+
+# ================================================================ friends overlay (Shift+Q while in a game)
+from PyQt6.QtWidgets import QSizeGrip, QListWidget, QListWidgetItem
+from PyQt6.QtCore import QPointF
+from PyQt6.QtGui import QPen
+
+def _force_foreground(hwnd):
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        u.keybd_event(0x12, 0, 0, 0)       # tap ALT so Windows lets us take focus from the game
+        u.keybd_event(0x12, 0, 2, 0)
+        u.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+class _FriendsDim(QWidget):
+    """Full-screen 50% black layer behind the panel; click it to close."""
+    clicked = pyqtSignal()
+    def __init__(self, geo):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setGeometry(geo)
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 128))
+        p.end()
+    def mousePressEvent(self, _e):
+        self.clicked.emit()
+
+def _fo_status(d):
+    """-> (text, color, group) group: 0 in game, 1 online, 2 offline."""
+    s, _c = _friend_status(d)
+    if s.startswith("Playing"):
+        return s, "#a97cff", 0
+    if s == "Online":
+        return s, "#4ade80", 1
+    if s == "Idle":
+        return s, "#60a5fa", 1
+    return s, "#6b6b78", 2
+
+def _fo_avatar(path, letter, size, dot=None):
+    """Round profile picture (or initial) with an optional status dot."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    circ = QPainterPath()
+    circ.addEllipse(0, 0, size, size)
+    p.setClipPath(circ)
+    src = QPixmap(path) if path else QPixmap()
+    if not src.isNull():
+        p.drawPixmap(0, 0, src.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                      Qt.TransformationMode.SmoothTransformation))
+    else:
+        p.fillRect(0, 0, size, size, QColor("#3a2f66"))
+        p.setPen(QColor("#d6c5ff"))
+        f = QFont()
+        f.setPixelSize(int(size * 0.42))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, letter)
+    p.setClipping(False)
+    if dot:
+        d = max(10, int(size * 0.32))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#1b1824"))                      # ring in the card colour
+        p.drawEllipse(size - d, size - d, d, d)
+        p.setBrush(QColor(dot))
+        p.drawEllipse(size - d + 2, size - d + 2, d - 4, d - 4)
+    p.end()
+    return pm
+
+def _fo_clear(layout):
+    while layout.count():
+        it = layout.takeAt(0)
+        if it.widget() is not None:
+            it.widget().deleteLater()
+        elif it.layout() is not None:
+            _fo_clear(it.layout())
+            it.layout().deleteLater()
+
+def _fo_icon(kind, color="#b8b0cc", size=20):
+    """Draws back / close / send icons so they never depend on font glyphs."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 2.0 * size / 20)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.scale(size / 20, size / 20)
+    if kind == "back":
+        p.drawPolyline([QPointF(12, 4.5), QPointF(6.5, 10), QPointF(12, 15.5)])
+    elif kind == "close":
+        p.drawLine(QPointF(5, 5), QPointF(15, 15))
+        p.drawLine(QPointF(15, 5), QPointF(5, 15))
+    else:  # send (arrow up)
+        p.drawLine(QPointF(10, 16), QPointF(10, 5))
+        p.drawPolyline([QPointF(5, 9.5), QPointF(10, 4.5), QPointF(15, 9.5)])
+    p.end()
+    return QIcon(pm)
+
+class _FriendRow(QFrame):
+    clicked = pyqtSignal(str)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+        self.setObjectName("Row")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+    def mousePressEvent(self, _e):
+        self.clicked.emit(self.uid)
+
+class _FriendsPanel(QWidget):
+    got_friends = pyqtSignal(object)
+    got_chat = pyqtSignal(object)
+    closed = pyqtSignal()
+
+    STYLE = """
+    #Card{background:#1b1824;border:1px solid #342d47;border-radius:14px;}
+    #Head{background:rgba(169,124,255,0.09);border-top-left-radius:13px;border-top-right-radius:13px;border-bottom:1px solid #2b2540;}
+    QLabel{color:#e8e8ee;background:transparent;}
+    #Title{font-size:17px;font-weight:700;color:#ffffff;}
+    #Sub{font-size:12px;color:#9a93b0;}
+    #Group{font-size:11px;font-weight:700;color:#6b6b78;padding:12px 8px 4px 8px;}
+    #Name{font-size:14px;font-weight:600;color:#ffffff;}
+    #Empty{color:#6b6b78;font-size:13px;}
+    #Row{background:transparent;border-radius:10px;}
+    #Row:hover{background:#282236;}
+    QScrollArea{background:transparent;border:none;}
+    #Body{background:transparent;}
+    QScrollBar:vertical{background:transparent;width:8px;margin:2px;}
+    QScrollBar::handle:vertical{background:#3f3658;border-radius:4px;min-height:24px;}
+    QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}
+    QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}
+    #IconBtn{background:transparent;color:#a0a0ad;border:none;border-radius:8px;font-size:18px;}
+    #IconBtn:hover{background:#2d2740;color:#ffffff;}
+    #Mine{background:#a97cff;color:#ffffff;border-radius:14px;padding:8px 12px;font-size:13px;}
+    #Theirs{background:#2d2740;color:#ececf1;border-radius:14px;padding:8px 12px;font-size:13px;}
+    #Bar{background:transparent;border-top:1px solid #2b2540;}
+    #Input{background:#282236;color:#ffffff;border:1px solid #342d47;border-radius:18px;padding:8px 14px;font-size:13px;}
+    #Input:focus{border:1px solid #a97cff;}
+    #Send{background:#a97cff;color:#ffffff;border:none;border-radius:18px;font-size:16px;font-weight:700;}
+    #Send:hover{background:#b794ff;}
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumSize(320, 400)
+        self.resize(420, 620)
+        self.setStyleSheet(self.STYLE)
+        self.friends, self.uid, self.fname = {}, None, ""
+        self._sig, self._bubbles = None, []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("Card")
+        outer.addWidget(card)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(0, 0, 0, 14)      # bottom strip holds the resize grip
+        root.setSpacing(0)
+
+        # header
+        head = QFrame()
+        head.setObjectName("Head")
+        head.setFixedHeight(62)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(14, 0, 10, 0)
+        hl.setSpacing(10)
+        self.back = QPushButton()
+        self.back.setIcon(_fo_icon("back"))
+        self.back.setIconSize(QSize(20, 20))
+        self.back.setObjectName("IconBtn")
+        self.back.setFixedSize(32, 32)
+        self.back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back.clicked.connect(self._show_list)
+        self.back.hide()
+        self.h_avatar = QLabel()
+        self.h_avatar.setFixedSize(38, 38)
+        self.h_avatar.hide()
+        tcol = QVBoxLayout()
+        tcol.setSpacing(0)
+        self.title = QLabel("Friends")
+        self.title.setObjectName("Title")
+        self.sub = QLabel("")
+        self.sub.setObjectName("Sub")
+        tcol.addStretch()
+        tcol.addWidget(self.title)
+        tcol.addWidget(self.sub)
+        tcol.addStretch()
+        x = QPushButton()
+        x.setIcon(_fo_icon("close"))
+        x.setIconSize(QSize(18, 18))
+        x.setObjectName("IconBtn")
+        x.setFixedSize(32, 32)
+        x.setCursor(Qt.CursorShape.PointingHandCursor)
+        x.clicked.connect(self.closed.emit)
+        hl.addWidget(self.back)
+        hl.addWidget(self.h_avatar)
+        hl.addLayout(tcol, 1)
+        ico = asset_path("icon.png")
+        if os.path.exists(ico):
+            logo = QLabel()
+            logo.setFixedSize(30, 30)
+            logo.setPixmap(_fo_avatar(ico, "", 30))
+            hl.addWidget(logo)
+        hl.addWidget(x)
+        root.addWidget(head)
+
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
+
+        # page 0: friends list
+        self.list_scroll = QScrollArea()
+        self.list_scroll.setWidgetResizable(True)
+        body = QWidget()
+        body.setObjectName("Body")
+        self.lv = QVBoxLayout(body)
+        self.lv.setContentsMargins(10, 4, 10, 8)
+        self.lv.setSpacing(2)
+        self.list_scroll.setWidget(body)
+        self.stack.addWidget(self.list_scroll)
+
+        # page 1: chat
+        page = QWidget()
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        self.chat_scroll = QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        cbody = QWidget()
+        cbody.setObjectName("Body")
+        self.cv = QVBoxLayout(cbody)
+        self.cv.setContentsMargins(14, 10, 14, 10)
+        self.cv.setSpacing(6)
+        self.chat_scroll.setWidget(cbody)
+        bar = QFrame()
+        bar.setObjectName("Bar")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(12, 10, 12, 0)
+        bl.setSpacing(8)
+        self.input = QLineEdit()
+        self.input.setObjectName("Input")
+        self.input.setPlaceholderText("Message...")
+        self.input.setMaxLength(500)
+        self.input.returnPressed.connect(self._send)
+        send = QPushButton()
+        send.setIcon(_fo_icon("send", "#ffffff"))
+        send.setIconSize(QSize(20, 20))
+        send.setObjectName("Send")
+        send.setFixedSize(36, 36)
+        send.setCursor(Qt.CursorShape.PointingHandCursor)
+        send.clicked.connect(self._send)
+        bl.addWidget(self.input, 1)
+        bl.addWidget(send)
+        pl.addWidget(self.chat_scroll, 1)
+        pl.addWidget(bar)
+        self.stack.addWidget(page)
+
+        self.grip = QSizeGrip(self)
+        self.grip.setFixedSize(14, 14)
+        self.got_friends.connect(self._fill_friends)
+        self.got_chat.connect(self._fill_chat)
+        self.timer = QTimer(self)             # chat refresh
+        self.timer.setInterval(4000)
+        self.timer.timeout.connect(self._load_chat)
+        self.ftimer = QTimer(self)            # friends list refresh
+        self.ftimer.setInterval(10000)
+        self.ftimer.timeout.connect(lambda: self.uid is None and self.refresh())
+        self.ftimer.start()
+
+    def _bg(self, fn, sig):
+        def work():
+            try:
+                res = fn()
+            except Exception:
+                res = None
+            try:
+                sig.emit(res)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def refresh(self):
+        self._bg(cloud_fetch_friends, self.got_friends)
+
+    # ---- friends list
+    def _fill_friends(self, friends):
+        if friends is None:
+            return
+        self.friends = friends
+        _fo_clear(self.lv)
+        rows = sorted(((_fo_status(d), uid, d) for uid, d in friends.items()), key=lambda r: r[0][2])
+        online = sum(1 for r in rows if r[0][2] < 2)
+        if self.uid is None:
+            self.sub.setText(f"{online} online" if friends else "")
+        if not friends:
+            e = QLabel("No friends yet.\nAdd some from the launcher.")
+            e.setObjectName("Empty")
+            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.lv.addStretch()
+            self.lv.addWidget(e)
+            self.lv.addStretch()
+            return
+        titles = {0: "IN GAME", 1: "ONLINE", 2: "OFFLINE"}
+        shown = set()
+        for (status, color, grp), uid, d in rows:
+            if grp not in shown:
+                shown.add(grp)
+                g = QLabel(titles[grp])
+                g.setObjectName("Group")
+                self.lv.addWidget(g)
+            name = d.get("username") or "Friend"
+            row = _FriendRow(uid)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(8, 8, 8, 8)
+            rl.setSpacing(12)
+            av = QLabel()
+            av.setFixedSize(40, 40)
+            av.setPixmap(_fo_avatar(_friend_avatar_file(uid, d.get("photo")), name[:1].upper(), 40, color))
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            n = QLabel(name)
+            n.setObjectName("Name")
+            s = QLabel(status)
+            s.setStyleSheet(f"color:{color};font-size:12px;")
+            col.addWidget(n)
+            col.addWidget(s)
+            rl.addWidget(av)
+            rl.addLayout(col, 1)
+            row.clicked.connect(self._open_chat)
+            self.lv.addWidget(row)
+        self.lv.addStretch()
+
+    def _show_list(self):
+        self.timer.stop()
+        self.uid, self._sig = None, None
+        self.back.hide()
+        self.h_avatar.hide()
+        self.title.setText("Friends")
+        self.sub.setStyleSheet("")
+        self._fill_friends(self.friends)
+        self.stack.setCurrentIndex(0)
+
+    # ---- chat
+    def _open_chat(self, uid):
+        d = self.friends.get(uid) or {}
+        self.uid, self._sig = uid, None
+        self.fname = d.get("username") or "Friend"
+        status, color, _g = _fo_status(d)
+        self.title.setText(self.fname)
+        self.sub.setText(status)
+        self.sub.setStyleSheet(f"color:{color};")
+        self.h_avatar.setPixmap(_fo_avatar(_friend_avatar_file(uid, d.get("photo")), self.fname[:1].upper(), 38, color))
+        self.h_avatar.show()
+        self.back.show()
+        _fo_clear(self.cv)
+        self._bubbles = []
+        self.stack.setCurrentIndex(1)
+        self.input.setFocus()
+        self._load_chat()
+        self.timer.start()
+
+    def _bubble_w(self):
+        return max(140, int(self.width() * 0.66))
+
+    def _load_chat(self):
+        uid = self.uid
+        if uid:
+            self._bg(lambda: (uid,) + tuple(cloud_get_messages(uid)[:2]), self.got_chat)
+
+    def _fill_chat(self, res):
+        if not res or res[0] != self.uid:
+            return
+        _other, me, msgs = res
+        sig = tuple((m.get("from"), m.get("text")) for m in msgs)
+        if sig == self._sig:
+            return                              # nothing new: don't rebuild (avoids flicker)
+        first = self._sig is None
+        sb = self.chat_scroll.verticalScrollBar()
+        stick = first or sb.value() >= sb.maximum() - 24
+        self._sig = sig
+        _fo_clear(self.cv)
+        self._bubbles = []
+        self.cv.addStretch()                    # keeps messages anchored to the bottom
+        if not msgs:
+            e = QLabel("No messages yet - say hi!")
+            e.setObjectName("Empty")
+            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.cv.addWidget(e)
+        for m in msgs:
+            mine = m.get("from") == me
+            b = QLabel(str(m.get("text", "")))
+            b.setObjectName("Mine" if mine else "Theirs")
+            b.setWordWrap(True)
+            b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            b.setMaximumWidth(self._bubble_w())
+            self._bubbles.append(b)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            if mine:
+                row.addStretch()
+                row.addWidget(b)
+            else:
+                row.addWidget(b)
+                row.addStretch()
+            self.cv.addLayout(row)
+        if stick:
+            self._scroll_bottom()
+
+    def _scroll_bottom(self):
+        sb = self.chat_scroll.verticalScrollBar()
+        for ms in (0, 60, 200):               # layout settles a moment after the bubbles are added
+            QTimer.singleShot(ms, lambda: sb.setValue(sb.maximum()))
+
+    def _send(self):
+        text = self.input.text().strip()
+        uid = self.uid
+        if not text or not uid:
+            return
+        self.input.clear()
+        def work():
+            try:
+                cloud_send_message(uid, text)
+            except Exception:
+                pass
+            QTimer.singleShot(0, self._load_chat)
+        threading.Thread(target=work, daemon=True).start()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.grip.move(self.width() - 20, self.height() - 20)
+        self.grip.raise_()
+        w = self._bubble_w()
+        for b in self._bubbles:
+            b.setMaximumWidth(w)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.closed.emit()
+        else:
+            super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):               # drag the panel by its header
+        if e.position().y() < 62 and self.windowHandle() is not None:
+            self.windowHandle().startSystemMove()
+
+class _FriendsOverlay(QObject):
+    toggle_req = pyqtSignal()
+    def __init__(self):
+        super().__init__()
+        self.dim = self.panel = None
+        self.toggle_req.connect(self.open, Qt.ConnectionType.QueuedConnection)
+
+    def open(self):
+        if self.panel is not None and self.panel.isVisible():
+            self.close()                 # Shift+Q again closes it
+            return
+        if get_overlay_mode() == "off" or not (_now_playing["name"] or _running):
+            return                       # only while a launcher-started game is running
+        if load_account() is None:
+            return
+        if get_overlay_mode() == "inject":
+            from overlay import has_injected
+            if has_injected():
+                return                   # the in-game panel handles Shift+Q (a launcher window would alt-tab out)
+        scr = QApplication.primaryScreen().geometry()
+        self.dim = _FriendsDim(scr)
+        self.panel = _FriendsPanel()
+        self.dim.clicked.connect(self.close)
+        self.panel.closed.connect(self.close)
+        self.dim.show()
+        self.panel.move(scr.center() - self.panel.rect().center())
+        self.panel.show()
+        self.panel.raise_()
+        self.panel.activateWindow()
+        _force_foreground(int(self.panel.winId()))
+        self.panel.refresh()
+
+    def close(self):
+        for w in (self.panel, self.dim):
+            if w is not None:
+                w.close()
+        self.panel = self.dim = None
+
+def _start_shift_q_hook(callback):
+    """Windows low-level keyboard hook. Only listens (never blocks keys), so Shift+Q still types normally."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    class KBD(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("extra", ctypes.c_size_t)]
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    u.SetWindowsHookExW.restype = ctypes.c_void_p
+    u.SetWindowsHookExW.argtypes = [ctypes.c_int, PROC, ctypes.c_void_p, wintypes.DWORD]
+    u.CallNextHookEx.restype = ctypes.c_ssize_t
+    u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    k.GetModuleHandleW.restype = ctypes.c_void_p
+    q_down = [False]                     # ignore key auto-repeat while Q is held
+    def proc(n, w, l):
+        if n >= 0:
+            kb = ctypes.cast(l, ctypes.POINTER(KBD)).contents
+            if kb.vkCode == 0x51:
+                if w in (0x100, 0x104):
+                    if not q_down[0] and (u.GetAsyncKeyState(0x10) & 0x8000):
+                        callback()
+                    q_down[0] = True
+                elif w in (0x101, 0x105):
+                    q_down[0] = False
+        return u.CallNextHookEx(None, n, w, l)
+    cb = PROC(proc)
+    def loop():
+        u.SetWindowsHookExW(13, cb, k.GetModuleHandleW(None), 0)
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+    threading.Thread(target=loop, daemon=True).start()
+    return cb
+
+class _InjectBridge(QObject):
+    """Serves the in-game (injected) friends panel: answers its commands with friends / chat data."""
+    def __init__(self):
+        super().__init__()
+        self.last, self.chat_uid, self._chat_t = None, None, 0.0
+        self.timer = QTimer(self)
+        self.timer.setInterval(350)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start()
+
+    @staticmethod
+    def _p(name):
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), name)
+
+    def _atomic_write(self, name, lines):
+        path = self._p(name)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(path + ".tmp", path)
+
+    @staticmethod
+    def _clean(s):
+        return " ".join(str(s).replace("\t", " ").split())
+
+    def _bg(self, fn):
+        def work():
+            try:
+                fn()
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _write_friends(self):
+        import time
+        friends = cloud_fetch_friends() or {}
+        rows = sorted(((_fo_status(d), uid, d) for uid, d in friends.items()), key=lambda r: r[0][2])
+        lines = [str(time.time_ns())]
+        for (status, color, grp), uid, d in rows:
+            lines.append("\t".join([uid, self._clean(d.get("username") or "Friend"), self._clean(status),
+                                    str(grp), color.lstrip("#")]))
+        self._atomic_write("ncz_friends.txt", lines)
+
+    def _write_chat(self, uid):
+        import time
+        res = cloud_get_messages(uid)
+        me, msgs = res[0], res[1]
+        lines = [str(time.time_ns()), uid]
+        for m in msgs:
+            lines.append(("1" if m.get("from") == me else "0") + "\t" + self._clean(m.get("text", "")))
+        self._atomic_write("ncz_chat.txt", lines)
+
+    def _load_chat(self, uid):
+        import time
+        self._chat_t = time.time()
+        self._bg(lambda: self._write_chat(uid))
+
+    def _handle(self, cmd):
+        if cmd == "open":
+            self.chat_uid = None
+            self._bg(self._write_friends)
+        elif cmd == "close":
+            self.chat_uid = None
+        elif cmd.startswith("chat "):
+            self.chat_uid = cmd[5:].strip()
+            self._load_chat(self.chat_uid)
+        elif cmd.startswith("send "):
+            uid, _, text = cmd[5:].partition(" ")
+            def work():
+                cloud_send_message(uid, text)
+                self._write_chat(uid)
+            self._bg(work)
+
+    def poll(self):
+        import time
+        if get_overlay_mode() != "inject":
+            return
+        try:
+            with open(self._p("ncz_cmd.txt"), encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            cmd = (lines[0], lines[1]) if len(lines) >= 2 else None
+        except OSError:
+            cmd = None
+        if self.last is None:                  # first tick: ignore leftovers from an earlier session
+            self.last = cmd[0] if cmd else ""
+            return
+        if cmd and cmd[0] != self.last:
+            self.last = cmd[0]
+            self._handle(cmd[1])
+        elif self.chat_uid and time.time() - self._chat_t > 3:
+            self._load_chat(self.chat_uid)     # keep the open chat fresh
+
+_fo_prev_init = AdaptiveApp.__init__
+
+def _fo_init(self):
+    _fo_prev_init(self)
+    self._friends_overlay = _FriendsOverlay()
+    self._inject_bridge = _InjectBridge()
+    if sys.platform.startswith("win"):
+        self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
+
+AdaptiveApp.__init__ = _fo_init
+
+
+# ================================================================ controller translator (Windows / XInput)
+def _controller_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "controller_settings.json")
+
+def get_controller_enabled():
+    try:
+        with open(_controller_path(), encoding="utf-8") as f:
+            return json.load(f).get("enabled") is True
+    except Exception:
+        return False
+
+def set_controller_enabled(on):
+    try:
+        os.makedirs(os.path.dirname(_controller_path()), exist_ok=True)
+        with open(_controller_path(), "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(on)}, f)
+    except Exception:
+        pass
+
+from PyQt6.QtWidgets import QDialog, QSlider, QGridLayout
+
+def _controller_profile_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "controller_profile.json")
+
+class _ControllerRemapDialog(QDialog):
+    """Pick the key / mouse button each controller input sends. Saves on every change."""
+    STYLE = """
+    QDialog{background:#1b1824;}
+    QLabel{color:#e8e8ee;font-size:13px;}
+    #Head{font-size:18px;font-weight:700;color:#ffffff;}
+    #Note{color:#9a93b0;font-size:12px;}
+    #Section{color:#a97cff;font-size:11px;font-weight:700;padding-top:10px;}
+    QComboBox{background:#282236;color:#ffffff;border:1px solid #342d47;border-radius:8px;padding:5px 10px;min-width:130px;}
+    QComboBox:hover{border:1px solid #a97cff;}
+    QComboBox QAbstractItemView{background:#231f2e;color:#ffffff;selection-background-color:#a97cff;border:1px solid #342d47;}
+    QScrollArea{background:transparent;border:none;}
+    #Body{background:transparent;}
+    QPushButton{background:#a97cff;color:#ffffff;border:none;border-radius:8px;padding:8px 16px;font-weight:600;}
+    QPushButton:hover{background:#b794ff;}
+    #Ghost{background:#2d2740;}
+    #Ghost:hover{background:#3a3252;}
+    QSlider::groove:horizontal{background:#342d47;height:6px;border-radius:3px;}
+    QSlider::handle:horizontal{background:#a97cff;width:16px;margin:-5px 0;border-radius:8px;}
+    QSlider::sub-page:horizontal{background:#a97cff;border-radius:3px;}
+    """
+    SECTIONS = [("BUTTONS", ["A", "B", "X", "Y", "LB", "RB", "L3", "R3", "Start", "Back"]),
+                ("D-PAD", ["DUp", "DDown", "DLeft", "DRight"]),
+                ("TRIGGERS", ["LT", "RT"]),
+                ("LEFT STICK", ["LSUp", "LSDown", "LSLeft", "LSRight"])]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from controller_input import INPUTS, ACTIONS, DEFAULTS, DEFAULT_SPEED, read_profile, write_profile
+        self._defaults, self._default_speed, self._write = DEFAULTS, DEFAULT_SPEED, write_profile
+        self.path = _controller_profile_path()
+        self.prof = read_profile(self.path)
+        self.setWindowTitle("Controller Remap")
+        self.resize(440, 600)
+        self.setStyleSheet(self.STYLE)
+        labels = {i: l for i, l, _m in INPUTS}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        head = QLabel("Controller Remap")
+        head.setObjectName("Head")
+        note = QLabel("Choose what each controller input sends to the game. The right stick always moves the mouse.")
+        note.setObjectName("Note")
+        note.setWordWrap(True)
+        root.addWidget(head)
+        root.addWidget(note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        body.setObjectName("Body")
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 8, 0)
+        grid.setVerticalSpacing(6)
+        self.combos = {}
+        r = 0
+        for title, ids in self.SECTIONS:
+            s = QLabel(title)
+            s.setObjectName("Section")
+            grid.addWidget(s, r, 0, 1, 2)
+            r += 1
+            for iid in ids:
+                cb = QComboBox()
+                cb.setMaxVisibleItems(12)
+                cb.addItems(list(ACTIONS))
+                cb.setCurrentText(self.prof[iid])
+                cb.currentTextChanged.connect(lambda txt, k=iid: self._changed(k, txt))
+                self.combos[iid] = cb
+                grid.addWidget(QLabel(labels[iid]), r, 0)
+                grid.addWidget(cb, r, 1)
+                r += 1
+        s = QLabel("MOUSE")
+        s.setObjectName("Section")
+        grid.addWidget(s, r, 0, 1, 2)
+        r += 1
+        self.speed = QSlider(Qt.Orientation.Horizontal)
+        self.speed.setRange(2, 40)
+        self.speed.setValue(int(self.prof["_mouse_speed"]))
+        self.speed_lbl = QLabel(str(self.speed.value()))
+        self.speed.valueChanged.connect(self._speed_changed)
+        grid.addWidget(QLabel("Right stick speed"), r, 0)
+        sr = QHBoxLayout()
+        sr.addWidget(self.speed, 1)
+        sr.addWidget(self.speed_lbl)
+        grid.addLayout(sr, r, 1)
+        grid.setColumnStretch(0, 1)
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
+        row = QHBoxLayout()
+        reset = QPushButton("Reset to defaults")
+        reset.setObjectName("Ghost")
+        reset.clicked.connect(self._reset)
+        done = QPushButton("Done")
+        done.clicked.connect(self.accept)
+        row.addWidget(reset)
+        row.addStretch()
+        row.addWidget(done)
+        root.addLayout(row)
+
+    def _save(self):
+        try:
+            self._write(self.path, self.prof)
+        except Exception:
+            pass
+
+    def _changed(self, iid, txt):
+        self.prof[iid] = txt
+        self._save()
+
+    def _speed_changed(self, v):
+        self.speed_lbl.setText(str(v))
+        self.prof["_mouse_speed"] = int(v)
+        self._save()
+
+    def _reset(self):
+        for iid, cb in self.combos.items():
+            cb.setCurrentText(self._defaults[iid])      # triggers _changed -> saves
+        self.speed.setValue(self._default_speed)
+
+_ct_prev_init = AdaptiveApp.__init__
+
+def _ct_init(self):
+    _ct_prev_init(self)
+    try:
+        from controller_input import ControllerTranslator, AVAILABLE
+        if AVAILABLE:
+            self._controller = ControllerTranslator(
+                get_controller_enabled, lambda: bool(_now_playing["name"] or _running),
+                _controller_profile_path())
+            self._controller.start()
+    except Exception:
+        pass
+
+AdaptiveApp.__init__ = _ct_init
+
+_ct_prev_settings_init = SettingsPage.__init__
+
+def _ct_settings_init(self, *a, **k):
+    _ct_prev_settings_init(self, *a, **k)
+    if not sys.platform.startswith("win"):
+        return
+    layout = self.layout()
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    name = QLabel("Controller Translator")
+    name.setObjectName("RowTitle")
+    desc = QLabel("Turns an Xbox-style controller into keyboard + mouse while a game is running "
+                  "(left stick = WASD, right stick = mouse, triggers = clicks, A = Space...). "
+                  "Turn it off for games that already support controllers, or they'll get both.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    text.addWidget(name)
+    text.addWidget(desc)
+    combo = QComboBox()
+    combo.setFixedWidth(240)
+    combo.addItem("Off", False)
+    combo.addItem("On (keyboard + mouse)", True)
+    combo.setCurrentIndex(1 if get_controller_enabled() else 0)
+    combo.currentIndexChanged.connect(lambda _i: set_controller_enabled(combo.currentData()))
+    row.addLayout(text, 1)
+    remap = QPushButton("Remap buttons")
+    remap.clicked.connect(lambda: _ControllerRemapDialog(self).exec())
+    btns = QVBoxLayout()
+    btns.addWidget(combo)
+    btns.addWidget(remap)
+    row.addLayout(btns)
+    pl.addLayout(row)
+    idx = max(layout.count() - 1, 0)
+    layout.insertSpacing(idx, 12)
+    layout.insertWidget(idx + 1, panel)
+
+SettingsPage.__init__ = _ct_settings_init
 
 
 if __name__ == "__main__":
