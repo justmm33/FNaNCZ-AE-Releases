@@ -404,7 +404,7 @@ def load_launcher_settings():
                     settings["dark_mode"] = mode
                 if loaded.get("wine_d3d") in ("default", "wined3d", "dxvk", "dxvk_vkd3d"):
                     settings["wine_d3d"] = loaded["wine_d3d"]
-                if loaded.get("currency") in ("EGP", "QAR", "USD", "SAR"):
+                if loaded.get("currency") in ("EGP", "QAR", "USD", "SAR", "AED", "EUR"):
                     settings["currency"] = loaded["currency"]
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
@@ -2374,8 +2374,9 @@ def fetch_steam_description(appid):
 
 # Steam only sells in a few currencies (no EGP), so prices are fetched in USD and converted.
 CURRENCIES = {"EGP": "Egyptian Pound (EGP)", "QAR": "Qatari Riyal (QAR)",
-              "USD": "US Dollar (USD)", "SAR": "Saudi Riyal (SAR)"}
-FALLBACK_RATES = {"USD": 1.0, "EGP": 48.0, "QAR": 3.64, "SAR": 3.75}
+              "USD": "US Dollar (USD)", "SAR": "Saudi Riyal (SAR)",
+              "AED": "Emirati Dirham (AED)", "EUR": "Euro (EUR)"}
+FALLBACK_RATES = {"USD": 1.0, "EGP": 48.0, "QAR": 3.64, "SAR": 3.75, "AED": 3.6725, "EUR": 0.92}
 _rates_cache = {"time": 0, "rates": dict(FALLBACK_RATES)}
 
 def get_usd_rates():
@@ -12771,6 +12772,8 @@ class _FriendsDim(QWidget):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
+        if sys.platform.startswith("linux"):
+            self.setWindowFlag(Qt.WindowType.X11BypassWindowManagerHint, True)   # show over fullscreen games
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setGeometry(geo)
@@ -12903,6 +12906,8 @@ class _FriendsPanel(QWidget):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
+        if sys.platform.startswith("linux"):
+            self.setWindowFlag(Qt.WindowType.X11BypassWindowManagerHint, True)   # show over fullscreen games
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(320, 400)
         self.resize(420, 620)
@@ -13279,6 +13284,33 @@ def _start_shift_q_hook(callback):
     threading.Thread(target=loop, daemon=True).start()
     return cb
 
+def _start_shift_q_hook_linux(callback):
+    """Linux (X11 / XWayland) Shift+Q listener via pynput (pip install pynput). Only listens, never blocks keys."""
+    try:
+        from pynput import keyboard
+    except Exception:
+        print("Shift+Q overlay hotkey on Linux needs: pip install pynput")
+        return None
+    state = {"shift": False, "q": False}
+    def on_press(k):
+        if k in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            state["shift"] = True
+        elif getattr(k, "char", None) and k.char.lower() == "q":
+            if state["shift"] and not state["q"]:
+                callback()
+            state["q"] = True
+    def on_release(k):
+        if k in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            state["shift"] = False
+        elif getattr(k, "char", None) and k.char.lower() == "q":
+            state["q"] = False
+    try:
+        lst = keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True)
+        lst.start()
+        return lst
+    except Exception:
+        return None
+
 class _InjectBridge(QObject):
     """Serves the in-game (injected) friends panel: answers its commands with friends / chat data."""
     def __init__(self):
@@ -13379,6 +13411,8 @@ def _fo_init(self):
     self._inject_bridge = _InjectBridge()
     if sys.platform.startswith("win"):
         self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
+    elif sys.platform.startswith("linux"):
+        self._kb_hook = _start_shift_q_hook_linux(self._friends_overlay.toggle_req.emit)
 
 AdaptiveApp.__init__ = _fo_init
 
