@@ -6676,13 +6676,17 @@ class FriendsPage(QWidget):
         self.list_timer.setInterval(10000)
         self.list_timer.timeout.connect(self.refresh)
         self.chat_timer = QTimer(self)
-        self.chat_timer.setInterval(4000)
+        self.chat_timer.setInterval(2000)
         self.chat_timer.timeout.connect(self.load_messages)
         self.beat_timer = QTimer(self)
         self.beat_timer.setInterval(60000)
         self.beat_timer.timeout.connect(self.heartbeat)
         self.beat_timer.start()
         self.list_timer.start()  # keeps polling in the background for notifications
+        self.msg_timer = QTimer(self)           # new messages: cheap check every 2 s instead of waiting for the 10 s refresh
+        self.msg_timer.setInterval(2000)
+        self.msg_timer.timeout.connect(self._poll_messages)
+        self.msg_timer.start()
         _playing_listeners.append(self._playing_changed)
         QTimer.singleShot(3000, self.heartbeat)
 
@@ -6805,6 +6809,13 @@ class FriendsPage(QWidget):
             return code, friends, cloud_fetch_requests(), cloud_fetch_last_messages(list(friends))
         self._run(work, self._on_fetched, key="refresh")
 
+    def _poll_messages(self):
+        if not self.friends or not self._signed_in():
+            return
+        ids = list(self.friends)
+        self._run(lambda: cloud_fetch_last_messages(ids),
+                  lambda res, err: None if err else self._detect_messages(res), key="msgs")
+
     def _on_fetched(self, res, err):
         if err:
             self.status_label.setText(err)
@@ -6815,7 +6826,8 @@ class FriendsPage(QWidget):
         self.code_ready.emit(code)
         self.friends = friends
         self._detect_events()
-        self._detect_messages(last)
+        if self._prev_last is None:
+            self._detect_messages(last)      # baseline only; _poll_messages raises the notifications
         self._rebuild_requests()
         self._rebuild_rows()
         if self.current_uid in self.friends and self.stack.currentIndex() == 1:
@@ -13026,7 +13038,7 @@ class _FriendsPanel(QWidget):
         self.got_friends.connect(self._fill_friends)
         self.got_chat.connect(self._fill_chat)
         self.timer = QTimer(self)             # chat refresh
-        self.timer.setInterval(4000)
+        self.timer.setInterval(2000)
         self.timer.timeout.connect(self._load_chat)
         self.ftimer = QTimer(self)            # friends list refresh
         self.ftimer.setInterval(10000)
@@ -13400,7 +13412,7 @@ class _InjectBridge(QObject):
         if cmd and cmd[0] != self.last:
             self.last = cmd[0]
             self._handle(cmd[1])
-        elif self.chat_uid and time.time() - self._chat_t > 3:
+        elif self.chat_uid and time.time() - self._chat_t > 1.5:
             self._load_chat(self.chat_uid)     # keep the open chat fresh
 
 _fo_prev_init = AdaptiveApp.__init__
