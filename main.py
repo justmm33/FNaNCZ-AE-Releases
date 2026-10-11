@@ -24,7 +24,12 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy
 )
 from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage
+from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen
+
+if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
+    from overlay import run_server
+    run_server()
+    sys.exit(0)
 
 def _bundled_dir():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -41,8 +46,10 @@ def _writable_dir():
 
 SCRIPT_DIR = _writable_dir()
 ASSETS_DIR = os.path.join(_bundled_dir(), "assets")
-GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
-DOWNLOAD_DIR = SCRIPT_DIR + "/games/"
+DEFAULT_GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
+GAMES_DIR = DEFAULT_GAMES_DIR            # where NEW installs go (changed in Settings -> Game Library)
+DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
+LIBRARY_FOLDER_NAME = "NCZLibrary"       # looked for on every partition
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
 NCZFRONT_URL = "https://occultist-tattling-elevation.ngrok-free.dev/"
@@ -53,8 +60,110 @@ FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebase
 def asset_path(filename):
     return os.path.join(ASSETS_DIR, filename)
 
+# ---------------------------------------------------------------- game library (multiple partitions)
+_SKIP_MOUNT_PREFIXES = ("/boot", "/snap", "/var/lib/snapd", "/var/lib/docker", "/sys", "/proc", "/dev", "/run/user",
+                        "/run/snapd", "/tmp", "/usr", "/etc", "/opt/pw-browsers")
+_SKIP_FSTYPES = {"squashfs", "iso9660", "udf", "tmpfs", "devtmpfs", "overlay", "proc", "sysfs", "cgroup2",
+                 "autofs", "efivarfs", "fuse.portal", "fuse.gvfsd-fuse"}
+
+def mounted_partitions():
+    """Mount points of the PC's partitions / drives (internal and external)."""
+    out = []
+    if sys.platform.startswith("win"):
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            if os.path.exists(c + ":\\"):
+                out.append(c + ":\\")
+        return out
+    best = {}   # device -> shortest mount point (btrfs subvolumes mount the same device many times)
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                dev, mp, fstype = parts[0], parts[1], parts[2]
+                mp = mp.replace("\\040", " ").replace("\\011", "\t")
+                if not dev.startswith("/dev/") or dev.startswith("/dev/loop") or fstype in _SKIP_FSTYPES:
+                    continue
+                if mp != "/" and mp.startswith(_SKIP_MOUNT_PREFIXES):
+                    continue
+                if dev not in best or len(mp) < len(best[dev]):
+                    best[dev] = mp
+    except OSError:
+        pass
+    for mp in best.values():
+        out.append(mp)
+    return sorted(out)
+
+def partition_library_path(mount_point):
+    return os.path.join(mount_point, LIBRARY_FOLDER_NAME)
+
+_roots_cache = {"time": 0.0, "roots": []}
+
+def invalidate_library_roots():
+    _roots_cache["time"] = 0.0
+
+def library_roots():
+    """Every folder that can hold installed games: the active install folder, the default one, folders
+    added by the user, and any NCZLibrary folder found on any partition. Cached for a few seconds."""
+    if time.time() - _roots_cache["time"] < 5 and _roots_cache["roots"]:
+        return _roots_cache["roots"]
+    roots = []
+    def add(path):
+        if path:
+            path = os.path.abspath(path)
+            if path not in roots:
+                roots.append(path)
+    add(GAMES_DIR)
+    add(DEFAULT_GAMES_DIR)
+    try:
+        for extra in load_launcher_settings().get("library_dirs", []):
+            add(extra)
+    except Exception:
+        pass
+    for mp in mounted_partitions():
+        lib = partition_library_path(mp)
+        try:
+            if os.path.isdir(lib):
+                add(lib)
+        except OSError:
+            pass
+    _roots_cache.update(time=time.time(), roots=roots)
+    return roots
+
+def apply_install_dir():
+    """Points GAMES_DIR / DOWNLOAD_DIR at the install folder chosen in Settings (default: ./games)."""
+    global GAMES_DIR, DOWNLOAD_DIR
+    chosen = ""
+    try:
+        chosen = load_launcher_settings().get("install_dir", "")
+    except Exception:
+        pass
+    target = DEFAULT_GAMES_DIR
+    if chosen:
+        try:
+            os.makedirs(chosen, exist_ok=True)
+            if os.access(chosen, os.W_OK):
+                target = chosen
+        except OSError:
+            pass   # drive unplugged / not writable: fall back to the default folder
+    GAMES_DIR = target
+    DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
+    invalidate_library_roots()
+
+def _find_in_library(name):
+    for root in library_roots():
+        path = os.path.join(root, name)
+        try:
+            if os.path.exists(path):
+                return path
+        except OSError:
+            pass
+    return None
+
 def installed_game_dir(game_name):
-    return os.path.join(GAMES_DIR, game_name)
+    # An already-installed game is found on any partition; a new install goes to the active install folder.
+    return _find_in_library(game_name) or os.path.join(GAMES_DIR, game_name)
 
 # ---------------------------------------------------------------- wine (Linux)
 GAME_INFO = {
@@ -76,7 +185,8 @@ GAME_INFO = {
 
 def wine_game_dir(game_name):
     # Separate from the native (converted) install so the two never overwrite each other.
-    return os.path.join(GAMES_DIR, f"{game_name} (Wine)")
+    name = f"{game_name} (Wine)"
+    return _find_in_library(name) or os.path.join(GAMES_DIR, name)
 
 def system_env():
     # A frozen build can point LD_LIBRARY_PATH at its own bundle, which breaks system programs like wine.
@@ -392,7 +502,8 @@ def get_launcher_settings_path():
     return os.path.expanduser("~/.config/NCZ_Games_Launcher/launcher.json")
 
 def load_launcher_settings():
-    settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default"}
+    settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
+                "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": []}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -406,6 +517,14 @@ def load_launcher_settings():
                     settings["wine_d3d"] = loaded["wine_d3d"]
                 if loaded.get("currency") in ("EGP", "QAR", "USD", "SAR", "AED", "EUR"):
                     settings["currency"] = loaded["currency"]
+                if loaded.get("library_sort") in ("custom", "az"):
+                    settings["library_sort"] = loaded["library_sort"]
+                if isinstance(loaded.get("install_dir"), str):
+                    settings["install_dir"] = loaded["install_dir"].strip()
+                if isinstance(loaded.get("library_dirs"), list):
+                    settings["library_dirs"] = [d for d in loaded["library_dirs"] if isinstance(d, str) and d.strip()]
+                if isinstance(loaded.get("discord_rpc"), bool):
+                    settings["discord_rpc"] = loaded["discord_rpc"]
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
                     settings["steamgriddb_api_key"] = key.strip()
@@ -423,6 +542,9 @@ def save_launcher_settings(settings):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=4)
+    invalidate_library_roots()
+
+apply_install_dir()
 
 # ---------------------------------------------------------------- launch options (per game)
 # Keys match the compatibility-tool keys: "ae", "ncz2", a Steam appid, "custom-<id>", "fan-<id>".
@@ -1627,6 +1749,8 @@ class SettingsPage(QWidget):
         cur_row.addWidget(self.currency_combo)
         cur_panel_layout.addLayout(cur_row)
         layout.addWidget(cur_panel)
+        layout.addSpacing(12)
+        layout.addWidget(self._build_library_panel())
 
         if sys.platform.startswith("linux"):
             layout.addSpacing(12)
@@ -1656,6 +1780,122 @@ class SettingsPage(QWidget):
             d3d_panel_layout.addLayout(d3d_row)
             layout.addWidget(d3d_panel)
         layout.addStretch()
+
+    # ---- game library locations (NCZLibrary on any partition)
+    def _build_library_panel(self):
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        pl.setSpacing(8)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel("Game Library")
+        name.setObjectName("RowTitle")
+        desc = QLabel(f"Where new games are installed. Games inside a \"{LIBRARY_FOLDER_NAME}\" folder on any "
+                      "partition are found automatically.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(desc)
+        self.install_combo = QComboBox()
+        self.install_combo.setFixedWidth(320)
+        self.install_combo.activated.connect(self._on_install_location_chosen)
+        row.addLayout(text, 1)
+        row.addWidget(self.install_combo)
+        pl.addLayout(row)
+        self.library_status = QLabel("")
+        self.library_status.setObjectName("RowDesc")
+        self.library_status.setWordWrap(True)
+        pl.addWidget(self.library_status)
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add existing library folder...")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.clicked.connect(self._on_add_library_folder)
+        rescan_btn = QPushButton("Rescan partitions")
+        rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rescan_btn.clicked.connect(self._refresh_library_panel)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(rescan_btn)
+        btn_row.addStretch()
+        pl.addLayout(btn_row)
+        self._refresh_library_panel()
+        return panel
+
+    def _refresh_library_panel(self):
+        invalidate_library_roots()
+        combo = self.install_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(f"Launcher folder (default)", DEFAULT_GAMES_DIR)
+        known = {os.path.abspath(DEFAULT_GAMES_DIR)}
+        for mp in mounted_partitions():
+            path = os.path.abspath(partition_library_path(mp))
+            try:
+                free = shutil.disk_usage(mp).free / 1024 ** 3
+                if not (os.access(mp, os.W_OK) or os.path.isdir(path)):
+                    continue   # e.g. "/" owned by root: can't create NCZLibrary there
+            except OSError:
+                continue
+            combo.addItem(f"{mp}  \u2022  {free:,.0f} GB free", path)
+            known.add(path)
+        for extra in load_launcher_settings().get("library_dirs", []):
+            if os.path.abspath(extra) not in known:
+                combo.addItem(extra, extra)
+                known.add(os.path.abspath(extra))
+        if os.path.abspath(GAMES_DIR) not in known:
+            combo.addItem(GAMES_DIR, GAMES_DIR)
+        combo.addItem("Choose another folder...", "")
+        idx = combo.findData(GAMES_DIR)
+        if idx < 0:
+            idx = max(0, min([i for i in range(combo.count()) if combo.itemData(i)
+                              and os.path.abspath(combo.itemData(i)) == os.path.abspath(GAMES_DIR)] or [0]))
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        found = [r for r in library_roots() if r != os.path.abspath(GAMES_DIR)]
+        self.library_status.setText(
+            f"New games install to: {GAMES_DIR}" + (("\nAlso scanning: " + ", ".join(found)) if found else ""))
+
+    def _on_install_location_chosen(self, _index):
+        path = self.install_combo.currentData()
+        if path == "":
+            path = QFileDialog.getExistingDirectory(self, "Choose where to install games", os.path.expanduser("~"))
+            if not path:
+                self._refresh_library_panel()
+                return
+            if os.path.basename(path.rstrip("/\\")) != LIBRARY_FOLDER_NAME:
+                path = os.path.join(path, LIBRARY_FOLDER_NAME)
+        try:
+            os.makedirs(path, exist_ok=True)
+            if not os.access(path, os.W_OK):
+                raise PermissionError(path)
+        except OSError as e:
+            QMessageBox.warning(self, "Game Library",
+                                f"Can't use that folder:\n{path}\n\n{e}\n\n"
+                                "If it's a partition that isn't yours to write to, mount it with your user's permissions.")
+            self._refresh_library_panel()
+            return
+        settings = load_launcher_settings()
+        settings["install_dir"] = "" if os.path.abspath(path) == os.path.abspath(DEFAULT_GAMES_DIR) else path
+        extras = settings.setdefault("library_dirs", [])
+        if settings["install_dir"] and path not in extras:
+            extras.append(path)
+        save_launcher_settings(settings)
+        apply_install_dir()
+        self._refresh_library_panel()
+
+    def _on_add_library_folder(self):
+        path = QFileDialog.getExistingDirectory(self, f"Choose a folder that contains installed games",
+                                                os.path.expanduser("~"))
+        if not path:
+            return
+        settings = load_launcher_settings()
+        extras = settings.setdefault("library_dirs", [])
+        if path not in extras:
+            extras.append(path)
+        save_launcher_settings(settings)
+        self._refresh_library_panel()
 
     def on_save_sgdb_key(self):
         key = self.sgdb_key_edit.text().strip()
@@ -2392,12 +2632,77 @@ def get_usd_rates():
         pass
     return _rates_cache["rates"]
 
+CURRENCY_NAMES = {   # code -> (singular, plural)
+    "EGP": ("Egyptian Pound", "Egyptian Pounds"), "QAR": ("Qatari Riyal", "Qatari Riyals"),
+    "USD": ("US Dollar", "US Dollars"), "SAR": ("Saudi Riyal", "Saudi Riyals"),
+    "AED": ("Emirati Dirham", "Emirati Dirhams"), "EUR": ("Euro", "Euros"),
+}
+
 def format_price(usd, currency):
-    if currency == "USD":
-        return f"${usd:,.2f}"
-    amount = usd * get_usd_rates().get(currency, FALLBACK_RATES[currency])
+    """'250 Qatari Riyals' - the exact converted amount with the full currency name."""
+    amount = usd if currency == "USD" else usd * get_usd_rates().get(currency, FALLBACK_RATES[currency])
     text = f"{amount:,.0f}" if currency == "EGP" else f"{amount:,.2f}"
-    return f"~{text} {currency}"
+    if "." in text and text.endswith(".00"):
+        text = text[:-3]
+    singular, plural = CURRENCY_NAMES.get(currency, (currency, currency))
+    return f"{text} {singular if text == '1' else plural}"
+
+FLAG_WIKI_FILES = {   # currency -> Wikipedia / Wikimedia Commons flag file
+    "EGP": "Flag_of_Egypt.svg", "QAR": "Flag_of_Qatar.svg", "USD": "Flag_of_the_United_States.svg",
+    "SAR": "Flag_of_Saudi_Arabia.svg", "AED": "Flag_of_the_United_Arab_Emirates.svg", "EUR": "Flag_of_Europe.svg",
+}
+
+def _flag_cache_path(code):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"{code}.png")
+
+def get_flag_file(code):
+    """Official flag from Wikimedia Commons (rendered as a PNG), downloaded once and cached. '' if unavailable."""
+    name = FLAG_WIKI_FILES.get(code)
+    if not name:
+        return ""
+    path = _flag_cache_path(code)
+    if os.path.exists(path) and os.path.getsize(path) > 200:
+        return path
+    try:
+        raw = _http_get(f"https://commons.wikimedia.org/wiki/Special:FilePath/{name}?width=240",
+                        headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=10)
+        if not QImage.fromData(raw).isNull():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(raw)
+            return path
+    except Exception:
+        pass
+    return ""
+
+def round_flag_pixmap(path, height=22):
+    """Whole flag (3:2) with rounded corners, crisp on HiDPI."""
+    src = QPixmap(path)
+    if src.isNull():
+        return None
+    dpr = 2
+    h = height * dpr
+    w = int(round(h * 1.5))
+    scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+    scaled = scaled.copy((scaled.width() - w) // 2, (scaled.height() - h) // 2, w, h)
+    out = QPixmap(w, h)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    radius = 5 * dpr
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), radius, radius)
+    p.setClipPath(clip)
+    p.drawPixmap(0, 0, scaled)
+    p.setClipping(False)
+    p.setPen(QPen(QColor(0, 0, 0, 60), 1.5))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(0.75, 0.75, w - 1.5, h - 1.5), radius, radius)
+    p.end()
+    out.setDevicePixelRatio(dpr)
+    return out
 
 def fetch_steam_details(appid, currency="EGP"):
     url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us"
@@ -2424,14 +2729,201 @@ def fetch_steam_details(appid, currency="EGP"):
                 shots.append(raw)
         except Exception:
             continue
+    platforms = info.get("platforms") or {}
+    reqs_src = info.get("pc_requirements")
+    if sys.platform.startswith("linux") and platforms.get("linux"):
+        lin = info.get("linux_requirements")
+        if isinstance(lin, dict) and (lin.get("minimum") or lin.get("recommended")):
+            reqs_src = lin
+    reqs = {}
+    if isinstance(reqs_src, dict):
+        reqs = {"minimum": parse_steam_requirements(reqs_src.get("minimum")),
+                "recommended": parse_steam_requirements(reqs_src.get("recommended"))}
     return dict(
+        reqs=reqs,
+        platforms=platforms,
         description=html_lib.unescape(re.sub(r"<[^>]+>", " ", text)).strip(),
         developers=", ".join(info.get("developers") or []),
         release=(info.get("release_date") or {}).get("date", ""),
         genres=[g.get("description", "") for g in (info.get("genres") or [])][:5],
         price=price,
+        price_flag=(get_flag_file(currency) if price and not info.get("is_free") else ""),
         shots=shots,
     )
+
+# ---------------------------------------------------------------- system requirements + "can I run it"
+def _req_clean(html):
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+
+def parse_steam_requirements(html):
+    """Steam's requirements HTML -> [(label, value)] e.g. [('OS', 'Windows 10'), ('Memory', '8 GB RAM')]."""
+    if not html or not isinstance(html, str):
+        return []
+    items = []
+    for li in re.findall(r"<li>(.*?)</li>", html, re.S | re.I):
+        m = re.match(r"\s*<strong>(.*?)</strong>\s*(.*)", li, re.S | re.I)
+        if m:
+            label = _req_clean(m.group(1)).rstrip(":").replace("*", "").strip()
+            value = _req_clean(m.group(2))
+        else:
+            label, value = "", _req_clean(li)
+        if label or value:
+            items.append((label, value))
+    if items:
+        return items
+    # no list: split the free text into lines, dropping the "Minimum:" / "Recommended:" heading
+    text = re.sub(r"<br\s*/?>|</li>|</p>|</ul>", "\n", html, flags=re.I)
+    for line in text.split("\n"):
+        line = _req_clean(line)
+        if line and line.lower().rstrip(":") not in ("minimum", "recommended"):
+            items.append(("", line))
+    return items
+
+_sys_specs_cache = {}
+
+def _run_quiet(cmd, timeout=6):
+    kw = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+def get_system_specs():
+    """This PC's CPU, graphics card(s), RAM and free disk space (best effort, cached). Safe to call in a thread."""
+    if _sys_specs_cache:
+        return _sys_specs_cache
+    cpu, gpu, ram_gb = "", "", 0.0
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / 1024 ** 3
+    except Exception:
+        pass
+    try:
+        if sys.platform.startswith("win"):
+            if not ram_gb:
+                import ctypes
+
+                class _MEM(ctypes.Structure):
+                    _fields_ = [("l", ctypes.c_ulong), ("p", ctypes.c_ulong), ("tp", ctypes.c_ulonglong),
+                                ("ap", ctypes.c_ulonglong), ("tf", ctypes.c_ulonglong), ("af", ctypes.c_ulonglong),
+                                ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ae", ctypes.c_ulonglong)]
+                m = _MEM()
+                m.l = ctypes.sizeof(_MEM)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+                ram_gb = m.tp / 1024 ** 3
+            out = _run_quiet(["powershell", "-NoProfile", "-Command",
+                              "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name; "
+                              "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ' | '"])
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            cpu = lines[0] if lines else ""
+            gpu = lines[1] if len(lines) > 1 else ""
+        elif sys.platform.startswith("linux"):
+            try:
+                with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.lower().startswith("model name"):
+                            cpu = line.split(":", 1)[1].strip()
+                            break
+            except OSError:
+                pass
+            if not ram_gb:
+                try:
+                    with open("/proc/meminfo", encoding="utf-8") as f:
+                        for line in f:
+                            if line.startswith("MemTotal:"):
+                                ram_gb = int(line.split()[1]) / 1024 ** 2
+                                break
+                except OSError:
+                    pass
+            gpus = []
+            for line in _run_quiet(["lspci"]).splitlines():
+                if re.search(r"VGA compatible|3D controller|Display controller", line, re.I):
+                    name = re.sub(r"\s*\(rev [0-9a-f]+\)$", "", line.split(": ", 1)[-1])
+                    inner = [b for b in re.findall(r"\[([^\]]+)\]", name) if b != "AMD/ATI"]
+                    if inner:       # "NVIDIA Corporation GA107M [GeForce RTX 3050 Ti Mobile]" -> the marketing name
+                        name = inner[-1]
+                    else:
+                        name = re.sub(r"\b(Corporation|Inc\.?|Advanced Micro Devices,?)\s*", "", name).strip()
+                    if name not in gpus:
+                        gpus.append(name)
+            gpu = " | ".join(gpus)
+    except Exception:
+        pass
+    probe = GAMES_DIR
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        free_gb = shutil.disk_usage(probe or os.path.expanduser("~")).free / 1024 ** 3
+    except Exception:
+        free_gb = 0.0
+    _sys_specs_cache.update(cpu=re.sub(r"\s+", " ", cpu), gpu=re.sub(r"\s+", " ", gpu), ram_gb=ram_gb, free_gb=free_gb)
+    return _sys_specs_cache
+
+def _gb_in(text):
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB)\b", text or "", re.I)
+    if not m:
+        return None
+    n = float(m.group(1).replace(",", "."))
+    unit = m.group(2).upper()
+    return n * 1024 if unit == "TB" else n if unit == "GB" else n / 1024
+
+_REQ_KEYS = {"ram": r"\b(ram|memory)\b",
+             "disk": r"\b(storage|hard drive|hard disk|disk space|hdd|drive space|space)\b"}
+
+def _req_gb(items, kind):
+    for label, value in items:
+        # a line with no label (free text like "512MB RAM, 200 MB hard drive space") is checked piece by piece
+        parts = [(label, value)] if label else [("", seg) for seg in re.split(r"[,;/]|\band\b", value)]
+        for lab, val in parts:
+            probe = (lab or val).lower()
+            if re.search(r"video|graphics|vram|gpu|card", probe):
+                continue
+            if re.search(_REQ_KEYS[kind], probe):
+                gb = _gb_in(val) or _gb_in(lab)
+                if gb:
+                    return gb
+    return None
+
+def _fmt_gb(gb):
+    return f"{gb:.0f}" if abs(gb - round(gb)) < 0.05 else f"{gb:.1f}"
+
+def assess_requirements(reqs, platforms, system):
+    """(verdict, colour, notes) from RAM and free disk space only. Never a hard yes/no."""
+    mn, rc = (reqs or {}).get("minimum") or [], (reqs or {}).get("recommended") or []
+    ram, free = system.get("ram_gb") or 0, system.get("free_gb") or 0
+    ram_min = _req_gb(mn, "ram") or _req_gb(rc, "ram")
+    ram_rec = _req_gb(rc, "ram")
+    disk = _req_gb(mn, "disk") or _req_gb(rc, "disk")
+    meets = lambda have, need: have >= need * 0.92       # RAM is reported a bit under its label (8 GB -> ~7.7)
+    problems = []
+    if ram and ram_min and not meets(ram, ram_min):
+        problems.append(f"your {_fmt_gb(ram)} GB of RAM is under the {_fmt_gb(ram_min)} GB minimum")
+    if free and disk and free < disk:
+        problems.append(f"it needs {_fmt_gb(disk)} GB of free space and you have {_fmt_gb(free)} GB")
+    if problems:
+        verdict, color = "May struggle: " + "; ".join(problems), RED
+    elif ram and ram_rec and not meets(ram, ram_rec):
+        verdict, color = "Should run: meets the minimum RAM, below the recommended", ORANGE
+    elif ram_min or disk:
+        verdict, color = "Looks OK for RAM and storage", GREEN
+    else:
+        verdict, color = "Couldn't check: no RAM or storage numbers in the listed requirements", None
+    notes = ["Only RAM and free disk space are checked. Compare the processor and graphics card yourself."]
+    if sys.platform.startswith("linux") and platforms and not platforms.get("linux"):
+        notes.insert(0, "This is a Windows game, so on Linux it needs Wine or Proton.")
+    return verdict, color, notes
+
+def _reqs_html(title, items):
+    if not items:
+        return ""
+    rows = [f"<b>{html_lib.escape(l)}:</b> {html_lib.escape(v)}" if l else html_lib.escape(v) for l, v in items]
+    return f"<p style='margin:0 0 6px 0; font-size:14px;'><b>{title}</b></p>" + "<br>".join(rows)
+
 
 def rounded_cover_pixmap(path, width, height, radius):
     src = QPixmap(path)
@@ -2695,6 +3187,8 @@ class StoreDetailPage(QWidget):
         self.chips_row.setSpacing(8)
         self.price_label = QLabel()
         self.price_label.setStyleSheet(f"color: {GREEN}; font-size: 20px; font-weight: bold;")
+        self.price_flag = QLabel()
+        self.price_flag.hide()
         self.desc_label = QLabel()
         self.desc_label.setWordWrap(True)
         self.desc_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -2708,7 +3202,12 @@ class StoreDetailPage(QWidget):
         col.addWidget(self.meta_label)
         col.addLayout(self.chips_row)
         col.addSpacing(4)
-        col.addWidget(self.price_label)
+        price_row = QHBoxLayout()
+        price_row.setSpacing(10)
+        price_row.addWidget(self.price_label)
+        price_row.addWidget(self.price_flag)
+        price_row.addStretch()
+        col.addLayout(price_row)
         col.addWidget(self.desc_label)
         col.addSpacing(6)
         self.lib_btn = QPushButton("Add to Library")
@@ -2726,6 +3225,47 @@ class StoreDetailPage(QWidget):
         row.addLayout(col, 1)
         layout.addLayout(row)
         layout.addSpacing(24)
+
+        # system requirements + "can I run it" (only filled in for Steam games)
+        self.reqs_wrap = QWidget()
+        wrap_lay = QVBoxLayout(self.reqs_wrap)
+        wrap_lay.setContentsMargins(0, 0, 0, 24)
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        pl.setSpacing(10)
+        reqs_title = QLabel("System Requirements")
+        reqs_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.verdict_label = QLabel()
+        self.verdict_label.setWordWrap(False)       # a wrapping label gets squashed when it is left-aligned
+        self.verdict_label.setMinimumHeight(36)
+        self.verdict_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.verdict_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.notes_label = QLabel()
+        self.notes_label.setObjectName("RowDesc")
+        self.notes_label.setWordWrap(True)
+        self.pc_label = QLabel()
+        self.pc_label.setObjectName("RowDesc")
+        self.pc_label.setWordWrap(True)
+        cols = QHBoxLayout()
+        cols.setSpacing(28)
+        self.min_label = QLabel()
+        self.rec_label = QLabel()
+        for lab in (self.min_label, self.rec_label):
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            lab.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            cols.addWidget(lab, 1)
+        self.notes_label.hide()
+        pl.addWidget(reqs_title)
+        pl.addWidget(self.verdict_label, 0, Qt.AlignmentFlag.AlignLeft)    # the green / red badge
+        pl.addWidget(self.pc_label)
+        pl.addLayout(cols)
+        wrap_lay.addWidget(panel)
+        self.reqs_wrap.hide()
+        layout.addWidget(self.reqs_wrap)
 
         self.shots_title = QLabel("Screenshots")
         self.shots_title.setStyleSheet("font-size: 16px; font-weight: bold;")
@@ -2773,10 +3313,12 @@ class StoreDetailPage(QWidget):
         self.title_label.setText(title)
         self.meta_label.setText("")
         self.price_label.setText("")
+        self.price_flag.hide()
         self.desc_label.setText("Loading details...")
         self._clear(self.chips_row)
         self._clear(self.shots_row)
         self._set_extras_visible(False)
+        self.reqs_wrap.hide()
         pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 12) if cover_path else None
         if pix:
             self.cover.setText("")
@@ -2789,7 +3331,9 @@ class StoreDetailPage(QWidget):
 
         def work():
             try:
-                return (appid, fetch_steam_details(appid, currency))
+                d = fetch_steam_details(appid, currency)
+                d["system"] = get_system_specs()
+                return (appid, d)
             except Exception:
                 return (appid, None)
 
@@ -2809,6 +3353,12 @@ class StoreDetailPage(QWidget):
         meta = [p for p in (d["developers"], d["release"]) if p]
         self.meta_label.setText("  \u2022  ".join(meta))
         self.price_label.setText(d["price"])
+        flag = round_flag_pixmap(d["price_flag"]) if d.get("price_flag") else None
+        if flag:
+            self.price_flag.setPixmap(flag)
+            self.price_flag.show()
+        else:
+            self.price_flag.hide()
         for genre in d["genres"]:
             chip = QLabel(genre)
             chip.setStyleSheet(self.CHIP_STYLE)
@@ -2822,6 +3372,36 @@ class StoreDetailPage(QWidget):
                 self.shots_row.addWidget(shot)
         self.shots_row.addStretch()
         self._set_extras_visible(bool(d["shots"]))
+        self._show_requirements(d)
+
+    def _show_requirements(self, d):
+        reqs, system = d.get("reqs") or {}, d.get("system") or {}
+        mn, rc = reqs.get("minimum") or [], reqs.get("recommended") or []
+        pc = [p for p in (system.get("cpu"), system.get("gpu")) if p]
+        if system.get("ram_gb"):
+            pc.append(f"{_fmt_gb(system['ram_gb'])} GB RAM")
+        if system.get("free_gb"):
+            pc.append(f"{_fmt_gb(system['free_gb'])} GB free")
+        self.pc_label.setText("Your PC: " + "  \u2022  ".join(pc) if pc else "")
+        self.pc_label.setVisible(bool(pc))
+        if not (mn or rc):
+            self.reqs_wrap.hide()           # nothing to show for this game
+            return
+        verdict, color, _notes = assess_requirements(reqs, d.get("platforms"), system)
+        if color is None:
+            self.verdict_label.hide()       # couldn't check: just show the lists
+        else:
+            ok = color in (GREEN, ORANGE)
+            self.verdict_label.setText("This game can run on your pc" if ok else "This game may struggle on your pc")
+            self.verdict_label.setStyleSheet(
+                f"background: {GREEN if ok else RED}; color: #ffffff; border-radius: 12px; "
+                "padding: 6px 16px; font-size: 14px; font-weight: bold;")
+            self.verdict_label.show()
+        self.min_label.setText(_reqs_html("Minimum", mn))
+        self.rec_label.setText(_reqs_html("Recommended", rc))
+        self.min_label.setVisible(bool(mn))
+        self.rec_label.setVisible(bool(rc))
+        self.reqs_wrap.show()
 
 class StorePage(QWidget):
     game_selected = pyqtSignal(int, str, str)
@@ -6291,7 +6871,6 @@ def _game_name_for_args(args):
     for g in load_steam_library() + load_custom_games():
         if g.get("exe_path") and g.get("title"):
             known[os.path.normcase(os.path.abspath(g["exe_path"]))] = g["title"]
-    games_root = os.path.normcase(os.path.abspath(GAMES_DIR))
     for a in args:
         if not isinstance(a, str):
             continue
@@ -6299,12 +6878,13 @@ def _game_name_for_args(args):
         norm = os.path.normcase(full)
         if norm in known:
             return _canonical_title(known[norm])
-        if norm.startswith(games_root + os.sep):
-            first = os.path.relpath(full, os.path.abspath(GAMES_DIR)).split(os.sep)[0]
-            for info in GAME_INFO.values():
-                if first.lower().startswith(info["name"].lower()):
-                    return _canonical_title(info["name"])
-            return _canonical_title(first)
+        for root in library_roots():
+            if norm.startswith(os.path.normcase(root) + os.sep):
+                first = os.path.relpath(full, root).split(os.sep)[0]
+                for info in GAME_INFO.values():
+                    if first.lower().startswith(info["name"].lower()):
+                        return _canonical_title(info["name"])
+                return _canonical_title(first)
     return None
 
 _running = {}  # game name -> Popen of the running game
@@ -7677,25 +8257,26 @@ def find_gmod_root():
             if os.path.dirname(d) == d:
                 break
             d = os.path.dirname(d)
-    if not os.path.isdir(GAMES_DIR):
-        return None
-    try:
-        children = sorted(os.listdir(GAMES_DIR))
-    except OSError:
-        return None
-    for name in children:
-        if "garrysmod" not in re.sub(r"[^a-z0-9]", "", name.lower()):
+    for root in library_roots():
+        if not os.path.isdir(root):
             continue
-        base = os.path.join(GAMES_DIR, name)
-        if not os.path.isdir(base):
+        try:
+            children = sorted(os.listdir(root))
+        except OSError:
             continue
-        if os.path.isdir(os.path.join(base, "garrysmod")):
-            return base
-        for folder, dirs, _files in os.walk(base):  # archive may have nested one folder deeper
-            if "garrysmod" in dirs:
-                return folder
-            if folder[len(base):].count(os.sep) >= 2:
-                dirs[:] = []
+        for name in children:
+            if "garrysmod" not in re.sub(r"[^a-z0-9]", "", name.lower()):
+                continue
+            base = os.path.join(root, name)
+            if not os.path.isdir(base):
+                continue
+            if os.path.isdir(os.path.join(base, "garrysmod")):
+                return base
+            for folder, dirs, _files in os.walk(base):  # archive may have nested one folder deeper
+                if "garrysmod" in dirs:
+                    return folder
+                if folder[len(base):].count(os.sep) >= 2:
+                    dirs[:] = []
     return None
 
 def _gma_cstr(buf, pos):
@@ -10319,6 +10900,63 @@ _OGD_RES = (re.compile(r'<meta[^>]+(?:property|name)=["\']og:description["\'][^>
             re.compile(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', re.I))
 _FAN_TAG_NAMES = {"undertale": "Undertale", "fnf": "FNF", "fnaf": "FNaF", "bendy": "Bendy"}
 
+def get_fan_shots_dir():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_shots")
+
+def fan_screenshot_urls(game, limit=6):
+    """Image urls of the game's screenshots on Game Jolt (videos are skipped)."""
+    urls = []
+    for item in (game.get("mediaItems") or []) if isinstance(game, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or item.get("media_type") or "").lower()
+        if "video" in kind or "sketchfab" in kind:
+            continue
+        u = _url_of(item.get("mediaserver_url")) or _url_of(item.get("img_url")) or _url_of(item.get("url"))
+        if u and u not in urls:
+            urls.append(u)
+    return urls[:limit]
+
+def _fan_shot_bytes(url):
+    """One screenshot as a small, low quality jpeg (cached on disk, so opening the page again is instant)."""
+    import hashlib
+    folder = get_fan_shots_dir()
+    path = os.path.join(folder, hashlib.md5(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        pass
+    raw = _http_get(url, timeout=12)
+    img = QImage()
+    if not img.loadFromData(raw):
+        return None
+    small = img.scaledToHeight(100, Qt.TransformationMode.SmoothTransformation)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    small.save(buf, "JPG", 45)
+    data = bytes(buf.data())
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+    return data
+
+def fetch_fan_screenshots(urls):
+    """All the screenshots at once (a few at a time), in order. Ones that fail are skipped."""
+    if not urls:
+        return []
+    def one(u):
+        try:
+            return _fan_shot_bytes(u)
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        return [b for b in pool.map(one, urls) if b]
+
+
 class FanDetailPage(StoreDetailPage):
     """Same details page as the Store, for Game Jolt fan games."""
     DETAIL_W, DETAIL_H = 480, 270   # horizontal cover
@@ -10330,6 +10968,7 @@ class FanDetailPage(StoreDetailPage):
             if b.text().startswith("< Back"):
                 b.setText("< Back to Fan Games")
         self.price_label.hide()
+        self.price_flag.hide()
         self.install_cb = None  # set by the app: (id, title, cover, link)
         self.steam_btn.setText("Install")
         self.steam_btn.clicked.disconnect()
@@ -10361,10 +11000,11 @@ class FanDetailPage(StoreDetailPage):
             self.cover.setText("No\ncover")
 
         def work():
-            desc, dev = "", ""
+            desc, dev, shot_urls = "", "", []
             try:
                 game = fetch_fan_overview(appid)
                 desc, dev = fan_description(game), fan_developer(game)
+                shot_urls = fan_screenshot_urls(game)
             except Exception:
                 pass
             if not desc:
@@ -10377,7 +11017,7 @@ class FanDetailPage(StoreDetailPage):
                             break
                 except Exception:
                     pass
-            return (appid, desc, dev)
+            return (appid, desc, dev, shot_urls)
 
         worker = TaskWorker(work)
         worker.done.connect(self._on_fan_details)
@@ -10385,12 +11025,32 @@ class FanDetailPage(StoreDetailPage):
         worker.start()
 
     def _on_fan_details(self, result):
-        appid, desc, dev = result
+        appid, desc, dev, shot_urls = result
         if appid != self._appid:
             return
         if dev:
             self.meta_label.setText(f"by {dev}  \u2022  Game Jolt fan game")
         self.desc_label.setText(desc or "No description available. Open the game on Game Jolt for more.")
+        if shot_urls:
+            # the text shows right away; the screenshots follow as soon as they're downloaded
+            shots_worker = TaskWorker(lambda u=shot_urls, a=appid: (a, fetch_fan_screenshots(u)))
+            shots_worker.done.connect(self._on_fan_shots)
+            self._workers = [w for w in self._workers if w.isRunning()] + [shots_worker]
+            shots_worker.start()
+
+    def _on_fan_shots(self, result):
+        appid, shots = result
+        if appid != self._appid or not shots:
+            return
+        self._clear(self.shots_row)
+        for raw in shots:
+            pm = QPixmap()
+            if pm.loadFromData(raw):
+                shot = QLabel()
+                shot.setPixmap(pm.scaledToHeight(160, Qt.TransformationMode.SmoothTransformation))
+                self.shots_row.addWidget(shot)
+        self.shots_row.addStretch()
+        self._set_extras_visible(True)
 
 FAN_COVER_W, FAN_COVER_H = 220, 124   # horizontal covers
 FAN_CARD_W = FAN_COVER_W + 18
@@ -12643,7 +13303,21 @@ def _frameless_init(self):
         QApplication.instance().quit()
 
     exit_btn.clicked.connect(exit_launcher)
+
+    min_btn = QPushButton("-")
+    min_btn.setObjectName("MinButton")
+    min_btn.setToolTip("Minimize")
+    min_btn.setFixedSize(40, 32)
+    min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    min_btn.setStyleSheet(
+        "QPushButton { background: transparent; color: #a0a0a8; border: none; border-radius: 6px;"
+        " font-size: 18px; font-weight: bold; padding: 0; }"
+        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); color: #ffffff; }"
+        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); color: #ffffff; }")
+    min_btn.clicked.connect(self.showMinimized)
+
     bar.layout().addSpacing(8)
+    bar.layout().addWidget(min_btn)
     bar.layout().addWidget(exit_btn)
 
 AdaptiveApp.__init__ = _frameless_init
@@ -13651,6 +14325,335 @@ def _ct_settings_init(self, *a, **k):
 
 SettingsPage.__init__ = _ct_settings_init
 
+
+# ================================================================ library sort (A to Z) + Discord Rich Presence
+# Library sort: "Custom order" is whatever you dragged the cards into; "A to Z" sorts everything alphabetically
+# but the three NCZ games always stay on top. Your dragged order is kept and comes back when you switch back.
+_lib_sort_cache = {"mode": None}
+
+def get_library_sort():
+    if _lib_sort_cache["mode"] is None:
+        _lib_sort_cache["mode"] = load_launcher_settings().get("library_sort", "custom")
+    return _lib_sort_cache["mode"]
+
+def set_library_sort(mode):
+    mode = mode if mode in ("custom", "az") else "custom"
+    _lib_sort_cache["mode"] = mode
+    try:
+        st = load_launcher_settings()
+        st["library_sort"] = mode
+        save_launcher_settings(st)
+    except Exception:
+        pass
+
+_sort_prev_apply_filter = AdaptiveApp.apply_filter
+
+def _sort_apply_filter(self, text=""):
+    if get_library_sort() != "az":
+        return _sort_prev_apply_filter(self, text)
+    # sort in place just for this layout pass, then put the custom order back untouched
+    fan = getattr(self, "fan_lib_list", None)
+    orig_main = list(self.cards)
+    orig_fan = list(fan) if fan is not None else None
+    try:
+        self.cards[3:] = sorted(self.cards[3:], key=lambda it: it[1].casefold())
+        if fan is not None:
+            fan.sort(key=lambda it: it[1].casefold())
+        return _sort_prev_apply_filter(self, text)
+    finally:
+        self.cards[:] = orig_main
+        if fan is not None:
+            fan[:] = orig_fan
+
+AdaptiveApp.apply_filter = _sort_apply_filter
+
+# dragging cards makes no sense while they're sorted A to Z
+_sort_prev_card_for = _CardReorder._card_for
+
+def _sort_card_for(self, widget):
+    if get_library_sort() == "az":
+        return None
+    return _sort_prev_card_for(self, widget)
+
+_CardReorder._card_for = _sort_card_for
+
+_sort_prev_init = AdaptiveApp.__init__
+
+def _sort_init(self):
+    _sort_prev_init(self)
+    try:
+        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+        idx = header.indexOf(self.search_edit)
+        if idx >= 0:
+            combo = QComboBox()
+            combo.setFixedHeight(36)
+            combo.setToolTip("Library order. A to Z keeps the NCZ games on top.")
+            combo.addItem("Custom order", "custom")
+            combo.addItem("A to Z", "az")
+            combo.setCurrentIndex(1 if get_library_sort() == "az" else 0)
+
+            def changed(_i):
+                set_library_sort(combo.currentData())
+                self.apply_filter(self.search_edit.text())
+
+            combo.currentIndexChanged.connect(changed)
+            header.insertWidget(idx, combo)
+            header.insertSpacing(idx + 1, 10)
+        self.apply_filter(self.search_edit.text())
+    except Exception:
+        pass
+
+AdaptiveApp.__init__ = _sort_init
+
+
+# Discord Rich Presence: shows the game you're playing (and for how long). Nothing is shown while no game is
+# running. Needs the "pypresence" package (pip install pypresence); without it this quietly does nothing.
+DISCORD_APP_ID = "1228748652974047362"
+
+def get_discord_rpc_enabled():
+    return bool(load_launcher_settings().get("discord_rpc", True))
+
+def set_discord_rpc_enabled(on):
+    try:
+        st = load_launcher_settings()
+        st["discord_rpc"] = bool(on)
+        save_launcher_settings(st)
+    except Exception:
+        pass
+    _discord_rpc.poke()
+
+# Cover art for Discord. Steam games use their public Steam cover (Discord accepts web links for images).
+# The two NCZ games have no public link, so they use art assets you upload in the Discord Developer Portal
+# (Rich Presence -> Art Assets) under exactly these names; until you do, they just show without a picture.
+_RPC_ASSET_KEYS = {AE_GAME_NAME.casefold(): "fnancz_ae", NCZ2_GAME_NAME.casefold(): "fnancz_2"}
+_rpc_image_cache = {}
+
+def _rpc_url_exists(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+def _rpc_image_for(name):
+    key = str(name).casefold()
+    if key in _rpc_image_cache:
+        return _rpc_image_cache[key]
+    image = _RPC_ASSET_KEYS.get(key)
+    if image is None:
+        try:
+            for g in load_steam_library():
+                if pretty_game_name(g.get("title", "")).casefold() == key and g.get("appid"):
+                    base = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{g['appid']}/"
+                    for fname in ("library_600x900.jpg", "header.jpg"):
+                        if _rpc_url_exists(base + fname):
+                            image = base + fname
+                            break
+                    break
+        except Exception:
+            image = None
+    _rpc_image_cache[key] = image
+    return image
+
+class _DiscordRPC:
+    """All pypresence calls happen on one background thread, so the launcher never waits on Discord."""
+    def __init__(self):
+        self._wake = threading.Event()
+        self._rpc = None
+        self._shown = None            # game currently shown on Discord
+        self._since = {}              # game -> when we first saw it running
+        self._missing = False         # pypresence isn't installed
+        self.status = "Starting..."
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _log(self, msg):
+        self.status = msg
+        try:
+            path = os.path.join(os.path.dirname(get_launcher_settings_path()), "discord_rpc.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+        except Exception:
+            pass
+
+    def poke(self):
+        self._wake.set()
+
+    def _loop(self):
+        while True:
+            self._wake.wait(timeout=15)     # also retries every 15 s (Discord may have been opened later)
+            self._wake.clear()
+            try:
+                self._sync()
+            except Exception as e:
+                self._drop()
+                self._log(f"Could not reach Discord ({type(e).__name__}: {e}). Is the Discord desktop app open?")
+
+    def _drop(self):
+        rpc, self._rpc, self._shown = self._rpc, None, None
+        if rpc is not None:
+            try:
+                rpc.close()
+            except Exception:
+                pass
+
+    def _connect(self):
+        if self._rpc is not None:
+            return True
+        if self._missing:
+            return False
+        try:
+            from pypresence import Presence
+        except Exception as e:
+            self._missing = True
+            self._log(f"pypresence is not installed for this Python ({sys.executable}): {e}. Run: pip install pypresence")
+            return False
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        rpc = Presence(DISCORD_APP_ID, loop=loop)
+        rpc.connect()
+        self._rpc = rpc
+        return True
+
+    def _sync(self):
+        name = _now_playing["name"] if get_discord_rpc_enabled() else None
+        if name == "NCZFront":          # NCZFront is a website: never shown on Discord
+            name = next((n for n in _running if n != "NCZFront"), None)
+        for g in list(self._since):
+            if g != name:
+                self._since.pop(g, None)
+        if not name:
+            self._drop()                    # no game running -> nothing on Discord
+            if self.status.startswith(("Starting", "Showing")) or not self.status.startswith(("pypresence", "Could")):
+                self.status = "Off" if not get_discord_rpc_enabled() else "Waiting for a game to start"
+            return
+        start = self._since.setdefault(name, int(time.time()))
+        if not self._connect():
+            return
+        if self._shown != name:
+            # "name" (pypresence 4.6+) makes the title the game's name instead of the application's name
+            fields = dict(name=name, details="via NCZ Games Launcher", start=start)
+            image = _rpc_image_for(name)
+            if image:
+                fields.update(large_image=image, large_text=name)
+            self._rpc.update(**fields)
+            self._shown = name
+            self._log(f"Showing '{name}' on Discord")
+
+_discord_rpc = _DiscordRPC()
+_playing_listeners.append(_discord_rpc.poke)
+
+_rpc_prev_settings_init = SettingsPage.__init__
+
+def _rpc_settings_init(self, *a, **k):
+    _rpc_prev_settings_init(self, *a, **k)
+    layout = self.layout()
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    name = QLabel("Discord Rich Presence")
+    name.setObjectName("RowTitle")
+    desc = QLabel("Shows the game you're playing from the launcher on your Discord profile. "
+                  "Needs Discord running, and the pypresence package installed.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    text.addWidget(name)
+    text.addWidget(desc)
+    status = QLabel()
+    status.setObjectName("RowDesc")
+    status.setWordWrap(True)
+    text.addWidget(status)
+    status_timer = QTimer(self)
+    status_timer.timeout.connect(lambda: status.setText("Status: " + _discord_rpc.status))
+    status_timer.start(1500)
+    status.setText("Status: " + _discord_rpc.status)
+    combo = QComboBox()
+    combo.setFixedWidth(240)
+    combo.addItem("Off", False)
+    combo.addItem("On", True)
+    combo.setCurrentIndex(1 if get_discord_rpc_enabled() else 0)
+    combo.currentIndexChanged.connect(lambda _i: set_discord_rpc_enabled(combo.currentData()))
+    row.addLayout(text, 1)
+    row.addWidget(combo)
+    pl.addLayout(row)
+    idx = max(layout.count() - 1, 0)
+    layout.insertSpacing(idx, 12)
+    layout.insertWidget(idx + 1, panel)
+
+SettingsPage.__init__ = _rpc_settings_init
+
+
+# ================================================================ FNaNCZ AE / 2 native launch on Linux
+# They're native Linux games made by the conversion script, started through their run.sh. This looks for run.sh
+# anywhere inside the game folder (the script may put it in a subfolder), says so when it can't find it, and
+# warns with the game's own output if it quits right away. Output also goes to launch-<game>.log.
+def _find_run_sh(game_dir):
+    for root, dirs, files in os.walk(game_dir):
+        if "run.sh" in files:
+            return os.path.join(root, "run.sh")
+        if root[len(game_dir):].count(os.sep) >= 2:
+            dirs[:] = []
+    return None
+
+def _native_linux_launch(app, game_dir, game_id, title):
+    if not os.path.isdir(game_dir):
+        QMessageBox.warning(app, title, f"{title} isn't installed.\n\nLooked in:\n{game_dir}")
+        return
+    sh = _find_run_sh(game_dir)
+    if not sh:
+        try:
+            listing = ", ".join(sorted(os.listdir(game_dir))[:15]) or "(empty)"
+        except OSError:
+            listing = "(couldn't read it)"
+        QMessageBox.warning(app, title, f"Couldn't find run.sh for {title}.\n\nLooked in:\n{game_dir}\n\n"
+                                        f"The folder contains: {listing}\n\n"
+                                        "The Linux conversion probably didn't finish. Try reinstalling the game.")
+        return
+    log_path = os.path.join(os.path.dirname(get_launcher_settings_path()), f"launch-{game_id}.log")
+    try:
+        os.chmod(sh, 0o755)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as log:
+            proc = subprocess.Popen(["bash", sh] + launch_args_for(game_id), cwd=os.path.dirname(sh),
+                                    stdout=log, stderr=subprocess.STDOUT)
+    except Exception as e:
+        QMessageBox.warning(app, title, f"Couldn't start {title}:\n{e}")
+        return
+
+    def check():
+        code = proc.poll()
+        if code is None or code == 0:
+            return
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-12:]).strip()
+        except OSError:
+            tail = ""
+        QMessageBox.warning(app, title, f"{title} closed right after starting (exit code {code}).\n\n"
+                                        f"{tail or 'It printed nothing.'}\n\nFull output: {log_path}")
+
+    QTimer.singleShot(4000, check)
+
+_native_prev_launch_ae = AdaptiveApp.launch_ae_game
+_native_prev_launch_ncz2 = AdaptiveApp.launch_ncz2_game
+
+def _native_launch_ae(self):
+    if sys.platform.startswith("linux"):
+        return _native_linux_launch(self, installed_game_dir(AE_GAME_NAME), "ae", AE_GAME_NAME)
+    return _native_prev_launch_ae(self)
+
+def _native_launch_ncz2(self):
+    if sys.platform.startswith("linux"):
+        return _native_linux_launch(self, installed_game_dir(NCZ2_GAME_NAME), "ncz2", NCZ2_GAME_NAME)
+    return _native_prev_launch_ncz2(self)
+
+AdaptiveApp.launch_ae_game = _native_launch_ae
+AdaptiveApp.launch_ncz2_game = _native_launch_ncz2
 
 if __name__ == "__main__":
     main()
