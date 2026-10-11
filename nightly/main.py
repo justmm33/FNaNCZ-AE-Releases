@@ -23,8 +23,8 @@ from PyQt6.QtWidgets import (
     QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy
 )
-from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen
+from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 
 if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
     from overlay import run_server
@@ -708,7 +708,7 @@ def _cloud_error_from(raw_message, http_code=0):
         return CloudError("The cloud refused the request (check the database rules).", code)
     return CloudError(f"Cloud error: {code or 'HTTP ' + str(http_code)}", code)
 
-def _http_json(url, method="GET", payload=None, form=None):
+def _http_json(url, method="GET", payload=None, form=None, timeout=None):
     headers = {"User-Agent": "NCZ-Games-Launcher"}
     data = None
     if form is not None:
@@ -719,7 +719,7 @@ def _http_json(url, method="GET", payload=None, form=None):
         headers["Content-Type"] = "application/json"
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=CLOUD_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
@@ -7104,6 +7104,8 @@ def cloud_get_messages(other):
     if not isinstance(data, dict):
         return uid, [], None
     keys = [k for k in sorted(data) if isinstance(data[k], dict)]
+    for k in keys:
+        data[k]["_key"] = k
     return uid, [data[k] for k in keys], (keys[-1] if keys else None)
 
 def cloud_fetch_last_messages(friend_ids):
@@ -7123,10 +7125,186 @@ def cloud_fetch_last_messages(friend_ids):
     with ThreadPoolExecutor(max_workers=6) as ex:
         return {f: v for f, v in ex.map(one, friend_ids) if v}
 
-def cloud_send_message(other, text):
+CHAT_MAX_ATTACH = 4
+CHAT_IMAGE_MAX_SIDE = 4096                  # only used when a pasted/odd-format image has to be re-encoded
+CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+CHAT_GIF_MAX_BYTES = CHAT_IMAGE_MAX_BYTES
+CHAT_VIDEO_MAX_BYTES = 10 * 1024 * 1024
+CHAT_CHUNK_CHARS = 4_000_000                # a Realtime Database string tops out at 10 MB, so big files are stored in chunks
+CHAT_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+CHAT_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v")
+_ATT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_EMOJI_CODE_RE = re.compile(r"^[0-9a-f]{2,6}(-[0-9a-f]{2,6})*$")
+_VIDEO_MIME = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+               ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v"}
+
+def _chat_fmt_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    return f"{n / (1024 * 1024):.1f} MB" if n >= 1024 * 1024 else f"{max(1, round(n / 1024))} KB"
+
+def chat_media_dir():
+    path = os.path.join(os.path.dirname(get_launcher_settings_path()), "chat_media")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def chat_preview(m):
+    """One-line text for notifications / the overlay: the message text, or a tag for attachments."""
+    text = str(m.get("text", "") or "").strip()
+    atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
+    if not atts:
+        return text
+    tag = {"img": "Image", "gif": "GIF", "vid": "Video"}.get(atts[0].get("k"), "File")
+    tag = f"[{tag}]" if len(atts) == 1 else f"[{len(atts)} attachments]"
+    return f"{text} {tag}" if text else tag
+
+# ---- preparing files for sending (runs on a worker thread, so only QImage here, never QPixmap)
+def _encode_qimage(img):
+    """Shrinks / re-encodes a QImage until it fits the size cap. Returns (bytes, mime, ext, w, h)."""
+    if img.isNull():
+        raise ValueError("That image couldn't be read.")
+    if max(img.width(), img.height()) > CHAT_IMAGE_MAX_SIDE:
+        img = img.scaled(CHAT_IMAGE_MAX_SIDE, CHAT_IMAGE_MAX_SIDE, Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+    alpha = img.hasAlphaChannel()
+    quality = 88
+    for _ in range(6):
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        if alpha:
+            ok, mime, ext = img.save(buf, "PNG"), "image/png", ".png"
+        else:
+            ok, mime, ext = img.save(buf, "JPEG", quality), "image/jpeg", ".jpg"
+        data = bytes(buf.data())
+        if ok and 0 < len(data) <= CHAT_IMAGE_MAX_BYTES:
+            return data, mime, ext, img.width(), img.height()
+        quality = max(50, quality - 12)
+        img = img.scaled(max(16, int(img.width() * 0.8)), max(16, int(img.height() * 0.8)),
+                         Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    raise ValueError("That image is too large to send.")
+
+def prepare_attachment_image(img, name=""):
+    data, mime, ext, w, h = _encode_qimage(img)
+    base = os.path.splitext(name or time.strftime("image-%Y%m%d-%H%M%S"))[0]
+    return {"kind": "img", "name": base + ext, "data": data, "mime": mime, "ext": ext,
+            "w": w, "h": h, "size": len(data)}
+
+def prepare_attachment(path):
+    name = os.path.basename(path)
+    ext = os.path.splitext(name)[1].lower()
+    if not os.path.isfile(path):
+        raise ValueError(f"Couldn't find {name}.")
+    size = os.path.getsize(path)
+    if ext in CHAT_VIDEO_EXTS:
+        if size > CHAT_VIDEO_MAX_BYTES:
+            raise ValueError(f"{name} is too big. Videos can be up to {CHAT_VIDEO_MAX_BYTES // (1024 * 1024)} MB.")
+        with open(path, "rb") as f:
+            data = f.read()
+        return {"kind": "vid", "name": name, "data": data, "mime": _VIDEO_MIME.get(ext, "video/mp4"),
+                "ext": ext, "w": 0, "h": 0, "size": len(data)}
+    if ext == ".gif":
+        if size > CHAT_GIF_MAX_BYTES:
+            raise ValueError(f"{name} is too big. GIFs can be up to {CHAT_GIF_MAX_BYTES // (1024 * 1024)} MB.")
+        img = QImage(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        return {"kind": "gif", "name": name, "data": data, "mime": "image/gif", "ext": ".gif",
+                "w": img.width(), "h": img.height(), "size": len(data)}
+    if ext in CHAT_IMAGE_EXTS:
+        img = QImage(path)
+        if ext in (".png", ".jpg", ".jpeg", ".webp") and not img.isNull() and size <= CHAT_IMAGE_MAX_BYTES:
+            with open(path, "rb") as f:                 # send the original untouched
+                data = f.read()
+            ext = ".jpg" if ext == ".jpeg" else ext
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}[ext]
+            return {"kind": "img", "name": name, "data": data, "mime": mime, "ext": ext,
+                    "w": img.width(), "h": img.height(), "size": len(data)}
+        return prepare_attachment_image(img, name)
+    raise ValueError(f"{name}: only images and videos can be attached.")
+
+# ---- where a downloaded attachment lives on disk (the id/extension come from the other person's data, so they're validated)
+def _att_cache_path(att):
+    aid = str(att.get("id", ""))
+    if not _ATT_ID_RE.match(aid):
+        return None
+    kind = att.get("k")
+    if kind == "gif":
+        ext = ".gif"
+    elif kind == "vid":
+        ext = os.path.splitext(str(att.get("n", "")))[1].lower()
+        ext = ext if ext in CHAT_VIDEO_EXTS else ".mp4"
+    else:
+        ext = str(att.get("x", "")).lower()
+        ext = ext if ext in (".png", ".jpg", ".webp") else ".jpg"
+    return os.path.join(chat_media_dir(), aid + ext)
+
+def cloud_fetch_media(other, att):
+    """Downloads one attachment (once; later calls hit the disk cache) and returns its file path."""
+    path = _att_cache_path(att)
+    if not path:
+        raise CloudError("This attachment is invalid.", "BAD_ATT")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
     token, uid = get_id_token()
-    _http_json(_fdb(f"chats/{_chat_id(uid, other)}", token), "POST",
-               {"from": uid, "text": text[:500], "ts": {".sv": "timestamp"}})
+    base = f"chatmedia/{_chat_id(uid, other)}/{att['id']}"
+    count = _http_json(_fdb(f"{base}/n", token), timeout=60)
+    if isinstance(count, int) and 0 < count <= 64:
+        parts = []
+        for i in range(count):
+            piece = _http_json(_fdb(f"{base}/c/{i}", token), timeout=180)
+            if not isinstance(piece, str):
+                raise CloudError("This attachment is no longer available.", "GONE")
+            parts.append(piece)
+        b64 = "".join(parts)
+    else:                                               # single-value format
+        rec = _http_json(_fdb(base, token), timeout=180)
+        b64 = rec.get("d") if isinstance(rec, dict) else None
+        if not isinstance(b64, str):
+            raise CloudError("This attachment is no longer available.", "GONE")
+    data = base64.b64decode(b64)
+    if not data or len(data) > 40 * 1024 * 1024:
+        raise CloudError("This attachment is invalid.", "BAD_ATT")
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+def cloud_send_message(other, text, attachments=None, reply=None):
+    """attachments: dicts from prepare_attachment(); reply: {'k': message key, 'f': author uid, 't': snippet, 'a': kind}."""
+    token, uid = get_id_token()
+    chat = _chat_id(uid, other)
+    atts = []
+    for a in (attachments or [])[:CHAT_MAX_ATTACH]:
+        aid = _secrets.token_hex(8)
+        b64 = base64.b64encode(a["data"]).decode("ascii")
+        pieces = [b64[i:i + CHAT_CHUNK_CHARS] for i in range(0, len(b64), CHAT_CHUNK_CHARS)]
+        for i, piece in enumerate(pieces):
+            _http_json(_fdb(f"chatmedia/{chat}/{aid}/c/{i}", token), "PUT", piece, timeout=300)
+        _http_json(_fdb(f"chatmedia/{chat}/{aid}/m", token), "PUT", a["mime"])
+        _http_json(_fdb(f"chatmedia/{chat}/{aid}/n", token), "PUT", len(pieces))
+        atts.append({"id": aid, "k": a["kind"], "n": str(a["name"])[:80], "x": a["ext"],
+                     "s": a["size"], "w": a["w"], "h": a["h"]})
+    msg = {"from": uid, "text": (text or "")[:500], "ts": {".sv": "timestamp"}}
+    if atts:
+        msg["att"] = atts
+    if isinstance(reply, dict) and reply.get("k"):
+        msg["re"] = {"k": str(reply["k"]), "f": str(reply.get("f", "")),
+                     "t": str(reply.get("t", ""))[:100], "a": str(reply.get("a", ""))}
+    _http_json(_fdb(f"chats/{chat}", token), "POST", msg)
+
+def cloud_set_reaction(other, msg_key, code, on):
+    """Adds / removes this user's reaction. code is the Twemoji file name, e.g. '1f44d'."""
+    if not _EMOJI_CODE_RE.match(code or "") or not msg_key:
+        return
+    token, uid = get_id_token()
+    url = _fdb(f"chats/{_chat_id(uid, other)}/{msg_key}/rx/{code}/{uid}", token)
+    if on:
+        _http_json(url, "PUT", True)
+    else:
+        _http_json(url, "DELETE")
 
 def _friend_status(d):
     if d.get("playing"):
@@ -7149,8 +7327,421 @@ def _friend_avatar_file(uid, photo):
         f.write(raw)
     return path
 
+# ---------------------------------------------------------------- chat: Twemoji, picker, message rows
+TWEMOJI_URLS = (
+    "https://raw.githubusercontent.com/jdecked/twemoji/v15.1.0/assets/72x72/{code}.png",
+    "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{code}.png",
+)
+
+EMOJI_CATEGORIES = [
+    ("Smileys", "\U0001F600",
+     "😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😛 😜 🤪 😎 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😓 🤗 🤔 🤭 🤫 😶 😐 😑 😬 🙄 😯 😮 😲 🥱 😴 🤤 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕 🤑 🤠 😈 👿 💀 ☠️ 👻 👽 👾 🤖 💩 🤡"),
+    ("Gestures", "\U0001F44D",
+     "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ 👋 ✋ 🖖 👏 🙌 👐 🤲 🤝 🙏 ✍️ 💪 🧠 👀 👁️ 👅 👄 🫡 🫶"),
+    ("Hearts", "\u2764\uFE0F",
+     "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💯 💢 💥 💫 💦 💨 🔥 ✨ ⭐ 🌟 💤 ✅ ❌ ❓ ❗ ‼️ ⚠️ 🚫"),
+    ("Animals", "\U0001F431",
+     "🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🙈 🙉 🙊 🐔 🐧 🐦 🦆 🦉 🐺 🐴 🦄 🐝 🐛 🦋 🐌 🐞 🐢 🐍 🐙 🦑 🦀 🐠 🐬 🐳 🦈 🐊 🌵 🌲 🌳 🌴 🌸 🌹 🌻 🍀 🍄 🌈 ☀️ 🌙 ⚡ ❄️ 🌊"),
+    ("Food", "\U0001F355",
+     "🍎 🍌 🍇 🍓 🍒 🍑 🍍 🥭 🥝 🍅 🥑 🌽 🥕 🍞 🧀 🍔 🍟 🍕 🌭 🌮 🍿 🍩 🍪 🎂 🍰 🍫 🍬 🍭 ☕ 🍺 🍷 🥤"),
+    ("Fun", "\U0001F3AE",
+     "⚽ 🏀 🏈 ⚾ 🎾 🏐 🎱 🎮 🕹️ 🎲 🧩 🎯 🎳 🎸 🎹 🎧 🎤 🎬 🏆 🥇 🎉 🎊 🎁 🎈 💻 📱 ⌨️ 🖥️ 💡 🔑 🔒 📷 📚 📌 ✏️ 🚀 ✈️ 🚗"),
+]
+
+def emoji_code(ch):
+    """Character(s) -> Twemoji file name ('1f44d'): lowercase hex code points, FE0F dropped unless there's a ZWJ."""
+    cps = [f"{ord(c):x}" for c in ch]
+    if "200d" not in cps:
+        cps = [c for c in cps if c != "fe0f"]
+    return "-".join(cps)
+
+def emoji_from_code(code):
+    try:
+        return "".join(chr(int(c, 16)) for c in code.split("-"))
+    except ValueError:
+        return "?"
+
+class _EmojiStore(QObject):
+    """Downloads Twemoji PNGs on demand (cached on disk) and hands them to whoever asked."""
+    loaded = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._pix = {}
+        self._waiters = {}
+        self._busy = set()
+        self._failed = {}
+        self.loaded.connect(self._on_loaded)
+
+    def _file(self, code):
+        folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "twemoji")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, code + ".png")
+
+    def pixmap(self, code):
+        pm = self._pix.get(code)
+        if pm is not None:
+            return pm
+        path = self._file(code)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            pm = QPixmap(path)
+            if not pm.isNull():
+                self._pix[code] = pm
+                return pm
+        return None
+
+    def bind(self, code, setter):
+        """Calls setter(QPixmap) now if the emoji is cached, otherwise as soon as it has downloaded."""
+        if not _EMOJI_CODE_RE.match(code or ""):
+            return
+        pm = self.pixmap(code)
+        if pm is not None:
+            setter(pm)
+            return
+        self._waiters.setdefault(code, []).append(setter)
+        self._fetch(code)
+
+    def _fetch(self, code):
+        if code in self._busy or time.time() - self._failed.get(code, 0) < 60:
+            return
+        self._busy.add(code)
+        path = self._file(code)
+        def work():
+            data = None
+            for url in TWEMOJI_URLS:
+                try:
+                    blob = _http_get(url.format(code=code), timeout=10)
+                    if blob[:4] == b"\x89PNG":
+                        data = blob
+                        break
+                except Exception:
+                    pass
+            if data:
+                try:
+                    with open(path + ".part", "wb") as f:
+                        f.write(data)
+                    os.replace(path + ".part", path)
+                except OSError:
+                    data = None
+            if not data:
+                self._failed[code] = time.time()
+            self.loaded.emit(code)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_loaded(self, code):
+        self._busy.discard(code)
+        pm = self.pixmap(code)
+        setters = self._waiters.pop(code, [])
+        if pm is None:
+            return
+        for setter in setters:
+            try:
+                setter(pm)
+            except RuntimeError:        # the widget was deleted while the download ran
+                pass
+
+_emoji_store_obj = None
+
+def emoji_store():
+    global _emoji_store_obj
+    if _emoji_store_obj is None:
+        _emoji_store_obj = _EmojiStore()
+    return _emoji_store_obj
+
+def _emoji_button(ch, size, parent=None):
+    """A flat button that shows the Twemoji image for ch (the plain character until the image arrives)."""
+    btn = QPushButton(ch, parent)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setFlat(True)
+    btn.setFixedSize(size + 12, size + 10)
+    btn.setStyleSheet("QPushButton{border:none;border-radius:6px;background:transparent;padding:0;}"
+                      "QPushButton:hover{background:rgba(128,128,128,0.30);}")
+    def put(pm, b=btn):
+        b.setText("")
+        b.setIcon(QIcon(pm))
+        b.setIconSize(QSize(size, size))
+    emoji_store().bind(emoji_code(ch), put)
+    return btn
+
+class EmojiPicker(QFrame):
+    picked = pyqtSignal(str)
+    COLS = 8
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setObjectName("EmojiPicker")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setAutoFillBackground(True)
+        self.setFixedSize(self.COLS * 38 + 28, 320)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(2)
+        for i, (name, icon, _items) in enumerate(EMOJI_CATEGORIES):
+            b = _emoji_button(icon, 20)
+            b.setToolTip(name)
+            b.clicked.connect(lambda _=False, n=i: self._show_cat(n))
+            tabs.addWidget(b)
+        tabs.addStretch()
+        lay.addLayout(tabs)
+        self._title = QLabel("")
+        self._title.setStyleSheet("color:#888888; font-size:11px;")
+        lay.addWidget(self._title)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        lay.addWidget(self._scroll, 1)
+        self._show_cat(0)
+
+    def _show_cat(self, i):
+        name, _icon, items = EMOJI_CATEGORIES[i]
+        self._title.setText(name)
+        holder = QWidget()
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(2)
+        for n, ch in enumerate(items.split()):
+            b = _emoji_button(ch, 24)
+            b.clicked.connect(lambda _=False, c=ch: self._pick(c))
+            grid.addWidget(b, n // self.COLS, n % self.COLS)
+        grid.setRowStretch(grid.rowCount(), 1)
+        self._scroll.setWidget(holder)
+
+    def _pick(self, ch):
+        self.close()
+        self.picked.emit(ch)
+
+    def show_near(self, anchor):
+        below = anchor.mapToGlobal(QPoint(0, anchor.height()))
+        above = anchor.mapToGlobal(QPoint(0, 0))
+        screen = QApplication.screenAt(below) or QApplication.primaryScreen()
+        g = screen.availableGeometry()
+        x = max(g.left(), min(below.x(), g.right() - self.width()))
+        y = below.y() if below.y() + self.height() <= g.bottom() else above.y() - self.height()
+        self.move(x, max(g.top(), y))
+        self.show()
+
+
+class _ClickLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+class _ChatInput(QLineEdit):
+    """Message box that also accepts pasted images / copied files, and Esc to cancel a reply."""
+    image_pasted = pyqtSignal(object)
+    files_pasted = pyqtSignal(object)
+    escaped = pyqtSignal()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.escaped.emit()
+            return
+        if e.matches(QKeySequence.StandardKey.Paste):
+            md = QApplication.clipboard().mimeData()
+            if md is not None:
+                files = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
+                if files:
+                    self.files_pasted.emit(files)
+                    return
+                if md.hasImage() and not md.hasText():
+                    img = QApplication.clipboard().image()
+                    if not img.isNull():
+                        self.image_pasted.emit(img)
+                        return
+        super().keyPressEvent(e)
+
+
+class _MsgRow(QWidget):
+    """One message: optional reply quote, bubble (text + images/videos), reaction chips, time, hover actions."""
+
+    def __init__(self, chat, m, me, mine):
+        super().__init__()
+        self.chat, self.m, self.mine = chat, m, mine
+        self.key = m.get("_key")
+        text = str(m.get("text", "") or "")
+        atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
+        align = Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft
+
+        col = QVBoxLayout()
+        col.setSpacing(2)
+
+        re_ = m.get("re")
+        if isinstance(re_, dict):
+            col.addWidget(self._quote(re_), 0, align)
+
+        self._bubble_base = ("#ChatBubble{background:#a666ff; border-radius:12px;}" if mine
+                             else "#ChatBubble{background:rgba(128,128,128,0.28); border-radius:12px;}")
+        self.bubble = QFrame()
+        self.bubble.setObjectName("ChatBubble")
+        self.bubble.setStyleSheet(self._bubble_base)
+        bl = QVBoxLayout(self.bubble)
+        pad = (10, 7, 10, 7) if text else (4, 4, 4, 4)
+        bl.setContentsMargins(*pad)
+        bl.setSpacing(6)
+        if text:
+            lab = QLabel(text)
+            lab.setTextFormat(Qt.TextFormat.PlainText)
+            lab.setWordWrap(True)
+            lab.setMaximumWidth(380)
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            lab.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+            lab.setStyleSheet("QLabel{background:transparent;" + ("color:#ffffff;" if mine else "") + "}")
+            bl.addWidget(lab)
+        for att in atts[:CHAT_MAX_ATTACH]:
+            bl.addWidget(chat.attachment_widget(att, mine))
+        if not text and not atts:
+            bl.addWidget(QLabel("(empty message)"))
+        col.addWidget(self.bubble, 0, align)
+
+        rx = m.get("rx") if isinstance(m.get("rx"), dict) else {}
+        chips = []
+        for code in sorted(rx):
+            users = [u for u, v in rx[code].items() if v] if isinstance(rx[code], dict) else []
+            if users and _EMOJI_CODE_RE.match(code):
+                chips.append((code, users))
+        for i in range(0, len(chips), 6):
+            line = QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(4)
+            for code, users in chips[i:i + 6]:
+                line.addWidget(self._chip(code, users, me))
+            line.addStretch()
+            holder = QWidget()
+            holder.setLayout(line)
+            col.addWidget(holder, 0, align)
+
+        ts = m.get("ts")
+        stamp = QLabel(time.strftime("%H:%M", time.localtime(ts / 1000.0)) if isinstance(ts, (int, float)) else "")
+        stamp.setStyleSheet("color:#888888; font-size:10px;")
+        col.addWidget(stamp, 0, align)
+
+        # hover actions sit beside the bubble, in the empty space, so showing them never moves the bubble
+        self.bar = QFrame()
+        self.bar.setObjectName("MsgBar")
+        self.bar.setStyleSheet("#MsgBar{border:1px solid rgba(128,128,128,0.5); border-radius:8px;"
+                               "background:rgba(128,128,128,0.15);}")
+        bar_l = QHBoxLayout(self.bar)
+        bar_l.setContentsMargins(3, 2, 3, 2)
+        bar_l.setSpacing(2)
+        self.react_btn = _emoji_button("\U0001F642", 18)
+        self.react_btn.setToolTip("Add reaction")
+        self.react_btn.clicked.connect(self._pick_reaction)
+        reply_btn = QPushButton("Reply")
+        reply_btn.setFlat(True)
+        reply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reply_btn.setStyleSheet("QPushButton{border:none;padding:2px 6px;border-radius:6px;}"
+                                "QPushButton:hover{background:rgba(128,128,128,0.30);}")
+        reply_btn.clicked.connect(lambda: chat.reply_requested.emit(self.m))
+        bar_l.addWidget(self.react_btn)
+        bar_l.addWidget(reply_btn)
+        self.bar.hide()
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        if mine:
+            outer.addStretch()
+            outer.addWidget(self.bar, 0, Qt.AlignmentFlag.AlignTop)
+            outer.addLayout(col)
+        else:
+            outer.addLayout(col)
+            outer.addWidget(self.bar, 0, Qt.AlignmentFlag.AlignTop)
+            outer.addStretch()
+
+    def _quote(self, re_):
+        who = "You" if re_.get("f") == self.chat.me else (self.chat.names.get(re_.get("f")) or "Unknown")
+        snippet = str(re_.get("t") or "").strip() or {"img": "Image", "gif": "GIF", "vid": "Video"}.get(
+            re_.get("a"), "Attachment" if re_.get("a") else "Original message")
+        snippet = snippet if len(snippet) <= 60 else snippet[:57] + "..."
+        lab = _ClickLabel(f"\u21AA {who}: {snippet}")
+        lab.setTextFormat(Qt.TextFormat.PlainText)
+        lab.setCursor(Qt.CursorShape.PointingHandCursor)
+        lab.setStyleSheet("QLabel{color:#888888; font-size:11px; border-left:3px solid #a666ff; padding-left:6px;}")
+        lab.setMaximumWidth(380)
+        lab.setToolTip("Jump to the original message")
+        key = re_.get("k")
+        lab.clicked.connect(lambda: self.chat.jump_to(key))
+        return lab
+
+    def _chip(self, code, users, me):
+        mine_on = me in users
+        btn = QPushButton(f"{emoji_from_code(code)} {len(users)}")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        names = ["You" if u == me else (self.chat.names.get(u) or "Someone") for u in users]
+        btn.setToolTip(", ".join(names))
+        if mine_on:
+            style = "border:1px solid #a666ff; background:rgba(166,102,255,0.28);"
+        else:
+            style = "border:1px solid rgba(128,128,128,0.45); background:rgba(128,128,128,0.18);"
+        btn.setStyleSheet("QPushButton{" + style + "border-radius:10px; padding:1px 7px;}"
+                          "QPushButton:hover{background:rgba(128,128,128,0.35);}")
+        def put(pm, b=btn, n=len(users)):
+            b.setIcon(QIcon(pm))
+            b.setIconSize(QSize(16, 16))
+            b.setText(f" {n}")
+        emoji_store().bind(code, put)
+        key = self.key
+        btn.clicked.connect(lambda: key and self.chat.react_requested.emit(key, code))
+        return btn
+
+    def _pick_reaction(self, anchor=None):
+        key = self.key
+        if not key:
+            return
+        self.chat.open_picker(anchor if isinstance(anchor, QWidget) else self.react_btn,
+                              lambda ch: self.chat.react_requested.emit(key, emoji_code(ch)))
+
+    def flash(self):
+        try:
+            self.bubble.setStyleSheet(self._bubble_base + "#ChatBubble{border:2px solid #ffd666;}")
+            QTimer.singleShot(1200, self._unflash)
+        except RuntimeError:
+            pass
+
+    def _unflash(self):
+        try:
+            self.bubble.setStyleSheet(self._bubble_base)
+        except RuntimeError:
+            pass
+
+    def enterEvent(self, e):
+        if self.key:
+            self.bar.show()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.bar.hide()
+        super().leaveEvent(e)
+
+    def contextMenuEvent(self, e):
+        if not self.key:
+            return
+        menu = QMenu(self)
+        a_reply = menu.addAction("Reply")
+        a_react = menu.addAction("Add reaction...")
+        text = str(self.m.get("text", "") or "")
+        a_copy = menu.addAction("Copy text") if text else None
+        act = menu.exec(e.globalPos())
+        if act is a_reply:
+            self.chat.reply_requested.emit(self.m)
+        elif act is a_react:
+            self._pick_reaction(self.bubble)
+        elif a_copy is not None and act is a_copy:
+            QApplication.clipboard().setText(text)
+
+
 class ChatView(QScrollArea):
-    """Scrollable chat with message bubbles (green = you, grey = them)."""
+    """Scrollable chat: bubbles (purple = you, grey = them) with replies, attachments and reactions."""
+    reply_requested = pyqtSignal(object)        # the message dict to reply to
+    react_requested = pyqtSignal(str, str)      # message key, Twemoji code (toggles the reaction)
+    _media_ready = pyqtSignal(str, str, str)    # attachment id, file path, error
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
@@ -7163,6 +7754,16 @@ class ChatView(QScrollArea):
         self.setWidget(self._holder)
         self._stick = False
         self._force_bottom = True
+        self.other_uid = None
+        self.me = None
+        self.names = {}
+        self._rows = {}
+        self._pix_cache = {}
+        self._media_waiters = {}
+        self._media_busy = set()
+        self._picker = None
+        self._picker_cb = None
+        self._media_ready.connect(self._on_media_ready)
         bar = self.verticalScrollBar()
         # whenever the content grows, stay glued to the newest message while sticking
         bar.rangeChanged.connect(lambda _mn, mx: bar.setValue(mx) if self._stick else None)
@@ -7173,14 +7774,147 @@ class ChatView(QScrollArea):
         self.clear()
 
     def clear(self):
+        self._rows = {}
         while self._lay.count() > 1:
             w = self._lay.takeAt(0).widget()
             if w:
+                w.hide()                        # gone from the screen right away, freed on the next event-loop pass
                 w.deleteLater()
 
-    def set_messages(self, me, msgs):
+    # -- emoji picker (shared by the message rows and the composer)
+    def open_picker(self, anchor, callback):
+        if self._picker is None:
+            self._picker = EmojiPicker(self)
+            self._picker.picked.connect(lambda ch: self._picker_cb(ch) if self._picker_cb else None)
+        self._picker_cb = callback
+        self._picker.show_near(anchor)
+
+    def jump_to(self, key):
+        row = self._rows.get(key)
+        if row is not None:
+            self.ensureWidgetVisible(row, 0, 80)
+            row.flash()
+
+    # -- attachments
+    def attachment_widget(self, att, mine):
+        if att.get("k") == "vid":
+            return self._video_button(att, mine)
+        return self._image_label(att, att.get("k") == "gif")
+
+    def _cached(self, att):
+        path = _att_cache_path(att)
+        return path if path and os.path.exists(path) and os.path.getsize(path) > 0 else None
+
+    def _want_media(self, att, cb):
+        aid = str(att.get("id", ""))
+        self._media_waiters.setdefault(aid, []).append(cb)
+        if aid in self._media_busy:
+            return
+        self._media_busy.add(aid)
+        other = self.other_uid
+        def work():
+            try:
+                path, err = cloud_fetch_media(other, att), ""
+            except Exception as e:
+                path, err = "", str(e) or "Couldn't load this attachment."
+            self._media_ready.emit(aid, path, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_media_ready(self, aid, path, err):
+        self._media_busy.discard(aid)
+        for cb in self._media_waiters.pop(aid, []):
+            try:
+                cb(path or None, err)
+            except RuntimeError:                # the bubble was rebuilt while this downloaded
+                pass
+
+    def _image_label(self, att, is_gif):
+        w, h = int(att.get("w") or 0), int(att.get("h") or 0)
+        if w <= 0 or h <= 0:
+            w, h = 320, 200
+        scale = min(1.0, 320 / w, 260 / h)
+        dw, dh = max(48, int(w * scale)), max(48, int(h * scale))
+        lab = _ClickLabel("Loading...")
+        lab.setFixedSize(dw, dh)
+        lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lab.setCursor(Qt.CursorShape.PointingHandCursor)
+        lab.setStyleSheet("QLabel{background:rgba(128,128,128,0.25); border-radius:8px; color:#aaaaaa;}")
+        def paint(path, _err=""):
+            if not path:
+                lab.setText("Couldn't load")
+                return
+            if is_gif:
+                mv = QMovie(path)
+                mv.setScaledSize(QSize(dw, dh))
+                mv.setParent(lab)
+                lab.setMovie(mv)
+                lab.setStyleSheet("QLabel{background:transparent;}")
+                mv.start()
+                return
+            ck = (att.get("id"), dw, dh)
+            pm = self._pix_cache.get(ck)
+            if pm is None:
+                pm = rounded_cover_pixmap(path, dw, dh, 8)
+                if pm is not None:
+                    if len(self._pix_cache) > 80:
+                        self._pix_cache.clear()
+                    self._pix_cache[ck] = pm
+            if pm is None:
+                lab.setText("Couldn't load")
+                return
+            lab.setStyleSheet("QLabel{background:transparent;}")
+            lab.setPixmap(pm)
+        cached = self._cached(att)
+        if cached:
+            paint(cached)
+        else:
+            self._want_media(att, paint)
+        lab.clicked.connect(lambda: self._open_attachment(att))
+        return lab
+
+    def _video_button(self, att, mine):
+        name = str(att.get("n") or "video")
+        name = name if len(name) <= 34 else name[:31] + "..."
+        label = f"\u25B6  {name}   ({_chat_fmt_size(att.get('s'))})"
+        btn = QPushButton(label)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("Open in your video player")
+        btn.setStyleSheet("QPushButton{text-align:left; padding:10px 14px; border:none; border-radius:8px;"
+                          "background:rgba(0,0,0,0.25);" + ("color:#ffffff;" if mine else "") + "}"
+                          "QPushButton:hover{background:rgba(0,0,0,0.38);}")
+        def open_it(path, err=""):
+            try:
+                btn.setEnabled(True)
+                btn.setText(label if path else "Couldn't load this video")
+            except RuntimeError:
+                return
+            if path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        def clicked():
+            cached = self._cached(att)
+            if cached:
+                open_it(cached)
+                return
+            btn.setEnabled(False)
+            btn.setText("Downloading...")
+            self._want_media(att, open_it)
+        btn.clicked.connect(clicked)
+        return btn
+
+    def _open_attachment(self, att):
+        cached = self._cached(att)
+        if cached:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(cached))
+        else:
+            self._want_media(att, lambda p, e="": QDesktopServices.openUrl(QUrl.fromLocalFile(p)) if p else None)
+
+    # -- the messages
+    def set_messages(self, me, msgs, names=None):
         bar = self.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 30
+        keep = bar.value()
+        self.me = me
+        self.names = names or {}
         self.clear()
         if not msgs:
             hint = QLabel("No messages yet. Say hi!")
@@ -7188,40 +7922,18 @@ class ChatView(QScrollArea):
             hint.setStyleSheet("color: #888888;")
             self._lay.insertWidget(0, hint)
         for i, m in enumerate(msgs):
-            mine = m.get("from") == me
-            bubble = QLabel(str(m.get("text", "")))
-            bubble.setTextFormat(Qt.TextFormat.PlainText)
-            bubble.setWordWrap(True)
-            bubble.setMaximumWidth(380)
-            bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            if mine:
-                bubble.setStyleSheet("background:#a666ff; color:#ffffff; border-radius:12px; padding:8px 12px;")
-            else:
-                bubble.setStyleSheet("background:rgba(128,128,128,0.28); border-radius:12px; padding:8px 12px;")
-            ts = m.get("ts")
-            stamp = QLabel(time.strftime("%H:%M", time.localtime(ts / 1000.0))
-                           if isinstance(ts, (int, float)) else "")
-            stamp.setStyleSheet("color:#888888; font-size:10px;")
-            col = QVBoxLayout()
-            col.setSpacing(1)
-            col.addWidget(bubble, 0, Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft)
-            col.addWidget(stamp, 0, Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft)
-            row = QHBoxLayout()
-            if mine:
-                row.addStretch()
-                row.addLayout(col)
-            else:
-                row.addLayout(col)
-                row.addStretch()
-            wrap = QWidget()
-            wrap.setLayout(row)
-            row.setContentsMargins(0, 0, 0, 0)
-            self._lay.insertWidget(i, wrap)
+            row = _MsgRow(self, m, me, m.get("from") == me)
+            if m.get("_key"):
+                self._rows[m["_key"]] = row
+            self._lay.insertWidget(i, row)
         self._stick = self._force_bottom or at_bottom
         self._force_bottom = False
         if self._stick:
             QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
             QTimer.singleShot(300, lambda: setattr(self, "_stick", False))
+        else:                                   # a reaction in the middle of the history shouldn't throw you to the bottom
+            for ms in (0, 60):
+                QTimer.singleShot(ms, lambda: bar.setValue(keep))
 
 
 class FriendsPage(QWidget):
@@ -7243,6 +7955,15 @@ class FriendsPage(QWidget):
         self.friends = {}
         self.current_uid = None
         self._last_msg_key = ""
+        self._msgs = []
+        self._me = None
+        self._pending = []          # prepared attachments waiting to be sent
+        self._preparing = 0
+        self._reply = None
+        self._sending = False
+        self._rx_inflight = 0
+        self._att_seq = 0
+        self.setAcceptDrops(True)
         self._done.connect(lambda cb, res, err: cb(res, err))
 
         outer = QVBoxLayout(self)
@@ -7444,7 +8165,7 @@ class FriendsPage(QWidget):
                 if viewing:
                     continue
                 name = self.friends.get(uid, {}).get("username") or "A friend"
-                text = str(msg.get("text", ""))
+                text = chat_preview(msg)
                 self.friend_event.emit(name, text if len(text) <= 100 else text[:97] + "...", uid)
         self._prev_last = {uid: key for uid, (key, _m) in last.items()}
 
@@ -7594,16 +8315,64 @@ class FriendsPage(QWidget):
         msg_title.setObjectName("RowTitle")
         lay.addWidget(msg_title)
         self.chat_view = ChatView()
+        self.chat_view.reply_requested.connect(self.start_reply)
+        self.chat_view.react_requested.connect(self.toggle_reaction)
         lay.addWidget(self.chat_view, 1)
+
+        self.reply_bar = QFrame()
+        self.reply_bar.setObjectName("ReplyBar")
+        self.reply_bar.setStyleSheet("#ReplyBar{background:rgba(128,128,128,0.18); border-radius:8px;}")
+        rb = QHBoxLayout(self.reply_bar)
+        rb.setContentsMargins(10, 4, 6, 4)
+        self.reply_label = QLabel("")
+        self.reply_label.setStyleSheet("color:#888888;")
+        cancel_reply = QPushButton("\u2715")
+        cancel_reply.setFlat(True)
+        cancel_reply.setFixedSize(24, 24)
+        cancel_reply.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_reply.setToolTip("Cancel reply (Esc)")
+        cancel_reply.clicked.connect(self.cancel_reply)
+        rb.addWidget(self.reply_label, 1)
+        rb.addWidget(cancel_reply)
+        self.reply_bar.hide()
+        lay.addWidget(self.reply_bar)
+
+        self.att_bar = QWidget()
+        self.att_row = QHBoxLayout(self.att_bar)
+        self.att_row.setContentsMargins(0, 0, 0, 0)
+        self.att_row.setSpacing(6)
+        self.att_row.addStretch()
+        self.att_bar.hide()
+        lay.addWidget(self.att_bar)
+
+        self.chat_status = QLabel("")
+        self.chat_status.setStyleSheet("color:#888888; font-size:11px;")
+        self.chat_status.hide()
+        lay.addWidget(self.chat_status)
+
         send_row = QHBoxLayout()
-        self.chat_input = QLineEdit()
+        self.attach_btn = QPushButton("+")
+        self.attach_btn.setFixedSize(36, 34)
+        self.attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.attach_btn.setToolTip("Attach images or videos (you can also paste or drop them)")
+        self.attach_btn.clicked.connect(self.pick_attachments)
+        self.chat_input = _ChatInput()
         self.chat_input.setPlaceholderText("Write a message...")
         self.chat_input.setMaxLength(500)
+        self.chat_input.setAcceptDrops(False)       # so dropped files reach the page instead of becoming text
         self.chat_input.returnPressed.connect(self.send_message)
+        self.chat_input.image_pasted.connect(self._on_image_pasted)
+        self.chat_input.files_pasted.connect(self.add_files)
+        self.chat_input.escaped.connect(self.cancel_reply)
+        self.emoji_btn = _emoji_button("\U0001F642", 22)
+        self.emoji_btn.setToolTip("Emoji")
+        self.emoji_btn.clicked.connect(self._emoji_for_input)
         send = QPushButton("Send")
         send.setObjectName("Primary")
         send.clicked.connect(self.send_message)
+        send_row.addWidget(self.attach_btn)
         send_row.addWidget(self.chat_input, 1)
+        send_row.addWidget(self.emoji_btn)
         send_row.addWidget(send)
         lay.addLayout(send_row)
         lay.addSpacing(16)
@@ -7612,6 +8381,12 @@ class FriendsPage(QWidget):
     def open_friend(self, uid):
         self.current_uid = uid
         self._last_msg_key = ""
+        self._msgs = []
+        self._pending = []
+        self._refresh_att_bar()
+        self.cancel_reply()
+        self._set_status("")
+        self.chat_view.other_uid = uid
         self.chat_view.reset()
         self._lib_sig = None
         self._fill_profile()
@@ -7685,27 +8460,241 @@ class FriendsPage(QWidget):
         if self.current_uid == uid and self.stack.currentIndex() == 1:
             self._fill_profile()
 
-    def load_messages(self):
+    # -- chat: loading, replies, attachments, reactions
+    def _chat_names(self):
+        names = {}
+        if self._me:
+            names[self._me] = "You"
+        if self.current_uid:
+            names[self.current_uid] = self.friends.get(self.current_uid, {}).get("username") or "Unknown"
+        return names
+
+    @staticmethod
+    def _sig_of(msgs):
+        return json.dumps(msgs, sort_keys=True, default=str)
+
+    def _render_chat(self):
+        self.chat_view.other_uid = self.current_uid
+        self.chat_view.set_messages(self._me, self._msgs, self._chat_names())
+
+    def _set_status(self, text):
+        self.chat_status.setText(text or "")
+        self.chat_status.setVisible(bool(text))
+
+    def load_messages(self, force=False):
         uid = self.current_uid
         if not uid:
             return
         def done(res, err):
             if err or uid != self.current_uid:
                 return
-            me, msgs, last_key = res
-            if last_key == self._last_msg_key:
+            if self._rx_inflight > 0 and not force:     # a reaction is still being saved: don't flash the old state back
                 return
-            self._last_msg_key = last_key
-            self.chat_view.set_messages(me, msgs)
+            me, msgs, _last_key = res
+            sig = self._sig_of(msgs)
+            if sig == self._last_msg_key:
+                return
+            self._last_msg_key = sig
+            self._me, self._msgs = me, msgs
+            self._render_chat()
         self._run(lambda: cloud_get_messages(uid), done, key=("messages", uid))
 
     def send_message(self):
-        text = self.chat_input.text().strip()
         uid = self.current_uid
-        if not text or not uid:
+        if not uid or self._sending:
             return
+        if self._preparing:
+            self._set_status("Still preparing your files...")
+            return
+        text = self.chat_input.text().strip()
+        atts = list(self._pending)
+        if not text and not atts:
+            return
+        reply = self._reply
         self.chat_input.clear()
-        self._run(lambda: cloud_send_message(uid, text), lambda r, e: self.load_messages())
+        self._pending = []
+        self._refresh_att_bar()
+        self.cancel_reply()
+        if atts:
+            self._sending = True
+            self.attach_btn.setEnabled(False)
+            self._set_status(f"Uploading {len(atts)} file{'s' if len(atts) != 1 else ''}...")
+        def done(res, err):
+            if atts:
+                self._sending = False
+                self.attach_btn.setEnabled(True)
+            if err:
+                self._set_status(err)
+                if uid == self.current_uid:             # give the user their message back
+                    if not self.chat_input.text():
+                        self.chat_input.setText(text)
+                    if atts and not self._pending:
+                        self._pending = atts
+                        self._refresh_att_bar()
+                    if reply and not self._reply:
+                        self._show_reply(reply)
+            else:
+                self._set_status("")
+            self.load_messages(force=True)
+        self._run(lambda: cloud_send_message(uid, text, atts, reply), done)
+
+    # replies
+    def start_reply(self, m):
+        key = m.get("_key")
+        if not key:
+            return
+        atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
+        self._show_reply({"k": key, "f": m.get("from") or "", "t": str(m.get("text") or "")[:100],
+                          "a": (atts[0].get("k") or "file") if atts else ""})
+        self.chat_input.setFocus()
+
+    def _show_reply(self, reply):
+        self._reply = reply
+        who = "yourself" if reply.get("f") == self._me else (self._chat_names().get(reply.get("f")) or "Unknown")
+        snippet = reply.get("t") or {"img": "an image", "gif": "a GIF", "vid": "a video"}.get(reply.get("a"), "an attachment")
+        snippet = self.reply_label.fontMetrics().elidedText(snippet, Qt.TextElideMode.ElideRight, 420)
+        self.reply_label.setText(f"Replying to {who}: {snippet}")
+        self.reply_bar.show()
+
+    def cancel_reply(self):
+        self._reply = None
+        self.reply_bar.hide()
+
+    # attachments
+    def pick_attachments(self):
+        exts = " ".join("*" + e for e in CHAT_IMAGE_EXTS + CHAT_VIDEO_EXTS)
+        paths, _f = QFileDialog.getOpenFileNames(self, "Attach images or videos", os.path.expanduser("~"),
+                                                 f"Images and videos ({exts});;All files (*)")
+        if paths:
+            self.add_files(paths)
+
+    def add_files(self, paths):
+        if not self.current_uid or self._sending:
+            return
+        room = CHAT_MAX_ATTACH - len(self._pending) - self._preparing
+        if room <= 0:
+            self._set_status(f"You can attach up to {CHAT_MAX_ATTACH} files per message.")
+            return
+        if len(paths) > room:
+            self._set_status(f"Only {CHAT_MAX_ATTACH} files fit in one message, the rest were skipped.")
+        for p in list(paths)[:room]:
+            self._queue_prepare(lambda p=p: prepare_attachment(p))
+
+    def _on_image_pasted(self, img):
+        if not self.current_uid or self._sending:
+            return
+        if len(self._pending) + self._preparing >= CHAT_MAX_ATTACH:
+            self._set_status(f"You can attach up to {CHAT_MAX_ATTACH} files per message.")
+            return
+        self._queue_prepare(lambda: prepare_attachment_image(img))
+
+    def _queue_prepare(self, fn):
+        """Prepares a file on a worker thread; results are re-sorted so attachments keep the order they were picked in."""
+        self._preparing += 1
+        self._att_seq += 1
+        seq = self._att_seq
+        self._run(fn, lambda att, err, n=seq: self._on_prepared(att, err, n))
+
+    def _on_prepared(self, att, err, seq=0):
+        self._preparing = max(0, self._preparing - 1)
+        if err or not att:
+            self._set_status(err or "Couldn't attach that file.")
+            return
+        if att["kind"] != "vid":
+            thumb = QImage.fromData(att["data"])
+            if not thumb.isNull():
+                att["thumb"] = QPixmap.fromImage(thumb.scaled(
+                    40, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        att["_seq"] = seq
+        self._pending.append(att)
+        self._pending.sort(key=lambda a: a.get("_seq", 0))
+        self._refresh_att_bar()
+
+    def _remove_attachment(self, i):
+        if 0 <= i < len(self._pending):
+            del self._pending[i]
+            self._refresh_att_bar()
+
+    def _refresh_att_bar(self):
+        while self.att_row.count() > 1:
+            w = self.att_row.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        for i, a in enumerate(self._pending):
+            chip = QFrame()
+            chip.setObjectName("AttChip")
+            chip.setStyleSheet("#AttChip{background:rgba(128,128,128,0.2); border-radius:8px;}")
+            cl = QHBoxLayout(chip)
+            cl.setContentsMargins(4, 4, 4, 4)
+            cl.setSpacing(6)
+            thumb = QLabel()
+            thumb.setFixedSize(40, 40)
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if a.get("thumb") is not None:
+                thumb.setPixmap(a["thumb"])
+            else:
+                thumb.setText("\u25B6")
+            name = str(a["name"])
+            cl.addWidget(thumb)
+            cl.addWidget(QLabel(name if len(name) <= 18 else name[:15] + "..."))
+            rm = QPushButton("\u2715")
+            rm.setFlat(True)
+            rm.setFixedSize(22, 22)
+            rm.setCursor(Qt.CursorShape.PointingHandCursor)
+            rm.setToolTip("Remove")
+            rm.clicked.connect(lambda _=False, n=i: self._remove_attachment(n))
+            cl.addWidget(rm)
+            self.att_row.insertWidget(i, chip)
+        self.att_bar.setVisible(bool(self._pending))
+
+    def dragEnterEvent(self, e):
+        if self.stack.currentIndex() == 1 and e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.add_files(paths)
+            e.acceptProposedAction()
+
+    # emoji + reactions
+    def _emoji_for_input(self):
+        def insert(ch):
+            self.chat_input.insert(ch)
+            self.chat_input.setFocus()
+        self.chat_view.open_picker(self.emoji_btn, insert)
+
+    def toggle_reaction(self, key, code):
+        uid = self.current_uid
+        if not uid or not self._me or not _EMOJI_CODE_RE.match(code or ""):
+            return
+        msg = next((m for m in self._msgs if m.get("_key") == key), None)
+        if msg is None:
+            return
+        rx = dict(msg["rx"]) if isinstance(msg.get("rx"), dict) else {}
+        users = dict(rx[code]) if isinstance(rx.get(code), dict) else {}
+        on = not users.get(self._me)
+        if on:
+            users[self._me] = True
+        else:
+            users.pop(self._me, None)
+        if users:
+            rx[code] = users
+        else:
+            rx.pop(code, None)
+        if rx:
+            msg["rx"] = rx
+        else:
+            msg.pop("rx", None)
+        self._last_msg_key = self._sig_of(self._msgs)       # show the change instantly, then confirm with the server
+        self._render_chat()
+        self._rx_inflight += 1
+        def done(res, err):
+            self._rx_inflight = max(0, self._rx_inflight - 1)
+            if err:
+                self._set_status(err)
+            self.load_messages(force=True)
+        self._run(lambda: cloud_set_reaction(uid, key, code, on), done)
 
 _friends_prev_init = AdaptiveApp.__init__
 
@@ -13845,7 +14834,7 @@ class _FriendsPanel(QWidget):
         if not res or res[0] != self.uid:
             return
         _other, me, msgs = res
-        sig = tuple((m.get("from"), m.get("text")) for m in msgs)
+        sig = tuple((m.get("from"), chat_preview(m)) for m in msgs)
         if sig == self._sig:
             return                              # nothing new: don't rebuild (avoids flicker)
         first = self._sig is None
@@ -13862,7 +14851,7 @@ class _FriendsPanel(QWidget):
             self.cv.addWidget(e)
         for m in msgs:
             mine = m.get("from") == me
-            b = QLabel(str(m.get("text", "")))
+            b = QLabel(chat_preview(m))
             b.setObjectName("Mine" if mine else "Theirs")
             b.setWordWrap(True)
             b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -14068,7 +15057,7 @@ class _InjectBridge(QObject):
         me, msgs = res[0], res[1]
         lines = [str(time.time_ns()), uid]
         for m in msgs:
-            lines.append(("1" if m.get("from") == me else "0") + "\t" + self._clean(m.get("text", "")))
+            lines.append(("1" if m.get("from") == me else "0") + "\t" + self._clean(chat_preview(m)))
         self._atomic_write("ncz_chat.txt", lines)
 
     def _load_chat(self, uid):
