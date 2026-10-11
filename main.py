@@ -1161,6 +1161,7 @@ QToolTip { background: #ffffff; color: #0a0a0c; border: none; padding: 5px 8px; 
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget#qt_scrollarea_viewport { background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
+QWidget#SettingsContent { background: transparent; }
 
 /* ---- top navigation bar ---- */
 QFrame#Sidebar { background: $sidebar; border-bottom: 1px solid #1e1e22; }
@@ -1621,8 +1622,22 @@ class SettingsPage(QWidget):
         self._key_worker = None
         QApplication.instance().aboutToQuit.connect(self._wait_for_key_worker)
         self.setObjectName("Content")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 28, 36, 0)
+        # Everything lives in a scroll area so the panels keep their full height instead of being squashed
+        # (other code adds rows through self.layout(), so layout() returns the inner content layout).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._content = QWidget()
+        self._content.setObjectName("SettingsContent")
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll)
+        layout = QVBoxLayout(self._content)
+        self._content_layout = layout
+        layout.setContentsMargins(36, 28, 36, 28)
         layout.setSpacing(0)
 
         title = QLabel("Settings")
@@ -1780,6 +1795,9 @@ class SettingsPage(QWidget):
             d3d_panel_layout.addLayout(d3d_row)
             layout.addWidget(d3d_panel)
         layout.addStretch()
+
+    def layout(self):
+        return getattr(self, "_content_layout", None) or super().layout()
 
     # ---- game library locations (NCZLibrary on any partition)
     def _build_library_panel(self):
