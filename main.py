@@ -12437,12 +12437,13 @@ import csv as _csv
 
 def _fan_csv_path():
     names = ("fan_games.csv", "gamejolt_by_tag.csv")
-    dirs = [os.path.dirname(os.path.abspath(__file__))]
-    for getter in (_bundled_dir, _writable_dir):
+    dirs = []
+    for getter in (_writable_dir, _bundled_dir):
         try:
             dirs.append(getter())
         except Exception:
             pass
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
     for d in dirs:
         for n in names:
             p = os.path.join(d, n)
@@ -12899,6 +12900,289 @@ class FanDetailPage(StoreDetailPage):
         self.shots_row.addStretch()
         self._set_extras_visible(True)
 
+# ---------------------------------------------------------------- Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv)
+GAMEJOLT_SCRAPER_URL = "https://github.com/justmm33/FNaNCZ-AE-Releases/raw/refs/heads/main/gamejolt_scraper.py"
+
+def _scraper_python():
+    """A python that can run the scraper. Frozen builds have no python of their own, so look on the system."""
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    names = ("python", "py", "python3") if sys.platform.startswith("win") else ("python3", "python")
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+class ScrapeWorker(QThread):
+    stage = pyqtSignal(str)          # what is happening right now
+    line = pyqtSignal(str)           # one line of scraper output
+    finished_ok = pyqtSignal(bool, str)   # success, message
+
+    def __init__(self, count):
+        super().__init__()
+        self.count = count
+        self._proc = None
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        p = self._proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        folder = _writable_dir()
+        script = os.path.join(folder, "gamejolt_scraper.py")
+        csv_path = os.path.join(folder, "fan_games.csv")
+        backup = csv_path + ".bak"
+        had_csv = os.path.exists(csv_path)
+        try:
+            # 1) download the newest scraper (an older copy is used if the download fails)
+            self.stage.emit("Downloading the scraper...")
+            try:
+                req = urllib.request.Request(GAMEJOLT_SCRAPER_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                if not data.strip():
+                    raise ValueError("the downloaded file is empty")
+                with open(script, "wb") as f:
+                    f.write(data)
+                self.line.emit("Downloaded gamejolt_scraper.py")
+            except Exception as e:
+                if not os.path.exists(script):
+                    self.finished_ok.emit(False, f"Could not download the scraper: {e}")
+                    return
+                self.line.emit(f"Download failed ({e}), using the copy that is already here.")
+            if self._cancelled:
+                self.finished_ok.emit(False, "Cancelled.")
+                return
+
+            py = _scraper_python()
+            if not py:
+                self.finished_ok.emit(False, "Python was not found on this PC. Install Python and try again.")
+                return
+
+            # 2) run it. The old csv is kept as a backup until the new one is written.
+            if had_csv:
+                shutil.copy2(csv_path, backup)
+            self.stage.emit("Scraping games...")
+            cmd = [py, "-u", "gamejolt_scraper.py", "--count", str(self.count), "--out", "fan_games.csv"]
+            env = system_env()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            kw = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+            self._proc = subprocess.Popen(cmd, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                          bufsize=1, **kw)
+            for raw in self._proc.stdout:
+                text = raw.rstrip()
+                if text:
+                    self.line.emit(text)
+            code = self._proc.wait()
+
+            if self._cancelled:
+                self._restore(csv_path, backup, had_csv)
+                self.finished_ok.emit(False, "Cancelled. Your old game list was kept.")
+                return
+            if code != 0:
+                self._restore(csv_path, backup, had_csv)
+                self.finished_ok.emit(False, f"The scraper stopped with an error (code {code}). Your old game list was kept.")
+                return
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) < 10:
+                self._restore(csv_path, backup, had_csv)
+                self.finished_ok.emit(False, "The scraper finished but did not create fan_games.csv. Your old game list was kept.")
+                return
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
+            self.finished_ok.emit(True, "Done!")
+        except Exception as e:
+            self._restore(csv_path, backup, had_csv)
+            self.finished_ok.emit(False, f"Something went wrong: {e}")
+
+    @staticmethod
+    def _restore(csv_path, backup, had_csv):
+        try:
+            if had_csv and os.path.exists(backup):
+                shutil.copy2(backup, csv_path)
+                os.remove(backup)
+        except OSError:
+            pass
+
+class ScrapeOptionsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QSpinBox
+        self.setWindowTitle("Scrape Games")
+        self.setMinimumWidth(400)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(12)
+        title = QLabel("Scrape Games")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        lay.addWidget(title)
+        lay.addWidget(QLabel("How many games from each genre?"))
+        self.spin = QSpinBox()
+        self.spin.setRange(1, 5000)
+        self.spin.setValue(50)
+        self.spin.setMinimumHeight(32)
+        lay.addWidget(self.spin)
+        warn = QLabel("This can affect PC performance. It also replaces your current fan games list.")
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color: #e0a030;")
+        lay.addSpacing(6)
+        lay.addWidget(warn)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        go = QPushButton("Scrape")
+        go.setObjectName("Primary")
+        go.setDefault(True)
+        go.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(go)
+        lay.addLayout(row)
+
+    def count(self):
+        return int(self.spin.value())
+
+class ScrapeProgressDialog(QDialog):
+    def __init__(self, parent, count):
+        super().__init__(parent)
+        self.success = False
+        self._done = False
+        self._t0 = time.time()
+        self.setWindowTitle("Scraping Game Jolt")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(10)
+        self.title = QLabel("Scraping Game Jolt")
+        self.title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        lay.addWidget(self.title)
+        self.stage = QLabel("Starting...")
+        lay.addWidget(self.stage)
+        bar_row = QHBoxLayout()
+        bar_row.setSpacing(10)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)          # moving bar until the scraper reports real numbers
+        self.bar.setTextVisible(False)   # the bar is only a few pixels tall, so the % is a separate label
+        self.percent = QLabel("")
+        self.percent.setMinimumWidth(42)
+        self.percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.percent.setStyleSheet("font-weight: bold;")
+        bar_row.addWidget(self.bar, 1)
+        bar_row.addWidget(self.percent)
+        lay.addLayout(bar_row)
+        self.detail = QLabel(f"{count} games per genre")
+        self.detail.setStyleSheet("color: gray;")
+        lay.addWidget(self.detail)
+        self.log_btn = QPushButton("Show details")
+        self.log_btn.setFlat(True)
+        self.log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_btn.clicked.connect(self._toggle_log)
+        lay.addWidget(self.log_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFixedHeight(160)
+        self.log.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.log.hide()
+        lay.addWidget(self.log)
+        row = QHBoxLayout()
+        self.elapsed = QLabel("0:00")
+        self.elapsed.setStyleSheet("color: gray;")
+        row.addWidget(self.elapsed)
+        row.addStretch()
+        self.btn = QPushButton("Cancel")
+        self.btn.clicked.connect(self._on_button)
+        row.addWidget(self.btn)
+        lay.addLayout(row)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(500)
+
+        self.worker = ScrapeWorker(count)
+        self.worker.stage.connect(self.stage.setText)
+        self.worker.line.connect(self._on_line)
+        self.worker.finished_ok.connect(self._on_finished)
+        self.worker.start()
+
+    def _toggle_log(self):
+        show = not self.log.isVisible()
+        self.log.setVisible(show)
+        self.log_btn.setText("Hide details" if show else "Show details")
+        self.adjustSize()
+
+    def _tick(self):
+        s = int(time.time() - self._t0)
+        self.elapsed.setText(f"{s // 60}:{s % 60:02d}")
+
+    def _on_line(self, text):
+        self.log.append(text)
+        short = text if len(text) <= 70 else text[:67] + "..."
+        self.detail.setText(short)
+        m = re.search(r"(\d+)\s*/\s*(\d+)", text)
+        if m and int(m.group(2)) > 0 and int(m.group(1)) <= int(m.group(2)):
+            self.bar.setRange(0, int(m.group(2)))
+            self.bar.setValue(int(m.group(1)))
+            self.percent.setText(f"{int(m.group(1)) * 100 // int(m.group(2))}%")
+            return
+        m = re.search(r"\b(\d{1,3})\s*%", text)
+        if m and int(m.group(1)) <= 100:
+            self.bar.setRange(0, 100)
+            self.bar.setValue(int(m.group(1)))
+            self.percent.setText(f"{int(m.group(1))}%")
+
+    def _on_finished(self, ok, message):
+        self._done = True
+        self.success = ok
+        self._timer.stop()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(100 if ok else 0)
+        self.percent.setText("100%" if ok else "")
+        if ok:
+            self.title.setText("All done")
+            self.stage.setText("Fan games list updated.")
+            self.detail.setText("")
+        else:
+            self.title.setText("Scrape did not finish")
+            self.stage.setText(message)
+            self.stage.setWordWrap(True)
+            if not self.log.isVisible():
+                self._toggle_log()
+        self.btn.setText("Close")
+        self.btn.setObjectName("Primary")
+        self.btn.style().unpolish(self.btn)
+        self.btn.style().polish(self.btn)
+        self.btn.setDefault(True)
+
+    def _on_button(self):
+        if self._done:
+            self.accept()
+            return
+        self.btn.setEnabled(False)
+        self.btn.setText("Cancelling...")
+        self.stage.setText("Stopping...")
+        self.worker.cancel()
+
+    def reject(self):          # Esc must not close the window while the scraper is running
+        if self._done:
+            super().reject()
+
+    def done(self, r):
+        if getattr(self, "worker", None) is not None:
+            self.worker.wait(3000)
+        super().done(r)
+
 FAN_COVER_W, FAN_COVER_H = 220, 124   # horizontal covers
 FAN_CARD_W = FAN_COVER_W + 18
 
@@ -12945,6 +13229,12 @@ class FanGamesPage(StorePage):
             self._tag_row.addWidget(b)
             self._tag_buttons[tag] = b
         self._tag_row.addStretch()
+        scrape = QPushButton("Scrape Games")
+        scrape.setCursor(Qt.CursorShape.PointingHandCursor)
+        scrape.setFixedHeight(32)
+        scrape.setToolTip("Download the Game Jolt scraper and rebuild fan_games.csv")
+        scrape.clicked.connect(self._scrape_games)
+        self._tag_row.addWidget(scrape)
         add = QPushButton("+ Add Game")
         add.setCursor(Qt.CursorShape.PointingHandCursor)
         add.setFixedHeight(32)
@@ -12965,6 +13255,18 @@ class FanGamesPage(StorePage):
         self._tag = cat.strip().lower()
         self._build_tag_buttons()
         self._set_tag(self._tag)
+
+    def _scrape_games(self):
+        dlg = ScrapeOptionsDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        prog = ScrapeProgressDialog(self, dlg.count())
+        prog.exec()
+        if prog.success:
+            games = reload_fan_games()                 # read the new csv
+            self._links = {gid: l for gid, _t, l, _tg in games}
+            self._build_tag_buttons()
+            self._set_tag(self._tag)
 
     def _set_tag(self, tag):
         self._tag = tag
