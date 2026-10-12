@@ -503,7 +503,8 @@ def get_launcher_settings_path():
 
 def load_launcher_settings():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
-                "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": []}
+                "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
+                "start_on_boot": True, "auto_update": True, "xwayland_mode": True}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -525,6 +526,12 @@ def load_launcher_settings():
                     settings["library_dirs"] = [d for d in loaded["library_dirs"] if isinstance(d, str) and d.strip()]
                 if isinstance(loaded.get("discord_rpc"), bool):
                     settings["discord_rpc"] = loaded["discord_rpc"]
+                if isinstance(loaded.get("start_on_boot"), bool):
+                    settings["start_on_boot"] = loaded["start_on_boot"]
+                if isinstance(loaded.get("auto_update"), bool):
+                    settings["auto_update"] = loaded["auto_update"]
+                if isinstance(loaded.get("xwayland_mode"), bool):
+                    settings["xwayland_mode"] = loaded["xwayland_mode"]
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
                     settings["steamgriddb_api_key"] = key.strip()
@@ -1791,6 +1798,584 @@ class PingWorker(QThread):
             pass
         self.result.emit(False)
 
+# ---------------------------------------------------------------- common redistributables
+REDIST_DIRNAME = "_CommonRedist"
+REDIST_DOWNLOADS = [
+    # (name, url, file name)
+    ("Visual C++ 2015-2022 (x64)", "https://aka.ms/vs/17/release/vc_redist.x64.exe", "vc_redist.x64.exe"),
+    ("Visual C++ 2015-2022 (x86)", "https://aka.ms/vs/17/release/vc_redist.x86.exe", "vc_redist.x86.exe"),
+    ("DirectX End-User Runtime", "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe", "dxwebsetup.exe"),
+]
+_REDIST_OK_CODES = {0, 1638, 1641, 3010, 5100}   # ok / newer already installed / reboot needed
+
+def _redist_silent_args(filename):
+    """Silent switches for a known redist installer, or None if we don't know how to run it quietly."""
+    n = filename.lower()
+    if n.endswith(".msi"):
+        return "msi"
+    if "unins" in n:
+        return None
+    if "vc_redist" in n or "vcredist" in n:
+        return ["/q", "/norestart"]
+    if "dxwebsetup" in n:
+        return ["/Q"]
+    if "dxsetup" in n:
+        return ["/silent"]
+    if "dotnet" in n or "ndp" in n:
+        return ["/q", "/norestart"]
+    if "oalinst" in n:
+        return ["/s"]
+    return None
+
+def collect_redist_installers(redist_dir):
+    """[(file name, path)] of the installers inside one _CommonRedist folder, one per file name."""
+    seen, items = set(), []
+    for base, _dirs, files in os.walk(redist_dir):
+        for f in sorted(files):
+            if not f.lower().endswith((".exe", ".msi")):
+                continue
+            key = f.lower()
+            if key in seen or _redist_silent_args(f) is None:
+                continue
+            seen.add(key)
+            items.append((f, os.path.join(base, f)))
+    return items
+
+def download_common_redist(dest_dir, report=None):
+    """Downloads the standard redistributables into dest_dir (normally <game folder>/_CommonRedist).
+    report(text, value, maximum) is called with progress (maximum 0 = unknown)."""
+    os.makedirs(dest_dir, exist_ok=True)
+    downloads = [d for d in REDIST_DOWNLOADS if sys.platform.startswith("win") or not _is_dx_setup(d[2])]
+    total = len(downloads)
+    for i, (name, url, fname) in enumerate(downloads, 1):
+        dest = os.path.join(dest_dir, fname)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            continue
+        if report:
+            report(f"Downloading {name} ({i} of {total})", 0, 0)
+        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
+        tmp = dest + ".part"
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+            size = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if report and size:
+                    report(f"Downloading {name} ({i} of {total})", done, size)
+        os.replace(tmp, dest)
+
+def _is_dx_setup(filename):
+    n = filename.lower()
+    return "dxwebsetup" in n or "dxsetup" in n
+
+_WINETRICKS_DX = ["d3dx9", "d3dx10", "d3dx11_43", "d3dcompiler_47"]
+
+def _proton_wine_bin(tool):
+    base = os.path.dirname(tool)
+    for sub in ("files/bin/wine64", "files/bin/wine", "dist/bin/wine64", "dist/bin/wine"):
+        p = os.path.join(base, sub)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def _proton_redist_env(proton):
+    env = _clean_proton_env()
+    os.makedirs(proton[1], exist_ok=True)
+    env["STEAM_COMPAT_DATA_PATH"] = proton[1]
+    env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.local/share/Steam")
+    return env
+
+_redist_last = {"detail": ""}
+
+def _redist_check(r, ok_codes=None):
+    """True if the finished process succeeded; otherwise remembers a short reason for the results list."""
+    ok_codes = _REDIST_OK_CODES if ok_codes is None else ok_codes
+    if r.returncode in ok_codes:
+        _redist_last["detail"] = ""
+        return True
+    text = ((r.stderr or b"") + b"\n" + (r.stdout or b"")).decode("utf-8", "replace")
+    lines = [l.strip() for l in text.splitlines() if l.strip()
+             and "unit test" not in l and "ProtonFixes" not in l and not l.startswith("fixme:")]
+    _redist_last["detail"] = f"exit code {r.returncode}" + (f": {lines[-1][:160]}" if lines else "")
+    return False
+
+def _run_redist_installer(path, wine=None, proton=None):
+    """Runs one installer silently. proton = (proton script, compat data folder) installs into that Proton prefix.
+    Returns True on success (on failure _redist_last['detail'] says why)."""
+    _redist_last["detail"] = ""
+    if proton:
+        tool, compat = proton
+        env = _proton_redist_env(proton)
+        if path == "winetricks":
+            tricks, wbin = shutil.which("winetricks"), _proton_wine_bin(tool)
+            if not tricks or not wbin:
+                _redist_last["detail"] = "winetricks or Proton's wine not found"
+                return False
+            env["WINE"] = wbin
+            env["WINEPREFIX"] = os.path.join(compat, "pfx")
+            r = subprocess.run([tricks, "-q"] + _WINETRICKS_DX, env=env, capture_output=True, timeout=3600)
+            return _redist_check(r, {0})
+        a = _redist_silent_args(os.path.basename(path))
+        cmd = [tool, "run", "msiexec", "/i", path, "/qn", "/norestart"] if a == "msi" else [tool, "run", path] + a
+        return _redist_check(subprocess.run(cmd, env=env, capture_output=True, timeout=3600))
+    if path == "winetricks":     # Linux stand-in for the DirectX installers (they don't work under wine)
+        tricks = shutil.which("winetricks")
+        if not tricks:
+            _redist_last["detail"] = "winetricks not found"
+            return False
+        env = wine_game_env()
+        if wine:
+            env["WINE"] = wine
+        r = subprocess.run([tricks, "-q"] + _WINETRICKS_DX, env=env, capture_output=True, timeout=3600)
+        return _redist_check(r, {0})
+    args = _redist_silent_args(os.path.basename(path))
+    if sys.platform.startswith("win"):
+        if args == "msi":
+            exe, arg_str = "msiexec", f'/i "{path}" /qn /norestart'
+        else:
+            exe, arg_str = path, " ".join(args)
+        q = lambda t: t.replace("'", "''")
+        ps = (f"$p = Start-Process -FilePath '{q(exe)}' -ArgumentList '{q(arg_str)}' -Verb RunAs -Wait -PassThru; "
+              "exit $p.ExitCode")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+                           timeout=1800, creationflags=0x08000000)
+        return _redist_check(r)
+    if not wine:
+        _redist_last["detail"] = "wine not found"
+        return False
+    cmd = [wine, "msiexec", "/i", path, "/qn", "/norestart"] if args == "msi" else [wine, path] + args
+    r = subprocess.run(cmd, env=wine_game_env(), capture_output=True, timeout=1800)
+    return _redist_check(r)
+
+def install_game_redist(game_dir, wine=None, report=None, item_done=None, proton=None):
+    """Installs the redists in <game_dir>/_CommonRedist; downloads them into that folder if it's missing/empty.
+    Windows: runs them directly (asks for admin). Linux: runs them with wine.
+    report(text, value, maximum) = progress; item_done(name, ok) = one installer finished. Returns a summary."""
+    report = report or (lambda *a: None)
+    item_done = item_done or (lambda *a: None)
+    if not game_dir or not os.path.isdir(game_dir):
+        raise RuntimeError("This game isn't installed.")
+    if not sys.platform.startswith("win") and not wine and not proton:
+        raise RuntimeError("Wine isn't installed, so the Windows redistributables can't be installed.")
+    redist_dir = os.path.join(game_dir, REDIST_DIRNAME)
+    report(f"Looking in {REDIST_DIRNAME}...", 0, 0)
+    items = collect_redist_installers(redist_dir) if os.path.isdir(redist_dir) else []
+    source = f"the game's {REDIST_DIRNAME} folder"
+    if not items:
+        download_common_redist(redist_dir, report)
+        items = collect_redist_installers(redist_dir)
+        source = f"a download into {REDIST_DIRNAME}"
+    if not sys.platform.startswith("win"):
+        # wine has DirectX built in and Microsoft's DirectX installers fail under it; winetricks adds the d3dx DLLs instead
+        had_dx = any(_is_dx_setup(n) for n, _p in items)
+        items = [x for x in items if not _is_dx_setup(x[0])]
+        if had_dx and shutil.which("winetricks") and (not proton or _proton_wine_bin(proton[0])):
+            items.append(("DirectX (d3dx9/10/11 via winetricks)", "winetricks"))
+    if not items:
+        raise RuntimeError("Nothing to install here. Wine already includes DirectX; "
+                           "install winetricks if you want the d3dx9/10/11 DLLs added too.")
+    ok, failed = 0, []
+    for i, (name, path) in enumerate(items):
+        report(f"Installing {name} ({i + 1} of {len(items)})", i, len(items))
+        try:
+            good = _run_redist_installer(path, wine, proton)
+            detail = _redist_last["detail"]
+        except Exception as e:
+            good, detail = False, str(e)[:160]
+        item_done(name, good, "" if good else detail)
+        if good:
+            ok += 1
+        else:
+            failed.append(name)
+    report("Done", len(items), len(items))
+    text = f"Installed {ok} of {len(items)} redistributables from {source}."
+    if failed:
+        text += f" {len(failed)} couldn't be installed."
+    return text
+
+class _RedistWorker(QThread):
+    progress = pyqtSignal(str, int, int)
+    item = pyqtSignal(str, bool, str)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, game_dir, wine, proton=None):
+        super().__init__()
+        self.game_dir, self.wine, self.proton = game_dir, wine, proton
+
+    def run(self):
+        try:
+            text = install_game_redist(self.game_dir, self.wine,
+                                       report=lambda t, v, m: self.progress.emit(t, int(v), int(m)),
+                                       item_done=lambda n, ok, d="": self.item.emit(n, bool(ok), d),
+                                       proton=self.proton)
+        except Exception as e:
+            self.failed.emit(str(e))
+        else:
+            self.done.emit(text)
+
+class RedistDialog(QDialog):
+    """Progress window for installing a game's common redistributables."""
+    def __init__(self, title, game_dir, wine, parent=None, proton=None):
+        super().__init__(parent)
+        self.setWindowTitle("Common Redistributables")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self._finished = False
+        self.result_text = ""
+        self.error = ""
+        self._lines = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(6)
+
+        heading = QLabel("Installing redistributables")
+        heading.setObjectName("RowTitle")
+        sub = QLabel(title + (" (Proton prefix)" if proton else ""))
+        sub.setObjectName("RowDesc")
+        sub.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(sub)
+        layout.addSpacing(14)
+
+        self.status = QLabel("Starting...")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        layout.addSpacing(2)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(10)
+        layout.addWidget(self.bar)
+
+        self.results = QLabel("")
+        self.results.setTextFormat(Qt.TextFormat.RichText)
+        self.results.setWordWrap(True)
+        self.results.setVisible(False)
+        layout.addSpacing(10)
+        layout.addWidget(self.results)
+
+        hint = "If Windows asks for permission, approve it so the installers can run." \
+            if sys.platform.startswith("win") else (
+            "Installers run inside the game's Proton prefix and may take a minute." if proton
+            else "Installers run through wine and may take a minute.")
+        self.hint = QLabel(hint)
+        self.hint.setObjectName("RowDesc")
+        self.hint.setWordWrap(True)
+        layout.addSpacing(8)
+        layout.addWidget(self.hint)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setFixedWidth(110)
+        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_btn.setEnabled(False)
+        self.close_btn.clicked.connect(self.accept)
+        row.addWidget(self.close_btn)
+        layout.addSpacing(10)
+        layout.addLayout(row)
+
+        self.worker = _RedistWorker(game_dir, wine, proton)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.item.connect(self._on_item)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+
+    def _on_progress(self, text, value, maximum):
+        self.status.setText(text)
+        self.bar.setRange(0, maximum)
+        self.bar.setValue(value)
+
+    def _on_item(self, name, ok, detail=""):
+        mark = "&#10003;" if ok else "&#10007;"
+        color = "#10eb73" if ok else "#ff5c5c"
+        line = f'<span style="color:{color}">{mark}</span>&nbsp; {html_lib.escape(name)}'
+        if detail:
+            line += f'<br><span style="color:#888">&nbsp;&nbsp;&nbsp;&nbsp;{html_lib.escape(detail)}</span>'
+        self._lines.append(line)
+        self.results.setText("<br>".join(self._lines))
+        self.results.setVisible(True)
+
+    def _finish(self):
+        self._finished = True
+        self.hint.setVisible(False)
+        self.close_btn.setEnabled(True)
+        self.close_btn.setFocus()
+
+    def _on_done(self, text):
+        self.result_text = text
+        self.status.setText(text)
+        self.bar.setRange(0, 1)
+        self.bar.setValue(1)
+        self._finish()
+
+    def _on_failed(self, message):
+        self.error = message
+        self.status.setText(f"Couldn't install: {message}")
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self._finish()
+
+    def reject(self):
+        if self._finished:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self._finished:
+            event.accept()
+        else:
+            event.ignore()
+
+    def run(self):
+        self.worker.start()
+        self.exec()
+        self.worker.wait()
+
+def install_redist_for_game(app, game_dir_func, title, launch_func=None):
+    """Menu action: installs the common redistributables for one game (resolved at click time).
+    launch_func() -> (exe, compat tool): if the game runs on a Proton tool, installs into its Proton prefix."""
+    game_dir = game_dir_func()
+    wine = None if sys.platform.startswith("win") else default_wine_path(app)
+    proton = None
+    if sys.platform.startswith("linux") and launch_func:
+        exe, tool = launch_func()
+        if exe and compat_tool_kind(tool) == "proton":
+            proton = (tool, compat_data_dir_for(exe))
+    RedistDialog(title, game_dir, wine, app, proton).run()
+
+def _ae_launch_info(game_id, game_name):
+    cfg = GAME_INFO.get(game_id)
+    exe = find_game_exe(_ae_redist_dir(game_name), cfg["exe"]) if cfg else None
+    return exe, load_compat_config().get(game_id, "")
+
+def _ae_redist_dir(game_name):
+    if sys.platform.startswith("linux"):
+        wd = wine_game_dir(game_name)
+        if os.path.isdir(wd):
+            return wd
+    return installed_game_dir(game_name)
+
+# ---------------------------------------------------------------- start with the system
+STARTUP_NAME = "NCZGamesLauncher"
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+def _startup_command():
+    target, args, _workdir = get_launch_command()
+    return [target] + list(args) + ["--startup"]
+
+def _linux_autostart_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "autostart", "ncz-games-launcher.desktop")
+
+def set_startup_registered(enabled):
+    """Adds / removes the launcher from the system's startup apps (Windows: Run key, Linux: ~/.config/autostart)."""
+    if sys.platform.startswith("win"):
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(_startup_command()))
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_NAME)
+                except FileNotFoundError:
+                    pass
+    elif sys.platform.startswith("linux"):
+        path = _linux_autostart_path()
+        if not enabled:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            return
+        quote = lambda a: '"' + str(a).replace('"', '\\"').replace("%", "%%") + '"'
+        lines = ["[Desktop Entry]", "Type=Application", "Name=NCZ Games Launcher",
+                 "Exec=" + " ".join(quote(a) for a in _startup_command()),
+                 f"Path={get_launch_command()[2]}"]
+        icon = prepare_shortcut_icon()
+        if icon:
+            lines.append(f"Icon={icon}")
+        lines += ["Terminal=false", "X-GNOME-Autostart-enabled=true", ""]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+def apply_startup_setting():
+    """On by default; refreshed every launch so the startup entry keeps pointing at the right place."""
+    if _ncz_profile:     # a separate-data profile instance never registers itself
+        return
+    try:
+        if load_launcher_settings().get("start_on_boot", True):
+            set_startup_registered(True)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------- only one launcher at a time
+def _instance_name():
+    user = re.sub(r"[^A-Za-z0-9]", "", os.environ.get("USERNAME") or os.environ.get("USER") or "user")
+    return f"NCZGamesLauncher-{user}-{_ncz_profile}"
+
+def _another_instance_running(wake=True):
+    """True if a launcher is already running (it's asked to come to the front unless wake=False)."""
+    try:
+        from PyQt6.QtNetwork import QLocalSocket
+    except ImportError:
+        return False
+    sock = QLocalSocket()
+    sock.connectToServer(_instance_name())
+    if sock.waitForConnected(400):
+        if wake:
+            sock.write(b"show")
+            sock.flush()
+            sock.waitForBytesWritten(400)
+        sock.disconnectFromServer()
+        return True
+    return False
+
+def _prefer_xwayland():
+    """On a Wayland session, run the launcher through XWayland (Qt's xcb plugin). Native Wayland windows can't be
+    placed over a game and global hotkeys (Shift+Q) can't be heard there; XWayland also hosts Proton games.
+    Turn it off in Settings (Linux) or by setting QT_QPA_PLATFORM yourself."""
+    if not sys.platform.startswith("linux") or os.environ.get("QT_QPA_PLATFORM"):
+        return
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
+        return
+    if not os.environ.get("DISPLAY") or not load_launcher_settings().get("xwayland_mode", True):
+        return
+    try:
+        import ctypes.util
+        if not ctypes.util.find_library("xcb-cursor"):      # Qt's xcb plugin refuses to load without it
+            return
+    except Exception:
+        return
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+def _other_launcher_pids():
+    """PIDs of other launcher processes started from this same file/exe with the same NCZ_PROFILE (Linux only)."""
+    me = os.getpid()
+    frozen = getattr(sys, "frozen", False)
+    target = os.path.realpath(sys.executable if frozen else os.path.abspath(__file__))
+    pids = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for d in entries:
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                args = [a.decode(errors="ignore") for a in f.read().split(b"\0") if a]
+            if not args or "--ncz-overlay-server" in args:
+                continue
+            cwd = os.readlink(f"/proc/{d}/cwd")
+            with open(f"/proc/{d}/environ", "rb") as f:
+                env = dict(e.split(b"=", 1) for e in f.read().split(b"\0") if b"=" in e)
+        except OSError:
+            continue
+        prof = re.sub(r"[^A-Za-z0-9_-]", "_", env.get(b"NCZ_PROFILE", b"").decode(errors="ignore").strip())
+        if prof != _ncz_profile:
+            continue
+        cands = args[:1] if frozen else args[1:4]
+        if any(os.path.realpath(os.path.join(cwd, a)) == target for a in cands):
+            pids.append(int(d))
+    return pids
+
+def _kill_other_launchers():
+    """Fallback for an old instance that doesn't understand the 'quit' request."""
+    if sys.platform.startswith("linux"):
+        import signal
+        pids = _other_launcher_pids()
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            for _ in range(15):
+                if not _another_instance_running(wake=False):
+                    return
+                time.sleep(0.2)
+    elif sys.platform.startswith("win") and not _ncz_profile:
+        script = os.path.abspath(__file__).replace("'", "''")
+        ps = (f"Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne {os.getpid()} -and "
+              f"$_.CommandLine -like '*{script}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=15, creationflags=0x08000000)
+        except Exception:
+            pass
+
+def _replace_running_instance():
+    """Closes the launcher that's already running so this one can take over. True if it's gone."""
+    try:
+        from PyQt6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer(_instance_name())
+        if sock.waitForConnected(400):
+            sock.write(b"quit")
+            sock.flush()
+            sock.waitForBytesWritten(400)
+            sock.disconnectFromServer()
+    except Exception:
+        pass
+    for _ in range(20):                              # up to ~4 s for it to close by itself
+        if not _another_instance_running(wake=False):
+            return True
+        time.sleep(0.2)
+    _kill_other_launchers()
+    for _ in range(10):
+        if not _another_instance_running(wake=False):
+            return True
+        time.sleep(0.2)
+    return False
+
+def _start_instance_server(app, window):
+    try:
+        from PyQt6.QtNetwork import QLocalServer
+    except ImportError:
+        return
+    name = _instance_name()
+    QLocalServer.removeServer(name)      # clears a stale socket left by a crash
+    server = QLocalServer(app)
+    if not server.listen(name):
+        return
+    def on_connection():
+        woke = False
+        quit_req = False
+        friends_req = False
+        while server.hasPendingConnections():
+            conn = server.nextPendingConnection()
+            conn.waitForReadyRead(200)
+            data = bytes(conn.readAll())
+            woke = woke or data == b"show"
+            quit_req = quit_req or data == b"quit"
+            friends_req = friends_req or data == b"friends"
+            conn.disconnectFromServer()
+        if friends_req:                  # `main.py --friends` from a desktop keyboard shortcut
+            fo = getattr(window, "_friends_overlay", None)
+            if fo is not None:
+                fo._verbose = True
+                fo.toggle_req.emit()
+        if quit_req:                     # a newer launcher is replacing this one
+            server.close()
+            QApplication.quit()
+            QTimer.singleShot(2500, lambda: os._exit(0))   # don't hang on a stuck background thread
+            return
+        if woke:
+            window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized)
+            window.show()
+            window.raise_()
+            window.activateWindow()
+    server.newConnection.connect(on_connection)
+    app._ncz_instance_server = server    # keep it alive
+
 class SettingsPage(QWidget):
     steamgriddb_key_changed = pyqtSignal()
 
@@ -1876,6 +2461,90 @@ class SettingsPage(QWidget):
         shortcut_panel_layout.addLayout(shortcut_row)
         layout.addWidget(shortcut_panel)
         layout.addSpacing(12)
+
+        startup_panel = QFrame()
+        startup_panel.setObjectName("Panel")
+        startup_panel_layout = QVBoxLayout(startup_panel)
+        startup_panel_layout.setContentsMargins(22, 18, 22, 18)
+        startup_row = QHBoxLayout()
+        startup_text = QVBoxLayout()
+        startup_text.setSpacing(2)
+        startup_name = QLabel("Start with System")
+        startup_name.setObjectName("RowTitle")
+        startup_desc = QLabel("Start the launcher in the background when you log in")
+        startup_desc.setObjectName("RowDesc")
+        startup_text.addWidget(startup_name)
+        startup_text.addWidget(startup_desc)
+        self.startup_btn = QPushButton()
+        self.startup_btn.setCheckable(True)
+        self.startup_btn.setChecked(load_launcher_settings().get("start_on_boot", True))
+        self.startup_btn.setFixedWidth(160)
+        self.startup_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.startup_btn.clicked.connect(self.on_startup_toggled)
+        self._refresh_startup_btn()
+        startup_row.addLayout(startup_text, 1)
+        startup_row.addWidget(self.startup_btn)
+        startup_panel_layout.addLayout(startup_row)
+        layout.addWidget(startup_panel)
+        layout.addSpacing(12)
+
+        autoupdate_panel = QFrame()
+        autoupdate_panel.setObjectName("Panel")
+        autoupdate_panel_layout = QVBoxLayout(autoupdate_panel)
+        autoupdate_panel_layout.setContentsMargins(22, 18, 22, 18)
+        autoupdate_row = QHBoxLayout()
+        autoupdate_text = QVBoxLayout()
+        autoupdate_text.setSpacing(2)
+        autoupdate_name = QLabel("Automatic Updates")
+        autoupdate_name.setObjectName("RowTitle")
+        autoupdate_desc = QLabel("Download new launcher versions automatically when it starts. "
+                                 "When disabled, the launcher stays on the version you have now.")
+        autoupdate_desc.setObjectName("RowDesc")
+        autoupdate_desc.setWordWrap(True)
+        autoupdate_text.addWidget(autoupdate_name)
+        autoupdate_text.addWidget(autoupdate_desc)
+        self.autoupdate_btn = QPushButton()
+        self.autoupdate_btn.setCheckable(True)
+        self.autoupdate_btn.setChecked(load_launcher_settings().get("auto_update", True))
+        self.autoupdate_btn.setFixedWidth(160)
+        self.autoupdate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.autoupdate_btn.clicked.connect(self.on_autoupdate_toggled)
+        self._refresh_autoupdate_btn()
+        autoupdate_row.addLayout(autoupdate_text, 1)
+        autoupdate_row.addWidget(self.autoupdate_btn)
+        autoupdate_panel_layout.addLayout(autoupdate_row)
+        layout.addWidget(autoupdate_panel)
+        layout.addSpacing(12)
+
+        if sys.platform.startswith("linux"):
+            xw_panel = QFrame()
+            xw_panel.setObjectName("Panel")
+            xw_panel_layout = QVBoxLayout(xw_panel)
+            xw_panel_layout.setContentsMargins(22, 18, 22, 18)
+            xw_row = QHBoxLayout()
+            xw_text = QVBoxLayout()
+            xw_text.setSpacing(2)
+            xw_name = QLabel("Use XWayland on Wayland")
+            xw_name.setObjectName("RowTitle")
+            xw_desc = QLabel("Needed for the Shift+Q friends overlay and for overlay windows to show over games on a "
+                             "Wayland desktop. Turn it off if the launcher looks blurry on a scaled display. "
+                             "Restart the launcher to apply.")
+            xw_desc.setObjectName("RowDesc")
+            xw_desc.setWordWrap(True)
+            xw_text.addWidget(xw_name)
+            xw_text.addWidget(xw_desc)
+            self.xwayland_btn = QPushButton()
+            self.xwayland_btn.setCheckable(True)
+            self.xwayland_btn.setChecked(load_launcher_settings().get("xwayland_mode", True))
+            self.xwayland_btn.setFixedWidth(160)
+            self.xwayland_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.xwayland_btn.clicked.connect(self.on_xwayland_toggled)
+            self._refresh_xwayland_btn()
+            xw_row.addLayout(xw_text, 1)
+            xw_row.addWidget(self.xwayland_btn)
+            xw_panel_layout.addLayout(xw_row)
+            layout.addWidget(xw_panel)
+            layout.addSpacing(12)
 
         sgdb_panel = QFrame()
         sgdb_panel.setObjectName("Panel")
@@ -2135,6 +2804,41 @@ class SettingsPage(QWidget):
             return
         QApplication.restoreOverrideCursor()
         QMessageBox.information(self, "Desktop Shortcut", f"Shortcut created:\n{path}")
+
+    def _refresh_startup_btn(self):
+        self.startup_btn.setText("Enabled" if self.startup_btn.isChecked() else "Disabled")
+
+    def on_startup_toggled(self):
+        want = self.startup_btn.isChecked()
+        try:
+            set_startup_registered(want)
+        except Exception as e:
+            self.startup_btn.setChecked(not want)
+            QMessageBox.warning(self, "Start with System", f"Couldn't change it:\n\n{e}")
+        else:
+            settings = load_launcher_settings()
+            settings["start_on_boot"] = want
+            save_launcher_settings(settings)
+        self._refresh_startup_btn()
+
+    def _refresh_xwayland_btn(self):
+        self.xwayland_btn.setText("Enabled" if self.xwayland_btn.isChecked() else "Disabled")
+
+    def on_xwayland_toggled(self):
+        settings = load_launcher_settings()
+        settings["xwayland_mode"] = self.xwayland_btn.isChecked()
+        save_launcher_settings(settings)
+        self._refresh_xwayland_btn()
+        QMessageBox.information(self, "XWayland", "Restart the launcher for this to take effect.")
+
+    def _refresh_autoupdate_btn(self):
+        self.autoupdate_btn.setText("Enabled" if self.autoupdate_btn.isChecked() else "Disabled")
+
+    def on_autoupdate_toggled(self):
+        settings = load_launcher_settings()
+        settings["auto_update"] = self.autoupdate_btn.isChecked()
+        save_launcher_settings(settings)
+        self._refresh_autoupdate_btn()
 
     def on_wine_d3d_changed(self):
         settings = load_launcher_settings()
@@ -4674,6 +5378,10 @@ class AdaptiveApp(QMainWindow):
                 btn_tool.triggered.connect(lambda _checked=False, g=game_id: self.switch_compat_tool(g))
             btn_open_location = menu.addAction("Open Game Location")
             btn_open_location.triggered.connect(lambda _checked=False, n=game_name: self.open_game_location(n))
+            btn_redist = menu.addAction("Install Common Redist")
+            btn_redist.setToolTip("Install Visual C++ / DirectX from the game's _CommonRedist folder (downloads them if missing)")
+            btn_redist.triggered.connect(lambda _checked=False, n=game_name, g=game_id: install_redist_for_game(
+                self, lambda: _ae_redist_dir(n), n, lambda: _ae_launch_info(g, n)))
             self.open_location_buttons[game_id] = btn_open_location
             btn_uninstall = menu.addAction("Uninstall")
             if sys.platform.startswith("linux"):
@@ -4827,8 +5535,29 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NCZ.GamesLauncher")
         except Exception:
             pass
+    _prefer_xwayland()
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
+    if "--friends" in sys.argv:          # toggles the friends panel of the running launcher, then exits
+        try:
+            from PyQt6.QtNetwork import QLocalSocket
+            sock = QLocalSocket()
+            sock.connectToServer(_instance_name())
+            if sock.waitForConnected(800):
+                sock.write(b"friends")
+                sock.flush()
+                sock.waitForBytesWritten(800)
+                sock.disconnectFromServer()
+        except Exception:
+            pass
+        sys.exit(0)
+    if "--startup" in sys.argv:
+        if _another_instance_running(wake=False):
+            sys.exit(0)  # started at login while one is already up: leave it alone
+    elif _another_instance_running(wake=False):
+        if not _replace_running_instance():     # close the old one and carry on starting this one
+            _another_instance_running(wake=True)
+            sys.exit(0)  # it wouldn't go away: bring it to the front instead
 
     icon_path = asset_path("icon.png")
     if os.path.exists(icon_path):
@@ -4846,7 +5575,13 @@ def main():
         pass
 
     window = AdaptiveApp()
-    window.showMaximized()
+    _start_instance_server(app, window)
+    apply_startup_setting()
+    if "--startup" in sys.argv:
+        if getattr(window, "_tray", None) is None:      # no tray to hide in
+            window.showMinimized()
+    else:
+        window.showMaximized()
     sys.exit(app.exec())
 # --- Firebase Steam Link & Downloads Tab Integration ---
 
@@ -5089,6 +5824,10 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
 
             menu.addAction("Uninstall").triggered.connect(uninstall_steam_game)
             menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(sanitize_folder_name(title_text)))
+            menu.addAction("Install Common Redist").triggered.connect(
+                lambda _c=False, t=title_text, a=appid: install_redist_for_game(
+                    self, lambda: _safe_installed_game_dir(t), t,
+                    lambda: (find_best_game_exe(_safe_installed_game_dir(t), t), load_compat_config().get(str(a), ""))))
 
             copy_action = menu.addAction("Copy Game ID")
             copy_action.triggered.connect(lambda _c=False, a=appid: QApplication.clipboard().setText(str(a)))
@@ -5777,6 +6516,10 @@ def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path,
         menu.addAction("Switch Compatibility Tool").triggered.connect(switch_custom_tool)
     menu.addAction("Remove from Library").triggered.connect(remove_custom_game)
     menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(os.path.dirname(exe_path)))
+    menu.addAction("Install Common Redist").triggered.connect(
+        lambda _c=False: install_redist_for_game(
+            self, lambda: os.path.dirname(exe_path), os.path.basename(os.path.dirname(exe_path)) or "this game",
+            lambda: (exe_path, _custom_tool(game_id, compat_tool))))
 
     actions.addWidget(btn_play, 1)
     actions.addWidget(more_btn)
@@ -6977,7 +7720,11 @@ def friends_library_titles():
 
 def _game_name_for_args(args):
     known = {}
-    for g in load_steam_library() + load_custom_games():
+    try:
+        fan = load_fan_library()
+    except Exception:
+        fan = []
+    for g in load_steam_library() + load_custom_games() + fan:
         if g.get("exe_path") and g.get("title"):
             known[os.path.normcase(os.path.abspath(g["exe_path"]))] = g["title"]
     for a in args:
@@ -9221,6 +9968,8 @@ def _selfupdate_init(self):
         "The launcher has been updated to the latest version.\n\n"
         "Please restart the tool to apply the update."))
     def work():
+        if not load_launcher_settings().get("auto_update", True):
+            return                       # "Automatic Updates" is turned off in Settings
         try:
             updated = self_update_check()
         except Exception:
@@ -12371,6 +13120,10 @@ def _fan_create_library_card(self, g):
         menu.addAction("Switch Compatibility Tool").triggered.connect(lambda _c=False, i=gid: self._fan_compat_dialog(i))
     menu.addAction("Open Game Location").triggered.connect(
         lambda _c=False, i=gid, t=title_text: self._fan_open_location(i, t))
+    menu.addAction("Install Common Redist").triggered.connect(
+        lambda _c=False, i=gid, t=title_text: install_redist_for_game(
+            self, lambda: _fan_game_dir(i, t), t,
+            lambda: (_fan_installed_exe(t), load_compat_config().get(f"fan-{i}", ""))))
     menu.addAction("Uninstall").triggered.connect(lambda _c=False, i=gid, t=title_text: self._fan_uninstall(i, t))
     menu.addSeparator()
     menu.addAction("Remove from Library").triggered.connect(lambda _c=False, i=gid: self._fan_remove(i))
@@ -12886,7 +13639,7 @@ def _launch_spec(app, exe, compat_tool=""):
         kind = compat_tool_kind(compat_tool)
         if kind == "proton":
             return ([compat_tool, "run", exe], cwd,
-                    {"STEAM_COMPAT_DATA_PATH": cwd + "_compat_data",
+                    {"STEAM_COMPAT_DATA_PATH": compat_data_dir_for(exe),
                      "STEAM_COMPAT_CLIENT_INSTALL_PATH": os.path.expanduser("~/.local/share/Steam")})
         if kind == "wine" and exe.lower().endswith(".exe"):
             return ([compat_tool, exe], cwd, {})
@@ -12899,6 +13652,60 @@ def _launch_spec(app, exe, compat_tool=""):
             if wine:
                 return ([wine, exe], cwd, {})
     return ([exe], cwd, {})
+
+def compat_data_dir_for(exe):
+    """Proton's STEAM_COMPAT_DATA_PATH for a game. Normally <game folder>_compat_data, but wine refuses a prefix it
+    doesn't own (NTFS/exFAT drives usually report another owner), so then it goes in the home folder instead."""
+    game_dir = os.path.dirname(exe)
+    default = game_dir + "_compat_data"
+    try:
+        os.makedirs(default, exist_ok=True)
+        ok = os.stat(default).st_uid == os.geteuid() and os.access(default, os.W_OK)
+        pfx = os.path.join(default, "pfx")
+        if ok and os.path.exists(pfx):
+            ok = os.stat(pfx).st_uid == os.geteuid()
+        if ok:
+            return default
+    except OSError:
+        pass
+    import hashlib
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(game_dir)) or "game"
+    tag = hashlib.md5(game_dir.encode("utf-8", "replace")).hexdigest()[:8]
+    return os.path.expanduser(f"~/.local/share/NCZ_Games_Launcher/compat/{name}_{tag}")
+
+def _clean_proton_env():
+    """The environment Proton runs in: the system one (not the launcher's bundled libs / Python env)."""
+    env = system_env()
+    for k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+        env.pop(k, None)
+    return env
+
+def _watch_proton_start(app, proc, log_path):
+    """If the game exits within a few seconds of starting, tell the user and point at the log."""
+    state = {"n": 0}
+    timer = QTimer(app)
+    def tick():
+        state["n"] += 1
+        code = proc.poll()
+        if code is None:
+            if state["n"] >= 40:        # still running after 20 s: it started fine
+                timer.stop()
+                timer.deleteLater()
+            return
+        timer.stop()
+        timer.deleteLater()
+        if code != 0 or state["n"] <= 10:
+            tail = ""
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    tail = "".join(f.readlines()[-12:]).strip()
+            except OSError:
+                pass
+            QMessageBox.warning(app, "Proton",
+                                f"The game closed right after starting (exit code {code}).\n\n"
+                                f"Full log: {log_path}\n\n{tail}")
+    timer.timeout.connect(tick)
+    timer.start(500)
 
 def _d3d_for(key):
     """The Direct3D renderer picked for one game ('' = use the launcher setting)."""
@@ -12968,11 +13775,20 @@ def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
     _d3d_override["mode"] = d3d if d3d in WINE_D3D_MODES else ""
     try:
         if extra:  # Proton
-            env = os.environ.copy()
-            os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
+            env = _clean_proton_env()
+            compat = extra["STEAM_COMPAT_DATA_PATH"]
+            os.makedirs(compat, exist_ok=True)
             env.update(extra)
+            env.setdefault("PROTON_LOG", "1")            # Proton's own log (steam-*.log) goes next to the prefix
+            env.setdefault("PROTON_LOG_DIR", compat)
             apply_proton_d3d(env)
-            subprocess.Popen(argv + args, cwd=cwd, env=env)
+            log_path = os.path.join(compat, "ncz_proton_launch.log")
+            with open(log_path, "w", encoding="utf-8", errors="replace") as lf:
+                lf.write("Command: " + " ".join(shlex.quote(a) for a in argv + args) + "\n")
+                lf.write(f"Working dir: {cwd}\nSTEAM_COMPAT_DATA_PATH={compat}\n\n")
+                lf.flush()
+                proc = subprocess.Popen(argv + args, cwd=cwd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+            _watch_proton_start(app, proc, log_path)
         elif linux and is_exe:  # wine (system or a Wine tab build): applies the chosen D3D renderer
             launch_wine(argv[0], exe, cwd, args)
         else:
@@ -13244,6 +14060,13 @@ class AddExistingFanGameDialog(QDialog):
         self.result_data = {"id": gid, "title": title, "link": link, "tags": sorted(tags), "exe_path": exe,
                             "compat_tool": self.compat_combo.currentData() if self.compat_combo else ""}
         self.accept()
+
+def _fan_game_dir(gid, title):
+    entry = next((g for g in load_fan_library() if g["id"] == gid), None)
+    exe = entry.get("exe_path") if entry else ""
+    if exe and os.path.exists(exe):
+        return os.path.dirname(exe)
+    return installed_game_dir(sanitize_folder_name(title))
 
 def _fan_open_location(self, gid, title):
     entry = next((g for g in load_fan_library() if g["id"] == gid), None)
@@ -14355,6 +15178,37 @@ class _TitleBarDrag(QObject):
             return True
         return False
 
+def _caption_icon(restore):
+    """Maximize (one square) / restore down (two squares) glyph, drawn so it doesn't depend on a font."""
+    icon = QIcon()
+    for mode, color in ((QIcon.Mode.Normal, "#a0a0a8"), (QIcon.Mode.Active, "#ffffff")):
+        pm = QPixmap(24, 24)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(color), 1.2))
+        if restore:
+            p.drawRect(QRectF(1.5, 3.5, 7, 7))
+            p.drawPolyline([QPointF(3.5, 3.5), QPointF(3.5, 1.5), QPointF(10.5, 1.5),
+                            QPointF(10.5, 8.5), QPointF(8.5, 8.5)])
+        else:
+            p.drawRect(QRectF(1.5, 1.5, 9, 9))
+        p.end()
+        icon.addPixmap(pm, mode)
+    return icon
+
+class _WindowStateWatcher(QObject):
+    def __init__(self, window, callback):
+        super().__init__(window)
+        self._callback = callback
+        window.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._callback()
+        return False
+
 _frameless_prev_init = AdaptiveApp.__init__
 
 def _frameless_init(self):
@@ -14399,8 +15253,28 @@ def _frameless_init(self):
         "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); color: #ffffff; }")
     min_btn.clicked.connect(self.showMinimized)
 
+    max_btn = QPushButton()
+    max_btn.setObjectName("MaxButton")
+    max_btn.setFixedSize(40, 32)
+    max_btn.setIconSize(QSize(12, 12))
+    max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    max_btn.setStyleSheet(
+        "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
+        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
+
+    def refresh_max_btn():
+        maximized = self.isMaximized()
+        max_btn.setIcon(_caption_icon(maximized))
+        max_btn.setToolTip("Restore Down" if maximized else "Maximize")
+
+    max_btn.clicked.connect(lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
+    _WindowStateWatcher(self, refresh_max_btn)
+    refresh_max_btn()
+
     bar.layout().addSpacing(8)
     bar.layout().addWidget(min_btn)
+    bar.layout().addWidget(max_btn)
     bar.layout().addWidget(exit_btn)
 
 AdaptiveApp.__init__ = _frameless_init
@@ -14414,7 +15288,7 @@ except Exception:
 
 OVERLAY_MODES = {
     "window": "Overlay window (default)",
-    "inject": "In-game injection (Windows, D3D11 games)",
+    "inject": "In-game injection (D3D11, 64-bit; Wine/Proton too)",
     "off": "Off",
 }
 
@@ -14444,7 +15318,88 @@ def _overlay_game_launched(exe):
     if _overlay is None or get_overlay_mode() != "inject":
         return
     from overlay import inject_overlay
-    inject_overlay(exe, asset_path("overlay_hook.dll"))
+    ok = inject_overlay(exe, asset_path("overlay_hook.dll"))
+    _ov_log(f"in-game overlay in {os.path.basename(exe)}: {'LOADED' if ok else 'not loaded (yet)'}")
+    if not ok and sys.platform.startswith("linux"):
+        try:
+            from overlay import diagnose_linux
+            _ov_log("   why: " + diagnose_linux(exe))
+        except Exception as e:
+            _ov_log(f"   (diagnose failed: {e!r})")
+
+_OV_REG_HEAD = ("Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows]\r\n")
+_OV_DLL_DIR = "ncz"      # C:\\ncz\\overlay_hook.dll inside the prefix (AppInit_DLLs can't take paths with spaces)
+
+def _overlay_wine_target(app, exe, compat_tool):
+    """(prefix, argv-prefix, env) for running a command inside the Wine/Proton prefix this game launches in."""
+    if not (sys.platform.startswith("linux") and exe.lower().endswith(".exe")):
+        return None
+    kind = compat_tool_kind(compat_tool)
+    if kind == "proton":
+        compat = compat_data_dir_for(exe)
+        os.makedirs(compat, exist_ok=True)
+        return os.path.join(compat, "pfx"), [compat_tool, "run"], _proton_redist_env((compat_tool, compat))
+    wine = compat_tool if kind == "wine" else default_wine_path(app)
+    if not wine:
+        return None
+    env = wine_game_env()
+    return env.get("WINEPREFIX") or _wine_prefix(), [wine], env
+
+def _overlay_prepare_wine(app, exe, compat_tool, enable):
+    """Before a Wine/Proton game starts: registers (enable) or removes the overlay DLL as an AppInit_DLL in its
+    prefix. Wine loads AppInit_DLLs into every GUI process as user32 starts, which is the Linux stand-in for the
+    Windows remote-thread injection. Returns the prefix when the DLL is set up, else None."""
+    import tempfile
+    target = _overlay_wine_target(app, exe, compat_tool)
+    if target is None:
+        return None
+    prefix, base_cmd, env = target
+    marker = os.path.join(prefix, ".ncz_overlay_appinit")
+    src = asset_path("overlay_hook.dll")
+    dest_dir = os.path.join(prefix, "drive_c", _OV_DLL_DIR)
+    dest = os.path.join(dest_dir, "overlay_hook.dll")
+
+    def regedit(body):
+        reg = os.path.join(tempfile.gettempdir(), "ncz_overlay_appinit.reg")
+        with open(reg, "w", encoding="ascii", newline="") as f:
+            f.write(_OV_REG_HEAD + body)
+        win_path = "Z:" + reg.replace("/", "\\")
+        r = subprocess.run(base_cmd + ["regedit", "/S", win_path], env=env, cwd=os.path.dirname(exe),
+                           capture_output=True, timeout=120)
+        return r.returncode == 0
+
+    if not enable:
+        if os.path.exists(marker):
+            if regedit('"AppInit_DLLs"=-\r\n"LoadAppInit_DLLs"=-\r\n"RequireSignedAppInit_DLLs"=-\r\n'):
+                os.remove(marker)
+        return None
+    if not os.path.isfile(src):
+        return None
+    same = False
+    try:
+        with open(src, "rb") as a, open(dest, "rb") as b:
+            same = a.read() == b.read()
+    except OSError:
+        pass
+    if not (same and os.path.exists(marker)):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)       # first time per prefix takes a few seconds
+        try:
+            if not regedit('"AppInit_DLLs"="C:\\\\' + _OV_DLL_DIR + '\\\\overlay_hook.dll"\r\n'
+                           '"LoadAppInit_DLLs"=dword:00000001\r\n"RequireSignedAppInit_DLLs"=dword:00000000\r\n'):
+                return None
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copy2(src, dest)
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("1")
+        finally:
+            QApplication.restoreOverrideCursor()
+    try:
+        from overlay import register_wine_prefix
+        register_wine_prefix(exe, prefix)
+    except Exception:
+        pass
+    return prefix
 
 def _overlay_classify(text):
     """Launcher friend notification text -> (line-2 prefix, highlighted part)."""
@@ -14480,9 +15435,19 @@ def _overlay_friend_event(page, name, text, uid):
 _ov_prev_launch_exe = _launch_exe
 
 def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
+    linux = sys.platform.startswith("linux")
+    if linux and _overlay is not None and exe and os.path.exists(exe):
+        try:       # has to happen before the game starts: Wine reads AppInit_DLLs while the process is loading
+            pfx = _overlay_prepare_wine(app, exe, compat_tool, get_overlay_mode() == "inject")
+            _ov_log(f"overlay mode={get_overlay_mode()}, wine prefix prepared: {pfx}")
+        except Exception as e:
+            print(f"overlay: couldn't set up the Wine prefix: {e}")
+            _ov_log(f"couldn't set up the Wine prefix: {e!r}")
     _ov_prev_launch_exe(app, exe, compat_tool, d3d, args)
     if exe and os.path.exists(exe):
-        QTimer.singleShot(1500, lambda: _overlay_game_launched(exe))
+        # on Linux the Wine process takes a while to appear: look again a few times
+        for ms in ((2500, 6000, 12000, 25000) if linux else (1500,)):
+            QTimer.singleShot(ms, lambda: _overlay_game_launched(exe))
 
 _ov_prev_friends_init = FriendsPage.__init__
 
@@ -14507,7 +15472,7 @@ def _ov_settings_init(self, *a, **k):
     name = QLabel("Game Overlay")
     name.setObjectName("RowTitle")
     desc = QLabel("Shows \"FRIEND is playing GAME\" when a friend starts a game. Overlay window works over "
-                  "borderless/windowed games; injection (Windows, D3D11 only) also works in exclusive fullscreen; if it fails it falls back to the window. Don't use it with anti-cheat games.")
+                  "borderless/windowed games; injection (D3D11, 64-bit games) also works in exclusive fullscreen; on Linux it is loaded into Wine/Proton games through AppInit_DLLs. If it fails it falls back to the window. Don't use it with anti-cheat games.")
     desc.setObjectName("RowDesc")
     desc.setWordWrap(True)
     text.addWidget(name)
@@ -14544,7 +15509,35 @@ from PyQt6.QtWidgets import QSizeGrip, QListWidget, QListWidgetItem
 from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QPen
 
+def _force_foreground_x11(winid):
+    """Asks the window manager to focus our window the way a taskbar/pager would (a plain activateWindow() is
+    ignored by focus-stealing prevention when the keypress that opened the panel went to the game)."""
+    try:
+        from Xlib import display, X, protocol
+        d = display.Display()
+        root = d.screen().root
+        ev = protocol.event.ClientMessage(window=d.create_resource_object("window", int(winid)),
+                                          client_type=d.intern_atom("_NET_ACTIVE_WINDOW"),
+                                          data=(32, [2, X.CurrentTime, 0, 0, 0]))     # source 2 = pager
+        root.send_event(ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+        d.flush()
+        d.close()
+        return
+    except Exception:
+        pass
+    xdotool = shutil.which("xdotool")
+    if xdotool:
+        try:
+            subprocess.Popen([xdotool, "windowactivate", str(int(winid))],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
 def _force_foreground(hwnd):
+    if sys.platform.startswith("linux"):
+        if QApplication.platformName() == "xcb":
+            _force_foreground_x11(hwnd)
+        return
     if not sys.platform.startswith("win"):
         return
     try:
@@ -14563,8 +15556,7 @@ class _FriendsDim(QWidget):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
-        if sys.platform.startswith("linux"):
-            self.setWindowFlag(Qt.WindowType.X11BypassWindowManagerHint, True)   # show over fullscreen games
+        # (no X11 bypass hint here: a bypass window can't get keyboard focus, so the chat box wouldn't work)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setGeometry(geo)
@@ -14697,8 +15689,7 @@ class _FriendsPanel(QWidget):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
-        if sys.platform.startswith("linux"):
-            self.setWindowFlag(Qt.WindowType.X11BypassWindowManagerHint, True)   # show over fullscreen games
+        # (no X11 bypass hint here: a bypass window can't get keyboard focus, so the chat box wouldn't work)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(320, 400)
         self.resize(420, 620)
@@ -15000,6 +15991,18 @@ class _FriendsPanel(QWidget):
         if e.position().y() < 62 and self.windowHandle() is not None:
             self.windowHandle().startSystemMove()
 
+def _ov_log(msg):
+    """Small debug log next to launcher.json (overlay_debug.log) - helps when the hotkey/panel doesn't show."""
+    try:
+        path = os.path.join(os.path.dirname(get_launcher_settings_path()), "overlay_debug.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 100000:
+            os.remove(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass
+
 class _FriendsOverlay(QObject):
     toggle_req = pyqtSignal()
     def __init__(self):
@@ -15007,30 +16010,48 @@ class _FriendsOverlay(QObject):
         self.dim = self.panel = None
         self.toggle_req.connect(self.open, Qt.ConnectionType.QueuedConnection)
 
+    _verbose = False      # True when asked via `main.py --friends`: then say why nothing opens
+
+    def _refuse(self, why):
+        _ov_log(f"friends panel not opened: {why}")
+        if self._verbose and _overlay is not None:
+            _overlay.notify_playing("Friends panel", why, None, "")
+        self._verbose = False
+
     def open(self):
+        _ov_log("friends panel requested")
         if self.panel is not None and self.panel.isVisible():
             self.close()                 # Shift+Q again closes it
             return
-        if get_overlay_mode() == "off" or not (_now_playing["name"] or _running):
-            return                       # only while a launcher-started game is running
+        if get_overlay_mode() == "off":
+            return self._refuse("the game overlay is set to Off in Settings")
+        if not (_now_playing["name"] or _running):
+            return self._refuse("no game started from the launcher is running")   # only while a launcher game runs
         if load_account() is None:
-            return
+            return self._refuse("you are not logged in")
         if get_overlay_mode() == "inject":
             from overlay import has_injected
             if has_injected():
-                return                   # the in-game panel handles Shift+Q (a launcher window would alt-tab out)
-        scr = QApplication.primaryScreen().geometry()
-        self.dim = _FriendsDim(scr)
-        self.panel = _FriendsPanel()
-        self.dim.clicked.connect(self.close)
-        self.panel.closed.connect(self.close)
-        self.dim.show()
-        self.panel.move(scr.center() - self.panel.rect().center())
-        self.panel.show()
-        self.panel.raise_()
-        self.panel.activateWindow()
-        _force_foreground(int(self.panel.winId()))
-        self.panel.refresh()
+                return self._refuse("the in-game overlay is active - press Shift+Q inside the game")
+        self._verbose = False
+        try:
+            scr = QApplication.primaryScreen().geometry()
+            self.dim = _FriendsDim(scr)
+            self.panel = _FriendsPanel()
+            self.dim.clicked.connect(self.close)
+            self.panel.closed.connect(self.close)
+            self.dim.show()
+            self.panel.move(scr.center() - self.panel.rect().center())
+            self.panel.show()
+            self.panel.raise_()
+            self.panel.activateWindow()
+            _force_foreground(int(self.panel.winId()))
+            self.panel.refresh()
+            _ov_log(f"friends panel shown (platform {QApplication.platformName()})")
+        except Exception:
+            import traceback
+            _ov_log("friends panel failed:\n" + traceback.format_exc())
+            self.close()
 
     def close(self):
         for w in (self.panel, self.dim):
@@ -15079,15 +16100,20 @@ def _start_shift_q_hook_linux(callback):
     """Linux (X11 / XWayland) Shift+Q listener via pynput (pip install pynput). Only listens, never blocks keys."""
     try:
         from pynput import keyboard
-    except Exception:
+    except Exception as e:
         print("Shift+Q overlay hotkey on Linux needs: pip install pynput")
+        _ov_log(f"pynput unavailable: {e!r}")
         return None
     state = {"shift": False, "q": False}
     def on_press(k):
+        if not state.get("seen"):
+            state["seen"] = True
+            _ov_log(f"first key event heard: {k!r}")      # proves the listener receives keys at all
         if k in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
             state["shift"] = True
         elif getattr(k, "char", None) and k.char.lower() == "q":
             if state["shift"] and not state["q"]:
+                _ov_log("Shift+Q heard")
                 callback()
             state["q"] = True
     def on_release(k):
@@ -15098,8 +16124,19 @@ def _start_shift_q_hook_linux(callback):
     try:
         lst = keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True)
         lst.start()
+        _ov_log(f"hotkey listener started (platform {QApplication.platformName()}, "
+                f"session {os.environ.get('XDG_SESSION_TYPE', '?')}, DISPLAY={os.environ.get('DISPLAY', '')})")
+        def health():
+            _ov_log(f"hotkey listener running={getattr(lst, 'running', '?')}, keys heard so far={state.get('seen', False)}")
+            if not getattr(lst, "running", True):
+                try:
+                    lst.join(0.2)             # re-raises whatever killed the listener thread
+                except Exception as e:
+                    _ov_log(f"hotkey listener died: {e!r}")
+        threading.Timer(4.0, health).start()
         return lst
-    except Exception:
+    except Exception as e:
+        _ov_log(f"hotkey listener failed: {e!r}")
         return None
 
 class _InjectBridge(QObject):
@@ -15113,15 +16150,23 @@ class _InjectBridge(QObject):
         self.timer.start()
 
     @staticmethod
-    def _p(name):
-        import tempfile
-        return os.path.join(tempfile.gettempdir(), name)
+    def _dirs():
+        try:
+            from overlay import injected_temp_dirs
+            return injected_temp_dirs()       # Wine/Proton: the prefix Temp folder(s) of the injected games
+        except Exception:
+            import tempfile
+            return [tempfile.gettempdir()]
 
     def _atomic_write(self, name, lines):
-        path = self._p(name)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        os.replace(path + ".tmp", path)
+        for d in self._dirs():
+            path = os.path.join(d, name)
+            try:
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                os.replace(path + ".tmp", path)
+            except OSError:
+                pass
 
     @staticmethod
     def _clean(s):
@@ -15179,12 +16224,20 @@ class _InjectBridge(QObject):
         import time
         if get_overlay_mode() != "inject":
             return
-        try:
-            with open(self._p("ncz_cmd.txt"), encoding="utf-8") as f:
-                lines = f.read().splitlines()
-            cmd = (lines[0], lines[1]) if len(lines) >= 2 else None
-        except OSError:
-            cmd = None
+        cmd = None
+        for d in self._dirs():
+            try:
+                with open(os.path.join(d, "ncz_cmd.txt"), encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+            if len(lines) >= 2:
+                try:
+                    newer = cmd is None or int(lines[0]) > int(cmd[0])
+                except ValueError:
+                    newer = cmd is None
+                if newer:
+                    cmd = (lines[0], lines[1])
         if self.last is None:                  # first tick: ignore leftovers from an earlier session
             self.last = cmd[0] if cmd else ""
             return
@@ -15204,6 +16257,9 @@ def _fo_init(self):
         self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
     elif sys.platform.startswith("linux"):
         self._kb_hook = _start_shift_q_hook_linux(self._friends_overlay.toggle_req.emit)
+        if self._kb_hook is None and _overlay is not None and get_overlay_mode() != "off":
+            QTimer.singleShot(4000, lambda: _overlay.notify_playing(
+                "Shift+Q overlay", "pip install pynput", None, "needs: "))
 
 AdaptiveApp.__init__ = _fo_init
 
