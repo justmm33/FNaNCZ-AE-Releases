@@ -1487,6 +1487,210 @@ def stream_download(response, dest_path, emit_progress, is_cancelled=lambda: Fal
     elapsed = max(time.time() - start, 1e-6)
     emit_progress(downloaded, total, downloaded / elapsed)
 
+# ---- resumable downloads: a dropped connection or an expired link keeps what's already on disk ----
+DL_MAX_FAILS = 6                          # failed attempts in a row (with no new data) before giving up
+DL_DEAD_CODES = (400, 401, 403, 404, 410) # the link itself is dead: ask for a new one right away
+
+class _DLBadLink(Exception):
+    """The link answered, but not with the file we were downloading (error page, wrong offset...)."""
+
+class _DLRestart(Exception):
+    """The new link serves a different file than the partial one: start again from byte 0."""
+
+class _DLFatal(Exception):
+    """Retrying can't help (e.g. the disk is full)."""
+
+def _dl_cancelled(w):
+    return bool(getattr(w, "_is_cancelled", False))
+
+def _dl_backoff(fails):
+    return min(2 ** fails, 20)
+
+def _dl_wait(w, seconds):
+    """Sleeps; returns True if the download was cancelled meanwhile."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if _dl_cancelled(w):
+            return True
+        time.sleep(0.2)
+    return _dl_cancelled(w)
+
+def resumable_download(w, get_link, pick_name, expected_total=0, first=None):
+    """Downloads a file into DOWNLOAD_DIR and returns its path.
+
+    get_link()  -> (url, headers): finds a download link; called again whenever a fresh one is needed.
+    pick_name(response, url) -> file name, used once, on the first connection.
+    first       -> an already-found (url, headers), so the first link isn't looked up twice.
+
+    If the connection drops or the link dies mid-download, the bytes already on disk are kept, the downloader
+    reconnects (a new link when the old one is dead, or didn't work on a retry) and continues with a Range
+    request from the same byte. If a server ignores Range, it skips ahead to the same byte instead.
+    Progress never goes backwards. Returns early (file left in place) when w is cancelled; callers clean up."""
+    url, headers = first if first else get_link()
+    dest_path, done, server_total = None, 0, 0
+    fails, retry_same, need_new = 0, 1, False
+    while True:
+        if _dl_cancelled(w):
+            if dest_path:
+                return dest_path
+            raise RuntimeError("CANCELLED")
+        if need_new:
+            w.status_update.emit("Getting a new download link...")
+            try:
+                url, headers = get_link()
+                need_new = False
+                try:
+                    w.download_url = url        # the card/worker always points at the link in use
+                except Exception:
+                    pass
+            except Exception as e:
+                if _dl_cancelled(w) or str(e) == "CANCELLED":
+                    return dest_path
+                fails += 1
+                if fails > DL_MAX_FAILS:
+                    raise RuntimeError(f"Couldn't get a new download link: {e}") from e
+                if _dl_wait(w, _dl_backoff(fails)):
+                    return dest_path
+                continue
+        before = done
+        try:
+            if done > 0 and (not os.path.exists(dest_path) or os.path.getsize(dest_path) < done):
+                done = before = 0               # the partial file went missing: nothing to resume
+            hdrs = dict(headers)
+            if done > 0:
+                hdrs["Range"] = f"bytes={done}-"
+                w.status_update.emit("Reconnecting...")
+            else:
+                w.status_update.emit("Connecting...")
+            try:
+                response = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=NET_TIMEOUT)
+            except urllib.error.HTTPError as he:
+                if he.code == 416 and done > 0:   # "range not satisfiable": everything had already arrived, or the file changed
+                    m = re.search(r"/(\d+)\s*$", he.headers.get("Content-Range") or "")
+                    if m and int(m.group(1)) == done:
+                        return dest_path
+                    raise _DLRestart()
+                raise
+            with response:
+                w._response = response
+                if _dl_cancelled(w):
+                    raise RuntimeError("CANCELLED")
+                code = getattr(response, "status", 200)
+                ctype = (response.headers.get("Content-Type") or "").lower()
+                clen = int(response.headers.get("Content-Length") or 0)
+                skip = 0
+                if code == 206 and done > 0:
+                    m = re.match(r"\s*bytes\s+(\d+)-\d+/(\d+|\*)", response.headers.get("Content-Range") or "")
+                    if not m or int(m.group(1)) != done:
+                        raise _DLBadLink("The server resumed at the wrong position.")
+                    if m.group(2) != "*":
+                        total = int(m.group(2))
+                        if server_total and total != server_total:
+                            raise _DLRestart()
+                        server_total = total
+                else:                           # a whole-file answer: first connection, or this server ignores Range
+                    if done > 0:
+                        if ctype.startswith("text/html"):
+                            raise _DLBadLink("The link returned a web page instead of the file.")
+                        if (server_total and clen and clen != server_total) or (clen and clen <= done):
+                            raise _DLRestart()
+                        skip = done
+                    if clen:
+                        server_total = clen
+                shown_total = int(expected_total or 0) or server_total
+                if dest_path is None:
+                    dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, pick_name(response, url)))
+                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+                with open(dest_path, "r+b" if done > 0 else "wb") as f:
+                    if done > 0:
+                        f.truncate(done)
+                        f.seek(done)
+                    w.progress.emit(done, shown_total, 0.0)    # the bar keeps its place on a reconnect
+                    if skip:
+                        w.status_update.emit("This server can't resume, skipping ahead to where it stopped...")
+                        left = skip
+                        while left > 0:
+                            if _dl_cancelled(w):
+                                return dest_path
+                            chunk = response.read(min(1 << 16, left))
+                            if not chunk:
+                                raise ConnectionError("Connection closed while skipping ahead")
+                            left -= len(chunk)
+                    sess_t0, sess_base, last_emit = time.time(), done, 0.0
+                    while not _dl_cancelled(w):
+                        buf = response.read(1 << 16)
+                        if not buf:
+                            break
+                        try:
+                            f.write(buf)
+                        except OSError as de:
+                            raise _DLFatal(f"Couldn't write the file: {de}")
+                        done += len(buf)
+                        now = time.time()
+                        if now - last_emit >= 0.1:
+                            last_emit = now
+                            w.progress.emit(done, shown_total, (done - sess_base) / max(now - sess_t0, 1e-6))
+                if _dl_cancelled(w):
+                    return dest_path
+                if server_total and done < server_total:
+                    raise ConnectionError(f"Connection closed early ({done} of {server_total} bytes)")
+                w.progress.emit(done, shown_total, (done - sess_base) / max(time.time() - sess_t0, 1e-6))
+                return dest_path
+        except Exception as e:
+            if _dl_cancelled(w) or str(e) == "CANCELLED":
+                if dest_path:
+                    return dest_path
+                raise RuntimeError("CANCELLED")
+            if isinstance(e, _DLFatal):
+                raise RuntimeError(str(e)) from e
+            if dest_path is None:
+                raise                           # never got going: report it like before
+            if isinstance(e, _DLRestart):
+                done, server_total = 0, 0
+            made_progress = done > before
+            if made_progress:
+                fails, retry_same = 0, 1
+            else:
+                fails += 1
+            if fails > DL_MAX_FAILS:
+                raise RuntimeError(f"Download failed after {DL_MAX_FAILS} retries: {e}") from e
+            dead = isinstance(e, _DLBadLink) or (isinstance(e, urllib.error.HTTPError) and e.code in DL_DEAD_CODES)
+            if dead or retry_same <= 0:
+                need_new = True                 # a retry on the same link already failed (or it's plainly dead)
+            else:
+                retry_same -= 1                 # first hiccup: the same link usually still works
+            wait = _dl_backoff(fails)
+            w.status_update.emit(f"Connection lost, retrying in {wait}s...")
+            if _dl_wait(w, wait):
+                return dest_path
+
+def _resolve_version_link(w):
+    """Reads the game's version file and returns its download_link_windows (MediaFire pages are resolved to the
+    direct link). Called again for a brand-new link whenever a download needs one."""
+    w.status_update.emit("Checking version...")
+    req = urllib.request.Request(w.version_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+        content = resp.read().decode('utf-8')
+    w.remote_version = parse_remote_version(content)
+    download_url = None
+    for line in content.splitlines():
+        if 'download_link_windows' in line:
+            parts = line.split('=', 1)
+            if len(parts) == 2:
+                download_url = parts[1].strip().strip('"').strip("'")
+                break
+    if not download_url:
+        raise ValueError("Could not find download_link_windows in version file")
+    if "mediafire.com" in download_url:
+        w.status_update.emit("Resolving MediaFire link...")
+        mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT) as mf_resp:
+            mf_html = mf_resp.read().decode('utf-8')
+        match = re.search(r'href="(https?://download[^"]+)"', mf_html)
+        if match:
+            download_url = match.group(1)
+    return download_url, {'User-Agent': 'Mozilla/5.0'}
+
 def linux_install_terminal(linux_cmd, project_root, dest_path):
     """Starts the Linux conversion script in a terminal window and returns the process.
     Paths are shell-quoted and no outer shell is used, so a server-supplied file name can't run commands."""
@@ -1527,37 +1731,10 @@ class DownloadWorker(QThread):
                 dest_path = self.existing_zip_path
             else:
                 downloaded_here = True
-                req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
-                    content = resp.read().decode('utf-8')
-                self.remote_version = parse_remote_version(content)
-
-                download_url = None
-                for line in content.splitlines():
-                    if 'download_link_windows' in line:
-                        parts = line.split('=', 1)
-                        if len(parts) == 2:
-                            download_url = parts[1].strip().strip('"').strip("'")
-                            break
-
-                if not download_url:
-                    raise ValueError("Could not find download_link_windows in version file")
-
-                if "mediafire.com" in download_url:
-                    mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT) as mf_resp:
-                        mf_html = mf_resp.read().decode('utf-8')
-                    match = re.search(r'href="(https?://download[^"]+)"', mf_html)
-                    if match:
-                        download_url = match.group(1)
-
-                dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(dl_req, timeout=NET_TIMEOUT) as response:
+                dest_path = resumable_download(
+                    self, lambda: _resolve_version_link(self),
                     # The server picks the name; strip path separators so it can't land outside DOWNLOAD_DIR.
-                    file_name = safe_filename_from_headers(response, self.game_name)
-                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                    dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                    stream_download(response, dest_path, self.progress.emit)
+                    lambda response, url: safe_filename_from_headers(response, self.game_name))
 
             if self.download_only:
                 self.finished.emit(dest_path)
@@ -5938,38 +6115,11 @@ def _new_fb_run(self):
             self.failed.emit("CANCELLED")
             return
 
-        self.status_update.emit("Connecting...")
-        req = urllib.request.Request(self.download_url, headers={'User-Agent': 'Mozilla/5.0'})
-        
-        with urllib.request.urlopen(req, timeout=20) as response:
-            self._response = response
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            ext = ".rar" if self.download_url.lower().endswith('.rar') else ".zip"
-            file_name = safe_filename_from_headers(response, self.title, ext)
-
-            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-            
-            if total_size <= 0:
-                total_size = int(response.headers.get('Content-Length', 0))
-
-            downloaded = 0
-            block_size = 8192
-            start_time = time.time()
-
-            with open(dest_path, 'wb') as f:
-                while not self._is_cancelled:
-                    buffer = response.read(block_size)
-                    if not buffer:
-                        break
-                    downloaded += len(buffer)
-                    f.write(buffer)
-                    elapsed = time.time() - start_time
-                    speed = downloaded / elapsed if elapsed > 0 else 0
-                    self.progress.emit(downloaded, total_size, speed)
+        ext = ".rar" if self.download_url.lower().endswith('.rar') else ".zip"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        dest_path = resumable_download(
+            self, lambda: (self.download_url, headers),
+            lambda response, url: safe_filename_from_headers(response, self.title, ext), total_size)
 
         if self._is_cancelled:
             if dest_path and os.path.exists(dest_path):
@@ -6352,30 +6502,12 @@ def _pw_find_link(self, start_url):
         finally:
             browser.close()
 
-def _fb_stream(self, url, headers):
-    total_size = self.expected_size
-    self.status_update.emit("Connecting...")
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-        self._response = response
-        if self._is_cancelled:
-            raise RuntimeError("CANCELLED")
-        ext = ".rar" if url.lower().split("?")[0].endswith(".rar") else ".zip"
-        file_name = safe_filename_from_headers(response, self.title, ext)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-        if total_size <= 0:
-            total_size = int(response.headers.get('Content-Length', 0) or 0)
-        downloaded, start_time = 0, time.time()
-        with open(dest_path, 'wb') as f:
-            while not self._is_cancelled:
-                buf = response.read(8192)
-                if not buf:
-                    break
-                downloaded += len(buf)
-                f.write(buf)
-                elapsed = time.time() - start_time
-                self.progress.emit(downloaded, total_size, downloaded / elapsed if elapsed > 0 else 0)
-    return dest_path
+def _fb_stream(self, url, headers, relink=None):
+    """Downloads url; relink() (optional) finds a brand-new link if this one dies mid-download."""
+    def name(response, u):
+        ext = ".rar" if u.lower().split("?")[0].endswith(".rar") else ".zip"
+        return safe_filename_from_headers(response, self.title, ext)
+    return resumable_download(self, relink or (lambda: (url, headers)), name, self.expected_size, first=(url, headers))
 
 def _fb_pw_run(self):
     if _pw_is_ncz(self.title):
@@ -6386,7 +6518,7 @@ def _fb_pw_run(self):
         if not dest_path:
             url, headers = _pw_find_link(self, pw_game_url(self.title))
             self.download_url = url  # bridged: the copied link becomes this download's link
-            dest_path = _fb_stream(self, url, headers)
+            dest_path = _fb_stream(self, url, headers, lambda: _pw_find_link(self, pw_game_url(self.title)))
             fresh = True
         if self._is_cancelled:
             if fresh and os.path.exists(dest_path):
@@ -6421,50 +6553,9 @@ def _new_game_worker_run(self):
         downloaded_here = False
         if not dest_path or not os.path.exists(dest_path):
             downloaded_here = True
-            self.status_update.emit("Checking version...")
-            req = urllib.request.Request(self.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                content = resp.read().decode('utf-8')
-            self.remote_version = parse_remote_version(content)
-
-            download_url = None
-            for line in content.splitlines():
-                if 'download_link_windows' in line:
-                    parts = line.split('=', 1)
-                    if len(parts) == 2:
-                        download_url = parts[1].strip().strip('"').strip("'")
-                        break
-
-            if not download_url:
-                raise ValueError("Could not find download_link_windows in version file")
-
-            if "mediafire.com" in download_url:
-                self.status_update.emit("Resolving MediaFire link...")
-                mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(mf_req, timeout=20) as mf_resp:
-                    mf_html = mf_resp.read().decode('utf-8')
-                match = re.search(r'href="(https?://download[^"]+)"', mf_html)
-                if match:
-                    download_url = match.group(1)
-
-            if self._is_cancelled:
-                self.failed.emit("CANCELLED")
-                return
-
-            self.status_update.emit("Connecting...")
-            dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-            
-            with urllib.request.urlopen(dl_req, timeout=20) as response:
-                self._response = response
-                if self._is_cancelled:
-                    self.failed.emit("CANCELLED")
-                    return
-
-                # The server picks the name; strip path separators so it can't land outside DOWNLOAD_DIR.
-                file_name = safe_filename_from_headers(response, self.title)
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, file_name))
-                stream_download(response, dest_path, self.progress.emit, lambda: self._is_cancelled)
+            dest_path = resumable_download(
+                self, lambda: _resolve_version_link(self),
+                lambda response, url: safe_filename_from_headers(response, self.title))
 
         if self._is_cancelled:
             if downloaded_here and dest_path and os.path.exists(dest_path):
@@ -12603,35 +12694,20 @@ def _gj_find_link(self, game_url, gid=None):
             browser.close()
 
 
-def _gj_stream(self, url, headers):
+def _gj_name(response, url, title):
+    name = ""
+    cd = response.headers.get("Content-Disposition") or ""
+    m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I) or re.search(r'filename="?([^";]+)"?', cd, re.I)
+    if m:
+        name = urllib.parse.unquote(m.group(1).strip().strip('"'))
+    if not name:
+        name = os.path.basename(urllib.parse.unquote(response.geturl().split("?")[0]))
+    return re.sub(r'[<>:"/\\|?*]', "_", name).strip() or sanitize_folder_name(title) + ".bin"
+
+def _gj_stream(self, url, headers, relink=None):
     """Like _fb_stream, but keeps the file's real name/extension (.exe, .zip, .rar, .7z...)."""
-    self.status_update.emit("Connecting...")
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-        self._response = response
-        if self._is_cancelled:
-            raise RuntimeError("CANCELLED")
-        name = ""
-        cd = response.headers.get("Content-Disposition") or ""
-        m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I) or re.search(r'filename="?([^";]+)"?', cd, re.I)
-        if m:
-            name = urllib.parse.unquote(m.group(1).strip().strip('"'))
-        if not name:
-            name = os.path.basename(urllib.parse.unquote(response.geturl().split("?")[0]))
-        name = re.sub(r'[<>:"/\\|?*]', "_", name).strip() or sanitize_folder_name(self.title) + ".bin"
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        dest_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, name))
-        total = int(response.headers.get("Content-Length", 0) or 0)
-        downloaded, start = 0, time.time()
-        with open(dest_path, "wb") as f:
-            while not self._is_cancelled:
-                buf = response.read(8192)
-                if not buf:
-                    break
-                downloaded += len(buf)
-                f.write(buf)
-                el = time.time() - start
-                self.progress.emit(downloaded, total, downloaded / el if el > 0 else 0)
-    return dest_path
+    return resumable_download(self, relink or (lambda: (url, headers)),
+                              lambda response, u: _gj_name(response, u, self.title), 0, first=(url, headers))
 
 def _gj_install_file(path, game_dir):
     """Installs whatever Game Jolt gave us: archive -> extracted, lone .exe -> copied into the game folder."""
@@ -12667,7 +12743,7 @@ class GameJoltDownloadWorker(FirebaseDownloadWorker):
             else:
                 url, headers = _gj_find_link(self, self.game_url, self.gid)
                 self.download_url = url
-                dest_path = _gj_stream(self, url, headers)
+                dest_path = _gj_stream(self, url, headers, lambda: _gj_find_link(self, self.game_url, self.gid))
                 fresh = True
             if self._is_cancelled:
                 if fresh and os.path.exists(dest_path):   # never delete a file the user chose to keep
