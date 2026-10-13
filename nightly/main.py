@@ -504,7 +504,8 @@ def get_launcher_settings_path():
 def load_launcher_settings():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
-                "start_on_boot": True, "auto_update": True, "xwayland_mode": True}
+                "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
+                "start_minimized": True, "close_to_tray": True}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -532,6 +533,9 @@ def load_launcher_settings():
                     settings["auto_update"] = loaded["auto_update"]
                 if isinstance(loaded.get("xwayland_mode"), bool):
                     settings["xwayland_mode"] = loaded["xwayland_mode"]
+                for _k in ("start_minimized", "close_to_tray"):
+                    if isinstance(loaded.get(_k), bool):
+                        settings[_k] = loaded[_k]
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
                     settings["steamgriddb_api_key"] = key.strip()
@@ -2288,8 +2292,29 @@ def _other_launcher_pids():
             pids.append(int(d))
     return pids
 
+_instance_lock_ref = None
+
+def _acquire_instance_lock():
+    """Atomic 'one launcher per profile' lock (a lock file in the temp folder). Unlike the local-socket check it
+    also holds while the launcher is still starting up, so two quick starts - e.g. the login autostart plus a
+    double click - can't both get through. A lock left by a crashed launcher is recognised and taken over."""
+    global _instance_lock_ref
+    if _instance_lock_ref is not None:
+        return True
+    try:
+        from PyQt6.QtCore import QLockFile
+    except ImportError:
+        return True
+    import tempfile
+    lock = QLockFile(os.path.join(tempfile.gettempdir(), _instance_name() + ".lock"))
+    lock.setStaleLockTime(0)           # a dead owner is still detected by its process id; never steal by age
+    if lock.tryLock(0):
+        _instance_lock_ref = lock
+        return True
+    return False
+
 def _kill_other_launchers():
-    """Fallback for an old instance that doesn't understand the 'quit' request."""
+    """Fallback for an old instance that doesn't understand the 'quit' request, or that is still starting up."""
     if sys.platform.startswith("linux"):
         import signal
         pids = _other_launcher_pids()
@@ -2300,20 +2325,24 @@ def _kill_other_launchers():
                 except OSError:
                     pass
             for _ in range(15):
-                if not _another_instance_running(wake=False):
+                if not any(os.path.exists(f"/proc/{p}") for p in pids):
                     return
                 time.sleep(0.2)
     elif sys.platform.startswith("win") and not _ncz_profile:
+        names = [os.path.basename(sys.executable)] if getattr(sys, "frozen", False) else []
         script = os.path.abspath(__file__).replace("'", "''")
+        cond = f"$_.CommandLine -like '*{script}*'"
+        if names:
+            cond = f"$_.Name -eq '{names[0]}'"
         ps = (f"Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne {os.getpid()} -and "
-              f"$_.CommandLine -like '*{script}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}")
+              f"{cond} }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}")
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=15, creationflags=0x08000000)
         except Exception:
             pass
 
 def _replace_running_instance():
-    """Closes the launcher that's already running so this one can take over. True if it's gone."""
+    """Closes the launcher that's already running so this one can take over. True once we hold the lock."""
     try:
         from PyQt6.QtNetwork import QLocalSocket
         sock = QLocalSocket()
@@ -2325,18 +2354,19 @@ def _replace_running_instance():
             sock.disconnectFromServer()
     except Exception:
         pass
-    for _ in range(20):                              # up to ~4 s for it to close by itself
-        if not _another_instance_running(wake=False):
+    for _ in range(25):                              # up to ~5 s for it to close by itself
+        if _acquire_instance_lock() and not _another_instance_running(wake=False):
             return True
         time.sleep(0.2)
     _kill_other_launchers()
-    for _ in range(10):
-        if not _another_instance_running(wake=False):
+    for _ in range(15):
+        if _acquire_instance_lock() and not _another_instance_running(wake=False):
             return True
         time.sleep(0.2)
     return False
 
-def _start_instance_server(app, window):
+def _start_instance_server(app, window=None):
+    window_arg = window
     try:
         from PyQt6.QtNetwork import QLocalServer
     except ImportError:
@@ -2347,6 +2377,7 @@ def _start_instance_server(app, window):
     if not server.listen(name):
         return
     def on_connection():
+        window = app._ncz_main_window if getattr(app, "_ncz_main_window", None) is not None else window_arg
         woke = False
         quit_req = False
         friends_req = False
@@ -2368,7 +2399,9 @@ def _start_instance_server(app, window):
             QApplication.quit()
             QTimer.singleShot(2500, lambda: os._exit(0))   # don't hang on a stuck background thread
             return
-        if woke:
+        if woke and window is None:      # still starting up: show it as soon as it exists
+            app._ncz_wake_pending = True
+        elif woke:
             window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized)
             window.show()
             window.raise_()
@@ -2515,6 +2548,16 @@ class SettingsPage(QWidget):
         autoupdate_panel_layout.addLayout(autoupdate_row)
         layout.addWidget(autoupdate_panel)
         layout.addSpacing(12)
+
+        for _key, _title, _desc in (
+                ("close_to_tray", "Close button minimizes to tray",
+                 "Closing the launcher keeps it running in the system tray (use Quit in the tray menu to exit). "
+                 "When disabled, closing exits the launcher. Needs a system tray."),
+                ("start_minimized", "Start in the tray",
+                 "When the launcher starts with your computer it stays hidden in the tray instead of opening "
+                 "its window.")):
+            layout.addWidget(self._toggle_panel(_key, _title, _desc))
+            layout.addSpacing(12)
 
         if sys.platform.startswith("linux"):
             xw_panel = QFrame()
@@ -2820,6 +2863,43 @@ class SettingsPage(QWidget):
             settings["start_on_boot"] = want
             save_launcher_settings(settings)
         self._refresh_startup_btn()
+
+    def _toggle_panel(self, key, title, desc):
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel(title)
+        name.setObjectName("RowTitle")
+        info = QLabel(desc)
+        info.setObjectName("RowDesc")
+        info.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(info)
+        btn = QPushButton()
+        btn.setCheckable(True)
+        btn.setChecked(load_launcher_settings().get(key, True))
+        btn.setFixedWidth(160)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def refresh():
+            btn.setText("Enabled" if btn.isChecked() else "Disabled")
+
+        def toggled():
+            settings = load_launcher_settings()
+            settings[key] = btn.isChecked()
+            save_launcher_settings(settings)
+            refresh()
+
+        btn.clicked.connect(toggled)
+        refresh()
+        row.addLayout(text, 1)
+        row.addWidget(btn)
+        pl.addLayout(row)
+        return panel
 
     def _refresh_xwayland_btn(self):
         self.xwayland_btn.setText("Enabled" if self.xwayland_btn.isChecked() else "Disabled")
@@ -5551,13 +5631,16 @@ def main():
         except Exception:
             pass
         sys.exit(0)
-    if "--startup" in sys.argv:
-        if _another_instance_running(wake=False):
-            sys.exit(0)  # started at login while one is already up: leave it alone
-    elif _another_instance_running(wake=False):
+    got_lock = _acquire_instance_lock()
+    if got_lock and _another_instance_running(wake=False):
+        got_lock = False             # an older launcher (one that doesn't use the lock) is already running
+    if not got_lock:
+        if "--startup" in sys.argv:
+            sys.exit(0)  # started at login while one is already up (or starting): leave it alone
         if not _replace_running_instance():     # close the old one and carry on starting this one
             _another_instance_running(wake=True)
             sys.exit(0)  # it wouldn't go away: bring it to the front instead
+    _start_instance_server(app)                 # listen right away, not only once the window is built
 
     icon_path = asset_path("icon.png")
     if os.path.exists(icon_path):
@@ -5575,11 +5658,16 @@ def main():
         pass
 
     window = AdaptiveApp()
-    _start_instance_server(app, window)
+    app._ncz_main_window = window
     apply_startup_setting()
-    if "--startup" in sys.argv:
-        if getattr(window, "_tray", None) is None:      # no tray to hide in
+    tray = getattr(window, "_tray", None)
+    if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
+        if tray is None:                                # no tray to hide in
             window.showMinimized()
+        else:
+            window.hide()                               # start quietly in the tray
+        if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
+            window.showNormal()
     else:
         window.showMaximized()
     sys.exit(app.exec())
@@ -9723,12 +9811,18 @@ def _tray_init(self):
 
 def _tray_close_event(self, event):
     tray = getattr(self, "_tray", None)
-    if tray is not None and tray.isVisible() and not getattr(self, "_really_quit", False):
+    if getattr(self, "_really_quit", False):
+        event.accept()
+    elif tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
         event.ignore()
         self.hide()
         self._tray_hint_shown = True     # no "still running in the background" popup (notifications muted)
     else:
         event.accept()
+        if tray is not None:             # closing the last window doesn't quit while a tray icon is in use
+            self._really_quit = True
+            tray.hide()
+            QTimer.singleShot(0, QApplication.quit)
 
 AdaptiveApp.__init__ = _tray_init
 AdaptiveApp.closeEvent = _tray_close_event
@@ -15524,7 +15618,7 @@ def _frameless_init(self):
 
     exit_btn = QPushButton("\u2715")
     exit_btn.setObjectName("ExitButton")
-    exit_btn.setToolTip("Exit")
+    exit_btn.setToolTip("Close")
     exit_btn.setFixedSize(40, 32)
     exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     exit_btn.setStyleSheet(
@@ -15534,9 +15628,13 @@ def _frameless_init(self):
         "QPushButton:pressed { background: #c93a3f; color: #ffffff; }")
 
     def exit_launcher():
-        # Really quit (the normal close button only hides the launcher to the tray).
-        self._really_quit = True
+        # With "Close button minimizes to tray" on, this hides the launcher to the tray (Quit is in the tray menu);
+        # otherwise it really quits.
         tray = getattr(self, "_tray", None)
+        if tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
+            self.close()
+            return
+        self._really_quit = True
         if tray is not None:
             tray.hide()
         QApplication.instance().quit()
@@ -15748,7 +15846,7 @@ def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
     _ov_prev_launch_exe(app, exe, compat_tool, d3d, args)
     if exe and os.path.exists(exe):
         # on Linux the Wine process takes a while to appear: look again a few times
-        for ms in ((2500, 6000, 12000, 25000) if linux else (1500,)):
+        for ms in ((2500, 6000, 12000, 25000, 45000, 70000) if linux else (1500,)):
             QTimer.singleShot(ms, lambda: _overlay_game_launched(exe))
 
 _ov_prev_friends_init = FriendsPage.__init__
