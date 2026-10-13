@@ -34,6 +34,27 @@ ACCENT = QColor("#a97cff")
 NAME_COLOR = QColor("#9b6cff")
 GAME_COLOR = QColor("#9b6cff")
 AVATAR_COLOR = QColor("#b18cff")
+_accent_hex = ""   # set by set_accent(); sent along to the XWayland helper so its toasts match
+
+
+def _readable(c):
+    """Lifts a dark accent so text in that colour stays readable on the toast's dark background."""
+    h, s, l, a = c.getHslF()
+    if l >= 0.55:
+        return QColor(c)
+    return QColor.fromHslF(max(h, 0.0), s, 0.55, a)
+
+
+def set_accent(color):
+    """Recolours the toasts (bar, username, game name, fallback avatar) to the launcher's accent colour."""
+    global ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR, _accent_hex
+    c = QColor(color)
+    if not c.isValid():
+        return
+    _accent_hex = c.name()
+    ACCENT = c
+    NAME_COLOR = GAME_COLOR = _readable(c)
+    AVATAR_COLOR = _readable(c).lighter(115)
 
 
 _font_family = {"name": None, "tried": False}
@@ -294,7 +315,7 @@ class OverlayManager:
                 self._spawn_helper()
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
-                                         "prefix": prefix}) + "\n")
+                                         "prefix": prefix, "accent": _accent_hex}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
                 self._pending.append((user, game, avatar_path, prefix))
@@ -623,6 +644,8 @@ class _ServerBridge(QObject):
 
     @pyqtSlot(dict)
     def on_got(self, d):
+        if d.get("accent"):
+            set_accent(str(d["accent"]))
         overlay.notify_playing(str(d.get("user", "")), str(d.get("game", "")), d.get("avatar") or None,
                                str(d.get("prefix", "is playing ")))
 
