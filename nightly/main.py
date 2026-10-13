@@ -1219,7 +1219,7 @@ QLabel#RowDesc { color: $subtext; font-size: 12px; }
 QFrame#GameCard { background: transparent; border: 1px solid transparent; border-radius: 12px; }
 QFrame#GameCard:hover { background: $panel; border: 1px solid $accent; }
 QLabel#CardTitle { font-size: 14px; font-weight: 600; padding-left: 2px; }
-QLabel#CardStatus { color: $subtext; font-size: 12px; padding-left: 2px; }
+QLabel#CardStatus, QLabel#CardPlaytime { color: $subtext; font-size: 12px; padding-left: 2px; }
 QLabel#CoverPlaceholder { background: $panel; border: 1px dashed $border; border-radius: 8px; color: $subtext; }
 
 /* ---- buttons ---- */
@@ -6338,7 +6338,7 @@ def _change_steam_game_cover(self, appid):
             if card is old_card:
                 title_text = title
                 break
-        self.remove_steam_game(appid)
+        _drop_steam_card_widget(self, appid)   # card only: remove_steam_game() also deleted the library entry + the new cover
         self.create_steam_card(appid, title_text, saved_cover)
         self.apply_filter()
 
@@ -18299,6 +18299,490 @@ def _native_launch_ncz2(self):
 
 AdaptiveApp.launch_ae_game = _native_launch_ae
 AdaptiveApp.launch_ncz2_game = _native_launch_ncz2
+
+# ================================================================ library duplicate-card fix + library saved to account
+def _drop_steam_card_widget(self, appid):
+    """Removes a store card's widget only (library file and cover stay untouched)."""
+    card = self.steam_cards.pop(appid, None)
+    if card is None:
+        return
+    self.cards = [(c, t) for c, t in self.cards if c is not card]
+    try:
+        card.hide()
+        card.setParent(None)
+        card.deleteLater()
+    except RuntimeError:
+        pass
+
+# Adding a game as "existing" after it was added from the Store used to build a second card for the same appid and
+# overwrite steam_cards[appid], orphaning the first card (remove then hit the wrong card, the orphan was unremovable).
+# Every caller goes through here, so there can only ever be one card per appid.
+_lib_prev_create_steam_card = AdaptiveApp.create_steam_card
+
+def _lib_create_steam_card(self, appid, title_text, cover_path):
+    if appid in self.steam_cards:
+        _drop_steam_card_widget(self, appid)
+    _lib_prev_create_steam_card(self, appid, title_text, cover_path)
+
+AdaptiveApp.create_steam_card = _lib_create_steam_card
+
+# ---- library <-> account (users/<uid>/library in the cloud)
+_lib_lock = threading.RLock()
+_lib_timer = None
+_lib_suppress = False       # True while a cloud copy is being applied locally, so that doesn't push straight back
+_lib_last_sync = 0.0
+
+def _lib_state_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "library_sync.json")
+
+def _lib_load_state():
+    try:
+        with open(_lib_state_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+def _lib_save_state(state):
+    try:
+        os.makedirs(os.path.dirname(_lib_state_path()), exist_ok=True)
+        with open(_lib_state_path(), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+def _lib_url(uid, token):
+    base = FIREBASE_DB_URL.strip().rstrip("/")
+    return (f"{base}/users/{urllib.parse.quote(uid, safe='')}/library.json"
+            f"?auth={urllib.parse.quote(token, safe='')}")
+
+def _lib_local_payload():
+    """What goes to the cloud: store games and fan games (paths on this PC stay on this PC)."""
+    games = {str(g["appid"]): {"title": g["title"]} for g in load_steam_library()}
+    fan = {str(g["id"]): {"title": g["title"], "link": g.get("link", ""), "tags": list(g.get("tags") or [])}
+           for g in load_fan_library()}
+    return games, fan
+
+def _lib_push_now():
+    with _lib_lock:
+        token, uid = get_id_token()
+        state = _lib_load_state()
+        seq = state.get("seq", 0)
+        games, fan = _lib_local_payload()
+        body = {"updated": {".sv": "timestamp"}, "device": platform.system() or "Unknown",
+                "games": games, "fan": fan}
+        res = _http_json(_lib_url(uid, token), "PUT", body)
+        rev = res.get("updated") if isinstance(res, dict) else None
+        state = _lib_load_state()
+        state.update(uid=uid, rev=rev)
+        if state.get("seq", 0) == seq:
+            state["dirty"] = False
+        _lib_save_state(state)
+
+def _lib_push_bg():
+    try:
+        _lib_push_now()
+    except Exception:
+        pass    # stays marked dirty; retried on the next change, launch or login
+
+def _lib_schedule_push(delay=2.0):
+    global _lib_timer
+    with _lib_lock:
+        if _lib_timer is not None:
+            _lib_timer.cancel()
+        _lib_timer = threading.Timer(delay, _lib_push_bg)
+        _lib_timer.daemon = True
+        _lib_timer.start()
+
+def _lib_mark_dirty():
+    if _lib_suppress or not cloud_configured():
+        return
+    acct = load_account()
+    if not acct:
+        return
+    with _lib_lock:
+        state = _lib_load_state()
+        if state.get("uid") != acct["uid"]:
+            state = {"uid": acct["uid"], "rev": None}
+        state["dirty"] = True
+        state["seq"] = state.get("seq", 0) + 1
+        _lib_save_state(state)
+    _lib_schedule_push()
+
+# Every add/remove in the app saves through these two, so the account copy follows automatically.
+_lib_raw_save_steam_library = save_steam_library
+_lib_raw_save_fan_library = save_fan_library
+
+def save_steam_library(games):
+    _lib_raw_save_steam_library(games)
+    _lib_mark_dirty()
+
+def save_fan_library(games):
+    _lib_raw_save_fan_library(games)
+    _lib_mark_dirty()
+
+def _lib_download_cover(appid):
+    dest = os.path.join(get_library_cover_dir(), f"{appid}.img")
+    if os.path.exists(dest):
+        return dest
+    urls = []
+    try:
+        data = _http_json(f"{FIREBASE_DB_URL.strip().rstrip('/')}/steam_links/{appid}.json", "GET")
+        if isinstance(data, dict) and isinstance(data.get("cover_url"), str):
+            urls.append(data["cover_url"])
+    except Exception:
+        pass
+    urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
+    urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg")
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                img = resp.read()
+            if img:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(img)
+                return dest
+        except Exception:
+            continue
+    return ""
+
+def _lib_as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def _lib_sync_worker():
+    """Background: reconcile this PC's library with the account. Returns what to apply locally, or None."""
+    token, uid = get_id_token()
+    state = _lib_load_state()
+    if state.get("uid") != uid:
+        state = {"uid": uid, "rev": None, "dirty": False, "seq": 0}
+    cloud = _http_json(_lib_url(uid, token))
+    local_games, local_fan = _lib_local_payload()
+    if not isinstance(cloud, dict):                      # nothing in this account yet: upload what we have
+        if local_games or local_fan:
+            _lib_save_state(state)
+            _lib_push_now()
+        return None
+    c_games, c_fan = _lib_as_dict(cloud.get("games")), _lib_as_dict(cloud.get("fan"))
+    rev = cloud.get("updated")
+    if state.get("rev") is None:
+        # first time this PC meets this account: keep everything from both sides
+        t_games, t_fan = dict(c_games), dict(c_fan)
+        t_games.update(local_games)
+        t_fan.update(local_fan)
+        push = (t_games != c_games) or (t_fan != c_fan)
+    elif state.get("dirty"):
+        _lib_save_state(state)
+        _lib_push_now()                                  # this PC changed while offline: its copy wins
+        return None
+    elif rev != state.get("rev"):
+        t_games, t_fan, push = dict(c_games), dict(c_fan), False     # changed on another PC: take it
+        state.update(rev=rev, dirty=False)
+    else:
+        return None
+    _lib_save_state(state)
+    for aid in t_games:
+        if aid.isdigit() and aid not in local_games:
+            _lib_download_cover(int(aid))
+    return {"games": t_games, "fan": t_fan, "push": push}
+
+def _lib_apply(self, result):
+    global _lib_suppress
+    if not result:
+        return
+    _lib_suppress = True
+    try:
+        # store games
+        local = {g["appid"]: g for g in load_steam_library()}
+        target = {}
+        for key, info in _lib_as_dict(result["games"]).items():
+            if str(key).isdigit() and isinstance(info, dict) and info.get("title"):
+                target[int(key)] = info["title"]
+        entries = [local[a] for a in local if a in target]
+        for aid, title in target.items():
+            if aid not in local:
+                cover = os.path.join(get_library_cover_dir(), f"{aid}.img")
+                entries.append({"appid": aid, "title": title, "cover": cover if os.path.exists(cover) else ""})
+        save_steam_library(entries)
+        for aid in [a for a in list(self.steam_cards) if a not in target]:
+            _drop_steam_card_widget(self, aid)
+        for e in entries:
+            if e["appid"] not in self.steam_cards:
+                self.create_steam_card(e["appid"], e["title"], e.get("cover", ""))
+
+        # fan games
+        flocal = {g["id"]: g for g in load_fan_library()}
+        ftarget = {}
+        for key, info in _lib_as_dict(result["fan"]).items():
+            if str(key).isdigit() and isinstance(info, dict) and info.get("title"):
+                ftarget[int(key)] = info
+        fentries = [flocal[a] for a in flocal if a in ftarget]
+        for gid, info in ftarget.items():
+            if gid not in flocal:
+                fentries.append({"id": gid, "title": info["title"], "link": info.get("link", ""),
+                                 "tags": list(info.get("tags") or []), "cover": ""})
+        save_fan_library(fentries)
+        fan_cards = getattr(self, "fan_lib_cards", None)
+        if fan_cards is not None:
+            for gid in [g for g in list(fan_cards) if g not in ftarget]:
+                card = fan_cards.pop(gid)
+                self.fan_lib_list = [(c, t) for c, t in self.fan_lib_list if c is not card]
+                card.hide()
+                card.setParent(None)
+                card.deleteLater()
+            for e in fentries:
+                if e["id"] not in fan_cards:
+                    self._fan_create_library_card(e)
+        self.apply_filter()
+        try:
+            page = self.store_detail_page
+            page.set_in_library(page._appid in self.steam_cards)
+        except Exception:
+            pass
+    finally:
+        _lib_suppress = False
+    if result.get("push"):
+        _lib_mark_dirty()
+
+def _lib_sync_async(self):
+    global _lib_last_sync
+    if not cloud_configured() or load_account() is None:
+        return
+    worker = getattr(self, "_lib_worker", None)
+    if worker is not None and worker.isRunning():
+        return
+    if time.time() - _lib_last_sync < 20:
+        return
+    _lib_last_sync = time.time()
+    worker = TaskWorker(_lib_sync_worker)
+    worker.done.connect(lambda result: _lib_apply(self, result))
+    self._lib_worker = worker
+    worker.start()
+
+AdaptiveApp.sync_library = _lib_sync_async
+
+_acl_prev_init = AdaptiveApp.__init__
+
+def _acl_init(self):
+    _acl_prev_init(self)
+    self.account_page.account_changed.connect(self.sync_library)
+    QTimer.singleShot(1500, self.sync_library)
+
+AdaptiveApp.__init__ = _acl_init
+
+# ================================================================ playtime counter (saved to the account)
+# Each PC only ever writes its own number (users/<uid>/playtime/<game>/dev/<this PC>), so two PCs never overwrite each
+# other; a game's total is the sum over all PCs.
+_pt_lock = threading.RLock()
+_pt_data = None            # {"device": str, "games": {key: {"title", "own", "others", "last"}}}
+_pt_active = {}            # key -> time of the last increment of a running session (for the live counter)
+_pt_timer = None
+_pt_last_sync = 0.0
+
+def _pt_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "playtime.json")
+
+def _pt_key(title):
+    return _hashlib.md5(str(title).strip().lower().encode("utf-8")).hexdigest()[:12]
+
+def _pt_load():
+    global _pt_data
+    with _pt_lock:
+        if _pt_data is None:
+            data = {}
+            try:
+                with open(_pt_path(), encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+            if not isinstance(data, dict):
+                data = {}
+            if not isinstance(data.get("games"), dict):
+                data["games"] = {}
+            if not isinstance(data.get("device"), str) or not data["device"]:
+                data["device"] = os.urandom(6).hex()
+            _pt_data = data
+        return _pt_data
+
+def _pt_save():
+    with _pt_lock:
+        try:
+            os.makedirs(os.path.dirname(_pt_path()), exist_ok=True)
+            tmp = _pt_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_pt_load(), f)
+            os.replace(tmp, _pt_path())
+        except OSError:
+            pass
+
+def _pt_add(title, seconds):
+    seconds = int(seconds)
+    if seconds <= 0:
+        return
+    with _pt_lock:
+        games = _pt_load()["games"]
+        g = games.setdefault(_pt_key(title), {"title": title, "own": 0, "others": 0, "last": 0})
+        g["title"] = title
+        g["own"] = int(g.get("own", 0)) + seconds
+        g["last"] = int(time.time() * 1000)
+        _pt_save()
+    _pt_schedule_push()
+
+def _pt_total(title):
+    key = _pt_key(title)
+    with _pt_lock:
+        g = _pt_load()["games"].get(key)
+        total = (int(g.get("own", 0)) + int(g.get("others", 0))) if g else 0
+        if key in _pt_active:
+            total += max(0, int(time.time() - _pt_active[key]))
+    return total
+
+def _pt_fmt(seconds):
+    if seconds < 60:
+        return "Not played yet" if seconds <= 0 else "Played: under 1 min"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"Played: {minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"Played: {hours} h {minutes} min" if hours < 100 else f"Played: {hours} h"
+
+def _pt_session(name, proc):
+    """Counts the time a launched game's process is alive. Saved every 30 s so a crash/quit loses almost nothing."""
+    key = _pt_key(name)
+    def run():
+        start = last = time.time()
+        _pt_active[key] = last
+        while True:
+            try:
+                proc.wait(timeout=30)
+                done = True
+            except subprocess.TimeoutExpired:
+                done = False
+            except Exception:
+                done = True
+            now = time.time()
+            if not done or now - start >= 10:     # ignore launcher stubs / scripts that exit straight away
+                _pt_add(name, now - last)
+                last = now
+                _pt_active[key] = now
+            if done:
+                break
+        _pt_active.pop(key, None)
+    threading.Thread(target=run, daemon=True).start()
+
+_pt_prev_track_playing = _track_playing
+
+def _track_playing(name, proc):
+    _pt_prev_track_playing(name, proc)
+    try:
+        _pt_session(pretty_game_name(name), proc)
+    except Exception:
+        pass
+
+def _pt_url(uid, token):
+    base = FIREBASE_DB_URL.strip().rstrip("/")
+    return (f"{base}/users/{urllib.parse.quote(uid, safe='')}/playtime.json"
+            f"?auth={urllib.parse.quote(token, safe='')}")
+
+def _pt_sync_now():
+    """Pull the other PCs' totals, then push this PC's. Raises on cloud errors (callers ignore them)."""
+    if not cloud_configured() or load_account() is None:
+        return
+    token, uid = get_id_token()
+    cloud = _http_json(_pt_url(uid, token))
+    cloud = cloud if isinstance(cloud, dict) else {}
+    with _pt_lock:
+        data = _pt_load()
+        dev = data["device"]
+        games = data["games"]
+        for g in games.values():
+            g["others"] = 0
+        for key, val in cloud.items():
+            if not isinstance(val, dict) or not isinstance(val.get("title"), str):
+                continue
+            devs = val.get("dev") if isinstance(val.get("dev"), dict) else {}
+            others = sum(int(v) for d, v in devs.items() if d != dev and isinstance(v, (int, float)))
+            mine = int(devs.get(dev, 0)) if isinstance(devs.get(dev, 0), (int, float)) else 0
+            g = games.setdefault(key, {"title": val["title"], "own": 0, "others": 0, "last": 0})
+            g["others"] = others
+            g["own"] = max(int(g.get("own", 0)), mine)
+            g["last"] = max(int(g.get("last", 0)), int(val.get("last") or 0))
+        _pt_save()
+        payload = {}
+        for key, g in games.items():
+            if int(g.get("own", 0)) > 0:
+                payload[f"{key}/title"] = g["title"]
+                payload[f"{key}/last"] = int(g.get("last", 0))
+                payload[f"{key}/dev/{dev}"] = int(g["own"])
+    if payload:
+        token, uid = get_id_token()
+        _http_json(_pt_url(uid, token), "PATCH", payload)
+
+def _pt_sync_bg():
+    try:
+        _pt_sync_now()
+    except Exception:
+        pass
+
+def _pt_schedule_push(delay=20.0):
+    global _pt_timer
+    if not cloud_configured():
+        return
+    with _pt_lock:
+        if _pt_timer is not None and _pt_timer.is_alive():
+            return          # a push is already queued; it will send the latest numbers
+        _pt_timer = threading.Timer(delay, _pt_sync_bg)
+        _pt_timer.daemon = True
+        _pt_timer.start()
+
+def _pt_refresh_cards(self):
+    """Gives every game card a 'Played: ...' line under its status and keeps it current."""
+    pairs = list(getattr(self, "cards", [])) + list(getattr(self, "fan_lib_list", []))
+    for card, title in pairs:
+        if title == "NCZFront":         # a website: the launcher can't see how long it's open
+            continue
+        try:
+            label = card.findChild(QLabel, "CardPlaytime")
+            if label is None:
+                layout = card.layout()
+                status = card.findChild(QLabel, "CardStatus")
+                idx = layout.indexOf(status) if (layout is not None and status is not None) else -1
+                if idx < 0:
+                    continue
+                label = QLabel(card)
+                label.setObjectName("CardPlaytime")
+                layout.insertWidget(idx + 1, label)
+            text = _pt_fmt(_pt_total(title))
+            if label.text() != text:
+                label.setText(text)
+        except RuntimeError:
+            continue
+
+def _pt_sync_async(self):
+    global _pt_last_sync
+    if time.time() - _pt_last_sync < 20:
+        return
+    _pt_last_sync = time.time()
+    threading.Thread(target=_pt_sync_bg, daemon=True).start()
+
+AdaptiveApp.sync_playtime = _pt_sync_async
+
+_pt_prev_init = AdaptiveApp.__init__
+
+def _pt_init(self):
+    _pt_prev_init(self)
+    self._pt_ui_timer = QTimer(self)
+    self._pt_ui_timer.setInterval(3000)
+    self._pt_ui_timer.timeout.connect(lambda: _pt_refresh_cards(self))
+    self._pt_ui_timer.start()
+    QTimer.singleShot(2500, lambda: _pt_refresh_cards(self))
+    self.account_page.account_changed.connect(self.sync_playtime)
+    QTimer.singleShot(3000, self.sync_playtime)
+
+AdaptiveApp.__init__ = _pt_init
 
 if __name__ == "__main__":
     main()
