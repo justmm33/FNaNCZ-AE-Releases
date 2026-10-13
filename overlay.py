@@ -340,30 +340,45 @@ class OverlayManager:
 overlay = OverlayManager()
 
 # ---------------------------------------------------------------- injection backend (Windows, D3D11)
-def _find_pid_linux(exe_name):
-    """PID of the Wine process running <exe_name>. Under Wine the game's /proc cmdline holds its Windows path
-    (Z:\\...\\game.exe); Proton's own `proton run <exe>` python process also mentions it, so only processes
-    that are wine(64)-preloader binaries count."""
+def _game_pids_linux(exe_name):
+    """PIDs of the Wine process(es) running <exe_name>, best match first. Under Proton several processes mention the
+    exe: `proton run <exe>` (python), the 32-bit `steam.exe` wrapper (the exe's unix path is one of its arguments) and
+    the game itself, whose own command line *is* the exe's Windows path. Only the last one gets the 64-bit overlay DLL,
+    so processes whose argv[0] is the exe come first."""
     want = exe_name.lower()
+    strong, weak = [], []
     try:
-        entries = os.listdir("/proc")
+        entries = sorted((d for d in os.listdir("/proc") if d.isdigit()), key=int)
     except OSError:
-        return None
+        return []
     for d in entries:
-        if not d.isdigit():
-            continue
         try:
-            with open(f"/proc/{d}/cmdline", "rb") as f:
-                raw = f.read()
-            if not any(a.decode("utf-8", "ignore").replace("\\", "/").lower().rsplit("/", 1)[-1] == want
-                       for a in raw.split(b"\0") if a):
-                continue
             if not os.path.basename(os.readlink(f"/proc/{d}/exe")).lower().startswith("wine"):
                 continue
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                raw = f.read()
         except OSError:
             continue
-        return int(d)
-    return None
+        base = lambda a: a.decode("utf-8", "ignore").replace("\\", "/").strip().lower().rsplit("/", 1)[-1]
+        args = [a for a in raw.split(b"\0") if a.strip()]
+        if not args:
+            continue
+        if base(args[0]) == want:
+            strong.append(int(d))
+        elif any(base(a) == want for a in args[1:]):
+            weak.append(int(d))
+    return strong + weak
+
+
+def _find_pid_linux(exe_name):
+    pids = _game_pids_linux(exe_name)
+    return pids[0] if pids else None
+
+
+def _pid_alive(name, pid):
+    if sys.platform.startswith("linux"):
+        return pid in _game_pids_linux(name)
+    return _find_pid(name) == pid
 
 
 def _find_pid(exe_name):
@@ -471,16 +486,19 @@ def _inject_linux(exe_path):
     """True once the overlay DLL is loaded inside the running Wine game (it gets there via AppInit_DLLs)."""
     name = os.path.basename(exe_path)
     prefix = _wine_prefixes.get(name)
-    pid = _find_pid(name) if prefix else None
-    if not pid:
+    pids = _game_pids_linux(name) if prefix else []
+    if not pids:
         return False
-    if _injected.get(name) == pid:
+    if _injected.get(name) in pids:
         return True
     tmp = _wine_temp_dir(prefix)
-    if tmp and _dll_loaded(pid):
-        _wine_temp[name] = tmp
-        _injected[name] = pid
-        return True
+    if not tmp:
+        return False
+    for pid in pids:                       # whichever of the game's processes really has the DLL mapped
+        if _dll_loaded(pid):
+            _wine_temp[name] = tmp
+            _injected[name] = pid
+            return True
     return False
 
 
@@ -498,7 +516,7 @@ def diagnose_linux(exe_path):
         out.append(f"system.reg={hit[:3] or 'no AppInit entries (registry file is only saved when wine exits)'}")
     except (OSError, TypeError):
         out.append("system.reg=unreadable")
-    out.append(f"game pid={_find_pid(name)}")
+    out.append(f"game pids={_game_pids_linux(name)}")
     want = name.lower()
     wine_pids, loose, with_dll = [], [], []
     try:
@@ -570,9 +588,13 @@ def send_to_injected(user, game, prefix="is playing "):
     """Queues a toast for the injected DLL. True if a game with the overlay is still running."""
     global _send_running
     import threading
-    alive = {n: p for n, p in _injected.items() if _find_pid(n) == p}
+    alive = {n: p for n, p in _injected.items() if _pid_alive(n, p)}
     _injected.clear()
     _injected.update(alive)
+    if not alive and sys.platform.startswith("linux"):
+        for n in list(_wine_prefixes):     # the DLL may have come up after the launcher's last look: check again now
+            _inject_linux(n)
+        alive = dict(_injected)
     if not alive:
         return False
     _send_q.append((user, game, prefix))
@@ -584,9 +606,13 @@ def send_to_injected(user, game, prefix="is playing "):
 
 def has_injected():
     """True if a game that has the overlay DLL is still running."""
-    alive = {n: p for n, p in _injected.items() if _find_pid(n) == p}
+    alive = {n: p for n, p in _injected.items() if _pid_alive(n, p)}
     _injected.clear()
     _injected.update(alive)
+    if not alive and sys.platform.startswith("linux"):
+        for n in list(_wine_prefixes):
+            _inject_linux(n)
+        alive = dict(_injected)
     return bool(alive)
 
 
