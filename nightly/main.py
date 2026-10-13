@@ -21,9 +21,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QMenu, QButtonGroup, QStackedWidget,
     QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
-    QFileDialog, QInputDialog, QTextEdit, QSizePolicy
+    QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
+    QAbstractItemView
 )
-from PyQt6.QtCore import QSize, Qt, QRectF, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 
 if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
@@ -505,7 +506,7 @@ def load_launcher_settings():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
-                "start_minimized": True, "close_to_tray": True}
+                "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff"}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -536,6 +537,8 @@ def load_launcher_settings():
                 for _k in ("start_minimized", "close_to_tray"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
+                if isinstance(loaded.get("accent_color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", loaded["accent_color"]):
+                    settings["accent_color"] = loaded["accent_color"].lower()
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
                     settings["steamgriddb_api_key"] = key.strip()
@@ -1152,16 +1155,22 @@ THEMES = {
         handle="#34343a", hover="#1c1c20",
         red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
         nav_text="#a0a0a8", nav_active="#ffffff",
+        brand="#ffffff", sidebar_border="#1e1e22", nav_fill="rgba(255,255,255,0.05)", nav_fill_hover="rgba(255,255,255,0.10)",
     ),
     "light": dict(
-        bg="#f2f2f4", sidebar="#0a0a0c", panel="#ffffff", input="#ffffff", border="#d9d9de",
+        bg="#f2f2f4", sidebar="#e4e4e8", panel="#ffffff", input="#ffffff", border="#d9d9de",
         text="#141416", subtext="#6a6a72", accent="#a666ff", accent_hover="#bb85ff", accent_press="#8444e0",
         button="#e4e4e8", button_hover="#d6d6db", disabled_bg="#ececef", disabled_text="#a4a4ab",
         handle="#c4c4cb", hover="#e9e9ed",
         red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
-        nav_text="#a0a0a8", nav_active="#ffffff",
+        nav_text="#5c5c64", nav_active="#141416", brand="#141416",
+        sidebar_border="#d2d2d8", nav_fill="rgba(0,0,0,0.06)", nav_fill_hover="rgba(0,0,0,0.11)",
     ),
 }
+
+# Colour the window-caption buttons (minimize / maximize / close) follow, so they stay readable on the bar.
+_theme_state = {"nav_text": "#a0a0a8", "nav_active": "#ffffff"}
+_theme_listeners = []
 
 STYLE_TEMPLATE = Template("""
 QMainWindow, QWidget#Content, QWidget#GridContainer { background: $bg; }
@@ -1175,16 +1184,18 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 QWidget#SettingsContent { background: transparent; }
 
 /* ---- top navigation bar ---- */
-QFrame#Sidebar { background: $sidebar; border-bottom: 1px solid #1e1e22; }
-QLabel#Brand { font-size: 15px; font-weight: bold; color: #ffffff; }
+QFrame#Sidebar { background: $sidebar; border-bottom: 1px solid $sidebar_border; }
+QLabel#Brand { font-size: 15px; font-weight: bold; color: $brand; }
 QPushButton#NavButton {
     background: transparent; color: $nav_text; border: none; border-bottom: 3px solid transparent;
     border-radius: 0; text-align: center; padding: 0px 15px; font-size: 12px; font-weight: bold;
 }
-QPushButton#NavButton:hover { background: rgba(255,255,255,0.05); color: $nav_active; }
+QPushButton#NavButton:hover { background: $nav_fill; color: $nav_active; }
 QPushButton#NavButton:checked { background: transparent; color: $nav_active; border-bottom: 3px solid $red; }
-QPushButton#ProfileButton { background: rgba(255,255,255,0.05); border: 1px solid transparent; border-radius: 22px; padding: 0; text-align: left; }
-QPushButton#ProfileButton:hover { background: rgba(255,255,255,0.10); }
+QPushButton#ProfileButton { background: $nav_fill; border: 1px solid transparent; border-radius: 22px; padding: 0; text-align: left; }
+QPushButton#ProfileButton:hover { background: $nav_fill_hover; }
+QPushButton#MinButton, QPushButton#ExitButton { color: $nav_text; }
+QPushButton#MinButton:hover, QPushButton#MinButton:pressed { color: $nav_active; }
 QPushButton#ProfileButton:checked { background: rgba(166,102,255,0.18); border: 1px solid $red; }
 QPushButton#ProfileButton QLabel { color: $nav_active; }
 QLabel#Avatar { background: $accent; color: #ffffff; border-radius: 18px; font-size: 15px; font-weight: bold; }
@@ -1252,7 +1263,7 @@ QMenu::separator { height: 1px; background: $border; margin: 6px 8px; }
 /* ---- progress + scrollbars ---- */
 QProgressBar { background: $button; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #bb85ff, stop:1 #8444e0); border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $accent_hover, stop:1 $accent_press); border-radius: 3px;
 }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: $handle; border-radius: 5px; min-height: 30px; }
@@ -1335,6 +1346,54 @@ def system_prefers_dark():
         window_color = app.palette().color(QPalette.ColorRole.Window)
         return window_color.lightness() < 128
 
+def set_accent(color):
+    """Recolors the launcher's accent (buttons, highlights, links) in both themes."""
+    c = QColor(color)
+    if not c.isValid():
+        c = QColor("#a666ff")
+    base, hover, press = c.name(), c.lighter(120).name(), c.darker(125).name()
+    for t in THEMES.values():
+        t.update(accent=base, accent_hover=hover, accent_press=press, red=base, red_hover=hover, red_press=press)
+
+def apply_accent_to_icon(color):
+    """Recolors assets/icon.png to match the accent. The original is kept once as assets/icon_default.png
+    and every recolor starts from it, so Reset restores the exact original. Returns True if icon.png changed."""
+    import colorsys
+    try:
+        icon, orig = asset_path("icon.png"), asset_path("icon_default.png")
+        if not os.path.exists(orig):
+            if not os.path.exists(icon):
+                return False
+            shutil.copyfile(icon, orig)
+        if QColor(color).name() == "#a666ff":
+            shutil.copyfile(orig, icon)
+            return True
+        img = QImage(orig)
+        if img.isNull():
+            return False
+        if max(img.width(), img.height()) > 512:
+            img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        base, target = QColor("#a666ff"), QColor(color)
+        shift = (max(target.hslHue(), 0) - base.hslHue()) / 360.0
+        bs = base.hslSaturation() / 255.0
+        ratio = (target.hslSaturation() / 255.0) / bs if bs else 1.0
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        data, cache = bytearray(ptr), {}
+        for i in range(0, len(data), 4):                      # bytes are B, G, R, A
+            key = (data[i], data[i + 1], data[i + 2])
+            new = cache.get(key)
+            if new is None:
+                h, l, sat = colorsys.rgb_to_hls(key[2] / 255.0, key[1] / 255.0, key[0] / 255.0)
+                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, l, min(1.0, sat * ratio))
+                new = cache[key] = (round(b * 255), round(g * 255), round(r * 255))
+            data[i], data[i + 1], data[i + 2] = new
+        out = QImage(bytes(data), img.width(), img.height(), img.bytesPerLine(), QImage.Format.Format_ARGB32).copy()
+        return out.save(icon, "PNG")
+    except Exception:
+        return False
+
 def apply_dark_mode(mode):
     app = QApplication.instance()
     if app is None:
@@ -1347,6 +1406,13 @@ def apply_dark_mode(mode):
     family = load_app_font()
     force_font = f'* {{ font-family: "{family}"; }}\n' if family else ""
     app.setStyleSheet(force_font + STYLE_TEMPLATE.substitute(theme))
+    _theme_state["nav_text"] = theme["nav_text"]
+    _theme_state["nav_active"] = theme["nav_active"]
+    for listener in list(_theme_listeners):
+        try:
+            listener()
+        except Exception:
+            pass
 
 class JsonEditorDialog(QDialog):
     def __init__(self, file_path, title="Edit Save File", parent=None):
@@ -2469,6 +2535,27 @@ class SettingsPage(QWidget):
         row.addLayout(text_col, 1)
         row.addWidget(self.dark_mode_combo)
         panel_layout.addLayout(row)
+
+        acc_row = QHBoxLayout()
+        acc_text = QVBoxLayout()
+        acc_text.setSpacing(2)
+        acc_name = QLabel("Accent Color")
+        acc_name.setObjectName("RowTitle")
+        acc_desc = QLabel("Pick the highlight color used across the launcher")
+        acc_desc.setObjectName("RowDesc")
+        acc_text.addWidget(acc_name)
+        acc_text.addWidget(acc_desc)
+        self.accent_btn = QPushButton("Choose...")
+        self.accent_btn.setFixedWidth(100)
+        self.accent_btn.clicked.connect(self.on_accent_pick)
+        accent_reset = QPushButton("Reset")
+        accent_reset.setFixedWidth(70)
+        accent_reset.clicked.connect(lambda: self._set_accent_setting("#a666ff"))
+        acc_row.addLayout(acc_text, 1)
+        acc_row.addWidget(self.accent_btn)
+        acc_row.addWidget(accent_reset)
+        panel_layout.addSpacing(10)
+        panel_layout.addLayout(acc_row)
         layout.addWidget(panel)
         layout.addSpacing(12)
 
@@ -2929,6 +3016,29 @@ class SettingsPage(QWidget):
         settings = load_launcher_settings()
         settings["currency"] = self.currency_combo.currentData()
         save_launcher_settings(settings)
+
+    def on_accent_pick(self):
+        from PyQt6.QtWidgets import QColorDialog
+        current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
+        chosen = QColorDialog.getColor(current, self, "Pick an accent color")
+        if chosen.isValid():
+            self._set_accent_setting(chosen.name())
+
+    def _set_accent_setting(self, color):
+        settings = load_launcher_settings()
+        settings["accent_color"] = color
+        save_launcher_settings(settings)
+        set_accent(color)
+        apply_dark_mode(settings.get("dark_mode", "system"))
+        if apply_accent_to_icon(color):
+            new_icon = QIcon(asset_path("icon.png"))
+            QApplication.instance().setWindowIcon(new_icon)
+            for w in QApplication.topLevelWidgets():
+                w.setWindowIcon(new_icon)
+            main_win = self.window()
+            if hasattr(main_win, "reload_brand_logo"):
+                main_win.reload_brand_logo()         # top-left logo
+            prepare_shortcut_icon()                  # refreshes launcher.ico used by shortcuts / the taskbar menu
 
     def on_dark_mode_changed(self):
         mode = self.dark_mode_combo.currentData()
@@ -3516,13 +3626,117 @@ def parse_steam_results(results_html):
         games.append((int(appid), title, base))
     return games
 
-def fetch_steam_games(term, start, count=STORE_PAGE_SIZE):
-    """One page of Steam's own game list (games only, no DLC/software). Returns (games, total_count)."""
+def fetch_steam_games(term, start, count=STORE_PAGE_SIZE, tags=None, sort_by="_ASC"):
+    """One page of Steam's own game list (games only, no DLC/software). Returns (games, total_count).
+    tags: optional list of Steam tag ids, a game must have all of them. sort_by: "_ASC" (relevance) or "Reviews_DESC"."""
     params = {"query": "", "term": term, "start": start, "count": count, "dynamic_data": "",
-              "sort_by": "_ASC", "category1": 998, "l": "english", "infinite": 1}
+              "sort_by": sort_by, "category1": 998, "l": "english", "infinite": 1}
+    if tags:
+        params["tags"] = ",".join(str(int(t)) for t in tags)
     url = STEAM_SEARCH_URL + "?" + urllib.parse.urlencode(params)
     data = json.loads(_http_get(url).decode("utf-8", errors="replace"))
     return parse_steam_results(data.get("results_html", "")), int(data.get("total_count") or 0)
+
+# ---- Store tags: the tag list, a game's own tags, and "more like this"
+# Used if Steam's tag list can't be downloaded (offline). Name -> tag id.
+_TAG_FALLBACK = (
+    ("Action", 19), ("Adventure", 21), ("RPG", 122), ("Strategy", 9), ("Simulation", 599), ("Indie", 492),
+    ("Casual", 597), ("Puzzle", 1664), ("Horror", 1667), ("Multiplayer", 3859), ("Co-op", 1685),
+    ("Singleplayer", 4182), ("FPS", 1663), ("Shooter", 1774), ("Open World", 1695), ("Roguelike", 1716),
+    ("Survival", 1662), ("Platformer", 1625), ("Sandbox", 3810), ("Racing", 699), ("Sports", 701),
+    ("Story Rich", 1742), ("Atmospheric", 4166), ("Pixel Graphics", 3964), ("Souls-like", 29482),
+    ("Metroidvania", 1628), ("Turn-Based", 1677), ("Fantasy", 1684), ("Sci-fi", 3942), ("Anime", 4085),
+    ("Free to Play", 113), ("Early Access", 493), ("Difficult", 4026), ("Funny", 4136),
+)
+# Tags nearly every game has: skipped when picking what "more like this" should match on.
+_GENERIC_TAGS = {"singleplayer", "multiplayer", "indie", "action", "adventure", "casual", "early access",
+                 "free to play", "great soundtrack", "atmospheric", "2d", "3d", "colorful", "cute", "funny",
+                 "controller", "violent", "gore", "nudity", "sexual content", "mature", "co-op",
+                 "online co-op", "local co-op"}
+_tags_cache = []
+_STORE_WORKERS = set()      # keeps short-lived background workers alive until they finish
+
+def _keep_worker(worker):
+    _STORE_WORKERS.add(worker)
+    worker.finished.connect(lambda w=worker: _STORE_WORKERS.discard(w))
+
+def get_steam_tags():
+    """[(name, tag_id)] sorted by name. Steam's list is cached for a week; a built-in list is the offline fallback."""
+    global _tags_cache
+    if _tags_cache:
+        return _tags_cache
+    path = os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "tags.json")
+    tags = []
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 7 * 86400:
+            with open(path, encoding="utf-8") as f:
+                tags = [(str(n), int(i)) for n, i in json.load(f)]
+    except Exception:
+        tags = []
+    if not tags:
+        try:
+            raw = json.loads(_http_get("https://store.steampowered.com/tagdata/populartags/english",
+                                       timeout=10).decode("utf-8", errors="replace"))
+            tags = [(html_lib.unescape(str(t["name"])).strip(), int(t["tagid"]))
+                    for t in raw if t.get("name") and t.get("tagid")]
+            if tags:
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(tags, f)
+                except OSError:
+                    pass
+        except Exception:
+            tags = []
+    if not tags:
+        return sorted(_TAG_FALLBACK, key=lambda t: t[0].lower())     # not cached, so we retry next time
+    tags.sort(key=lambda t: t[0].lower())
+    _tags_cache = tags
+    return tags
+
+_APP_TAG_JSON_RE = re.compile(r"InitAppTagModal\(\s*\d+\s*,\s*(\[.*?\])\s*,", re.S)
+_APP_TAG_LINK_RE = re.compile(r'<a\b[^>]*class="app_tag"[^>]*>(.*?)</a>', re.S)
+
+def fetch_app_tags(appid, limit=12):
+    """A game's Steam user tags, most voted first, as [(tag_id, name)]."""
+    headers = {"Accept-Language": "en-US,en;q=0.9",
+               "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1"}
+    page = _http_get(f"https://store.steampowered.com/app/{appid}/?l=english", headers=headers,
+                     timeout=15).decode("utf-8", errors="replace")
+    tags = []
+    match = _APP_TAG_JSON_RE.search(page)
+    if match:
+        try:
+            for t in json.loads(match.group(1)):
+                if t.get("tagid") and t.get("name") and t.get("browseable", True):
+                    tags.append((int(t["tagid"]), html_lib.unescape(str(t["name"])).strip()))
+        except (ValueError, TypeError):
+            tags = []
+    if not tags:    # older page layout: only the names are in the markup, so look the ids up by name
+        by_name = {name.lower(): tid for name, tid in get_steam_tags()}
+        for raw in _APP_TAG_LINK_RE.findall(page):
+            name = html_lib.unescape(re.sub(r"<[^>]+>", "", raw)).strip()
+            if name.lower() in by_name and by_name[name.lower()] not in [t for t, _ in tags]:
+                tags.append((by_name[name.lower()], name))
+    return tags[:limit]
+
+def fetch_similar_games(appid, tags, count=24):
+    """Games sharing this game's most distinctive tags, best reviewed first. Tries 3 tags, then 2, then 1."""
+    specific = [t for t, name in tags if name.lower() not in _GENERIC_TAGS]
+    generic = [t for t, name in tags if name.lower() in _GENERIC_TAGS]
+    ordered = specific + generic
+    best, tried = [], []
+    for chosen in (ordered[:3], ordered[:2], ordered[:1]):
+        if not chosen or chosen in tried:
+            continue
+        tried.append(chosen)
+        games, _ = fetch_steam_games("", 0, count + 1, tags=chosen, sort_by="Reviews_DESC")
+        games = [g for g in games if g[0] != appid][:count]
+        if len(games) > len(best):
+            best = games
+        if len(games) >= 12:
+            break
+    return best
 
 SGDB_PORTRAIT_SIZES = "600x900,342x482,660x930"
 
@@ -4109,9 +4323,141 @@ class StoreCard(QFrame):
             self.clicked.emit(self.appid, self.title, self.cover_path)
         super().mousePressEvent(event)
 
+class FlowLayout(QLayout):
+    """Left-to-right layout that wraps onto new lines (used for tag chips)."""
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self._items = []
+        self._gap = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = area.x(), area.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > area.right() + 1 and line_h > 0:
+                x = area.x()
+                y += line_h + self._gap
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._gap
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()
+
+TAG_CHIP_STYLE = ("QPushButton { background: rgba(128,128,128,0.22); border: none; border-radius: 12px; "
+                  "padding: 4px 14px; font-size: 12px; }"
+                  "QPushButton:hover { background: rgba(128,128,128,0.42); }")
+
+def make_tag_chip(text):
+    chip = QPushButton(text)
+    chip.setCursor(Qt.CursorShape.PointingHandCursor)
+    chip.setStyleSheet(TAG_CHIP_STYLE)
+    chip.setFixedHeight(26)
+    return chip
+
+class TagPickerDialog(QDialog):
+    """Pick the Steam tags to filter the Store by. Games have to match all the picked tags."""
+    def __init__(self, selected_ids, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Filter by tags")
+        self.resize(380, 520)
+        self._selected = set(selected_ids)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        hint = QLabel("Pick one or more tags. Games have to match all of them.")
+        hint.setObjectName("RowDesc")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search tags")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+        self.status = QLabel("Loading tags...")
+        self.status.setObjectName("RowDesc")
+        layout.addWidget(self.status)
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        layout.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.list.clearSelection)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        apply_btn = QPushButton("Apply")
+        apply_btn.setObjectName("Primary")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(self.accept)
+        row.addWidget(clear_btn)
+        row.addStretch()
+        row.addWidget(cancel_btn)
+        row.addWidget(apply_btn)
+        layout.addLayout(row)
+        worker = TaskWorker(get_steam_tags)
+        worker.done.connect(self._on_tags)
+        _keep_worker(worker)
+        worker.start()
+
+    def _on_tags(self, tags):
+        self.status.hide()
+        for name, tag_id in tags:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, tag_id)
+            self.list.addItem(item)
+            if tag_id in self._selected:
+                item.setSelected(True)
+        self._filter(self.search.text())
+
+    def _filter(self, text):
+        needle = text.strip().lower()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def result_tags(self):
+        return [(item.data(Qt.ItemDataRole.UserRole), item.text()) for item in self.list.selectedItems()]
+
 class StoreDetailPage(QWidget):
     back_requested = pyqtSignal()
     add_requested = pyqtSignal(int, str, str)   # appid, title, cover path
+    game_selected = pyqtSignal(int, str, str)   # a "more like this" card was clicked
+    tag_requested = pyqtSignal(int, str)        # a tag chip was clicked: tag id, name
     DETAIL_W, DETAIL_H = 300, 450
     CHIP_STYLE = ("background: rgba(128,128,128,0.22); border-radius: 11px; "
                   "padding: 3px 12px; font-size: 12px;")
@@ -4124,10 +4470,16 @@ class StoreDetailPage(QWidget):
         self._cover_path = ""
         self._in_library = False
         self._workers = []
+        self._history = []              # games we came from when jumping through "more like this"
+        self._nav_internal = False
+        self._sim_cards = {}
+        self.loader = CoverLoader()
+        self.loader.loaded.connect(self._on_sim_cover)
+        QApplication.instance().aboutToQuit.connect(self.loader.shutdown)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        scroll = self.scroll_area = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -4139,11 +4491,11 @@ class StoreDetailPage(QWidget):
         layout.setContentsMargins(36, 28, 36, 28)
         layout.setSpacing(0)
 
-        back = QPushButton("< Back to Store")
-        back.setFlat(True)
-        back.setCursor(Qt.CursorShape.PointingHandCursor)
-        back.clicked.connect(self.back_requested.emit)
-        layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
+        self.back_btn = QPushButton("< Back to Store")
+        self.back_btn.setFlat(True)
+        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_btn.clicked.connect(self._on_back)
+        layout.addWidget(self.back_btn, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addSpacing(16)
 
         row = QHBoxLayout()
@@ -4205,6 +4557,24 @@ class StoreDetailPage(QWidget):
         layout.addLayout(row)
         layout.addSpacing(24)
 
+        # tags: click one to browse the Store by it
+        self.tags_wrap = QWidget()
+        tags_lay = QVBoxLayout(self.tags_wrap)
+        tags_lay.setContentsMargins(0, 0, 0, 24)
+        tags_lay.setSpacing(6)
+        tags_title = QLabel("Tags")
+        tags_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        tags_hint = QLabel("Click a tag to find more games with it")
+        tags_hint.setObjectName("RowDesc")
+        self.tags_host = QWidget()
+        self.tags_flow = FlowLayout(self.tags_host, spacing=8)
+        tags_lay.addWidget(tags_title)
+        tags_lay.addWidget(tags_hint)
+        tags_lay.addSpacing(4)
+        tags_lay.addWidget(self.tags_host)
+        self.tags_wrap.hide()
+        layout.addWidget(self.tags_wrap)
+
         # system requirements + "can I run it" (only filled in for Steam games)
         self.reqs_wrap = QWidget()
         wrap_lay = QVBoxLayout(self.reqs_wrap)
@@ -4262,6 +4632,29 @@ class StoreDetailPage(QWidget):
         self.shots_row.setSpacing(12)
         self.shots_scroll.setWidget(shots_body)
         layout.addWidget(self.shots_scroll)
+
+        # more like this: games sharing this game's tags
+        self.similar_wrap = QWidget()
+        sim_lay = QVBoxLayout(self.similar_wrap)
+        sim_lay.setContentsMargins(0, 24, 0, 0)
+        sim_lay.setSpacing(8)
+        similar_title = QLabel("More like this")
+        similar_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        sim_lay.addWidget(similar_title)
+        self.similar_scroll = QScrollArea()
+        self.similar_scroll.setWidgetResizable(True)
+        self.similar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.similar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.similar_scroll.setFixedHeight(STORE_COVER_H + 90)
+        sim_body = QWidget()
+        sim_body.setObjectName("GridContainer")
+        self.sim_row = QHBoxLayout(sim_body)
+        self.sim_row.setContentsMargins(0, 0, 0, 0)
+        self.sim_row.setSpacing(STORE_GRID_GAP)
+        self.similar_scroll.setWidget(sim_body)
+        sim_lay.addWidget(self.similar_scroll)
+        self.similar_wrap.hide()
+        layout.addWidget(self.similar_wrap)
         layout.addStretch()
         self._set_extras_visible(False)
 
@@ -4285,7 +4678,82 @@ class StoreDetailPage(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
+    def _on_back(self):
+        if self._history:
+            appid, title, cover = self._history.pop()
+            self._nav_internal = True
+            self.game_selected.emit(appid, title, cover)
+        else:
+            self.back_requested.emit()
+
+    def _on_similar_clicked(self, appid, title, cover_path):
+        self._history.append((self._appid, self._title, self._cover_path))
+        self._nav_internal = True
+        self.game_selected.emit(appid, title, cover_path)
+
+    def _on_sim_cover(self, appid, path):
+        card = self._sim_cards.get(appid)
+        if card is not None:
+            card.set_cover(path)
+
+    def _load_related(self, appid):
+        def work():
+            tags, games = [], []
+            try:
+                tags = fetch_app_tags(appid)
+            except Exception:
+                pass
+            if tags:
+                try:
+                    games = fetch_similar_games(appid, tags)
+                except Exception:
+                    pass
+            return (appid, tags, games)
+
+        worker = TaskWorker(work)
+        worker.done.connect(self._on_related)
+        _keep_worker(worker)
+        worker.start()
+
+    def _on_related(self, result):
+        appid, tags, games = result
+        if appid != self._appid:
+            return  # user already opened another game
+        for tag_id, name in tags:
+            chip = make_tag_chip(name)
+            chip.clicked.connect(lambda _c=False, t=tag_id, n=name: self.tag_requested.emit(t, n))
+            self.tags_flow.addWidget(chip)
+        self.tags_wrap.setVisible(bool(tags))
+        for sim_id, sim_title, img_base in games:
+            card = StoreCard(sim_id, sim_title)
+            card.clicked.connect(self._on_similar_clicked)
+            self._sim_cards[sim_id] = card
+            self.sim_row.addWidget(card)
+            self.loader.request(sim_id, img_base, sim_title)
+        self.sim_row.addStretch()
+        self.similar_wrap.setVisible(bool(games))
+
+    def _reset_related(self):
+        self.loader.cancel_pending()
+        self.loader.set_key(get_steamgriddb_key())
+        while self.tags_flow.count():
+            item = self.tags_flow.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._clear(self.sim_row)
+        self._sim_cards = {}
+        self.tags_wrap.hide()
+        self.similar_wrap.hide()
+
     def show_game(self, appid, title, cover_path):
+        if self._nav_internal:
+            self._nav_internal = False      # came from "more like this" or Back: keep the trail
+        else:
+            self._history.clear()           # opened from the Store or Library: start a new trail
+        self.back_btn.setText("< Back" if self._history else "< Back to Store")
+        self.scroll_area.verticalScrollBar().setValue(0)
         self._appid = appid
         self._title = title
         self._cover_path = cover_path or ""
@@ -4298,6 +4766,7 @@ class StoreDetailPage(QWidget):
         self._clear(self.shots_row)
         self._set_extras_visible(False)
         self.reqs_wrap.hide()
+        self._reset_related()
         pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 12) if cover_path else None
         if pix:
             self.cover.setText("")
@@ -4320,6 +4789,7 @@ class StoreDetailPage(QWidget):
         worker.done.connect(self._on_details)
         self._workers = [w for w in self._workers if w.isRunning()] + [worker]
         worker.start()
+        self._load_related(appid)
 
     def _on_details(self, result):
         appid, d = result
@@ -4400,6 +4870,7 @@ class StorePage(QWidget):
         self._card_by_id = {}
         self._workers = []
         self._cols = 0
+        self._tag_filter = []       # [(tag_id, name)] the Store is filtered by
 
         self.loader = CoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
@@ -4431,9 +4902,21 @@ class StorePage(QWidget):
         header.addWidget(title)
         header.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignBottom)
         header.addStretch()
+        self.tags_btn = QPushButton("Tags")
+        self.tags_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tags_btn.setFixedHeight(36)
+        self.tags_btn.setToolTip("Filter games by Steam tags")
+        self.tags_btn.clicked.connect(self._open_tag_picker)
+        header.addWidget(self.tags_btn)
+        header.addSpacing(8)
         header.addWidget(self.search_edit)
         layout.addLayout(header)
         layout.addSpacing(10)
+
+        self.tag_bar = QWidget()                    # chips for the tags in use (click one to drop it)
+        FlowLayout(self.tag_bar, spacing=8).setContentsMargins(0, 0, 0, 10)
+        self.tag_bar.hide()
+        layout.addWidget(self.tag_bar)
 
         self.banner = QLabel()
         self.banner.setObjectName("RowDesc")
@@ -4558,10 +5041,11 @@ class StorePage(QWidget):
             return
         self._loading = True
         request_id, term, start = self._request_id, self._term, self._next_start
+        tag_ids = [t for t, _ in self._tag_filter]
 
         def work():
             try:
-                games, total = fetch_steam_games(term, start)
+                games, total = fetch_steam_games(term, start, tags=tag_ids)
                 return (request_id, start, games, total, "")
             except Exception as e:
                 return (request_id, start, [], 0, str(e) or e.__class__.__name__)
@@ -4629,6 +5113,45 @@ class StorePage(QWidget):
         if card is not None:
             card.set_cover(path)
 
+    # ------------------------------------------------------------ tag filter
+    def _open_tag_picker(self):
+        dlg = TagPickerDialog([t for t, _ in self._tag_filter], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.set_tag_filter(dlg.result_tags())
+
+    def _remove_tag(self, tag_id):
+        self.set_tag_filter([(t, n) for t, n in self._tag_filter if t != tag_id])
+
+    def set_tag_filter(self, tags, clear_search=False):
+        """Filters the Store by these [(tag_id, name)] and reloads it."""
+        self._tag_filter = list(tags)
+        if clear_search:
+            self.search_edit.blockSignals(True)
+            self.search_edit.clear()
+            self.search_edit.blockSignals(False)
+        self._rebuild_tag_bar()
+        self._loaded_once = True
+        self._start_search()
+
+    def _rebuild_tag_bar(self):
+        flow = self.tag_bar.layout()
+        while flow.count():
+            item = flow.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for tag_id, name in self._tag_filter:
+            chip = make_tag_chip(f"{name}   x")
+            chip.setToolTip("Click to remove this tag")
+            chip.clicked.connect(lambda _c=False, t=tag_id: self._remove_tag(t))
+            flow.addWidget(chip)
+        self.tag_bar.setVisible(bool(self._tag_filter))
+        self.tags_btn.setText(f"Tags ({len(self._tag_filter)})" if self._tag_filter else "Tags")
+        self.tags_btn.setObjectName("Primary" if self._tag_filter else "")
+        self.tags_btn.style().polish(self.tags_btn)
+
+
 COVER_W, COVER_H = 200, 300
 GRID_COLUMNS = 3
 GREEN = "#22c55e"
@@ -4692,6 +5215,8 @@ class AdaptiveApp(QMainWindow):
         self.store_page.game_selected.connect(self.open_store_game)
         self.store_detail_page.add_requested.connect(self.add_steam_game)
         self.store_detail_page.back_requested.connect(lambda: self.pages.setCurrentIndex(4))
+        self.store_detail_page.game_selected.connect(self.open_store_game)
+        self.store_detail_page.tag_requested.connect(self.open_store_tag)
         root_layout.addWidget(self.pages, 1)
 
         self.apply_filter()
@@ -4723,13 +5248,10 @@ class AdaptiveApp(QMainWindow):
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(18, 0, 18, 0)
         brand_row.setSpacing(10)
-        logo_pix = CreditsPage.circular_pixmap(asset_path("icon.png"), 64)
-        if logo_pix:
-            logo_pix.setDevicePixelRatio(2.0)
-            logo = QLabel()
-            logo.setFixedSize(32, 32)
-            logo.setPixmap(logo_pix)
-            brand_row.addWidget(logo)
+        self.brand_logo = QLabel()
+        self.brand_logo.setFixedSize(32, 32)
+        brand_row.addWidget(self.brand_logo)
+        self.reload_brand_logo()
         brand = QLabel("NCZ Games")
         brand.setObjectName("Brand")
         brand_row.addWidget(brand)
@@ -4924,6 +5446,12 @@ class AdaptiveApp(QMainWindow):
         self.store_detail_page.show_game(appid, title, cover_path)
         self.store_detail_page.set_in_library(appid in self.steam_cards)
         self.pages.setCurrentWidget(self.store_detail_page)
+
+    def open_store_tag(self, tag_id, tag_name):
+        """A tag chip on a game's page was clicked: show the Store filtered by that tag."""
+        self.nav_group.button(4).setChecked(True)
+        self.pages.setCurrentWidget(self.store_page)
+        self.store_page.set_tag_filter([(tag_id, tag_name)], clear_search=True)
 
     def update_ae_button_state(self):
         if not self.btn_ae_action:
@@ -5599,11 +6127,44 @@ class AdaptiveApp(QMainWindow):
         if self.store_detail_page._appid == appid:
             self.store_detail_page.set_in_library(False)
 
+    def reload_brand_logo(self):
+        """(Re)loads the top-left logo from assets/icon.png, e.g. after the accent recolors it."""
+        logo_pix = CreditsPage.circular_pixmap(asset_path("icon.png"), 64)
+        self.brand_logo.setVisible(bool(logo_pix))
+        if logo_pix:
+            logo_pix.setDevicePixelRatio(2.0)
+            self.brand_logo.setPixmap(logo_pix)
+
     def center_on_screen(self):
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
+
+def set_windows_taskbar_identity(window):
+    """Windows only: makes the taskbar right-click menu show "NCZ Games Launcher" + its icon instead of "Python".
+    Needs pywin32 (pip install pywin32); silently does nothing if it's missing."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        from win32com.propsys import propsys, pscon
+        import pythoncom
+        target, args, _workdir = get_launch_command()
+        command = subprocess.list2cmdline([target] + list(args))
+        icon = prepare_shortcut_icon()
+        store = propsys.SHGetPropertyStoreForWindow(int(window.winId()), propsys.IID_IPropertyStore)
+
+        def put(key, text):
+            store.SetValue(key, propsys.PROPVARIANTType(text, pythoncom.VT_LPWSTR))
+
+        put(pscon.PKEY_AppUserModel_ID, "NCZ.GamesLauncher")                 # same ID as in main()
+        put(pscon.PKEY_AppUserModel_RelaunchCommand, command)                # required, or the two below are ignored
+        put(pscon.PKEY_AppUserModel_RelaunchDisplayNameResource, "NCZ Games Launcher")
+        if icon:
+            put(pscon.PKEY_AppUserModel_RelaunchIconResource, f"{icon},0")
+        store.Commit()
+    except Exception:
+        pass
 
 def main():
     import traceback
@@ -5646,6 +6207,7 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
+    set_accent(load_launcher_settings().get("accent_color", "#a666ff"))
     apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
 
     def on_system_color_scheme_changed(_scheme=None):
@@ -5660,6 +6222,7 @@ def main():
     window = AdaptiveApp()
     app._ncz_main_window = window
     apply_startup_setting()
+    set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
     if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
         if tray is None:                                # no tray to hide in
@@ -6009,153 +6572,6 @@ def _patched_build_library_page(self):
     return widget
 
 AdaptiveApp.build_library_page = _patched_build_library_page
-
-def fetch_steam_title_and_base(appid):
-    try:
-        url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
-        data = json.loads(_http_get(url).decode("utf-8", errors="replace"))
-        info = (data.get(str(appid)) or {}).get("data") or {}
-        name = info.get("name")
-        header_image = info.get("header_image", "")
-        img_base = ""
-        if header_image:
-            img_base = header_image.split("?")[0].rsplit("/", 1)[0]
-        return html_lib.unescape(name) if name else f"Game {appid}", img_base
-    except Exception:
-        pass
-    return f"Game {appid}", ""
-
-def fetch_activated_games():
-    if not FIREBASE_DB_URL:
-        return []
-    base = FIREBASE_DB_URL.strip().rstrip("/")
-    url = f"{base}/steam_links.json"
-    try:
-        data = _http_json(url, "GET")
-        if isinstance(data, dict):
-            res = []
-            for k, v in data.items():
-                try:
-                    appid = int(k)
-                except Exception:
-                    continue
-                if isinstance(v, dict):
-                    link = v.get("link") or v.get("url") or v.get("download_link")
-                    if isinstance(link, str) and link.strip():
-                        title = v.get("title")
-                        cover_url = v.get("cover_url") or ""
-                        res.append((appid, title, cover_url))
-                elif isinstance(v, str) and v.strip():
-                    res.append((appid, None, ""))
-            return res
-    except Exception:
-        pass
-    return []
-
-_original_store_page_init = StorePage.__init__
-
-def _patched_store_page_init(self, parent=None):
-    _original_store_page_init(self, parent)
-    self._showing_activated = False
-    main_layout = self.layout()
-    if main_layout and main_layout.count() > 0:
-        header = main_layout.itemAt(0).layout()
-        if isinstance(header, QHBoxLayout):
-            self.activated_btn = QPushButton("Activated Games")
-            self.activated_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.activated_btn.setFixedHeight(36)
-            self.activated_btn.clicked.connect(self._toggle_activated_games)
-            header.insertWidget(2, self.activated_btn)
-
-StorePage.__init__ = _patched_store_page_init
-
-def _toggle_activated_games(self):
-    self._showing_activated = not self._showing_activated
-    if self._showing_activated:
-        self.activated_btn.setObjectName("Primary")
-        self.activated_btn.style().polish(self.activated_btn)
-        self.search_edit.setEnabled(False)
-        self._load_activated_games()
-    else:
-        self.activated_btn.setObjectName("")
-        self.activated_btn.style().polish(self.activated_btn)
-        self.search_edit.setEnabled(True)
-        self._start_search()
-
-StorePage._toggle_activated_games = _toggle_activated_games
-
-def _load_activated_games(self):
-    self._request_id += 1
-    self.loader.cancel_pending()
-    self._clear_cards()
-    self._exhausted = True
-    self._loading = False
-    self.retry_btn.hide()
-    self.count_label.setText("")
-    self._set_status("Loading activated games...")
-    req_id = self._request_id
-
-    def work():
-        try:
-            raw_list = fetch_activated_games()
-            games = []
-            for appid, title, cover_url in raw_list:
-                img_base = ""
-                if not title:
-                    title, img_base = fetch_steam_title_and_base(appid)
-                
-                cover_path = ""
-                if cover_url:
-                    try:
-                        req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=10) as resp:
-                            img_data = resp.read()
-                        os.makedirs(get_library_cover_dir(), exist_ok=True)
-                        local_path = os.path.join(get_library_cover_dir(), f"{appid}.img")
-                        with open(local_path, 'wb') as f:
-                            f.write(img_data)
-                        cover_path = local_path
-                    except Exception:
-                        pass
-                games.append((appid, title, cover_path, img_base))
-            return (req_id, games, "")
-        except Exception as e:
-            return (req_id, [], str(e))
-
-    worker = TaskWorker(work)
-    worker.done.connect(self._on_activated_loaded)
-    self._workers = [w for w in self._workers if w.isRunning()] + [worker]
-    worker.start()
-
-StorePage._load_activated_games = _load_activated_games
-
-def _on_activated_loaded(self, result):
-    req_id, games, error = result
-    if req_id != self._request_id:
-        return
-    if error:
-        self._set_status("Couldn't load activated games.")
-        return
-    for appid, title, cover_path, img_base in games:
-        card = StoreCard(appid, title)
-        card.clicked.connect(self.game_selected.emit)
-        
-        if cover_path and os.path.exists(cover_path):
-            card.set_cover(cover_path)
-        else:
-            self.loader.request(appid, img_base, title)
-
-        index = len(self._cards)
-        cols = self._columns()
-        self._cols = cols
-        self._cards.append(card)
-        self._card_by_id[appid] = card
-        self.grid.addWidget(card, index // cols, index % cols)
-        
-    self._set_status("" if self._cards else "No activated games found.")
-    self.count_label.setText(f"{len(games)} activated")
-
-StorePage._on_activated_loaded = _on_activated_loaded
 
 COMPAT_CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "steam_compat_config.json"))
 
@@ -8063,6 +8479,7 @@ def cloud_fetch_last_messages(friend_ids):
                 k = sorted(data)[-1]
                 if isinstance(data[k], dict):
                     return fid, (k, data[k])
+            return fid, ("", None)       # fetched fine, the chat is just empty (a failed fetch returns None below)
         except CloudError:
             pass
         return fid, None
@@ -8519,7 +8936,7 @@ class _MsgRow(QWidget):
         if isinstance(re_, dict):
             col.addWidget(self._quote(re_), 0, align)
 
-        self._bubble_base = ("#ChatBubble{background:#a666ff; border-radius:12px;}" if mine
+        self._bubble_base = (f"#ChatBubble{{background:{THEMES['dark']['accent']}; border-radius:12px;}}" if mine
                              else "#ChatBubble{background:rgba(128,128,128,0.28); border-radius:12px;}")
         self.bubble = QFrame()
         self.bubble.setObjectName("ChatBubble")
@@ -8606,7 +9023,7 @@ class _MsgRow(QWidget):
         lab = _ClickLabel(f"\u21AA {who}: {snippet}")
         lab.setTextFormat(Qt.TextFormat.PlainText)
         lab.setCursor(Qt.CursorShape.PointingHandCursor)
-        lab.setStyleSheet("QLabel{color:#888888; font-size:11px; border-left:3px solid #a666ff; padding-left:6px;}")
+        lab.setStyleSheet("QLabel{color:#888888; font-size:11px; border-left:3px solid " + THEMES["dark"]["accent"] + "; padding-left:6px;}")
         lab.setMaximumWidth(380)
         lab.setToolTip("Jump to the original message")
         key = re_.get("k")
@@ -8620,7 +9037,9 @@ class _MsgRow(QWidget):
         names = ["You" if u == me else (self.chat.names.get(u) or "Someone") for u in users]
         btn.setToolTip(", ".join(names))
         if mine_on:
-            style = "border:1px solid #a666ff; background:rgba(166,102,255,0.28);"
+            _ac = QColor(THEMES["dark"]["accent"])
+            style = (f"border:1px solid {_ac.name()}; "
+                     f"background:rgba({_ac.red()},{_ac.green()},{_ac.blue()},0.28);")
         else:
             style = "border:1px solid rgba(128,128,128,0.45); background:rgba(128,128,128,0.18);"
         btn.setStyleSheet("QPushButton{" + style + "border-radius:10px; padding:1px 7px;}"
@@ -9100,9 +9519,13 @@ class FriendsPage(QWidget):
 
     def _detect_messages(self, last):
         me = (load_account() or {}).get("uid")
-        if self._prev_last is not None:
+        prev = self._prev_last
+        if prev is not None:
             for uid, (key, msg) in last.items():
-                if key == self._prev_last.get(uid) or msg.get("from") == me:
+                old = prev.get(uid)
+                # old is None: first time this chat is seen (new friend, or an earlier fetch of it failed),
+                # so it only sets the baseline. A key that isn't newer is a deleted/edited last message.
+                if old is None or msg is None or key <= old or msg.get("from") == me:
                     continue
                 viewing = (self.current_uid == uid and self.stack.currentIndex() == 1
                            and self.window().isActiveWindow())
@@ -9111,7 +9534,10 @@ class FriendsPage(QWidget):
                 name = self.friends.get(uid, {}).get("username") or "A friend"
                 text = chat_preview(msg)
                 self.friend_event.emit(name, text if len(text) <= 100 else text[:97] + "...", uid)
-        self._prev_last = {uid: key for uid, (key, _m) in last.items()}
+        # merge instead of replace: a friend whose fetch failed this round keeps their old baseline
+        merged = dict(prev or {})
+        merged.update({uid: key for uid, (key, _m) in last.items()})
+        self._prev_last = {uid: key for uid, key in merged.items() if uid in self.friends}
 
     def add_friend(self):
         if not self._signed_in():
@@ -12693,15 +13119,105 @@ def _find_cover_url(payload):
                 return found
     return ""
 
-def fetch_fan_overview(gid):
-    """Game Jolt's own site api (the same one its pages use). Returns the page data as one dict."""
-    data = json.loads(_http_get(f"https://gamejolt.com/site-api/web/discover/games/overview/{gid}?ignore", timeout=15))
-    payload = data.get("payload") or {}
+_FAN_LAST_ERROR = ""
+
+def _fan_overview_via_browser(gid, timeout_s=90):
+    """Last resort: opens the game's page in a headless Chromium (Playwright) and grabs the overview reply the page
+    itself loads. Needs `pip install playwright` + `playwright install chromium`; returns {} when that isn't available."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return {}
+    box = {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
+                def on_response(resp):
+                    try:
+                        if "/site-api/web/discover/games/overview/" in resp.url and resp.status == 200 and not box:
+                            box.update(resp.json())
+                    except Exception:
+                        pass
+                page.on("response", on_response)
+                page.goto(f"https://gamejolt.com/games/x/{gid}", wait_until="domcontentloaded", timeout=timeout_s * 1000)
+                for _ in range(timeout_s * 2):
+                    if box:
+                        break
+                    page.wait_for_timeout(500)
+            finally:
+                browser.close()
+    except Exception:
+        return {}
+    payload = box.get("payload") or {}
     merged = dict(payload)
-    for src in (data.get("game"), payload.get("game")):
+    for src in (box.get("game"), payload.get("game")):
         if isinstance(src, dict):
             merged.update(src)
     return merged
+
+def fetch_fan_overview(gid):
+    """Game Jolt's own site api (the same one its pages use). Returns the page data as one dict.
+    Retries when DNS/network hiccups ("Temporary failure in name resolution"), keeps a copy on disk so a page that
+    loaded once still has its details later, and writes the last failure to fan_debug.log."""
+    global _FAN_LAST_ERROR
+    cache_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_overview")
+    cache_file = os.path.join(cache_dir, f"{gid}.json")
+    def cached(max_age):
+        try:
+            if time.time() - os.path.getmtime(cache_file) < max_age:
+                with open(cache_file, encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+    hit = cached(6 * 3600)
+    if hit:
+        return hit
+    merged = _fan_overview_via_browser(gid, 60)      # first choice: a headless browser (Playwright), if it is installed
+    if merged:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(merged, f)
+        except Exception:
+            pass
+        return merged
+    errors = []
+    hdr = {"Accept": "application/json, text/plain, */*", "Referer": "https://gamejolt.com/", "Origin": "https://gamejolt.com"}
+    for rnd in range(3):
+        for path in (f"overview/{gid}?ignore", f"overview/{gid}"):
+            url = f"https://gamejolt.com/site-api/web/discover/games/{path}"
+            try:
+                data = json.loads(_http_get(url, headers=hdr, timeout=40))
+                payload = data.get("payload") or {}
+                merged = dict(payload)
+                for src in (data.get("game"), payload.get("game")):
+                    if isinstance(src, dict):
+                        merged.update(src)
+                if merged:
+                    try:
+                        os.makedirs(cache_dir, exist_ok=True)
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(merged, f)
+                    except Exception:
+                        pass
+                    return merged
+                errors.append(f"{url}: empty reply, keys={list(data)[:8]}")
+            except Exception as e:
+                errors.append(f"{url}: {type(e).__name__}: {e}")
+        time.sleep(0.7 * (rnd + 1))
+    old = cached(10 ** 9)       # network is down: an old copy is better than nothing
+    if old:
+        return old
+    _FAN_LAST_ERROR = " | ".join(errors[-2:])
+    try:
+        with open(os.path.join(_writable_dir(), "fan_debug.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} game {gid}: {_FAN_LAST_ERROR}\n")
+    except Exception:
+        pass
+    raise RuntimeError(_FAN_LAST_ERROR)
 
 def _microdata(game):
     md = game.get("microdata")
@@ -12765,6 +13281,19 @@ def _rich_text(node):
     walk(node)
     return "".join(parts)
 
+def fan_clean_text(text):
+    """Tidies a Game Jolt description: drops [Media 123] placeholders, bare links/markdown noise and extra blank lines."""
+    text = html_lib.unescape(str(text or ""))
+    text = re.sub(r"\[\s*(?:media|gif|video|image|embed)[^\]]*\]", " ", text, flags=re.I)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)                  # markdown images
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)]*\)", r"\1", text)    # [label](url) -> label
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)                   # markdown headings
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)                     # bold
+    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def fan_description(game):
     candidates = [game.get(k) for k in ("description_markdown", "description_compiled", "description_content", "description")]
     candidates += [game.get("metaDescription"), _microdata(game).get("description")]
@@ -12777,10 +13306,9 @@ def fan_description(game):
             text = html_lib.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"</p>|<br\s*/?>", "\n", str(v))))
         else:
             text = str(v)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+        text = fan_clean_text(text)
         if text:
-            return text[:1200]
+            return text[:2500]
     return ""
 
 def fan_developer(game):
@@ -12863,7 +13391,7 @@ def _fan_shot_bytes(url):
     """One screenshot as a small, low quality jpeg (cached on disk, so opening the page again is instant)."""
     import hashlib
     folder = get_fan_shots_dir()
-    path = os.path.join(folder, hashlib.md5(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    path = os.path.join(folder, hashlib.md5(url.encode("utf-8")).hexdigest()[:16] + "_v2.jpg")
     try:
         with open(path, "rb") as f:
             return f.read()
@@ -12873,10 +13401,10 @@ def _fan_shot_bytes(url):
     img = QImage()
     if not img.loadFromData(raw):
         return None
-    small = img.scaledToHeight(100, Qt.TransformationMode.SmoothTransformation)
+    small = img.scaledToHeight(260, Qt.TransformationMode.SmoothTransformation)
     buf = QBuffer()
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
-    small.save(buf, "JPG", 45)
+    small.save(buf, "JPG", 78)
     data = bytes(buf.data())
     try:
         os.makedirs(folder, exist_ok=True)
@@ -12899,13 +13427,262 @@ def fetch_fan_screenshots(urls):
         return [b for b in pool.map(one, urls) if b]
 
 
+from PyQt6.QtWidgets import QGraphicsOpacityEffect as _FanOpacity
+from PyQt6.QtCore import QPropertyAnimation as _FanAnim, QEvent as _FanEvent
+from PyQt6.QtGui import QLinearGradient as _FanGradient, QFontMetrics as _FanFM
+
+def _fan_num(n):
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 10_000:
+        return f"{n // 1000}K"
+    if n >= 1_000:
+        return f"{n / 1000:.1f}K".replace(".0K", "K")
+    return str(n)
+
+def _fan_ts(v):
+    """Game Jolt dates come as epoch seconds or milliseconds; returns seconds (0 if unusable)."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    return v / 1000.0 if v > 1e11 else v
+
+def _fan_ago(ts):
+    d = max(0, time.time() - ts)
+    for secs, name in ((365 * 86400, "yr"), (30 * 86400, "mo"), (7 * 86400, "wk"), (86400, "day")):
+        if d >= secs:
+            n = int(d // secs)
+            return f"{n} {name}{'s' if n != 1 and name != 'mo' else ''} ago"
+    return "today"
+
+_FAN_STATUS = {1: ("Finished", "#22c55e"), 2: ("In development", "#f59e0b"), 3: ("Canceled", "#f44336")}
+
+def fan_info(game):
+    """Extra facts for the page, read defensively from Game Jolt's data: anything missing is simply left out."""
+    info = {"stats": [], "status": None, "platforms": [], "released": "", "updated": ""}
+    if not isinstance(game, dict):
+        return info
+    posted = _fan_ts(game.get("published_on") or game.get("posted_on"))
+    updated = _fan_ts(game.get("modified_on") or game.get("updated_on"))
+    try:
+        if posted:
+            info["released"] = time.strftime("%B %d, %Y", time.localtime(posted)).replace(" 0", " ")
+        if updated:
+            info["updated"] = time.strftime("%B %d, %Y", time.localtime(updated)).replace(" 0", " ")
+    except Exception:
+        pass
+    if posted:
+        info["stats"].append((time.strftime("%Y", time.localtime(posted)), "Released"))
+    if updated and (not posted or updated - posted > 86400):
+        info["stats"].append((_fan_ago(updated), "Updated"))
+    def _find_num(*keys):
+        """First positive number stored under any of these keys, on the game or one level down."""
+        pools = [game] + [v for v in game.values() if isinstance(v, dict)]
+        for pool in pools:
+            for k in keys:
+                try:
+                    n = int(pool.get(k) or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                if n > 0:
+                    return n
+        return 0
+    for keys, label in ((("like_count", "likes_count", "likes"), "Likes"),
+                        (("view_count", "views_count", "views", "page_view_count"), "Views"),
+                        (("comment_count", "comments_count", "comments"), "Comments"),
+                        (("follower_count", "followers_count", "followers"), "Followers"),
+                        (("download_count", "downloads_count", "downloads"), "Downloads"),
+                        (("play_count", "plays_count", "plays"), "Plays")):
+        n = _find_num(*keys)
+        if n > 0:
+            info["stats"].append((_fan_num(n), label))
+    try:
+        info["status"] = _FAN_STATUS.get(int(game.get("development_status")))
+    except (TypeError, ValueError):
+        pass
+    comp = game.get("compatibility")
+    if isinstance(comp, dict):
+        for name, keys in (("Windows", ("os_windows", "os_windows_64")), ("Linux", ("os_linux", "os_linux_64")),
+                           ("Mac", ("os_mac", "os_mac_64")), ("Web", ("type_html",))):
+            if any(comp.get(k) for k in keys):
+                info["platforms"].append(name)
+    info["stats"] = info["stats"][:7]
+    return info
+
+def _fan_fade_in(widget, ms=380):
+    eff = _FanOpacity(widget)
+    widget.setGraphicsEffect(eff)
+    anim = _FanAnim(eff, b"opacity", widget)
+    anim.setDuration(ms)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    anim.start()
+    widget._fade_anim = anim
+
+def _fan_round(pm, radius):
+    out = QPixmap(pm.size())
+    out.setDevicePixelRatio(pm.devicePixelRatio())
+    out.fill(Qt.GlobalColor.transparent)
+    pr = QPainter(out)
+    pr.setRenderHint(QPainter.RenderHint.Antialiasing)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, pm.width() / pm.devicePixelRatio(), pm.height() / pm.devicePixelRatio()),
+                        radius, radius)
+    pr.setClipPath(clip)
+    pr.drawPixmap(0, 0, pm)
+    pr.end()
+    return out
+
+class _FanHero(QWidget):
+    """A soft blurred, faded copy of the cover behind the top of the page (gives it some colour)."""
+    HEIGHT = 420
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._color = None
+
+    def set_cover(self, path):
+        self._color = None
+        if path:
+            src = QImage(path)
+            if not src.isNull():
+                small = src.scaled(64, 36, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation).convertToFormat(QImage.Format.Format_RGB32)
+                buckets = {}
+                for y in range(small.height()):
+                    for x in range(small.width()):
+                        c = QColor(small.pixel(x, y))
+                        r, g, b = c.red(), c.green(), c.blue()
+                        if max(r, g, b) < 28 or min(r, g, b) > 232:   # ignore near-black / near-white borders
+                            continue
+                        key = (r >> 4, g >> 4, b >> 4)
+                        n, sr, sg, sb = buckets.get(key, (0, 0, 0, 0))
+                        buckets[key] = (n + 1, sr + r, sg + g, sb + b)
+                if buckets:
+                    n, sr, sg, sb = max(buckets.values(), key=lambda v: v[0])
+                    self._color = QColor(sr // n, sg // n, sb // n)
+        self.update()
+
+    def paintEvent(self, _e):
+        if self._color is None or self.width() < 2 or self.height() < 2:
+            return
+        g = _FanGradient(0, 0, 0, self.height())
+        top, bottom = QColor(self._color), QColor(self._color)
+        top.setAlpha(190)
+        bottom.setAlpha(0)
+        g.setColorAt(0.0, top)
+        g.setColorAt(1.0, bottom)
+        pr = QPainter(self)
+        pr.fillRect(0, 0, self.width(), self.height(), g)
+
+class _FanClickable(QLabel):
+    clicked = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+class _FanShotViewer(QDialog):
+    """Full size screenshot viewer: Left/Right arrows (or the buttons) to browse, Esc to close."""
+    def __init__(self, urls, index, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Screenshots")
+        self.resize(1120, 720)
+        self.setStyleSheet("QDialog { background: #0b0b0d; } QLabel { color: #d7d7dc; } "
+                           "QPushButton { background: #1d1d22; color: #e6e6ea; border: none; border-radius: 8px; "
+                           "padding: 8px 18px; } QPushButton:hover { background: #2a2a31; }")
+        self._urls, self._i, self._cache, self._workers = list(urls), index, {}, []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        self.img = QLabel("Loading...")
+        self.img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img.setMinimumSize(300, 200)
+        self.img.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        lay.addWidget(self.img, 1)
+        bar = QHBoxLayout()
+        self.prev_btn = QPushButton("\u2039 Previous")
+        self.next_btn = QPushButton("Next \u203a")
+        self.count = QLabel()
+        self.count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for b in (self.prev_btn, self.next_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_btn.clicked.connect(lambda: self.step(-1))
+        self.next_btn.clicked.connect(lambda: self.step(1))
+        bar.addWidget(self.prev_btn)
+        bar.addWidget(self.count, 1)
+        bar.addWidget(self.next_btn)
+        lay.addLayout(bar)
+        self._load()
+
+    def step(self, d):
+        self._i = (self._i + d) % len(self._urls)
+        self._load()
+
+    def _load(self):
+        self.count.setText(f"{self._i + 1} / {len(self._urls)}")
+        self.prev_btn.setVisible(len(self._urls) > 1)
+        self.next_btn.setVisible(len(self._urls) > 1)
+        url = self._urls[self._i]
+        if url in self._cache:
+            return self._render()
+        self.img.setPixmap(QPixmap())
+        self.img.setText("Loading...")
+        worker = TaskWorker(lambda u=url: (u, _http_get(u, timeout=20)))
+        worker.done.connect(self._loaded)
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+
+    def _loaded(self, result):
+        url, raw = result
+        pm = QPixmap()
+        if raw and pm.loadFromData(raw):
+            self._cache[url] = pm
+        if url == self._urls[self._i]:
+            self._render() if url in self._cache else self.img.setText("Couldn't load this screenshot.")
+
+    def _render(self):
+        pm = self._cache.get(self._urls[self._i])
+        if pm is not None and not pm.isNull():
+            self.img.setText("")
+            self.img.setPixmap(pm.scaled(self.img.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                         Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Left:
+            self.step(-1)
+        elif e.key() == Qt.Key.Key_Right:
+            self.step(1)
+        else:
+            super().keyPressEvent(e)
+
+
 class FanDetailPage(StoreDetailPage):
-    """Same details page as the Store, for Game Jolt fan games."""
+    """Same details page as the Store, for Game Jolt fan games - with a colour backdrop from the cover, stat cards,
+    status/platform chips, a readable About section and bigger, clickable screenshots."""
     DETAIL_W, DETAIL_H = 480, 270   # horizontal cover
+    ABOUT_PREVIEW = 520             # characters shown before "Show more"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._link = ""
+        self._about_full = ""
+        self._about_open = False
+        self._shot_urls = []
         for b in self.findChildren(QPushButton):
             if b.text().startswith("< Back"):
                 b.setText("< Back to Fan Games")
@@ -12917,23 +13694,188 @@ class FanDetailPage(StoreDetailPage):
         self.steam_btn.clicked.connect(
             lambda: self.install_cb and self.install_cb(self._appid, self._title, self._cover_path, self._link))
 
+        scroll = self.findChild(QScrollArea)
+        body = scroll.widget()
+        layout = body.layout()
+        self._body = body
+        self._hero = _FanHero(body)
+        self._hero.lower()
+        self._hero.setGeometry(0, 0, 10, _FanHero.HEIGHT)
+        body.installEventFilter(self)
+
+        # the right-hand column of the header (title, meta, chips, buttons)
+        row = next(layout.itemAt(i).layout() for i in range(layout.count()) if layout.itemAt(i).layout() is not None)
+        col = row.itemAt(1).layout()
+        chips_idx = next((i for i in range(col.count()) if col.itemAt(i).layout() is self.chips_row), 2)
+        self.title_label.setStyleSheet("font-size: 30px; font-weight: 800;")
+
+        # stat cards
+        self.stats_wrap = QWidget()
+        self.stats_row = QHBoxLayout(self.stats_wrap)
+        self.stats_row.setContentsMargins(0, 6, 0, 6)
+        self.stats_row.setSpacing(10)
+        col.insertWidget(chips_idx + 1, self.stats_wrap)
+        self.stats_wrap.hide()
+
+        # "Open on Game Jolt" next to Add to Library / Install
+        self.web_btn = QPushButton("Game Jolt page")
+        self.web_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.web_btn.setFixedHeight(38)
+        self.web_btn.setToolTip("Open this game on Game Jolt")
+        self.web_btn.clicked.connect(lambda: self._link and webbrowser.open(self._link))
+        btn_row = next(col.itemAt(i).layout() for i in range(col.count())
+                       if col.itemAt(i).layout() is not None and col.itemAt(i).layout().indexOf(self.lib_btn) >= 0)
+        btn_row.insertWidget(btn_row.count() - 1, self.web_btn)
+
+        # About panel (the full description, collapsed when long)
+        self.about_wrap = QFrame()
+        self.about_wrap.setObjectName("Panel")
+        al = QVBoxLayout(self.about_wrap)
+        al.setContentsMargins(22, 18, 22, 18)
+        al.setSpacing(8)
+        about_title = QLabel("About this game")
+        about_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.about_label = QLabel()
+        self.about_label.setWordWrap(True)
+        self.about_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.about_label.setStyleSheet("font-size: 14px;")
+        self.about_more = QPushButton("Show more")
+        self.about_more.setFlat(True)
+        self.about_more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.about_more.clicked.connect(self._toggle_about)
+        al.addWidget(about_title)
+        al.addWidget(self.about_label)
+        al.addWidget(self.about_more, 0, Qt.AlignmentFlag.AlignLeft)
+        idx = layout.indexOf(self.reqs_wrap)
+        layout.insertWidget(idx, self.about_wrap)
+        layout.insertSpacing(idx + 1, 20)
+        self.about_wrap.hide()
+
+        # Details panel (developer, release, platforms ...)
+        self.details_wrap = QFrame()
+        self.details_wrap.setObjectName("Panel")
+        dl = QVBoxLayout(self.details_wrap)
+        dl.setContentsMargins(22, 18, 22, 18)
+        dl.setSpacing(8)
+        dtitle = QLabel("Details")
+        dtitle.setStyleSheet("font-size: 16px; font-weight: bold;")
+        dl.addWidget(dtitle)
+        self.details_grid = QGridLayout()
+        self.details_grid.setHorizontalSpacing(24)
+        self.details_grid.setVerticalSpacing(8)
+        self.details_grid.setColumnStretch(1, 1)
+        dl.addLayout(self.details_grid)
+        layout.insertWidget(idx + 2, self.details_wrap)
+        layout.insertSpacing(idx + 3, 20)
+        self.details_wrap.hide()
+
+        # "More like this" row
+        self.similar_wrap = QFrame()
+        self.similar_wrap.setObjectName("Panel")
+        sl = QVBoxLayout(self.similar_wrap)
+        sl.setContentsMargins(22, 18, 22, 18)
+        sl.setSpacing(10)
+        stitle = QLabel("More like this")
+        stitle.setStyleSheet("font-size: 16px; font-weight: bold;")
+        sl.addWidget(stitle)
+        self.similar_scroll = QScrollArea()
+        self.similar_scroll.setWidgetResizable(True)
+        self.similar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.similar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.similar_scroll.setFixedHeight(168)
+        self.similar_scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        holder = QWidget()
+        self.similar_row = QHBoxLayout(holder)
+        self.similar_row.setContentsMargins(0, 0, 0, 0)
+        self.similar_row.setSpacing(14)
+        self.similar_scroll.setWidget(holder)
+        sl.addWidget(self.similar_scroll)
+        layout.insertWidget(idx + 4, self.similar_wrap)
+        layout.insertSpacing(idx + 5, 20)
+        self.similar_wrap.hide()
+        self.open_cb = None   # set by the app: (id, title, cover)
+        self._pulse = None
+
+        # roomier screenshot strip
+        self.shots_scroll.setFixedHeight(232)
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, "_body", None) and ev.type() == _FanEvent.Type.Resize:
+            self._hero.setGeometry(0, 0, obj.width(), _FanHero.HEIGHT)
+        return super().eventFilter(obj, ev)
+
+    # ---- small builders
+    def _chip(self, text, color=None):
+        chip = QLabel(text)
+        if color:
+            c = QColor(color)
+            chip.setStyleSheet(f"background: rgba({c.red()},{c.green()},{c.blue()},0.22); color: {color}; "
+                               "border-radius: 11px; padding: 3px 12px; font-size: 12px; font-weight: bold;")
+        else:
+            chip.setStyleSheet(self.CHIP_STYLE)
+        return chip
+
+    def _stat_card(self, value, label):
+        card = QFrame()
+        card.setStyleSheet("QFrame { background: rgba(128,128,128,0.16); border-radius: 12px; }")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(16, 10, 16, 10)
+        cl.setSpacing(0)
+        v = QLabel(value)
+        v.setStyleSheet("background: transparent; font-size: 20px; font-weight: 800;")
+        k = QLabel(label.upper())
+        k.setStyleSheet("background: transparent; font-size: 10px; font-weight: bold; color: rgba(160,160,170,1);")
+        cl.addWidget(v)
+        cl.addWidget(k)
+        return card
+
+    def _toggle_about(self):
+        self._about_open = not self._about_open
+        self._apply_about()
+
+    def _apply_about(self):
+        text = self._about_full
+        long = len(text) > self.ABOUT_PREVIEW
+        shown = text if (self._about_open or not long) else text[:self.ABOUT_PREVIEW].rsplit(" ", 1)[0] + "\u2026"
+        self.about_label.setText(shown)
+        self.about_more.setVisible(long)
+        self.about_more.setText("Show less" if self._about_open else "Show more")
+
     def show_game(self, appid, title, cover_path, link="", tags=()):
         self._appid = appid
         self._title = title
         self._link = link
         self._cover_path = cover_path or ""
+        self._about_full = ""
+        self._about_open = False
+        self._shot_urls = []
         self.title_label.setText(title)
         self.meta_label.setText("Fan game  \u2022  Game Jolt")
         self.desc_label.setText("Loading details...")
+        self.desc_label.setStyleSheet("font-size: 14px; color: rgba(160,160,170,1);")
+        self.desc_label.show()
+        self._start_pulse()
+        _a = appid
+        QTimer.singleShot(8000, lambda: self._appid == _a and self.desc_label.isVisible() and
+                          self.desc_label.text().startswith("Loading") and
+                          self.desc_label.setText("Loading details... Game Jolt can be slow, hang tight."))
+        self.about_wrap.hide()
+        self.details_wrap.hide()
+        self.similar_wrap.hide()
+        self._clear(self.details_grid)
+        self._clear(self.similar_row)
+        self.stats_wrap.hide()
+        self._clear(self.stats_row)
         self._clear(self.chips_row)
         self._clear(self.shots_row)
         self._set_extras_visible(False)
-        for t in sorted(tags):
-            chip = QLabel(_FAN_TAG_NAMES.get(t, t.title()))
-            chip.setStyleSheet(self.CHIP_STYLE)
-            self.chips_row.addWidget(chip)
+        self._tag_chips = [t for t in sorted(tags)]
+        for t in self._tag_chips:
+            self.chips_row.addWidget(self._chip(_FAN_TAG_NAMES.get(t, t.title())))
         self.chips_row.addStretch()
-        pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 12) if cover_path else None
+        self.web_btn.setVisible(bool(link))
+        self._hero.set_cover(cover_path)
+        pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 14) if cover_path else None
         if pix:
             self.cover.setText("")
             self.cover.setPixmap(pix)
@@ -12942,37 +13884,194 @@ class FanDetailPage(StoreDetailPage):
             self.cover.setText("No\ncover")
 
         def work():
-            desc, dev, shot_urls = "", "", []
+            desc, dev, shot_urls, info = "", "", [], {}
             try:
                 game = fetch_fan_overview(appid)
                 desc, dev = fan_description(game), fan_developer(game)
                 shot_urls = fan_screenshot_urls(game)
+                info = fan_info(game)
             except Exception:
                 pass
             if not desc:
                 try:
-                    page = _http_get(link, timeout=15).decode("utf-8", errors="replace")
+                    page = _http_get(link, timeout=40).decode("utf-8", errors="replace")
                     for rx in _OGD_RES:
                         m = rx.search(page)
                         if m and m.group(1).strip():
-                            desc = html_lib.unescape(m.group(1)).strip()
-                            break
+                            desc = fan_clean_text(m.group(1))
+                            if desc:
+                                break
                 except Exception:
                     pass
-            return (appid, desc, dev, shot_urls)
+            return (appid, desc, dev, shot_urls, info)
 
         worker = TaskWorker(work)
         worker.done.connect(self._on_fan_details)
         self._workers = [w for w in self._workers if w.isRunning()] + [worker]
         worker.start()
 
+        # "More like this": games sharing tags, covers are fetched in the background
+        def find_similar():
+            similar = []
+            try:
+                mine = set(tags)
+                scored = []
+                for g in load_fan_games():
+                    if g[0] != appid and mine & g[3]:
+                        scored.append((-len(mine & g[3]), hash((g[0], appid)) & 0xffff, g))
+                scored.sort(key=lambda s: (s[0], s[1]))
+                loader = FanCoverLoader()
+                for _s, _h, g in scored[:10]:
+                    p = os.path.join(get_fan_cover_dir(), f"{g[0]}.img")
+                    if not os.path.exists(p):
+                        try:
+                            p = loader._fetch(g[0], g[2], None, g[1])
+                        except Exception:
+                            p = ""
+                    similar.append((g[0], g[1], p))
+            except Exception:
+                pass
+            return (appid, similar)
+
+        self._find_similar = find_similar     # started once the details are in, so the two don't compete for the network
+
+    # ---- loading pulse, details panel, similar row
+    def _start_pulse(self):
+        self._stop_pulse()
+        eff = _FanOpacity(self.desc_label)
+        self.desc_label.setGraphicsEffect(eff)
+        anim = _FanAnim(eff, b"opacity", self.desc_label)
+        anim.setDuration(1100)
+        anim.setKeyValueAt(0.0, 1.0)
+        anim.setKeyValueAt(0.5, 0.35)
+        anim.setKeyValueAt(1.0, 1.0)
+        anim.setLoopCount(-1)
+        anim.start()
+        self._pulse = anim
+
+    def _stop_pulse(self):
+        if self._pulse is not None:
+            try:
+                self._pulse.stop()
+            except RuntimeError:
+                pass
+            self._pulse = None
+        try:
+            self.desc_label.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+
+    def _fill_details(self, dev, info):
+        self._clear(self.details_grid)
+        rows = []
+        if dev:
+            rows.append(("Developer", dev))
+        if info.get("released"):
+            rows.append(("Released", info["released"]))
+        if info.get("updated") and info.get("updated") != info.get("released"):
+            rows.append(("Last updated", info["updated"]))
+        if info.get("status"):
+            rows.append(("Status", info["status"][0]))
+        if info.get("platforms"):
+            rows.append(("Platforms", ", ".join(info["platforms"])))
+        if self._tag_chips:
+            rows.append(("Franchise", ", ".join(_FAN_TAG_NAMES.get(t, t.title()) for t in self._tag_chips)))
+        for n, (k, v) in enumerate(rows):
+            kl = QLabel(k.upper())
+            kl.setStyleSheet("font-size: 11px; font-weight: bold; color: rgba(160,160,170,1);")
+            vl = QLabel(v)
+            vl.setWordWrap(True)
+            vl.setStyleSheet("font-size: 14px;")
+            self.details_grid.addWidget(kl, n, 0)
+            self.details_grid.addWidget(vl, n, 1)
+        return bool(rows)
+
+    def _on_fan_similar(self, result):
+        appid, similar = result
+        if appid != self._appid or not similar or not self.open_cb:
+            return
+        self._clear(self.similar_row)
+        for gid, title, cover in similar:
+            tile = QWidget()
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(0, 0, 0, 0)
+            tl.setSpacing(6)
+            pic = _FanClickable()
+            pic.setFixedSize(176, 99)
+            pic.setCursor(Qt.CursorShape.PointingHandCursor)
+            pix = rounded_cover_pixmap(cover, 176, 99, 10) if cover else None
+            if pix:
+                pic.setPixmap(pix)
+            else:
+                pic.setText("No cover")
+                pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pic.setStyleSheet("background: rgba(128,128,128,0.18); border-radius: 10px;")
+            name = _FanClickable()
+            name.setFixedWidth(176)
+            name.setCursor(Qt.CursorShape.PointingHandCursor)
+            name.setText(_FanFM(name.font()).elidedText(title, Qt.TextElideMode.ElideRight, 176))
+            name.setStyleSheet("font-size: 12px; font-weight: bold;")
+            name.setToolTip(title)
+            for w in (pic, name):
+                w.clicked.connect(lambda g=gid, t=title, c=cover: self.open_cb(g, t, c))
+            tl.addWidget(pic)
+            tl.addWidget(name)
+            tl.addStretch()
+            self.similar_row.addWidget(tile)
+        self.similar_row.addStretch()
+        self.similar_wrap.show()
+        _fan_fade_in(self.similar_wrap)
+
     def _on_fan_details(self, result):
-        appid, desc, dev, shot_urls = result
+        appid, desc, dev, shot_urls, info = result
         if appid != self._appid:
             return
+        sim_worker = TaskWorker(self._find_similar)
+        sim_worker.done.connect(self._on_fan_similar)
+        self._workers = [w for w in self._workers if w.isRunning()] + [sim_worker]
+        sim_worker.start()
+        parts = []
         if dev:
-            self.meta_label.setText(f"by {dev}  \u2022  Game Jolt fan game")
-        self.desc_label.setText(desc or "No description available. Open the game on Game Jolt for more.")
+            parts.append(f"by {dev}")
+        parts.append("Game Jolt fan game")
+        self.meta_label.setText("  \u2022  ".join(parts))
+
+        # status + platform chips after the tag chips
+        self._clear(self.chips_row)
+        status = info.get("status")
+        if status:
+            self.chips_row.addWidget(self._chip(status[0], status[1]))
+        for t in self._tag_chips:
+            self.chips_row.addWidget(self._chip(_FAN_TAG_NAMES.get(t, t.title())))
+        for plat in info.get("platforms", []):
+            self.chips_row.addWidget(self._chip(plat))
+        self.chips_row.addStretch()
+
+        # stat cards
+        stats = info.get("stats") or []
+        if stats:
+            for value, label in stats:
+                self.stats_row.addWidget(self._stat_card(value, label))
+            self.stats_row.addStretch()
+            self.stats_wrap.show()
+            _fan_fade_in(self.stats_wrap)
+
+        self._stop_pulse()
+        self.desc_label.hide()
+        self._about_full = desc or ""
+        if desc:
+            self._apply_about()
+            self.about_wrap.show()
+            _fan_fade_in(self.about_wrap)
+        else:
+            self.desc_label.setText("No description available. Open the game on Game Jolt for more.")
+            self.desc_label.show()
+
+        if self._fill_details(dev, info):
+            self.details_wrap.show()
+            _fan_fade_in(self.details_wrap)
+
+        self._shot_urls = list(shot_urls)
         if shot_urls:
             # the text shows right away; the screenshots follow as soon as they're downloaded
             shots_worker = TaskWorker(lambda u=shot_urls, a=appid: (a, fetch_fan_screenshots(u)))
@@ -12985,14 +14084,22 @@ class FanDetailPage(StoreDetailPage):
         if appid != self._appid or not shots:
             return
         self._clear(self.shots_row)
-        for raw in shots:
+        for n, raw in enumerate(shots):
             pm = QPixmap()
             if pm.loadFromData(raw):
-                shot = QLabel()
-                shot.setPixmap(pm.scaledToHeight(160, Qt.TransformationMode.SmoothTransformation))
+                shot = _FanClickable()
+                scaled = pm.scaledToHeight(200, Qt.TransformationMode.SmoothTransformation)
+                shot.setPixmap(_fan_round(scaled, 10))
+                shot.setToolTip("Click to enlarge")
+                shot.clicked.connect(lambda i=n: self._open_viewer(i))
                 self.shots_row.addWidget(shot)
         self.shots_row.addStretch()
         self._set_extras_visible(True)
+        _fan_fade_in(self.shots_scroll)
+
+    def _open_viewer(self, index):
+        if self._shot_urls:
+            _FanShotViewer(self._shot_urls, min(index, len(self._shot_urls) - 1), self.window()).exec()
 
 # ---------------------------------------------------------------- Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv)
 GAMEJOLT_SCRAPER_URL = "https://github.com/justmm33/FNaNCZ-AE-Releases/raw/refs/heads/main/gamejolt_scraper.py"
@@ -13285,10 +14392,7 @@ class FanGamesPage(StorePage):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        try:  # this page has no "Activated Games" view
-            self.activated_btn.hide()
-        except Exception:
-            pass
+        self.tags_btn.hide()    # Fan Games has its own tag buttons
         self.loader.shutdown()
         self.loader = FanCoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
@@ -13674,6 +14778,7 @@ def _fan_init(self):
     self.search_edit.parentWidget().layout().insertWidget(2, tabs)
     self.fan_detail_page.add_requested.connect(self._fan_add)
     self.fan_page.fan_selected.connect(open_fan_game)
+    self.fan_detail_page.open_cb = open_fan_game
     self.fan_detail_page.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
     btn = self.make_nav_button("Fan Games", checkable=True)
     self.nav_group.addButton(btn, self.pages.indexOf(self.fan_page))
@@ -15577,7 +16682,7 @@ class _TitleBarDrag(QObject):
 def _caption_icon(restore):
     """Maximize (one square) / restore down (two squares) glyph, drawn so it doesn't depend on a font."""
     icon = QIcon()
-    for mode, color in ((QIcon.Mode.Normal, "#a0a0a8"), (QIcon.Mode.Active, "#ffffff")):
+    for mode, color in ((QIcon.Mode.Normal, _theme_state["nav_text"]), (QIcon.Mode.Active, _theme_state["nav_active"])):
         pm = QPixmap(24, 24)
         pm.setDevicePixelRatio(2.0)
         pm.fill(Qt.GlobalColor.transparent)
@@ -15622,7 +16727,7 @@ def _frameless_init(self):
     exit_btn.setFixedSize(40, 32)
     exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     exit_btn.setStyleSheet(
-        "QPushButton { background: transparent; color: #a0a0a8; border: none; border-radius: 6px;"
+        "QPushButton { background: transparent; border: none; border-radius: 6px;"
         " font-size: 15px; font-weight: bold; padding: 0; }"
         "QPushButton:hover { background: #e5484d; color: #ffffff; }"
         "QPushButton:pressed { background: #c93a3f; color: #ffffff; }")
@@ -15647,10 +16752,10 @@ def _frameless_init(self):
     min_btn.setFixedSize(40, 32)
     min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     min_btn.setStyleSheet(
-        "QPushButton { background: transparent; color: #a0a0a8; border: none; border-radius: 6px;"
+        "QPushButton { background: transparent; border: none; border-radius: 6px;"
         " font-size: 18px; font-weight: bold; padding: 0; }"
-        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); color: #ffffff; }"
-        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); color: #ffffff; }")
+        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
     min_btn.clicked.connect(self.showMinimized)
 
     max_btn = QPushButton()
@@ -15671,6 +16776,7 @@ def _frameless_init(self):
     max_btn.clicked.connect(lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
     _WindowStateWatcher(self, refresh_max_btn)
     refresh_max_btn()
+    _theme_listeners.append(refresh_max_btn)   # redraw the glyph when the theme changes
 
     bar.layout().addSpacing(8)
     bar.layout().addWidget(min_btn)
