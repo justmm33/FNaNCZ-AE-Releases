@@ -1354,6 +1354,11 @@ def set_accent(color):
     base, hover, press = c.name(), c.lighter(120).name(), c.darker(125).name()
     for t in THEMES.values():
         t.update(accent=base, accent_hover=hover, accent_press=press, red=base, red_hover=hover, red_press=press)
+    try:                                     # in-game toasts follow the accent too
+        import overlay as _overlay_mod
+        _overlay_mod.set_accent(base)
+    except Exception:
+        pass
 
 def apply_accent_to_icon(color):
     """Recolors assets/icon.png to match the accent. The original is kept once as assets/icon_default.png
@@ -14822,6 +14827,46 @@ GJ_API_JS = r"""async (gid) => {
     return null;
 }"""
 
+# lists every Windows build of the game with its details (for the "pick a build" window)
+GJ_BUILDS_JS = r"""async (gid) => {
+    const r = await fetch(`/site-api/web/discover/games/overview/${gid}?ignore`, {credentials: 'include'});
+    const j = await r.json();
+    const found = {}, packages = {}, releases = {};
+    const walk = (o, key) => {
+        if (Array.isArray(o)) {
+            if (key === 'packages') o.forEach(x => { if (x && x.id) packages[x.id] = x; });
+            if (key === 'releases') o.forEach(x => { if (x && x.id) releases[x.id] = x; });
+            o.forEach(x => walk(x, key));
+        } else if (o && typeof o === 'object') {
+            if (o.id && o.os_windows && (o.type === undefined || o.type === 'downloadable')) found[o.id] = o;
+            Object.entries(o).forEach(([k, v]) => walk(v, k));
+        }
+    };
+    walk(j.payload || j, '');
+    const out = Object.values(found).map(b => {
+        const pk = packages[b.game_package_id || b.package_id] || {};
+        const rl = releases[b.game_release_id || b.release_id] || {};
+        const f = b.primary_file || {};
+        return {id: b.id, filename: f.filename || b.filename || '', size: f.filesize || b.filesize || 0,
+                pkg: pk.title || pk.name || '', desc: pk.description || '', version: rl.version_number || '',
+                added: b.modified_on || b.added_on || rl.published_on || 0, primary: !!b.primary,
+                win64: !!b.os_windows_64, linux: !!(b.os_linux || b.os_linux_64), mac: !!(b.os_mac || b.os_mac_64)};
+    });
+    out.sort((a, b) => (((a.linux || a.mac) ? 1 : 0) - ((b.linux || b.mac) ? 1 : 0)) ||
+                       ((b.primary ? 1 : 0) - (a.primary ? 1 : 0)));
+    return out;
+}"""
+
+GJ_URL_JS = r"""async (id) => {
+    try {
+        const d = await fetch(`/site-api/web/discover/games/builds/get-download-url/${id}`,
+                              {method: 'POST', credentials: 'include',
+                               headers: {'Content-Type': 'application/json'}, body: '{}'});
+        const dj = await d.json();
+        return (dj.payload || dj).downloadUrl || null;
+    } catch (e) { return null; }
+}"""
+
 # finds buttons whose own row mentions windows (and not linux/mac), tags them for Playwright
 GJ_TAG_WIN_JS = r"""() => {
     let n = 0;
@@ -14841,6 +14886,95 @@ GJ_TAG_WIN_JS = r"""() => {
     }
     return n;
 }"""
+
+# tags the "Download" button that sits closest to the picked build's title text (data-gjpick); returns 1 if found
+GJ_NEAR_JS = r"""(titles) => {
+    document.querySelectorAll('[data-gjpick]').forEach(e => e.removeAttribute('data-gjpick'));
+    const btns = [...document.querySelectorAll('button, a')]
+        .filter(e => /^\s*download\b/i.test(e.innerText || '') && e.offsetParent !== null);
+    if (!btns.length) return 0;
+    const low = e => (e.innerText || '').toLowerCase().replace(/[’‘`]/g, "'");
+    for (const t of titles) {
+        const w = (t || '').trim().toLowerCase().replace(/[’‘`]/g, "'");
+        if (!w) continue;
+        const spots = [...document.querySelectorAll('body *')].filter(el =>
+            low(el).includes(w) && ![...el.children].some(c => low(c).includes(w)) && !btns.some(b => b.contains(el)));
+        if (!spots.length) continue;
+        let best = null, bd = Infinity;
+        for (const el of spots) {
+            const r = el.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+            for (const b of btns) {
+                const q = b.getBoundingClientRect();
+                if (q.top < r.top) continue;          // a card's button is below its title, never above it
+                const d = Math.hypot(q.left + q.width / 2 - cx, q.top + q.height / 2 - cy);
+                if (d < bd) { bd = d; best = b; }
+            }
+        }
+        if (best) { best.setAttribute('data-gjpick', '1'); return 1; }
+    }
+    return 0;
+}"""
+
+# every visible "Download" button with the text of the row it sits in (for matching + the debug log)
+GJ_ROWS_JS = r"""() => {
+    const all = [...document.querySelectorAll('button, a')]
+        .filter(e => /^\s*download\b/i.test(e.innerText || '') && e.offsetParent !== null);
+    return all.map(el => {
+        let node = el;
+        for (let i = 0; i < 6 && node.parentElement; i++) {
+            const p = node.parentElement;
+            if (all.filter(e => p.contains(e)).length > 1) break;
+            node = p;
+        }
+        return (node.innerText || '').replace(/\s+/g, ' ').trim();
+    });
+}"""
+
+GJ_TAG_IDX_JS = r"""(idx) => {
+    document.querySelectorAll('[data-gjpick]').forEach(e => e.removeAttribute('data-gjpick'));
+    const all = [...document.querySelectorAll('button, a')]
+        .filter(e => /^\s*download\b/i.test(e.innerText || '') && e.offsetParent !== null);
+    if (!all[idx]) return 0;
+    all[idx].setAttribute('data-gjpick', '1');
+    return 1;
+}"""
+
+def _gj_score_rows(rows, pick):
+    """Index of the Download row (the whole card the button sits in) that mentions the most details of the picked
+    build: name / file name count most, then version, then size."""
+    norm = lambda v: str(v).strip().lower().replace("\u2019", "'")
+    size = float(pick.get("size") or 0)
+    keys = [(pick.get("pkg"), 3), (pick.get("filename"), 3), (pick.get("version"), 2)]
+    if size:
+        keys += [(f"{size / 1048576:.1f} mb", 1), (f"{size / 1048576:.2f} mb", 1), (f"{size / 1048576:.0f} mb", 1),
+                 (f"{size / 1024:.0f} kb", 1), (f"{size / 1073741824:.2f} gb", 1)]
+    keys = [(norm(k), w) for k, w in keys if k and str(k).strip()]
+    best, best_i = 0, None
+    for i, text in enumerate(rows):
+        t = norm(text)
+        score = sum(w for k, w in keys if k in t)
+        if score > best:
+            best, best_i = score, i
+    return best_i
+
+def _gj_click_picked(pg, pick):
+    """Clicks the Download button of the picked build on this page. Returns how it was found, or ''."""
+    how = ""
+    idx = _gj_score_rows(pg.evaluate(GJ_ROWS_JS), pick)       # the card that holds the build's name / version / size
+    if idx is not None and pg.evaluate(GJ_TAG_IDX_JS, idx):
+        how = f"card {idx + 1} by name/version/size"
+    elif pg.evaluate(GJ_NEAR_JS, [pick.get("pkg"), pick.get("filename")]):
+        how = "nearest button below the title text"
+    if how:
+        pg.locator("[data-gjpick]").first.click(timeout=5000)
+    return how
+
+def _gj_debug(msg):
+    try:
+        with open(os.path.join(_writable_dir(), "gj_build_debug.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 def _gj_find_link(self, game_url, gid=None):
     """Opens the Game Jolt page, opens the builds list, clicks the (Windows) build's Download and copies the link."""
@@ -14881,26 +15015,67 @@ def _gj_find_link(self, game_url, gid=None):
                         continue
                 return False
 
-            # 1) ask Game Jolt's own api (from inside the browser) for the Windows build's download url
+            # 1) ask Game Jolt's own api (from inside the browser) for the Windows build's download url.
+            #    Several Windows builds -> the launcher shows a window to pick one.
+            pick, builds = None, []
             if gid:
                 self.status_update.emit("Looking for the Windows build...")
                 try:
-                    api_url = page.evaluate(GJ_API_JS, gid)
+                    builds = page.evaluate(GJ_BUILDS_JS, gid) or []
                 except Exception:
+                    builds = []
+                named = [b for b in builds if b.get("pkg") or b.get("filename")]   # only builds that have a real name
+                ask = getattr(self, "ask_build", None)
+                chosen = getattr(self, "_gj_build_id", None)     # kept, so a re-link (expired url) doesn't ask again
+                if len(named) > 1 and ask and chosen is None:
+                    self.status_update.emit("Waiting for you to pick a build...")
+                    chosen = ask(named)
+                    if chosen is None:
+                        raise RuntimeError("CANCELLED")
+                    self._gj_build_id = chosen
+                    self.status_update.emit("Getting the download link...")
+                if chosen is not None:
+                    # a build was picked: do it like the normal route - click Download and wait for the link on the page
+                    pick = next((b for b in builds if b["id"] == chosen), None)
+                    self.status_update.emit("Opening download options...")
+                else:
                     api_url = None
-                if api_url:
-                    cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(api_url))
-                    headers = {"User-Agent": PW_USER_AGENT, "Referer": game_url}
-                    if cookies:
-                        headers["Cookie"] = cookies
-                    return api_url, headers
+                    for b in (named or builds):
+                        try:
+                            api_url = page.evaluate(GJ_URL_JS, b["id"])
+                        except Exception:
+                            api_url = None
+                        if api_url:
+                            break
+                    if api_url:
+                        cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(api_url))
+                        headers = {"User-Agent": PW_USER_AGENT, "Referer": game_url}
+                        if cookies:
+                            headers["Cookie"] = cookies
+                        return api_url, headers
 
             # 2) fallback: click through the page, Windows build only
             self.status_update.emit("Opening download options...")
             main_btns = [page.get_by_role("button", name=GJ_DOWNLOAD_BTN),
                          page.get_by_role("link", name=GJ_DOWNLOAD_BTN)]
+            # The game page can list every package with its own Download button right away. The generic click below would
+            # press the FIRST one, so when a build was picked, press that build's button instead.
             clicked_main = False
-            for _ in range(60):  # up to ~15s, checked every 250ms so it reacts as soon as the button shows up
+            if pick:
+                for _ in range(40):
+                    if self._is_cancelled:
+                        raise RuntimeError("CANCELLED")
+                    try:
+                        how = _gj_click_picked(page, pick)
+                    except Exception:
+                        how = ""
+                    if how:
+                        _gj_debug(f"picked build: {pick}")
+                        _gj_debug(f"clicked on the game page: {how}")
+                        clicked_main = True
+                        break
+                    page.wait_for_timeout(250)
+            for _ in range(0 if clicked_main else 60):  # up to ~15s, checked every 250ms so it reacts as soon as the button shows up
                 if self._is_cancelled:
                     raise RuntimeError("CANCELLED")
                 if click_first(main_btns):
@@ -14912,7 +15087,7 @@ def _gj_find_link(self, game_url, gid=None):
             # Be patient: Game Jolt may show a builds list and/or a "download starts after the video" page.
             # Poll for up to 5 minutes; click a Windows build if a list shows up, otherwise just wait.
             self.status_update.emit("Waiting for the download to start (may play a video first)...")
-            end, clicked, saw_list = time.time() + 300, False, False
+            end, clicked, saw_list, list_since, logged = time.time() + 300, clicked_main and bool(pick), False, 0.0, False
             while "d" not in got and time.time() < end:
                 if self._is_cancelled:
                     raise RuntimeError("CANCELLED")
@@ -14923,7 +15098,25 @@ def _gj_find_link(self, game_url, gid=None):
                         n = pg.evaluate(GJ_TAG_WIN_JS)
                         if n:
                             saw_list = True
-                            if not clicked:
+                            if pick and not clicked:
+                                # the build the user chose: click the Download button closest to its title text
+                                list_since = list_since or time.time()
+                                if not logged:
+                                    logged = True
+                                    _gj_debug(f"picked build: {pick}")
+                                    _gj_debug(f"all builds: {builds}")
+                                    _gj_debug("download rows on the page: " + " || ".join(pg.evaluate(GJ_ROWS_JS)))
+                                how = _gj_click_picked(pg, pick) if time.time() - list_since > 0.5 else ""
+                                if how:
+                                    _gj_debug(f"clicking: {how}")
+                                    self.status_update.emit("Picking the build you chose...")
+                                    clicked = True
+                                    self.status_update.emit("Waiting for the download to start (may play a video first)...")
+                                elif time.time() - list_since > 12:      # nothing matched: first Windows build
+                                    _gj_debug("clicking: nothing matched, first Windows button")
+                                    pg.locator("[data-gjwin]").first.click(timeout=5000)
+                                    clicked = True
+                            elif not clicked:
                                 self.status_update.emit("Picking the Windows build...")
                                 pg.locator("[data-gjwin]").first.click(timeout=5000)
                                 clicked = True
@@ -14982,12 +15175,101 @@ def _gj_install_file(path, game_dir):
         raise ValueError("Game Jolt returned a web page instead of a file (the download link expired?). Try again.")
     extract_archive(path, game_dir)
 
+class GameJoltBuildDialog(QDialog):
+    """Pop-up listing the Windows builds a Game Jolt game offers, with their details."""
+    def __init__(self, parent, title, builds):
+        super().__init__(parent)
+        self.setWindowTitle("Choose a build")
+        self.setMinimumWidth(500)
+        self._builds = builds
+        lay = QVBoxLayout(self)
+        head = QLabel(f"<b>{html_lib.escape(title)}</b> has {len(builds)} Windows builds.<br>Pick the one you want to download:")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        self.list = QListWidget()
+        self.list.setMinimumHeight(260)
+        dim = self.palette().placeholderText().color().name()
+        for i, b in enumerate(builds):
+            name = b.get("pkg") or b.get("filename") or f"Build {b['id']}"
+            bits = []
+            if b.get("version"):
+                bits.append(f"Version {html_lib.escape(str(b['version']))}")
+            if b.get("size"):
+                bits.append(_fmt_size(b["size"]))
+            bits.append("64-bit" if b.get("win64") else "Windows")
+            if b.get("linux") or b.get("mac"):
+                bits.append("also " + "/".join(x for x, k in (("Linux", "linux"), ("Mac", "mac")) if b.get(k)))
+            if b.get("added"):
+                try:
+                    bits.append(time.strftime("%b %d, %Y", time.localtime(float(b["added"]) / 1000)))
+                except Exception:
+                    pass
+            lines = [f"<b>{html_lib.escape(str(name))}</b>" + ("  <i>(recommended)</i>" if i == 0 and b.get("primary") else ""),
+                     f'<span style="color:{dim}">{" · ".join(bits)}</span>']
+            if b.get("filename") and b.get("pkg"):
+                lines.append(f'<span style="color:{dim}">{html_lib.escape(str(b["filename"]))}</span>')
+            desc = " ".join(fan_clean_text(b.get("desc") or "").split())
+            if desc:
+                lines.append(html_lib.escape(desc[:160] + ("..." if len(desc) > 160 else "")))
+            lab = QLabel("<br>".join(lines))
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            lab.setFixedWidth(450)
+            lab.setContentsMargins(8, 6, 8, 6)
+            lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            it = QListWidgetItem()
+            it.setData(Qt.ItemDataRole.UserRole, b["id"])
+            it.setSizeHint(QSize(460, lab.heightForWidth(450) + 4))
+            self.list.addItem(it)
+            self.list.setItemWidget(it, lab)
+        self.list.setCurrentRow(0)
+        self.list.itemDoubleClicked.connect(lambda _i: self.accept())
+        lay.addWidget(self.list)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Download")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def chosen_id(self):
+        it = self.list.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+def _gj_show_build_dialog(parent, worker, builds):
+    dlg = GameJoltBuildDialog(parent, worker.title, builds)
+    ok = dlg.exec() == QDialog.DialogCode.Accepted
+    worker.answer_build(dlg.chosen_id() if ok else None)
+
 class GameJoltDownloadWorker(FirebaseDownloadWorker):
+    pick_build = pyqtSignal(object)      # list of build dicts -> the GUI thread shows the chooser
+
     def __init__(self, title, game_url, gid=None, existing_zip_path=None):
         super().__init__(title, game_url, 0)
         self.game_url = game_url
         self.gid = gid
         self.existing_zip_path = existing_zip_path
+        self._pick_event = threading.Event()
+        self._pick_result = None
+
+    def ask_build(self, builds):
+        """Called from the worker thread: blocks until the chooser window answers. Returns a build id or None."""
+        self._pick_event.clear()
+        self._pick_result = None
+        self.pick_build.emit(builds)
+        while not self._pick_event.wait(0.3):
+            if self._is_cancelled:
+                return None
+        return self._pick_result
+
+    def answer_build(self, build_id):
+        self._pick_result = build_id
+        self._pick_event.set()
 
     def run(self):
         dest_path, fresh = None, False
@@ -15026,6 +15308,7 @@ def _fan_install(self, gid, title, cover_path, link):
     if cancelled:
         return
     worker = GameJoltDownloadWorker(title, link, gid, existing)
+    worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(self, w, builds))
     worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
     card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
     self.downloads_page.add_download_card(card)
