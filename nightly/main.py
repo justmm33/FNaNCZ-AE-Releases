@@ -11049,7 +11049,7 @@ class SteamInviteDialog(QDialog):
         form.addRow("Game", self.name_edit)
         form.addRow("Join link", self.link_edit)
         lay.addLayout(form)
-        hint = QLabel("Paste the game's steam join link.)
+        hint = QLabel("Paste the game's steam join link.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888888; font-size:11px;")
         lay.addWidget(hint)
