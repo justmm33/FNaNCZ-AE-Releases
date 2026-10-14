@@ -24,12 +24,49 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
     QAbstractItemView
 )
-from PyQt6.QtCore import QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
+from PyQt6.QtCore import QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 
 if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
     from overlay import run_server
     run_server()
+    sys.exit(0)
+
+if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the running game's Steam rich presence "connect" text
+    import ctypes
+    _i = sys.argv.index("--ncz-rp-helper")
+    try:
+        _appid, _lib, _sid = sys.argv[_i + 1:_i + 4]
+        os.environ["SteamAppId"] = os.environ["SteamGameId"] = _appid
+        os.chdir(os.path.dirname(_lib))
+        _api = ctypes.CDLL(_lib)
+        _api.SteamAPI_Init.restype = ctypes.c_bool
+        if _api.SteamAPI_Init():
+            _fr = None
+            for _v in range(20, 7, -1):     # the accessor's name carries the ISteamFriends version of that steam_api library
+                _fn = getattr(_api, "SteamAPI_SteamFriends_v%03d" % _v, None)
+                if _fn is not None:
+                    _fn.restype = ctypes.c_void_p
+                    _fr = _fn()
+                    if _fr:
+                        break
+            if _fr:
+                _get = _api.SteamAPI_ISteamFriends_GetFriendRichPresence
+                _get.restype = ctypes.c_char_p
+                _get.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p]
+                _req = _api.SteamAPI_ISteamFriends_RequestFriendRichPresence
+                _req.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+                _req(_fr, int(_sid))
+                for _n in range(40):
+                    _api.SteamAPI_RunCallbacks()
+                    _val = _get(_fr, int(_sid), b"connect")
+                    if _val:
+                        print(_val.decode("utf-8", "replace"))
+                        break
+                    time.sleep(0.1)
+            _api.SteamAPI_Shutdown()
+    except Exception:
+        pass
     sys.exit(0)
 
 def _bundled_dir():
@@ -1246,6 +1283,11 @@ QLineEdit {
     padding: 8px 10px; selection-background-color: $accent; selection-color: #ffffff;
 }
 QLineEdit:focus { border: 1px solid $accent; }
+QTextEdit#ChatInput {
+    background: $input; color: $text; border: 1px solid $border; border-radius: 6px;
+    padding: 8px 10px; selection-background-color: $accent; selection-color: #ffffff;
+}
+QTextEdit#ChatInput:focus { border: 1px solid $accent; }
 QComboBox { background: $input; color: $text; border: 1px solid $border; border-radius: 6px; padding: 6px 10px; }
 QComboBox:hover { border: 1px solid $accent; }
 QComboBox QAbstractItemView {
@@ -1406,6 +1448,11 @@ def apply_dark_mode(mode):
     app.setStyle("Fusion")
     use_dark = mode == "on" or (mode == "system" and system_prefers_dark())
     theme = THEMES["dark" if use_dark else "light"]
+    try:                                     # in-game toasts follow light / dark mode
+        import overlay as _overlay_mod
+        _overlay_mod.set_light(not use_dark)
+    except Exception:
+        pass
     app.setPalette(build_palette(theme))
     app.setFont(build_app_font())
     family = load_app_font()
@@ -8516,9 +8563,454 @@ def chat_media_dir():
     os.makedirs(path, exist_ok=True)
     return path
 
+# ---- Steam game invites: a chat message whose text is a marker + a small json (works with the existing chat storage).
+# Accepting one opens the steam:// link, which is exactly what Steam itself does: Steam starts the game (if it isn't
+# running) and hands it the join info.
+INVITE_MARK = "::ncz-invite::"
+_INVITE_LINK_RE = re.compile(r"^steam://(?:connect|joinlobby)/[A-Za-z0-9.:/_+\-]{1,120}$")
+_RUNGAME_LINK_RE = re.compile(r"^steam://rungame/\d{1,10}/\d{15,20}/([A-Za-z0-9%+._\-]{1,200})$")
+# a friend's invite must never be able to start a game with arbitrary launch options: only join-style flags pass
+_RUNGAME_ARG_RE = re.compile(r"^[+\-]{1,2}[A-Za-z_]*(?:connect|join|lobby|server|invite)[A-Za-z_]*[ =][A-Za-z0-9.:_\-]{1,80}$", re.I)
+
+def _valid_invite_link(link):
+    if _INVITE_LINK_RE.match(link):
+        return True
+    m = _RUNGAME_LINK_RE.match(link)
+    return bool(m and _RUNGAME_ARG_RE.match(urllib.parse.unquote(m.group(1))))
+
+def normalize_steam_join(raw):
+    """What the user pasted -> a steam://connect/... or steam://joinlobby/... link, or "" when it isn't one."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("steam://"):
+        link = "steam://" + s[8:]
+    elif re.fullmatch(r"\d+/\d+/\d+", s):                                       # appid/lobbyid/steamid
+        link = "steam://joinlobby/" + s
+    elif re.fullmatch(r"[A-Za-z0-9.\-]+:\d{2,5}(/[A-Za-z0-9._\-]+)?", s):          # ip:port (/password)
+        link = "steam://connect/" + s
+    else:
+        return ""
+    return link if _valid_invite_link(link) else ""
+
+def make_invite_text(game, link, appid=0):
+    d = {"g": str(game)[:60], "l": link}
+    if isinstance(appid, int) and 0 < appid < 10 ** 9:
+        d["a"] = appid                      # lets the other launcher fetch the game's Steam cover
+    d["k"] = _cover_key(game)               # lets it find the cover among the sender's published covers (NCZ / custom games)
+    return INVITE_MARK + json.dumps(d, separators=(",", ":"))
+
+def parse_invite(text):
+    """-> {'game', 'link', 'appid', 'key'} for an invite message (link re-checked: it comes from the other person), else None."""
+    if not isinstance(text, str) or not text.startswith(INVITE_MARK):
+        return None
+    try:
+        d = json.loads(text[len(INVITE_MARK):])
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    link, game = str(d.get("l", "")), str(d.get("g", ""))[:60]
+    appid = d.get("a") if isinstance(d.get("a"), int) and not isinstance(d.get("a"), bool) else 0
+    if not (0 < appid < 10 ** 9):
+        appid = 0
+    key = str(d.get("k", ""))
+    key = key if re.fullmatch(r"[0-9a-f]{12}", key) else ""
+    if not _valid_invite_link(link):
+        return None
+    return {"game": game, "link": link, "appid": appid, "key": key}
+
+# ---- automatic invites: the game being played, its cover and (when Steam knows it) the join link are all found for you.
+import weakref as _weakref
+
+def _steam_appid_for_title(title):
+    low = pretty_game_name(title).casefold()
+    for g in load_steam_library():
+        if pretty_game_name(g.get("title", "")).casefold() == low:
+            return int(g["appid"])
+    return 0
+
+def current_game_for_invite():
+    """The game being played right now -> {'game', 'appid'} (appid 0 for games that aren't from the Steam store), or None."""
+    name = _now_playing["name"]
+    if name == "NCZFront":                  # NCZFront is a website, not a game you invite people to
+        name = next((n for n in _running if n != "NCZFront"), None)
+    if not name:
+        return None
+    name = pretty_game_name(name)
+    return {"game": name, "appid": _steam_appid_for_title(name)}
+
+def _steam_root_dirs():
+    dirs = []
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+                dirs.append(winreg.QueryValueEx(k, "SteamPath")[0])
+        except Exception:
+            pass
+        for env in ("ProgramFiles(x86)", "ProgramFiles"):
+            base = os.environ.get(env)
+            if base:
+                dirs.append(os.path.join(base, "Steam"))
+    else:
+        home = os.path.expanduser("~")
+        dirs += [home + "/.steam/steam", home + "/.local/share/Steam",
+                 home + "/.var/app/com.valvesoftware.Steam/.local/share/Steam"]
+    return [d for d in dirs if d and os.path.isdir(d)]
+
+def local_steam_id():
+    """SteamID64 of the account Steam is signed into on this PC ('' when Steam isn't installed)."""
+    first = ""
+    for root in _steam_root_dirs():
+        try:
+            with open(os.path.join(root, "config", "loginusers.vdf"), encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for sid, body in re.findall(r'"(7656\d{13})"\s*\{(.*?)\}', text, re.S):
+            if re.search(r'"MostRecent"\s*"1"', body):
+                return sid
+            first = first or sid
+    return first
+
+def steam_profile_join(sid):
+    """What Steam's public profile says this account is doing -> {'appid', 'name', 'link'}, or {} when it isn't in a game
+    (or the profile's game details are private). 'link' is '' when the game has no joinable lobby/server."""
+    out = {}
+    try:
+        xml = _http_get(f"https://steamcommunity.com/profiles/{sid}/?xml=1", timeout=8).decode("utf-8", "replace")
+    except Exception:
+        xml = ""
+    info = re.search(r"<inGameInfo>(.*?)</inGameInfo>", xml, re.S)
+    if info:
+        body = info.group(1)
+        m = re.search(r"<gameName>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</gameName>", body, re.S)
+        if m:
+            out["name"] = html_lib.unescape(m.group(1).strip())[:60]
+        m = re.search(r"/app/(\d+)", body)
+        if m:
+            out["appid"] = int(m.group(1))
+        m = re.search(r"<inGameServerIP>\s*([^<\s]+)\s*</inGameServerIP>", xml)
+        if m:
+            out["link"] = normalize_steam_join(m.group(1))
+    if out and not out.get("link"):
+        try:
+            page = _http_get(f"https://steamcommunity.com/profiles/{sid}", timeout=8).decode("utf-8", "replace")
+            m = re.search(r"steam://(?:joinlobby|connect)/[A-Za-z0-9.:/_+\-]{1,120}", page)
+            if m:
+                out["link"] = normalize_steam_join(m.group(0))
+        except Exception:
+            pass
+    out.setdefault("link", "")
+    return out if out.get("name") or out.get("appid") else {}
+
+def _steam_api_lib_for(appid):
+    """The game's own steam_api library (it ships next to the game), or ''."""
+    name = "steam_api64.dll" if sys.platform.startswith("win") else "libsteam_api.so"
+    for g in load_steam_library():
+        exe = g.get("exe_path")
+        if g.get("appid") == appid and exe:
+            base = os.path.dirname(exe)
+            for root, dirs, files in os.walk(base):
+                if root[len(base):].count(os.sep) >= 3:
+                    dirs[:] = []
+                if name in files:
+                    return os.path.join(root, name)
+    return ""
+
+def steam_join_via_steamworks(appid, sid, timeout=15):
+    """Asks the Steam client (through the game's own steam_api library, in a throw-away helper process) for the game's
+    rich presence 'connect' text and turns it into a join link. Worker thread. -> link or ''."""
+    lib = _steam_api_lib_for(appid)
+    if not lib or not sid:
+        return ""
+    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)])
+    cmd += ["--ncz-rp-helper", str(appid), lib, sid]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+    except Exception:
+        return ""
+    if not out:
+        return ""
+    return normalize_steam_join(f"steam://rungame/{appid}/{sid}/" + urllib.parse.quote(out.splitlines()[-1], safe=""))
+
+def detect_invite_info():
+    """Runs on a worker thread. -> {'game', 'appid', 'link'}; each is empty/0 when it couldn't be found."""
+    cur = current_game_for_invite() or {}
+    game, appid, link = cur.get("game", ""), cur.get("appid", 0), ""
+    sid = local_steam_id()
+    if sid and game and appid:              # first choice: ask the Steam client itself
+        link = steam_join_via_steamworks(appid, sid)
+    prof = steam_profile_join(sid) if (sid and not link) else {}
+    if prof:                                # the launcher's game wins for name + cover; the link comes from Steam either way
+        if not game:
+            game = pretty_game_name(prof.get("name", ""))
+        appid = appid or prof.get("appid", 0)
+        link = link or prof.get("link", "")
+    if game and not appid:
+        appid = _steam_appid_for_title(game)
+    return {"game": game, "appid": appid, "link": link}
+
+# ---- accepting an invite: if the invite's game (matched by NAME) isn't running, start it from this launcher's own
+# library card, wait 3 s, then accept the invite
+INVITE_JOIN_DELAY_MS = 3000
+INVITE_JOIN_MAX_RETRIES = 10     # extra 3 s rounds to wait for the game / a failed open before joining anyway
+_invite_games = {}           # join link -> game name (the overlay toast only knows the link)
+_invite_pending = set()      # links currently waiting for their game to start
+
+def _invite_game_is_open(game):
+    low = pretty_game_name(game or "").casefold()
+    return bool(low) and any(pretty_game_name(n).casefold() == low for n in list(_running))
+
+def _invite_norm(name):
+    return re.sub(r"[^a-z0-9]", "", pretty_game_name(name or "").casefold())
+
+def _invite_find_card(win, game):
+    low = _invite_norm(game)
+    if not low:
+        return None
+    for card, title in list(getattr(win, "cards", [])) + list(getattr(win, "fan_lib_list", [])):
+        try:
+            if _invite_norm(title) == low:
+                card.objectName()           # raises if the card was deleted
+                return card
+        except RuntimeError:
+            continue
+    return None
+
+def _invite_main_window():
+    return next((w for w in QApplication.topLevelWidgets() if isinstance(w, AdaptiveApp)), None)
+
+def _invite_start_card(card):
+    """Presses the card's Launch (-> 'launched') or Install (-> 'installing') button, else 'missing'."""
+    for b in card.findChildren(QPushButton):
+        if b.objectName() != "Primary" or not b.isEnabled():
+            continue
+        t = b.text().strip().lower()
+        if t in ("launch", "play"):
+            b.click()
+            return "launched", b
+        if t == "install":
+            b.click()
+            return "installing", b
+    return "missing", None
+
+def _invite_join_after_delay(link, on_state=None, tries=0):
+    """Opens the join link after 3 s. If the game isn't running yet or the link couldn't be opened, tries again in 3 s."""
+    def go():
+        game = _invite_games.get(link, "")
+        if tries < INVITE_JOIN_MAX_RETRIES and game and not _invite_game_is_open(game):
+            _invite_join_after_delay(link, on_state, tries + 1)         # game not up yet
+            return
+        ok = QDesktopServices.openUrl(QUrl(link))
+        if not ok and tries < INVITE_JOIN_MAX_RETRIES:
+            _invite_join_after_delay(link, on_state, tries + 1)         # couldn't open: try again
+            return
+        _invite_pending.discard(link)
+        if on_state:
+            on_state(False)
+    QTimer.singleShot(INVITE_JOIN_DELAY_MS, go)
+
+def _invite_wait_for_install(card, link, on_state, deadline):
+    """Polls the card until its install has finished (button says Launch), then launches and joins 3 s later."""
+    def poll():
+        try:
+            btns = [b for b in card.findChildren(QPushButton) if b.objectName() == "Primary"]
+        except RuntimeError:                        # card removed
+            _invite_pending.discard(link)
+            return
+        if btns and btns[0].text().strip().lower() in ("launch", "play"):
+            btns[0].click()
+            if on_state:
+                on_state(True)
+            _invite_join_after_delay(link, on_state)
+        elif time.time() < deadline:
+            QTimer.singleShot(3000, poll)
+        else:
+            _invite_pending.discard(link)
+    QTimer.singleShot(3000, poll)
+
+def _invite_proceed(link, game, on_state):
+    win = _invite_main_window()
+    card = _invite_find_card(win, game) if win else None
+    state, _b = _invite_start_card(card) if card is not None else ("missing", None)
+    if state == "launched":
+        if on_state:
+            on_state(True)
+        _invite_join_after_delay(link, on_state)
+    elif state == "installing":                      # keeps waiting for the download, then launches and joins
+        _invite_wait_for_install(card, link, on_state, time.time() + 7200)
+    else:                                            # can't be started from the launcher: just join
+        _invite_pending.discard(link)
+        QDesktopServices.openUrl(QUrl(link))
+
+class _InviteStoreBus(QObject):
+    found = pyqtSignal(str, str, object)             # link, game, (appid, title, cover path) or None
+
+_invite_store_bus = None
+_invite_cbs = {}                                     # link -> on_state callback
+
+def _invite_on_store_result(link, game, hit):
+    on_state = _invite_cbs.pop(link, None)
+    win = _invite_main_window()
+    if hit and win is not None:
+        appid, title, cover = hit
+        try:
+            win.add_steam_game(appid, title, cover)
+        except Exception as e:
+            print(f"invite: couldn't add {title} to the library: {e}")
+    _invite_proceed(link, game, on_state)
+
+def _invite_add_from_store(link, game, on_state):
+    """Game isn't in the library: look it up by NAME in the Steam store, add it to the library, then launch/install it."""
+    global _invite_store_bus
+    if _invite_store_bus is None:
+        _invite_store_bus = _InviteStoreBus()
+        _invite_store_bus.found.connect(_invite_on_store_result)
+    bus = _invite_store_bus
+    _invite_cbs[link] = on_state
+    want = _invite_norm(game)
+
+    def work():
+        hit = None
+        try:
+            games, _t = fetch_steam_games(game, 0, 20)
+            for appid, title, base in games:
+                if _invite_norm(title) == want:
+                    cover = ""
+                    if base:
+                        try:
+                            os.makedirs(get_store_cache_dir(), exist_ok=True)
+                            cover = os.path.join(get_store_cache_dir(), f"invite-{appid}.img")
+                            with open(cover, "wb") as f:
+                                f.write(_http_get(base + "/library_600x900.jpg"))
+                        except Exception:
+                            cover = ""
+                    hit = (appid, title, cover)
+                    break
+        except Exception:
+            hit = None
+        bus.found.emit(link, game, hit)
+    threading.Thread(target=work, daemon=True).start()
+
+def accept_invite(link, game="", on_state=None):
+    """Join button / overlay Accept. If the invite's game (matched by NAME) isn't open: launch it from the launcher,
+    adding it to the library from the Steam store first when it isn't there, wait 3 s, then open the join link.
+    A game that still has to be installed is launched and joined as soon as its install has finished.
+    on_state(bool) is called with True while waiting and False when done (to update a button)."""
+    game = game or _invite_games.get(link, "")
+    if link in _invite_pending:
+        return
+    if _invite_game_is_open(game):
+        QDesktopServices.openUrl(QUrl(link))
+        return
+    win = _invite_main_window()
+    if win is None or not _invite_norm(game):
+        QDesktopServices.openUrl(QUrl(link))
+        return
+    _invite_pending.add(link)
+    if _invite_find_card(win, game) is not None:
+        _invite_proceed(link, game, on_state)
+    else:
+        _invite_add_from_store(link, game, on_state)
+
+def _accept_invite_from_overlay(link):
+    accept_invite(link)
+
+# ---- invite cover art: own library first, then the Steam cover (cached), then the sender's published covers
+INVITE_COVER_W, INVITE_COVER_H = 72, 96
+
+def _invite_cover_dir():
+    path = os.path.join(os.path.dirname(get_launcher_settings_path()), "invite_covers")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _friend_cover_cache_path(uid, key):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "friend_covers",
+                        re.sub(r"[^A-Za-z0-9]", "_", uid) + "_" + key + ".jpg")
+
+def invite_cover_path(inv, sender_uid=None):
+    """A cover file that is already on this PC, or '' (fast: never touches the network)."""
+    low = pretty_game_name(inv.get("game", "")).casefold()
+    for title, path in list(_library_covers.items()):
+        if title.casefold() == low and os.path.exists(path):
+            return path
+    candidates = []
+    if inv.get("appid"):
+        candidates.append(os.path.join(_invite_cover_dir(), f"{inv['appid']}.jpg"))
+    if sender_uid and inv.get("key"):
+        candidates.append(_friend_cover_cache_path(sender_uid, inv["key"]))
+    for path in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return ""
+
+def _fetch_invite_cover(inv, sender_uid):
+    """Worker thread -> cover file path or ''."""
+    appid = inv.get("appid")
+    if appid:
+        dest = os.path.join(_invite_cover_dir(), f"{appid}.jpg")
+        for url in steam_cover_urls(appid, ""):
+            try:
+                data = _http_get(url, timeout=10)
+            except Exception:
+                continue
+            if data:
+                with open(dest, "wb") as f:
+                    f.write(data)
+                return dest
+    if sender_uid and inv.get("key"):
+        covers = cloud_fetch_covers(sender_uid)
+        return _friend_cover_file(sender_uid, inv["key"], covers.get(inv["key"])) or ""
+    return ""
+
+class _InviteCoverBus(QObject):
+    ready = pyqtSignal(str, str)            # waiter key, cover path ('' when none was found)
+
+    def __init__(self):
+        super().__init__()
+        self.waiters = {}                   # waiter key -> [weak refs to the cover labels]
+        self.ready.connect(self._on_ready)
+
+    def _on_ready(self, wkey, path):
+        for ref in self.waiters.pop(wkey, []):
+            lab = ref()
+            if lab is None or not path:
+                continue
+            try:
+                pix = rounded_cover_pixmap(path, INVITE_COVER_W, INVITE_COVER_H, 8)
+                if pix:
+                    lab.setPixmap(pix)
+            except RuntimeError:            # the chat was rebuilt and this label is gone
+                pass
+
+_invite_bus = _InviteCoverBus()
+
+def want_invite_cover(inv, sender_uid, label):
+    """Fills `label` with the invite's cover as soon as it has been downloaded."""
+    wkey = f"a{inv['appid']}" if inv.get("appid") else f"{sender_uid}:{inv.get('key', '')}"
+    if not inv.get("appid") and not (sender_uid and inv.get("key")):
+        return
+    first = wkey not in _invite_bus.waiters
+    _invite_bus.waiters.setdefault(wkey, []).append(_weakref.ref(label))
+    if not first:
+        return                              # already being fetched
+    def work():
+        try:
+            path = _fetch_invite_cover(inv, sender_uid)
+        except Exception:
+            path = ""
+        _invite_bus.ready.emit(wkey, path or "")
+    threading.Thread(target=work, daemon=True).start()
+
 def chat_preview(m):
     """One-line text for notifications / the overlay: the message text, or a tag for attachments."""
     text = str(m.get("text", "") or "").strip()
+    inv = parse_invite(text)
+    if inv:
+        return f"Game invite: {inv['game'] or 'a Steam game'}"
     atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
     if not atts:
         return text
@@ -8694,10 +9186,39 @@ def _friend_avatar_file(uid, photo):
     return path
 
 # ---------------------------------------------------------------- chat: Twemoji, picker, message rows
+# Apple emoji art (iamcal/emoji-data). Files there are named like '1f44d.png' / '2764-fe0f.png' (FE0F kept), so several
+# spellings of a code are tried. Twemoji is only the last resort when an emoji isn't in the Apple set.
+APPLE_EMOJI_URLS = (
+    "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/img-apple-64/{code}.png",
+    "https://raw.githubusercontent.com/iamcal/emoji-data/master/img-apple-64/{code}.png",
+    "https://cdn.jsdelivr.net/npm/emoji-datasource-apple@15.0.1/img/apple/64/{code}.png",
+)
 TWEMOJI_URLS = (
     "https://raw.githubusercontent.com/jdecked/twemoji/v15.1.0/assets/72x72/{code}.png",
     "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{code}.png",
 )
+
+def _apple_code_variants(code):
+    parts = code.split("-")
+    out = [code, code + "-fe0f"]
+    if len(parts) > 1:
+        out.append("-".join([parts[0], "fe0f"] + parts[1:]))
+    seen, res = set(), []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            res.append(c)
+    return res
+
+# Flags: every country flag is two regional-indicator letters.
+_FLAG_COUNTRIES = ("AF AL DZ AD AO AG AR AM AU AT AZ BS BH BD BB BY BE BZ BJ BT BO BA BW BR BN BG BF BI KH CM CA CV CF TD CL "
+                   "CN CO KM CG CD CR CI HR CU CY CZ DK DJ DM DO EC EG SV GQ ER EE SZ ET FJ FI FR GA GM GE DE GH GR GD GT GN "
+                   "GW GY HT HN HU IS IN ID IR IQ IE IL IT JM JP JO KZ KE KI KW KG LA LV LB LS LR LY LI LT LU MG MW MY MV ML "
+                   "MT MH MR MU MX FM MD MC MN ME MA MZ MM NA NR NP NL NZ NI NE NG KP MK NO OM PK PW PS PA PG PY PE PH PL PT "
+                   "QA RO RU RW KN LC VC WS SM ST SA SN RS SC SL SG SK SI SB SO ZA KR SS ES LK SD SR SE CH SY TW TJ TZ TH TL "
+                   "TG TO TT TN TR TM TV UG UA AE GB US UY UZ VU VA VE VN YE ZM ZW XK HK MO PR GL FO GI GU AS VG KY BM AW CW "
+                   "AX EU UN").split()
+_FLAGS_ITEMS = "🏁 🚩 🎌 🏴 🏳️ 🏳️‍🌈 🏴‍☠️ " + " ".join("".join(chr(0x1F1E6 + ord(c) - 65) for c in cc) for cc in _FLAG_COUNTRIES)
 
 EMOJI_CATEGORIES = [
     ("Smileys", "\U0001F600",
@@ -8712,7 +9233,119 @@ EMOJI_CATEGORIES = [
      "🍎 🍌 🍇 🍓 🍒 🍑 🍍 🥭 🥝 🍅 🥑 🌽 🥕 🍞 🧀 🍔 🍟 🍕 🌭 🌮 🍿 🍩 🍪 🎂 🍰 🍫 🍬 🍭 ☕ 🍺 🍷 🥤"),
     ("Fun", "\U0001F3AE",
      "⚽ 🏀 🏈 ⚾ 🎾 🏐 🎱 🎮 🕹️ 🎲 🧩 🎯 🎳 🎸 🎹 🎧 🎤 🎬 🏆 🥇 🎉 🎊 🎁 🎈 💻 📱 ⌨️ 🖥️ 💡 🔑 🔒 📷 📚 📌 ✏️ 🚀 ✈️ 🚗"),
+    ("Flags", "\U0001F3C1", _FLAGS_ITEMS),
 ]
+
+# ---- the full emoji list (names + search keywords) from iamcal/emoji-data, cached on disk; the short built-in list
+# above is only used until it has been downloaded (or when offline)
+EMOJI_CATALOG_URLS = (
+    "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/emoji.json",
+    "https://raw.githubusercontent.com/iamcal/emoji-data/master/emoji.json",
+)
+_EMOJI_CAT_ICONS = {"Smileys & Emotion": "\U0001F600", "People & Body": "\U0001F44B", "Animals & Nature": "\U0001F431",
+                    "Food & Drink": "\U0001F355", "Travel & Places": "\U0001F697", "Activities": "\u26BD",
+                    "Objects": "\U0001F4A1", "Symbols": "\u2764\uFE0F", "Flags": "\U0001F3C1"}
+_emoji_catalog_mem = None
+_emoji_catalog_fetching = False
+
+def _emoji_catalog_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "emoji_catalog_v1.json")
+
+def _build_emoji_rows(data):
+    rows = []
+    for e in sorted((x for x in data if isinstance(x, dict)), key=lambda x: x.get("sort_order") or 0):
+        cat, uni = e.get("category"), e.get("unified")
+        if not cat or cat == "Component" or not uni:
+            continue
+        try:
+            ch = "".join(chr(int(c, 16)) for c in uni.split("-"))
+        except ValueError:
+            continue
+        names = [str(e.get("name") or "")] + [str(n).replace("_", " ") for n in (e.get("short_names") or [])]
+        rows.append([cat, ch, " ".join(names).lower()])
+    return rows
+
+def _prefetch_emoji_catalog():
+    """Downloads the emoji list in the background (once a month at most)."""
+    global _emoji_catalog_fetching
+    path = _emoji_catalog_path()
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 30 * 86400:
+            return
+    except OSError:
+        pass
+    if _emoji_catalog_fetching:
+        return
+    _emoji_catalog_fetching = True
+    def work():
+        global _emoji_catalog_mem, _emoji_catalog_fetching
+        try:
+            for url in EMOJI_CATALOG_URLS:
+                try:
+                    rows = _build_emoji_rows(json.loads(_http_get(url, timeout=30).decode("utf-8")))
+                    if len(rows) > 1000:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path + ".part", "w", encoding="utf-8") as f:
+                            json.dump(rows, f, ensure_ascii=False)
+                        os.replace(path + ".part", path)
+                        _emoji_catalog_mem = None
+                        break
+                except Exception:
+                    pass
+        finally:
+            _emoji_catalog_fetching = False
+    threading.Thread(target=work, daemon=True).start()
+
+def emoji_catalog():
+    """[[category, emoji, search text]] - every emoji once downloaded, else the built-in list."""
+    global _emoji_catalog_mem
+    if _emoji_catalog_mem:
+        return _emoji_catalog_mem
+    try:
+        with open(_emoji_catalog_path(), encoding="utf-8") as f:
+            rows = json.load(f)
+        if isinstance(rows, list) and len(rows) > 1000:
+            _emoji_catalog_mem = rows
+            return rows
+    except Exception:
+        pass
+    import unicodedata
+    rows = []
+    for name, _icon, items in EMOJI_CATEGORIES:
+        for ch in items.split():
+            try:
+                nm = unicodedata.name(ch[0]).lower()
+            except ValueError:
+                nm = ""
+            rows.append([name, ch, nm])
+    return rows
+
+
+# ---- flags are searchable by country name (the downloaded list only has codes like "flag-eg")
+_FLAG_NAMES_RAW = "AC:Ascension Island|AD:Andorra|AE:United Arab Emirates uae emirates|AF:Afghanistan|AG:Antigua & Barbuda antigua barbuda|AI:Anguilla|AL:Albania|AM:Armenia|AO:Angola|AQ:Antarctica|AR:Argentina|AS:American Samoa|AT:Austria|AU:Australia|AW:Aruba|AX:Åland Islands|AZ:Azerbaijan|BA:Bosnia & Herzegovina bosnia|BB:Barbados|BD:Bangladesh|BE:Belgium|BF:Burkina Faso|BG:Bulgaria|BH:Bahrain|BI:Burundi|BJ:Benin|BL:St. Barthélemy|BM:Bermuda|BN:Brunei|BO:Bolivia|BQ:Caribbean Netherlands|BR:Brazil|BS:Bahamas|BT:Bhutan|BV:Bouvet Island|BW:Botswana|BY:Belarus|BZ:Belize|CA:Canada|CC:Cocos (Keeling) Islands|CD:Congo - Kinshasa congo drc|CF:Central African Republic|CG:Congo - Brazzaville congo|CH:Switzerland|CI:Côte d’Ivoire ivory coast cote d'ivoire|CK:Cook Islands|CL:Chile|CM:Cameroon|CN:China|CO:Colombia|CP:Clipperton Island|CQ:Sark|CR:Costa Rica|CU:Cuba|CV:Cape Verde cape verde|CW:Curaçao|CX:Christmas Island|CY:Cyprus|CZ:Czechia czechia czech republic|DE:Germany|DG:Diego Garcia|DJ:Djibouti|DK:Denmark|DM:Dominica|DO:Dominican Republic|DZ:Algeria|EA:Ceuta & Melilla|EC:Ecuador|EE:Estonia|EG:Egypt|EH:Western Sahara|ER:Eritrea|ES:Spain|ET:Ethiopia|EU:European Union european union europe|EZ:Eurozone|FI:Finland|FJ:Fiji|FK:Falkland Islands|FM:Micronesia|FO:Faroe Islands|FR:France|GA:Gabon|GB:United Kingdom uk britain great britain england|GD:Grenada|GE:Georgia|GF:French Guiana|GG:Guernsey|GH:Ghana|GI:Gibraltar|GL:Greenland|GM:Gambia|GN:Guinea|GP:Guadeloupe|GQ:Equatorial Guinea|GR:Greece|GS:South Georgia & South Sandwich Islands|GT:Guatemala|GU:Guam|GW:Guinea-Bissau|GY:Guyana|HK:Hong Kong SAR China hong kong|HM:Heard & McDonald Islands|HN:Honduras|HR:Croatia|HT:Haiti|HU:Hungary|IC:Canary Islands|ID:Indonesia|IE:Ireland|IL:Israel|IM:Isle of Man|IN:India|IO:British Indian Ocean Territory|IQ:Iraq|IR:Iran|IS:Iceland|IT:Italy|JE:Jersey|JM:Jamaica|JO:Jordan|JP:Japan|KE:Kenya|KG:Kyrgyzstan|KH:Cambodia|KI:Kiribati|KM:Comoros|KN:St. Kitts & Nevis saint kitts nevis|KP:North Korea korea north korea|KR:South Korea korea south korea|KW:Kuwait|KY:Cayman Islands|KZ:Kazakhstan|LA:Laos|LB:Lebanon|LC:St. Lucia|LI:Liechtenstein|LK:Sri Lanka|LR:Liberia|LS:Lesotho|LT:Lithuania|LU:Luxembourg|LV:Latvia|LY:Libya|MA:Morocco|MC:Monaco|MD:Moldova|ME:Montenegro|MF:St. Martin|MG:Madagascar|MH:Marshall Islands|MK:North Macedonia macedonia|ML:Mali|MM:Myanmar (Burma) burma|MN:Mongolia|MO:Macao SAR China macao macau|MP:Northern Mariana Islands|MQ:Martinique|MR:Mauritania|MS:Montserrat|MT:Malta|MU:Mauritius|MV:Maldives|MW:Malawi|MX:Mexico|MY:Malaysia|MZ:Mozambique|NA:Namibia|NC:New Caledonia|NE:Niger|NF:Norfolk Island|NG:Nigeria|NI:Nicaragua|NL:Netherlands holland|NO:Norway|NP:Nepal|NR:Nauru|NU:Niue|NZ:New Zealand|OM:Oman|PA:Panama|PE:Peru|PF:French Polynesia|PG:Papua New Guinea|PH:Philippines|PK:Pakistan|PL:Poland|PM:St. Pierre & Miquelon|PN:Pitcairn Islands|PR:Puerto Rico|PS:Palestinian Territories palestine|PT:Portugal|PW:Palau|PY:Paraguay|QA:Qatar|RE:Réunion|RO:Romania|RS:Serbia|RU:Russia russia|RW:Rwanda|SA:Saudi Arabia|SB:Solomon Islands|SC:Seychelles|SD:Sudan|SE:Sweden|SG:Singapore|SH:St. Helena saint helena|SI:Slovenia|SJ:Svalbard & Jan Mayen|SK:Slovakia|SL:Sierra Leone|SM:San Marino|SN:Senegal|SO:Somalia|SR:Suriname|SS:South Sudan|ST:São Tomé & Príncipe sao tome principe|SV:El Salvador|SX:Sint Maarten|SY:Syria|SZ:Eswatini swaziland eswatini|TA:Tristan da Cunha|TC:Turks & Caicos Islands|TD:Chad|TF:French Southern Territories|TG:Togo|TH:Thailand|TJ:Tajikistan|TK:Tokelau|TL:Timor-Leste east timor|TM:Turkmenistan|TN:Tunisia|TO:Tonga|TR:Türkiye turkey turkiye|TT:Trinidad & Tobago trinidad tobago|TV:Tuvalu|TW:Taiwan taiwan|TZ:Tanzania|UA:Ukraine|UG:Uganda|UM:U.S. Outlying Islands|UN:United Nations united nations|US:United States usa america united states of america|UY:Uruguay|UZ:Uzbekistan|VA:Vatican City vatican holy see|VC:St. Vincent & Grenadines saint vincent grenadines|VE:Venezuela|VG:British Virgin Islands|VI:U.S. Virgin Islands|VN:Vietnam|VU:Vanuatu|WF:Wallis & Futuna|WS:Samoa|XK:Kosovo|YE:Yemen|YT:Mayotte|ZA:South Africa|ZM:Zambia|ZW:Zimbabwe"
+_FLAG_NAMES = None
+
+def _flag_names():
+    global _FLAG_NAMES
+    if _FLAG_NAMES is None:
+        import unicodedata
+        out = {"GBENG": "england", "GBSCT": "scotland", "GBWLS": "wales"}
+        for part in _FLAG_NAMES_RAW.split("|"):
+            code, _, name = part.partition(":")
+            plain = "".join(c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+            out[code] = plain.replace("&", "and").lower() + " " + name.replace("&", "and").lower()
+        _FLAG_NAMES = out
+    return _FLAG_NAMES
+
+def _flag_search_text(ch):
+    """'country name' words for a flag emoji (regional-indicator pair or England / Scotland / Wales), else ''."""
+    cps = [ord(c) for c in ch]
+    if len(cps) == 2 and all(0x1F1E6 <= c <= 0x1F1FF for c in cps):
+        code = "".join(chr(c - 0x1F1E6 + 65) for c in cps)
+    else:
+        code = "".join(chr(c - 0xE0000).upper() for c in cps if 0xE0061 <= c <= 0xE007A)
+    return _flag_names().get(code, "")
+
 
 def emoji_code(ch):
     """Character(s) -> Twemoji file name ('1f44d'): lowercase hex code points, FE0F dropped unless there's a ZWJ."""
@@ -8727,8 +9360,10 @@ def emoji_from_code(code):
     except ValueError:
         return "?"
 
+_EMOJI_DL_SLOTS = threading.Semaphore(8)
+
 class _EmojiStore(QObject):
-    """Downloads Twemoji PNGs on demand (cached on disk) and hands them to whoever asked."""
+    """Downloads Apple emoji PNGs on demand (cached on disk) and hands them to whoever asked."""
     loaded = pyqtSignal(str)
 
     def __init__(self):
@@ -8740,7 +9375,7 @@ class _EmojiStore(QObject):
         self.loaded.connect(self._on_loaded)
 
     def _file(self, code):
-        folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "twemoji")
+        folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "emoji_apple")
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, code + ".png")
 
@@ -8774,14 +9409,27 @@ class _EmojiStore(QObject):
         path = self._file(code)
         def work():
             data = None
-            for url in TWEMOJI_URLS:
-                try:
-                    blob = _http_get(url.format(code=code), timeout=10)
-                    if blob[:4] == b"\x89PNG":
-                        data = blob
+            with _EMOJI_DL_SLOTS:                       # at most a few downloads at once (the Flags tab has ~250)
+                for url in APPLE_EMOJI_URLS:
+                    for c in _apple_code_variants(code):
+                        try:
+                            blob = _http_get(url.format(code=c), timeout=10)
+                            if blob[:4] == b"\x89PNG":
+                                data = blob
+                                break
+                        except Exception:
+                            pass
+                    if data:
                         break
-                except Exception:
-                    pass
+                if not data:
+                    for url in TWEMOJI_URLS:
+                        try:
+                            blob = _http_get(url.format(code=code), timeout=10)
+                            if blob[:4] == b"\x89PNG":
+                                data = blob
+                                break
+                        except Exception:
+                            pass
             if data:
                 try:
                     with open(path + ".part", "wb") as f:
@@ -8812,10 +9460,14 @@ def emoji_store():
     global _emoji_store_obj
     if _emoji_store_obj is None:
         _emoji_store_obj = _EmojiStore()
+        try:
+            _prefetch_emoji_catalog()
+        except Exception:
+            pass
     return _emoji_store_obj
 
 def _emoji_button(ch, size, parent=None):
-    """A flat button that shows the Twemoji image for ch (the plain character until the image arrives)."""
+    """A flat button that shows the Apple emoji image for ch (the plain character until the image arrives)."""
     btn = QPushButton(ch, parent)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setFlat(True)
@@ -8829,25 +9481,93 @@ def _emoji_button(ch, size, parent=None):
     emoji_store().bind(emoji_code(ch), put)
     return btn
 
+# ---- Apple emoji inside normal text (chat bubbles, reply quotes): the OS font would draw its own emoji otherwise
+_EL = (r"(?:[\U0001F1E6-\U0001F1FF]{2}"                                   # flag
+       r"|[0-9#*]\uFE0F?\u20E3"                                           # keycap
+       r"|(?:[\U0001F300-\U0001FAFF\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615\u2648-\u2653"
+       r"\u267F\u2693\u26A1\u26AA\u26AB\u26BD\u26BE\u26C4\u26C5\u26CE\u26D4\u26EA\u26F2\u26F3\u26F5\u26FA\u26FD"
+       r"\u2705\u270A\u270B\u2728\u274C\u274E\u2753-\u2755\u2757\u2795-\u2797\u27B0\u27BF\u2B1B\u2B1C\u2B50\u2B55]"
+       r"|[\u00A9\u00AE\u203C\u2049\u2122\u2139\u2190-\u21FF\u2300-\u23FF\u24C2\u25A0-\u25FF\u2600-\u27BF"
+       r"\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299]\uFE0F)"
+       r"[\U0001F3FB-\U0001F3FF]?\uFE0F?[\U000E0020-\U000E007F]*)")
+_EMOJI_TEXT_RE = re.compile(_EL + r"(?:\u200D" + _EL + r")*")
+
+def emoji_html(text, size=20, refresh=None):
+    """Plain text -> rich text with every emoji as its Apple image. None when the text has no emoji.
+    Emoji that haven't been downloaded yet stay as characters; refresh() is called when they arrive."""
+    if not _EMOJI_TEXT_RE.search(text):
+        return None
+    store = emoji_store()
+    out, pos = [], 0
+    for mt in _EMOJI_TEXT_RE.finditer(text):
+        out.append(html_lib.escape(text[pos:mt.start()], quote=False))
+        ch = mt.group(0)
+        code = emoji_code(ch)
+        path = store._file(code)
+        if _EMOJI_CODE_RE.match(code) and os.path.exists(path) and os.path.getsize(path) > 0:
+            out.append(f'<img src="{QUrl.fromLocalFile(path).toString()}" width="{size}" height="{size}" '
+                       f'style="vertical-align:middle">')
+        else:
+            out.append(html_lib.escape(ch, quote=False))
+            if refresh is not None and _EMOJI_CODE_RE.match(code):
+                store.bind(code, lambda _pm, r=refresh: r())
+        pos = mt.end()
+    out.append(html_lib.escape(text[pos:], quote=False))
+    return '<span style="white-space:pre-wrap">' + "".join(out).replace("\n", "<br>") + "</span>"
+
+def set_emoji_text(label, text, size=None):
+    """Sets label's text; emoji are drawn as Apple images sized to the label's font (re-rendered once their pictures
+    have downloaded)."""
+    def render():
+        try:
+            label.ensurePolished()
+            base = size or max(12, int(label.fontMetrics().height() * 0.95))
+            only = not _EMOJI_TEXT_RE.sub("", text).strip() and len(_EMOJI_TEXT_RE.findall(text)) <= 8
+            h = emoji_html(text, base * 2 if only else base, render)
+            if h is None:
+                label.setTextFormat(Qt.TextFormat.PlainText)
+                label.setText(text)
+            else:
+                label.setTextFormat(Qt.TextFormat.RichText)
+                label.setText(h)
+        except RuntimeError:            # the label was deleted while an image downloaded
+            pass
+    render()
+
 class EmojiPicker(QFrame):
     picked = pyqtSignal(str)
     COLS = 8
+    CHUNK = 80                       # buttons are created a chunk at a time (and only then downloaded)
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Popup)
         self.setObjectName("EmojiPicker")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAutoFillBackground(True)
-        self.setFixedSize(self.COLS * 38 + 28, 320)
+        self.setFixedSize(self.COLS * 38 + 28, 380)
+        self._cats = {}
+        for cat, ch, search in emoji_catalog():
+            fl = _flag_search_text(ch)
+            if fl:
+                search = search + " flag " + fl
+            self._cats.setdefault(cat, []).append((ch, search))
+        self._all = [(ch, search) for items in self._cats.values() for ch, search in items]
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(4)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search emoji...")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._on_search)
+        lay.addWidget(self._search)
         tabs = QHBoxLayout()
         tabs.setSpacing(2)
-        for i, (name, icon, _items) in enumerate(EMOJI_CATEGORIES):
+        self._cat_names = list(self._cats)
+        for i, name in enumerate(self._cat_names):
+            icon = _EMOJI_CAT_ICONS.get(name) or self._cats[name][0][0]
             b = _emoji_button(icon, 20)
             b.setToolTip(name)
-            b.clicked.connect(lambda _=False, n=i: self._show_cat(n))
+            b.clicked.connect(lambda _=False, n=i: self._pick_cat(n))
             tabs.addWidget(b)
         tabs.addStretch()
         lay.addLayout(tabs)
@@ -8857,22 +9577,58 @@ class EmojiPicker(QFrame):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._maybe_more)
         lay.addWidget(self._scroll, 1)
-        self._show_cat(0)
+        self._items, self._built, self._grid = [], 0, None
+        self._show_items(self._cat_names[0] if self._cat_names else "", self._cats.get(self._cat_names[0], []) if self._cat_names else [])
 
-    def _show_cat(self, i):
-        name, _icon, items = EMOJI_CATEGORIES[i]
-        self._title.setText(name)
+    def _pick_cat(self, i):
+        if self._search.text():
+            self._search.blockSignals(True)
+            self._search.clear()
+            self._search.blockSignals(False)
+        name = self._cat_names[i]
+        self._show_items(name, self._cats[name])
+
+    def _on_search(self, text):
+        terms = text.lower().split()
+        if not terms:
+            if self._cat_names:
+                self._show_items(self._cat_names[0], self._cats[self._cat_names[0]])
+            return
+        hits = [(ch, s) for ch, s in self._all if all(t in s for t in terms)]
+        self._show_items(f"{len(hits)} result{'s' if len(hits) != 1 else ''}" if hits else "No emoji found", hits)
+
+    def _show_items(self, title, items):
+        self._title.setText(title)
+        self._items, self._built = items, 0
         holder = QWidget()
-        grid = QGridLayout(holder)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(2)
-        for n, ch in enumerate(items.split()):
+        outer = QVBoxLayout(holder)
+        outer.setContentsMargins(0, 0, 0, 0)
+        gw = QWidget()
+        self._grid = QGridLayout(gw)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(2)
+        outer.addWidget(gw)
+        outer.addStretch(1)
+        self._scroll.setWidget(holder)
+        self._more()
+
+    def _more(self):
+        grid = self._grid
+        if grid is None:
+            return
+        for n in range(self._built, min(self._built + self.CHUNK, len(self._items))):
+            ch = self._items[n][0]
             b = _emoji_button(ch, 24)
             b.clicked.connect(lambda _=False, c=ch: self._pick(c))
             grid.addWidget(b, n // self.COLS, n % self.COLS)
-        grid.setRowStretch(grid.rowCount(), 1)
-        self._scroll.setWidget(holder)
+        self._built = min(self._built + self.CHUNK, len(self._items))
+
+    def _maybe_more(self, value):
+        bar = self._scroll.verticalScrollBar()
+        if self._built < len(self._items) and value >= bar.maximum() - 160:
+            self._more()
 
     def _pick(self, ch):
         self.close()
@@ -8887,6 +9643,7 @@ class EmojiPicker(QFrame):
         y = below.y() if below.y() + self.height() <= g.bottom() else above.y() - self.height()
         self.move(x, max(g.top(), y))
         self.show()
+        self._search.setFocus()
 
 
 class _ClickLabel(QLabel):
@@ -8898,13 +9655,130 @@ class _ClickLabel(QLabel):
         super().mouseReleaseEvent(e)
 
 
-class _ChatInput(QLineEdit):
-    """Message box that also accepts pasted images / copied files, and Esc to cancel a reply."""
+_CI_PROP = 0x100001      # QTextFormat user property holding the emoji an inline image stands for
+
+def _doc_text_with_emoji(doc):
+    """Document text with every inline emoji image turned back into its emoji character(s)."""
+    plain = doc.toPlainText()
+    if "\ufffc" not in plain:
+        return plain
+    cur = QTextCursor(doc)
+    out, u16 = [], 0
+    for c in plain:
+        if c == "\ufffc":
+            cur.setPosition(u16 + 1)
+            f = cur.charFormat()
+            out.append(f.toImageFormat().stringProperty(_CI_PROP) if f.isImageFormat() else "")
+        else:
+            out.append(c)
+        u16 += 2 if ord(c) > 0xFFFF else 1
+    return "".join(out)
+
+class _ChatInput(QTextEdit):
+    """One-line message box (looks like a line edit) that shows emoji as Apple images, also accepts pasted images /
+    copied files, Enter to send and Esc to cancel a reply."""
     image_pasted = pyqtSignal(object)
     files_pasted = pyqtSignal(object)
     escaped = pyqtSignal()
+    returnPressed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChatInput")
+        self.setAcceptRichText(False)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTabChangesFocus(True)
+        self.document().setDocumentMargin(0)
+        self.document().setUndoRedoEnabled(False)       # the emoji -> image swap would otherwise pollute undo
+        self._max, self._busy, self._img = 0, False, 18
+        self.setFixedHeight(max(self.fontMetrics().height(), self._img) + 18)
+        self.textChanged.connect(self._on_changed)
+
+    # ---- the QLineEdit-style API the chat page uses
+    def text(self):
+        return _doc_text_with_emoji(self.document()).replace("\n", " ")
+
+    def setText(self, t):
+        self.setPlainText(str(t).replace("\n", " "))
+
+    def insert(self, s):
+        c = self.textCursor()
+        c.insertText(str(s).replace("\n", " "))
+        self.setTextCursor(c)
+
+    def setMaxLength(self, n):
+        self._max = int(n)
+
+    # ---- emoji -> images
+    def _on_changed(self):
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            if self._max:
+                cur = None
+                while len(self.text()) > self._max:
+                    if cur is None:
+                        cur = QTextCursor(self.document())
+                        cur.movePosition(QTextCursor.MoveOperation.End)
+                    cur.deletePreviousChar()
+            self._convert()
+        finally:
+            self._busy = False
+
+    def _later(self):
+        try:
+            self._on_changed()
+        except RuntimeError:        # the widget was deleted while an image downloaded
+            pass
+
+    def _convert(self):
+        text = self.document().toPlainText()
+        matches = list(_EMOJI_TEXT_RE.finditer(text))
+        if not matches:
+            return
+        store = emoji_store()
+        cur = QTextCursor(self.document())
+        for mt in reversed(matches):                    # last first, so earlier positions stay valid
+            ch = mt.group(0)
+            code = emoji_code(ch)
+            if not _EMOJI_CODE_RE.match(code):
+                continue
+            path = store._file(code)
+            if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                store.bind(code, lambda _pm: self._later())      # converts once it has downloaded
+                continue
+            s16 = len(text[:mt.start()].encode("utf-16-le")) // 2
+            e16 = s16 + len(ch.encode("utf-16-le")) // 2
+            cur.setPosition(s16)
+            cur.setPosition(e16, QTextCursor.MoveMode.KeepAnchor)
+            fmt = QTextImageFormat()
+            fmt.setName(QUrl.fromLocalFile(path).toString())
+            img = max(12, int(self.fontMetrics().height() * 0.95))
+            fmt.setWidth(img)
+            fmt.setHeight(img)
+            fmt.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignMiddle)
+            fmt.setProperty(_CI_PROP, ch)
+            cur.insertImage(fmt)
+
+    # ---- clipboard: always plain one-line text, emoji kept as characters
+    def insertFromMimeData(self, source):
+        if source.hasText():
+            self.insertPlainText(source.text().replace("\r", " ").replace("\n", " "))
+
+    def createMimeDataFromSelection(self):
+        d = QTextDocument()
+        QTextCursor(d).insertFragment(self.textCursor().selection())
+        md = QMimeData()
+        md.setText(_doc_text_with_emoji(d))
+        return md
 
     def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.returnPressed.emit()
+            return
         if e.key() == Qt.Key.Key_Escape:
             self.escaped.emit()
             return
@@ -8931,6 +9805,7 @@ class _MsgRow(QWidget):
         self.chat, self.m, self.mine = chat, m, mine
         self.key = m.get("_key")
         text = str(m.get("text", "") or "")
+        inv = parse_invite(text)
         atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
         align = Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft
 
@@ -8943,16 +9818,20 @@ class _MsgRow(QWidget):
 
         self._bubble_base = (f"#ChatBubble{{background:{THEMES['dark']['accent']}; border-radius:12px;}}" if mine
                              else "#ChatBubble{background:rgba(128,128,128,0.28); border-radius:12px;}")
+        if inv:
+            self._bubble_base = "#ChatBubble{background:transparent;}"
         self.bubble = QFrame()
         self.bubble.setObjectName("ChatBubble")
         self.bubble.setStyleSheet(self._bubble_base)
         bl = QVBoxLayout(self.bubble)
-        pad = (10, 7, 10, 7) if text else (4, 4, 4, 4)
+        pad = (0, 0, 0, 0) if inv else ((10, 7, 10, 7) if text else (4, 4, 4, 4))
         bl.setContentsMargins(*pad)
         bl.setSpacing(6)
-        if text:
-            lab = QLabel(text)
-            lab.setTextFormat(Qt.TextFormat.PlainText)
+        if inv:
+            bl.addWidget(self._invite_card(inv, mine))
+        elif text:
+            lab = QLabel()
+            set_emoji_text(lab, text)
             lab.setWordWrap(True)
             lab.setMaximumWidth(380)
             lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -9025,8 +9904,8 @@ class _MsgRow(QWidget):
         snippet = str(re_.get("t") or "").strip() or {"img": "Image", "gif": "GIF", "vid": "Video"}.get(
             re_.get("a"), "Attachment" if re_.get("a") else "Original message")
         snippet = snippet if len(snippet) <= 60 else snippet[:57] + "..."
-        lab = _ClickLabel(f"\u21AA {who}: {snippet}")
-        lab.setTextFormat(Qt.TextFormat.PlainText)
+        lab = _ClickLabel()
+        set_emoji_text(lab, f"\u21AA {who}: {snippet}")
         lab.setCursor(Qt.CursorShape.PointingHandCursor)
         lab.setStyleSheet("QLabel{color:#888888; font-size:11px; border-left:3px solid " + THEMES["dark"]["accent"] + "; padding-left:6px;}")
         lab.setMaximumWidth(380)
@@ -9103,6 +9982,78 @@ class _MsgRow(QWidget):
         elif a_copy is not None and act is a_copy:
             QApplication.clipboard().setText(text)
 
+
+
+def _msgrow_invite_card(self, inv, mine):
+    acc = QColor(THEMES["dark"]["accent"])
+    rgb = f"{acc.red()},{acc.green()},{acc.blue()}"
+    card = QFrame()
+    card.setObjectName("InviteCard")
+    card.setMinimumWidth(280)
+    card.setMaximumWidth(340)
+    card.setStyleSheet(
+        ("#InviteCard{background:rgba(" + rgb + ",0.14);border:1px solid rgba(" + rgb + ",0.55);border-radius:14px;}")
+        if mine else
+        "#InviteCard{background:rgba(128,128,128,0.16);border:1px solid rgba(128,128,128,0.35);border-radius:14px;}")
+    row = QHBoxLayout(card)
+    row.setContentsMargins(10, 10, 14, 10)
+    row.setSpacing(12)
+
+    cover = QLabel()
+    cover.setFixedSize(INVITE_COVER_W, INVITE_COVER_H)
+    cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    cover.setStyleSheet("QLabel{background:rgba(128,128,128,0.25);border-radius:10px;font-size:24px;font-weight:bold;}")
+    sender = None if mine else getattr(self.chat, "other_uid", None)
+    path = invite_cover_path(inv, sender)
+    pix = rounded_cover_pixmap(path, INVITE_COVER_W, INVITE_COVER_H, 8) if path else None
+    if pix:
+        cover.setPixmap(pix)
+    else:
+        cover.setText((inv["game"] or "?")[:1].upper())
+        want_invite_cover(inv, sender, cover)
+    row.addWidget(cover, 0, Qt.AlignmentFlag.AlignTop)
+
+    col = QVBoxLayout()
+    col.setSpacing(3)
+    tag = QLabel("GAME INVITE")
+    tf = tag.font()
+    tf.setPixelSize(10)
+    tf.setBold(True)
+    tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
+    tag.setFont(tf)
+    tag.setStyleSheet("QLabel{background:transparent;color:" + acc.name() + ";}")
+    name = QLabel(inv["game"] or "A Steam game")
+    name.setWordWrap(True)
+    name.setMaximumWidth(220)
+    name.setStyleSheet("QLabel{background:transparent;font-size:17px;font-weight:bold;}")
+    sub = QLabel("Invite sent" if mine else "Wants you to join their game")
+    sub.setWordWrap(True)
+    sub.setMaximumWidth(220)
+    sub.setStyleSheet("QLabel{background:transparent;color:#888888;font-size:11px;}")
+    col.addWidget(tag)
+    col.addWidget(name)
+    col.addWidget(sub)
+    col.addStretch()
+    if not mine:                                # your own invite has nothing to join
+        btn = QPushButton("Join Game")
+        btn.setObjectName("Primary")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(30)
+        btn.setToolTip("Opens Steam and joins, the same as accepting an invite in Steam")
+        def _join(_c=False, b=btn, i=inv):
+            def state(waiting, b=b):
+                try:
+                    b.setEnabled(not waiting)
+                    b.setText("Starting game..." if waiting else "Join Game")
+                except RuntimeError:        # the card was closed meanwhile
+                    pass
+            accept_invite(i["link"], i.get("game", ""), state)
+        btn.clicked.connect(_join)
+        col.addWidget(btn)
+    row.addLayout(col)
+    return card
+
+_MsgRow._invite_card = _msgrow_invite_card
 
 class ChatView(QScrollArea):
     """Scrollable chat: bubbles (purple = you, grey = them) with replies, attachments and reactions."""
@@ -9538,6 +10489,7 @@ class FriendsPage(QWidget):
                     continue
                 name = self.friends.get(uid, {}).get("username") or "A friend"
                 text = chat_preview(msg)
+                self.__dict__.setdefault("_ov_msgs", {})[uid] = msg      # the overlay toast shows pictures from it
                 self.friend_event.emit(name, text if len(text) <= 100 else text[:97] + "...", uid)
         # merge instead of replace: a friend whose fetch failed this round keeps their old baseline
         merged = dict(prev or {})
@@ -9745,8 +10697,13 @@ class FriendsPage(QWidget):
         send = QPushButton("Send")
         send.setObjectName("Primary")
         send.clicked.connect(self.send_message)
+        self.invite_btn = QPushButton("Invite to Game")
+        self.invite_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.invite_btn.setToolTip("Invite to a Steam game")
+        self.invite_btn.clicked.connect(self.invite_to_game)
         send_row.addWidget(self.attach_btn)
         send_row.addWidget(self.chat_input, 1)
+        send_row.addWidget(self.invite_btn)
         send_row.addWidget(self.emoji_btn)
         send_row.addWidget(send)
         lay.addLayout(send_row)
@@ -10070,6 +11027,104 @@ class FriendsPage(QWidget):
                 self._set_status(err)
             self.load_messages(force=True)
         self._run(lambda: cloud_set_reaction(uid, key, code, on), done)
+
+
+class SteamInviteDialog(QDialog):
+    """Only shown when the invite couldn't be completed automatically; whatever was found is already filled in."""
+    def __init__(self, parent, game="", link="", appid=0, note=""):
+        super().__init__(parent)
+        self.setWindowTitle("Invite to game")
+        self.setMinimumWidth(440)
+        self._game0, self._appid0 = game, appid
+        lay = QVBoxLayout(self)
+        if note:
+            info = QLabel(note)
+            info.setWordWrap(True)
+            lay.addWidget(info)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(game)
+        self.name_edit.setPlaceholderText("Game name")
+        self.link_edit = QLineEdit(link)
+        self.link_edit.setPlaceholderText("steam://joinlobby/...  or  steam://connect/...  or  ip:port")
+        form.addRow("Game", self.name_edit)
+        form.addRow("Join link", self.link_edit)
+        lay.addLayout(form)
+        hint = QLabel("Paste the game's join link (a steam://joinlobby/ or steam://connect/ link) or a server ip:port. "
+                      "Your friend's Join button then opens Steam and joins, the same as accepting an invite in Steam.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888888; font-size:11px;")
+        lay.addWidget(hint)
+        self.err = QLabel("")
+        self.err.setStyleSheet("color:#e5484d;")
+        self.err.hide()
+        lay.addWidget(self.err)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Send invite")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self._ok)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def _ok(self):
+        if not self.name_edit.text().strip():
+            self.err.setText("Enter the game's name.")
+        elif not normalize_steam_join(self.link_edit.text()):
+            self.err.setText("That isn't a steam://joinlobby/ or steam://connect/ link (or ip:port).")
+        else:
+            self.accept()
+            return
+        self.err.show()
+
+    def values(self):
+        game = self.name_edit.text().strip()
+        appid = self._appid0 if game.casefold() == self._game0.casefold() else _steam_appid_for_title(game)
+        return game, normalize_steam_join(self.link_edit.text()), appid
+
+def _friends_send_invite(self, uid, game, link, appid):
+    text = make_invite_text(game, link, appid)
+    def done(res, err):
+        self._set_status(err or "")
+        self.load_messages(force=True)
+    self._run(lambda: cloud_send_message(uid, text), done)
+
+FriendsPage._send_invite = _friends_send_invite
+
+def _friends_invite_to_game(self):
+    """One click: finds the game you're playing, its cover and the join link, and sends the invite.
+    If the join link can't be found, a small dialog opens with everything else already filled in."""
+    uid = self.current_uid
+    if not uid or self._sending:
+        return
+    clip = normalize_steam_join(QApplication.clipboard().text())      # fallback: a link you just copied from the game
+    self._set_status("Finding your game and join link...")
+    def done(info, err):
+        if uid != self.current_uid:
+            return
+        info = info or {}
+        game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "")
+        if game and link:
+            self._send_invite(uid, game, link, appid)
+            return
+        self._set_status("")
+        if not game:
+            note = "No game is running right now, so enter the game and its join link."
+        elif clip:
+            note = f"Found {game}. Used the link from your clipboard; check it, then send."
+        else:
+            note = f"Found {game}, but Steam has no join link for it right now (it only has one while you're in a joinable lobby or server)."
+        dlg = SteamInviteDialog(self, game, link or clip, appid, note)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        g, l, a = dlg.values()
+        self._send_invite(uid, g, l, a)
+    self._run(detect_invite_info, done, key="invite-detect")
+
+FriendsPage.invite_to_game = _friends_invite_to_game
 
 _friends_prev_init = AdaptiveApp.__init__
 
@@ -17074,6 +18129,11 @@ try:
     from overlay import overlay as _overlay
 except Exception:
     _overlay = None
+try:        # the toasts draw emoji as Apple pictures from the same cache the chat uses
+    import overlay as _overlay_module
+    _overlay_module.set_emoji_dir(os.path.dirname(emoji_store()._file("0")))
+except Exception:
+    pass
 
 OVERLAY_MODES = {
     "window": "Overlay window (default)",
@@ -17194,6 +18254,8 @@ def _overlay_classify(text):
     """Launcher friend notification text -> (line-2 prefix, highlighted part)."""
     if text.startswith("is now playing "):
         return "is playing ", text[len("is now playing "):]
+    if text.startswith("Game invite: "):
+        return "invited you to play ", text[len("Game invite: "):]
     if text == "is now online":
         return "is ", "online"
     if text == "sent you a friend request":
@@ -17204,22 +18266,106 @@ def _overlay_classify(text):
         msg = msg[:29] + "..."
     return msg, ""
 
+class _OvImageBridge(QObject):
+    done = pyqtSignal(str, str, str, str, str)      # name, highlight, avatar, prefix, picture path ("" = none)
+
+_ov_image_bridge = None
+
+def _overlay_show(name, hl, avatar, prefix, image=None):
+    _overlay.set_mode("window")          # no injected game running: use the window toast
+    try:
+        _overlay.notify_playing(name, hl, avatar, prefix, image=image or None)
+    except TypeError:                    # an older overlay.py without picture support
+        _overlay.notify_playing(name, hl, avatar, prefix)
+
+class _OvInviteBridge(QObject):
+    done = pyqtSignal(str, str, str, str, str)      # sender name, game, avatar path, cover path, join link
+
+_ov_invite_bridge = None
+
+def _overlay_invite_ready(name, game, avatar, cover, link):
+    try:
+        import overlay as _ovm
+        _ovm.invite_accept_hook = _accept_invite_from_overlay
+    except Exception:
+        pass
+    _overlay.set_mode("window")
+    _overlay.notify_invite(name, game, link, avatar or None, cover or None)
+
+def _overlay_show_invite(uid, name, inv, avatar):
+    """Game invite -> overlay toast with the game's cover and an Accept button (cover is fetched off the GUI thread)."""
+    global _ov_invite_bridge
+    if _ov_invite_bridge is None:
+        _ov_invite_bridge = _OvInviteBridge()
+        _ov_invite_bridge.done.connect(_overlay_invite_ready)
+    bridge = _ov_invite_bridge
+    _invite_games[inv["link"]] = inv.get("game", "")
+    _invite_games[inv["link"]] = inv.get("game", "")
+
+    def work():
+        cover = invite_cover_path(inv, uid)
+        if not cover:
+            try:
+                cover = _fetch_invite_cover(inv, uid)
+            except Exception:
+                cover = ""
+        bridge.done.emit(name, inv["game"] or "a game", avatar or "", cover or "", inv["link"])
+    threading.Thread(target=work, daemon=True).start()
+
 def _overlay_friend_event(page, name, text, uid):
-    """Every friend notification (playing / online / friend request / message) -> overlay toast."""
+    """Every friend notification (playing / online / friend request / message) -> overlay toast.
+    A message with a picture (png / jpg / gif ...) shows the picture in the toast; a video says "sent a video"."""
+    global _ov_image_bridge
     if _overlay is None:
         return
+    msg = (page.__dict__.get("_ov_msgs") or {}).pop(uid, None)
     mode = get_overlay_mode()
     if mode == "off":
         return
     prefix, hl = _overlay_classify(text)
+    inv = parse_invite(str(msg.get("text") or "")) if isinstance(msg, dict) else None
+    if inv and hasattr(_overlay, "notify_invite"):
+        if mode == "inject":                 # the injected in-game toast is text only, so the clickable one comes on top
+            try:
+                from overlay import send_to_injected
+                send_to_injected(name, hl, prefix)
+            except Exception:
+                pass
+        _overlay_show_invite(uid, name, inv, _friend_avatar_file(uid, ((page.friends.get(uid) or {}).get("photo"))))
+        return
+    att = None
+    if isinstance(msg, dict):
+        atts = [a for a in (msg.get("att") if isinstance(msg.get("att"), list) else []) if isinstance(a, dict)]
+        if atts and atts[0].get("k") in ("img", "gif", "vid"):
+            att = atts[0]
+            caption = " ".join(str(msg.get("text") or "").split())
+            if att.get("k") == "vid":
+                prefix, hl = "sent a video", ""
+            elif caption:
+                prefix, hl = (caption if len(caption) <= 32 else caption[:29] + "..."), ""
+            else:
+                prefix, hl = ("sent a GIF" if att.get("k") == "gif" else "sent an image"), ""
     if mode == "inject":
         from overlay import send_to_injected
         if send_to_injected(name, hl, prefix):
-            return                       # shown inside the game
+            return                       # shown inside the game (text only)
     info = (page.friends.get(uid) or page.requests.get(uid) or {})
     avatar = _friend_avatar_file(uid, info.get("photo"))
-    _overlay.set_mode("window")          # no injected game running: use the window toast
-    _overlay.notify_playing(name, hl, avatar, prefix)
+    if att is None or att.get("k") == "vid":
+        _overlay_show(name, hl, avatar, prefix)
+        return
+    if _ov_image_bridge is None:         # picture: download it (cached on disk) off the GUI thread, then show the toast
+        _ov_image_bridge = _OvImageBridge()
+        _ov_image_bridge.done.connect(lambda n, h, a, p, i: _overlay_show(n, h, a, p, i))
+    bridge = _ov_image_bridge
+
+    def work():
+        try:
+            path = cloud_fetch_media(uid, att)
+        except Exception:
+            path = ""
+        bridge.done.emit(name, hl, avatar or "", prefix, path)
+    threading.Thread(target=work, daemon=True).start()
 
 _ov_prev_launch_exe = _launch_exe
 
@@ -17425,6 +18571,16 @@ def _fo_icon(kind, color="#b8b0cc", size=20):
     elif kind == "close":
         p.drawLine(QPointF(5, 5), QPointF(15, 15))
         p.drawLine(QPointF(15, 5), QPointF(5, 15))
+    elif kind == "game":   # game controller (invite to game)
+        body = QPainterPath()
+        body.addRoundedRect(QRectF(2.5, 5.5, 15, 9.5), 4.5, 4.5)
+        p.drawPath(body)
+        p.drawLine(QPointF(5.2, 10.2), QPointF(8.6, 10.2))
+        p.drawLine(QPointF(6.9, 8.5), QPointF(6.9, 11.9))
+        pen.setWidthF(2.6)
+        p.setPen(pen)
+        p.drawPoint(QPointF(12.6, 9.2))
+        p.drawPoint(QPointF(14.6, 11.2))
     else:  # send (arrow up)
         p.drawLine(QPointF(10, 16), QPointF(10, 5))
         p.drawPolyline([QPointF(5, 9.5), QPointF(10, 4.5), QPointF(15, 9.5)])
@@ -17444,6 +18600,8 @@ class _FriendRow(QFrame):
 class _FriendsPanel(QWidget):
     got_friends = pyqtSignal(object)
     got_chat = pyqtSignal(object)
+    got_invite = pyqtSignal(object)
+    invite_sent = pyqtSignal(object)
     closed = pyqtSignal()
 
     STYLE = """
@@ -17472,6 +18630,8 @@ class _FriendsPanel(QWidget):
     #Input:focus{border:1px solid #a97cff;}
     #Send{background:#a97cff;color:#ffffff;border:none;border-radius:18px;font-size:16px;font-weight:700;}
     #Send:hover{background:#b794ff;}
+    #Invite{background:#2d2740;border:none;border-radius:18px;}
+    #Invite:hover{background:#3d3458;}
     """
 
     def __init__(self):
@@ -17485,6 +18645,7 @@ class _FriendsPanel(QWidget):
         self.setStyleSheet(self.STYLE)
         self.friends, self.uid, self.fname = {}, None, ""
         self._sig, self._bubbles = None, []
+        self._inviting = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -17574,6 +18735,22 @@ class _FriendsPanel(QWidget):
         bl = QHBoxLayout(bar)
         bl.setContentsMargins(12, 10, 12, 0)
         bl.setSpacing(8)
+        self.note = QLabel("")                 # short status line ("Finding your game...", "Invite sent.")
+        self.note.setObjectName("Sub")
+        self.note.setWordWrap(True)
+        self.note.setContentsMargins(14, 6, 14, 0)
+        self.note.hide()
+        self._note_timer = QTimer(self)
+        self._note_timer.setSingleShot(True)
+        self._note_timer.timeout.connect(self.note.hide)
+        invite = QPushButton()
+        invite.setIcon(_fo_icon("game", "#d6c5ff"))
+        invite.setIconSize(QSize(20, 20))
+        invite.setObjectName("Invite")
+        invite.setFixedSize(36, 36)
+        invite.setCursor(Qt.CursorShape.PointingHandCursor)
+        invite.setToolTip("Invite to the game you're playing")
+        invite.clicked.connect(self._invite)
         self.input = QLineEdit()
         self.input.setObjectName("Input")
         self.input.setPlaceholderText("Message...")
@@ -17586,9 +18763,11 @@ class _FriendsPanel(QWidget):
         send.setFixedSize(36, 36)
         send.setCursor(Qt.CursorShape.PointingHandCursor)
         send.clicked.connect(self._send)
+        bl.addWidget(invite)
         bl.addWidget(self.input, 1)
         bl.addWidget(send)
         pl.addWidget(self.chat_scroll, 1)
+        pl.addWidget(self.note)
         pl.addWidget(bar)
         self.stack.addWidget(page)
 
@@ -17596,6 +18775,8 @@ class _FriendsPanel(QWidget):
         self.grip.setFixedSize(14, 14)
         self.got_friends.connect(self._fill_friends)
         self.got_chat.connect(self._fill_chat)
+        self.got_invite.connect(self._on_invite)
+        self.invite_sent.connect(self._on_invite_sent)
         self.timer = QTimer(self)             # chat refresh
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self._load_chat)
@@ -17689,6 +18870,7 @@ class _FriendsPanel(QWidget):
         self.h_avatar.setPixmap(_fo_avatar(_friend_avatar_file(uid, d.get("photo")), self.fname[:1].upper(), 38, color))
         self.h_avatar.show()
         self.back.show()
+        self._note("")
         _fo_clear(self.cv)
         self._bubbles = []
         self.stack.setCurrentIndex(1)
@@ -17761,6 +18943,77 @@ class _FriendsPanel(QWidget):
                 pass
             QTimer.singleShot(0, self._load_chat)
         threading.Thread(target=work, daemon=True).start()
+
+    # ---- game invite: same detection as the Friends page's "Invite to Game" button
+    def _note(self, text, ms=0):
+        self._note_timer.stop()
+        self.note.setText(text)
+        self.note.setVisible(bool(text))
+        if text and ms:
+            self._note_timer.start(ms)
+
+    def _invite(self):
+        uid = self.uid
+        if not uid or self._inviting:
+            return
+        self._inviting = True
+        clip = normalize_steam_join(QApplication.clipboard().text())      # fallback: a link you just copied
+        self._note("Finding your game and join link...")
+        self._bg(lambda: (uid, clip, detect_invite_info()), self.got_invite)
+
+    def _on_invite(self, res):
+        self._inviting = False
+        if not res:
+            self._note("Couldn't look up your game. Try again.", 4000)
+            return
+        uid, clip, info = res
+        if uid != self.uid:                       # went back / opened another chat meanwhile
+            self._note("")
+            return
+        info = info or {}
+        game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "")
+        if game and link:
+            self._send_invite(uid, game, link, appid)
+            return
+        self._note("")
+        if not game:
+            note = "No game is running right now, so enter the game and its join link."
+        elif clip:
+            note = f"Found {game}. Used the link from your clipboard; check it, then send."
+        else:
+            note = f"Found {game}, but Steam has no join link for it right now (it only has one while you're in a joinable lobby or server)."
+        dlg = SteamInviteDialog(None, game, link or clip, appid, note)     # no parent: the panel's dark style stays out of it
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        def front():
+            try:
+                dlg.raise_()
+                dlg.activateWindow()
+                _force_foreground(int(dlg.winId()))
+            except Exception:
+                pass
+        QTimer.singleShot(0, front)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        g, l, a = dlg.values()
+        if uid == self.uid:
+            self._send_invite(uid, g, l, a)
+
+    def _send_invite(self, uid, game, link, appid):
+        text = make_invite_text(game, link, appid)
+        self._note(f"Sending invite to {self.fname}...")
+        def send():
+            cloud_send_message(uid, text)
+            return uid, game
+        self._bg(send, self.invite_sent)          # a failure comes back as None
+
+    def _on_invite_sent(self, res):
+        if not res:
+            self._note("Couldn't send the invite. Try again.", 4000)
+            return
+        uid, game = res
+        self._note(f"Invite to {game} sent.", 3000)
+        if uid == self.uid:
+            self._load_chat()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
