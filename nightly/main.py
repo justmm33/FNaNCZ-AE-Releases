@@ -12516,7 +12516,7 @@ def parse_workshop_items(page):
         if fm:
             fid = fm.group(1)
             if fid not in info:
-                info[fid] = {"id": fid, "title": "", "preview": "", "author": ""}
+                info[fid] = {"id": fid, "title": "", "preview": "", "author": "", "author_url": ""}
                 order.append(fid)
             current = info[fid]
             img = _IMG_RE.search(inner)
@@ -12530,6 +12530,9 @@ def parse_workshop_items(page):
                 current["title"] = text
         elif "myworkshopfiles" in href and current is not None and not current["author"]:
             current["author"] = re.sub(r"^by\s+", "", _ws_text(inner), flags=re.I)
+            um = re.search(r"(/(?:id|profiles)/[^/?#]+)/myworkshopfiles", href)
+            if um:
+                current["author_url"] = "https://steamcommunity.com" + um.group(1)
     items = []
     for fid in order:
         d = info[fid]
@@ -12663,6 +12666,158 @@ class WorkshopFetchWorker(QThread):
         except Exception as e:
             self.done.emit(self.token, [], str(e))
 
+_WS_HEADERS = {"Accept-Language": "en-US,en;q=0.9", "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"}
+
+def ws_profile_base(text):
+    """Steam profile base URL from a pasted profile link or a 17-digit SteamID64, else ''."""
+    t = (text or "").strip()
+    m = re.search(r"steamcommunity\.com/(id|profiles)/([^/?#\s]+)", t, re.I)
+    if m:
+        return f"https://steamcommunity.com/{m.group(1).lower()}/{m.group(2)}"
+    if re.fullmatch(r"7656\d{13}", t):
+        return f"https://steamcommunity.com/profiles/{t}"
+    return ""
+
+class WorkshopAuthorWorker(QThread):
+    """Lists one author's Workshop items for a game. Takes a profile link/SteamID64, a known profile
+    base (clicked author name), or a plain name (scans search results for a matching author)."""
+    done = pyqtSignal(int, list, str)
+    resolved = pyqtSignal(int, str)     # profile base used for paging ("" when the results are just filtered)
+
+    def __init__(self, token, appid, query, base, page, parent=None):
+        super().__init__(parent)
+        self.token, self.appid, self.query, self.base, self.page = token, appid, query, base, page
+
+    def _get(self, url):
+        return _http_get(url, headers=_WS_HEADERS, timeout=20).decode("utf-8", "replace")
+
+    def _author_items(self, base, page, name):
+        url = f"{base}/myworkshopfiles/?" + urllib.parse.urlencode(
+            {"appid": self.appid, "p": page, "browsefilter": "myfiles", "l": "english"})
+        html = self._get(url)
+        items = parse_workshop_items(html)
+        if not name:
+            m = re.search(r"<title>(.*?)</title>", html, re.S)
+            parts = [p.strip() for p in html_lib.unescape(m.group(1)).split("::")] if m else []
+            name = parts[1] if len(parts) >= 3 else ""
+        for it in items:
+            if not it.get("author"):
+                it["author"] = name
+            it["author_url"] = base
+        return items
+
+    def run(self):
+        try:
+            link_base = ws_profile_base(self.query)
+            base = self.base or link_base
+            if base:
+                name = "" if link_base else self.query
+                items = self._author_items(base, self.page, name)
+                self.resolved.emit(self.token, base)
+                self.done.emit(self.token, items, "")
+                return
+            needle = self.query.casefold()
+            hits, seen, exact = [], set(), None
+            for text, page in ((self.query, 1), (self.query, 2), ("", 1), ("", 2), ("", 3)):
+                params = {"appid": self.appid, "searchtext": text, "childpublishedfileid": 0,
+                          "browsesort": "totaluniquesubscribers", "section": "readytouseitems",
+                          "p": page, "numperpage": 30, "l": "english"}
+                html = self._get("https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params))
+                for it in parse_workshop_items(html):
+                    if it["id"] in seen:
+                        continue
+                    seen.add(it["id"])
+                    if needle in (it.get("author") or "").casefold():
+                        hits.append(it)
+                        if (it["author"].casefold() == needle and it.get("author_url")) and exact is None:
+                            exact = it
+                if exact:
+                    break
+            if exact:
+                items = self._author_items(exact["author_url"], 1, exact["author"])
+                self.resolved.emit(self.token, exact["author_url"])
+                self.done.emit(self.token, items or hits, "")
+                return
+            self.resolved.emit(self.token, "")
+            self.done.emit(self.token, hits, "")
+        except Exception as e:
+            self.done.emit(self.token, [], str(e))
+
+def ws_parse_item_ids(text):
+    """Workshop item IDs from pasted links (…filedetails/?id=123) or bare numeric IDs, in order."""
+    ids = []
+    for tok in re.split(r"[\s,;]+", text or ""):
+        m = re.search(r"[?&]id=(\d+)", tok)
+        fid = m.group(1) if m else (tok if tok.isdigit() and len(tok) >= 5 else "")
+        if fid and fid not in ids:
+            ids.append(fid)
+    return ids
+
+class WorkshopLinkWorker(QThread):
+    """Looks up pasted Workshop items (title, preview, game) through Steam's public item-details API."""
+    done = pyqtSignal(list, list)   # [(appid, game title, item dict)], [error strings]
+
+    def __init__(self, ids, known_games, parent=None):
+        super().__init__(parent)
+        self.ids, self.known = list(ids), dict(known_games)
+
+    def _author_name(self, steamid):
+        try:
+            xml = _http_get(f"https://steamcommunity.com/profiles/{steamid}/?xml=1", timeout=8).decode("utf-8", "replace")
+            m = re.search(r"<steamID><!\[CDATA\[(.*?)\]\]></steamID>", xml, re.S)
+            return m.group(1).strip() if m else ""
+        except Exception:
+            return ""
+
+    def _game_name(self, appid):
+        try:
+            js = json.loads(_http_get(f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic",
+                                      timeout=8).decode("utf-8", "replace"))
+            return js[str(appid)]["data"]["name"]
+        except Exception:
+            return f"App {appid}"
+
+    def run(self):
+        results, errors = [], []
+        try:
+            body = {"itemcount": len(self.ids)}
+            body.update({f"publishedfileids[{i}]": v for i, v in enumerate(self.ids)})
+            req = urllib.request.Request(
+                "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+                data=urllib.parse.urlencode(body).encode(), headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                details = json.loads(resp.read().decode("utf-8", "replace")).get("response", {}).get(
+                    "publishedfiledetails", [])
+        except Exception as e:
+            self.done.emit([], [f"Couldn't reach Steam: {e}"])
+            return
+        by_id = {str(d.get("publishedfileid")): d for d in details if isinstance(d, dict)}
+        authors, games = {}, dict(self.known)
+        for fid in self.ids:
+            d = by_id.get(fid)
+            if not d or d.get("result") != 1:
+                errors.append(f"{fid}: not found (it may be private or deleted)")
+                continue
+            if d.get("file_type") == 2:
+                errors.append(f"{fid}: that's a collection, not a single mod")
+                continue
+            try:
+                appid = int(d.get("consumer_app_id") or d.get("creator_app_id") or 0)
+            except (TypeError, ValueError):
+                appid = 0
+            if not appid:
+                errors.append(f"{fid}: couldn't tell which game it belongs to")
+                continue
+            creator = str(d.get("creator") or "")
+            if creator and creator not in authors:
+                authors[creator] = self._author_name(creator)
+            if appid not in games:
+                games[appid] = self._game_name(appid)
+            results.append((appid, games[appid],
+                            {"id": fid, "title": d.get("title") or f"Workshop item {fid}",
+                             "preview": d.get("preview_url") or "", "author": authors.get(creator, "")}))
+        self.done.emit(results, errors)
+
 class SteamCmdWorker(QThread):
     status = pyqtSignal(str)
     progress = pyqtSignal(float)
@@ -12785,6 +12940,12 @@ class WorkshopPage(QWidget):
         self.card_list = []
         self.game_cards = []
         self.dl_rows = []
+        self._shown_items = {}
+        self._author_base = ""     # profile URL used to page through one author's mods
+        self._author_hint = ""     # profile URL carried over from clicking an author name
+        self._author_active = False
+        self.list_mode = False
+        self.selected = {}     # item id -> item dict (the list being built for export)
         self._cols = (0, 0)
         self.setObjectName("Content")
 
@@ -12801,8 +12962,22 @@ class WorkshopPage(QWidget):
         self.back_btn.setFlat(True)
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.clicked.connect(self.show_picker)
+        self.import_btn = QPushButton("Import List")
+        self.import_btn.setToolTip("Import a .nczlist file: its mods are added to the queue and downloaded")
+        self.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_btn.setFixedHeight(30)
+        self.import_btn.clicked.connect(self.import_list)
         head.addWidget(title)
         head.addWidget(self.game_label, 0, Qt.AlignmentFlag.AlignBottom)
+        self.link_btn = QPushButton("Download by Link")
+        self.link_btn.setToolTip("Paste a Steam Workshop link (or item ID) to download that mod")
+        self.link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.link_btn.setFixedHeight(30)
+        self.link_btn.clicked.connect(self.download_by_link)
+        head.addSpacing(16)
+        head.addWidget(self.import_btn)
+        head.addSpacing(8)
+        head.addWidget(self.link_btn)
         head.addStretch()
         head.addWidget(self.back_btn)
         outer.addLayout(head)
@@ -12881,10 +13056,43 @@ class WorkshopPage(QWidget):
         go.setObjectName("Primary")
         go.setFixedHeight(36)
         go.clicked.connect(self.search)
+        self.list_btn = QPushButton("List mode")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setFixedHeight(36)
+        self.list_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.list_btn.setToolTip("Select mods to export as a .nczlist file")
+        self.list_btn.toggled.connect(self.set_list_mode)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setFixedHeight(36)
+        self.mode_combo.addItem("Mods", "mods")
+        self.mode_combo.addItem("Author", "author")
+        self.mode_combo.setToolTip("Search by mod name, or by author (name or Steam profile link)")
+        self.mode_combo.currentIndexChanged.connect(lambda _i: self._on_mode_changed())
         bar.addWidget(self.search_edit, 1)
+        bar.addWidget(self.mode_combo)
         bar.addWidget(self.sort_combo)
         bar.addWidget(go)
+        bar.addWidget(self.list_btn)
         bl.addLayout(bar)
+        self.list_bar = QWidget()
+        lb = QHBoxLayout(self.list_bar)
+        lb.setContentsMargins(0, 0, 0, 0)
+        lb.setSpacing(8)
+        self.list_info = QLabel()
+        self.list_info.setObjectName("RowDesc")
+        sel_all = QPushButton("Select all shown")
+        sel_all.clicked.connect(self.select_all_shown)
+        sel_none = QPushButton("Clear selection")
+        sel_none.clicked.connect(self.clear_selection)
+        self.export_btn = QPushButton("Export list")
+        self.export_btn.setObjectName("Primary")
+        self.export_btn.clicked.connect(self.export_list)
+        lb.addWidget(self.list_info, 1)
+        lb.addWidget(sel_all)
+        lb.addWidget(sel_none)
+        lb.addWidget(self.export_btn)
+        self.list_bar.hide()
+        bl.addWidget(self.list_bar)
         sc2 = self._scroll()
         self.browse_container = QWidget()
         self.browse_container.setObjectName("GridContainer")
@@ -12970,6 +13178,7 @@ class WorkshopPage(QWidget):
         self.stack.addWidget(gv)
         self.back_btn.hide()
         self._apply_css()
+        self._refresh_list_bar()
         self._rebuild_games()
         QApplication.instance().aboutToQuit.connect(self._shutdown)
 
@@ -12991,7 +13200,11 @@ QPushButton#WsTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
 QPushButton#WsTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
 QFrame#WsCard {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 12px; }}
 QFrame#WsCard:hover {{ border: 1px solid {t['accent']}; }}
+QFrame#WsCard[sel="true"] {{ background: {t['hover']}; border: 1px solid {t['accent']}; }}
 QFrame#WsRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
+QPushButton#WsAuthor {{ background: transparent; border: none; color: {t['subtext']}; text-align: left;
+    padding: 0px; font-size: 12px; }}
+QPushButton#WsAuthor:hover:enabled {{ color: {t['accent']}; text-decoration: underline; }}
 QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t['subtext']}; }}
 """)
 
@@ -13120,6 +13333,13 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self._rebuild_games()
 
     def open_game(self, g):
+        if self.appid != g["appid"]:
+            self.selected.clear()
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.blockSignals(False)
+        self._on_mode_changed(search=False)
+        self._author_hint = ""
         self.appid, self.game_title = g["appid"], g["title"]
         self.game_label.setText(self.game_title)
         self.back_btn.show()
@@ -13142,7 +13362,28 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             frame.setParent(None)
             frame.deleteLater()
         self.cards, self.card_list, self.seen_ids = {}, [], set()
+        self._shown_items = {}
+        self._author_base, self._author_hint = self._author_hint or "", ""
         self._fetch(1)
+
+    def _on_mode_changed(self, search=True):
+        author = self.mode_combo.currentData() == "author"
+        self.search_edit.setPlaceholderText("Author name or Steam profile link" if author else "Search the Workshop")
+        self.sort_combo.setEnabled(not author or not self.search_edit.text().strip())
+        if search and self.appid is not None and self.search_edit.text().strip():
+            self.search()
+
+    def browse_author(self, it):
+        """Show every mod by the author of a clicked card."""
+        if not it.get("author"):
+            return
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(1)
+        self.mode_combo.blockSignals(False)
+        self.search_edit.setText(it["author"])
+        self._on_mode_changed(search=False)
+        self._author_hint = it.get("author_url", "")
+        self.search()
 
     def _fetch(self, page):
         self.token += 1
@@ -13150,12 +13391,22 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self.more_btn.hide()
         self.status_label.setText("Loading...")
         self.status_label.show()
-        w = WorkshopFetchWorker(self.token, self.appid, self.search_edit.text().strip(),
-                                self.sort_combo.currentData(), page, self)
+        query = self.search_edit.text().strip()
+        self._author_active = self.mode_combo.currentData() == "author" and bool(query)
+        self.sort_combo.setEnabled(not self._author_active)
+        if self._author_active:
+            w = WorkshopAuthorWorker(self.token, self.appid, query, self._author_base, page, self)
+            w.resolved.connect(self._on_author_resolved)
+        else:
+            w = WorkshopFetchWorker(self.token, self.appid, query, self.sort_combo.currentData(), page, self)
         w.done.connect(self._on_fetched)
         self._fetchers.append(w)
         w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
         w.start()
+
+    def _on_author_resolved(self, token, base):
+        if token == self.token:
+            self._author_base = base
 
     def _on_fetched(self, token, items, err):
         if token != self.token:
@@ -13166,20 +13417,27 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         new = [it for it in items if it["id"] not in self.seen_ids]
         for it in new:
             self.seen_ids.add(it["id"])
+            self._shown_items[it["id"]] = it
             card = self._make_item_card(it)
             self.card_list.append(card)
         self._layout_grid(self.browse_grid, self.card_list, self._calc_cols(self.CARD_W))
         self._refresh_card_states()
         if not self.card_list:
-            self.status_label.setText("No Workshop items found for this game.")
+            self.status_label.setText(
+                "No mods found for that author in this game.\nTip: click an author's name on a mod card, "
+                "or paste their Steam profile link." if self._author_active
+                else "No Workshop items found for this game.")
         else:
             self.status_label.hide()
-        self.more_btn.setVisible(len(items) >= 9 and bool(new))
+        self.more_btn.setVisible(len(items) >= 9 and bool(new)
+                                 and (not self._author_active or bool(self._author_base)))
 
     def _make_item_card(self, it):
-        card = QFrame()
+        card = _WsClickFrame()
         card.setObjectName("WsCard")
+        card.setProperty("sel", False)
         card.setFixedWidth(self.CARD_W)
+        card.clicked.connect(lambda it=it: self._card_clicked(it))
         v = QVBoxLayout(card)
         v.setContentsMargins(8, 8, 8, 10)
         v.setSpacing(6)
@@ -13193,15 +13451,24 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         title.setWordWrap(True)
         title.setFixedHeight(40)
         title.setToolTip(it["title"])
-        author = QLabel(("by " + it["author"]) if it["author"] else "")
-        author.setObjectName("RowDesc")
-        author.setSizePolicy(self._QSizePolicy.Policy.Ignored, self._QSizePolicy.Policy.Preferred)
+        author = QPushButton()
+        author.setObjectName("WsAuthor")
+        author.setFlat(True)
+        author.setFixedHeight(20)
+        if it["author"]:
+            author.setText(author.fontMetrics().elidedText("by " + it["author"], Qt.TextElideMode.ElideRight,
+                                                           self.CARD_W - 20))
+            author.setToolTip(f"Show all mods by {it['author']}")
+            author.setCursor(Qt.CursorShape.PointingHandCursor)
+            author.clicked.connect(lambda _c=False, it=it: self.browse_author(it))
+        else:
+            author.setEnabled(False)
         row = QHBoxLayout()
         row.setSpacing(6)
         btn = QPushButton("Download")
         btn.setObjectName("Primary")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(lambda _c=False, it=it: self.enqueue(it))
+        btn.clicked.connect(lambda _c=False, it=it: self._card_clicked(it, from_button=True))
         view = QPushButton("View")
         view.setFlat(True)
         view.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -13220,8 +13487,16 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         done = {d["id"] for d in self._downloads_for_game()}
         active = {q["id"]: q["status"] for q in self.queue
                   if q["appid"] == self.appid and q["status"] in ("queued", "downloading")}
-        for item_id, (_f, btn) in self.cards.items():
-            if item_id in active:
+        for item_id, (frame, btn) in self.cards.items():
+            picked = self.list_mode and item_id in self.selected
+            if bool(frame.property("sel")) != picked:
+                frame.setProperty("sel", picked)
+                frame.style().unpolish(frame)
+                frame.style().polish(frame)
+            if self.list_mode:
+                btn.setText("Remove from list" if picked else "Add to list")
+                btn.setEnabled(True)
+            elif item_id in active:
                 btn.setText("Downloading..." if active[item_id] == "downloading" else "Queued")
                 btn.setEnabled(False)
             elif item_id in done:
@@ -13231,6 +13506,174 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 btn.setText("Download")
                 btn.setEnabled(True)
 
+    # ------------------------------------------------------------ lists (.nczlist import / export)
+    def _card_clicked(self, it, from_button=False):
+        if self.list_mode:
+            if it["id"] in self.selected:
+                del self.selected[it["id"]]
+            else:
+                self.selected[it["id"]] = {"id": it["id"], "title": it["title"],
+                                           "preview": it.get("preview", ""), "author": it.get("author", "")}
+            self._refresh_card_states()
+            self._refresh_list_bar()
+        elif from_button:
+            self.enqueue(it)
+
+    def set_list_mode(self, on):
+        self.list_mode = bool(on)
+        self.list_bar.setVisible(self.list_mode)
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def _refresh_list_bar(self):
+        n = len(self.selected)
+        self.list_info.setText(f"List mode: pick the mods you want, then press Export list ({n} selected)"
+                               if n else "List mode: pick the mods you want, then press Export list")
+        self.export_btn.setText(f"Export list ({n})" if n else "Export list")
+        self.export_btn.setEnabled(n > 0)
+
+    def select_all_shown(self):
+        for item_id in self.cards:
+            if item_id in self.selected:
+                continue
+            it = self._shown_items.get(item_id)
+            if it:
+                self.selected[item_id] = {"id": it["id"], "title": it["title"],
+                                          "preview": it.get("preview", ""), "author": it.get("author", "")}
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def clear_selection(self):
+        self.selected.clear()
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def export_list(self):
+        if not self.selected or self.appid is None:
+            return
+        safe = re.sub(r"[^\w\- ]+", "", self.game_title).strip().replace(" ", "_") or "workshop"
+        start_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        path, _f = QFileDialog.getSaveFileName(self, "Export Workshop list",
+                                               os.path.join(start_dir, f"{safe}.nczlist"),
+                                               "NCZ Workshop list (*.nczlist)")
+        if not path:
+            return
+        if not path.lower().endswith(".nczlist"):
+            path += ".nczlist"
+        data = {"format": "nczlist", "version": 1, "appid": self.appid, "game": self.game_title,
+                "created": int(time.time()), "items": list(self.selected.values())}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            QMessageBox.warning(self, "Export list", f"Couldn't save the list:\n{e}")
+            return
+        QMessageBox.information(self, "Export list",
+                                f"Saved {len(self.selected)} mod(s) to:\n{path}")
+
+    def import_list(self):
+        start_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        path, _f = QFileDialog.getOpenFileName(self, "Import Workshop list", start_dir,
+                                               "NCZ Workshop list (*.nczlist);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            appid = int(data["appid"])
+            raw = data["items"]
+            if not isinstance(raw, list):
+                raise ValueError("items is not a list")
+        except Exception:
+            QMessageBox.warning(self, "Import list", "That doesn't look like a valid .nczlist file.")
+            return
+        game = str(data.get("game") or "").strip()
+        if not game:
+            game = next((g["title"] for g in _ws_installed_games() if g["appid"] == appid), f"App {appid}")
+        items, seen = [], set()
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            item_id = str(r.get("id", "")).strip()
+            if not item_id.isdigit() or item_id in seen:
+                continue
+            seen.add(item_id)
+            items.append({"id": item_id, "title": str(r.get("title") or f"Workshop item {item_id}"),
+                          "preview": str(r.get("preview") or ""), "author": str(r.get("author") or "")})
+        if not items:
+            QMessageBox.information(self, "Import list", "The list is empty.")
+            return
+        have = {d["id"] for d in ws_load_downloads()
+                if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))}
+        # jump to that game's Queue tab so the downloads are visible
+        self.open_game({"appid": appid, "title": game})
+        self.tab_btns[1].setChecked(True)
+        self.inner.setCurrentIndex(1)
+        added = skipped = 0
+        for it in items:
+            if it["id"] in have:
+                skipped += 1
+            elif self.enqueue(it, appid, game):
+                added += 1
+            else:
+                skipped += 1
+        msg = f"Added {added} mod(s) to the queue for {game}."
+        if skipped:
+            msg += f"\nSkipped {skipped} that are already downloaded or queued."
+        QMessageBox.information(self, "Import list", msg)
+
+    # ------------------------------------------------------------ download by link
+    def download_by_link(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Download by Link", "Paste one or more Steam Workshop links (or item IDs):")
+        if not ok or not text.strip():
+            return
+        ids = ws_parse_item_ids(text)
+        if not ids:
+            QMessageBox.warning(self, "Download by Link", "I couldn't find a Workshop link or item ID in that text.")
+            return
+        self.link_btn.setEnabled(False)
+        self.link_btn.setText("Looking up...")
+        known = {g["appid"]: g["title"] for g in _ws_installed_games()}
+        w = WorkshopLinkWorker(ids, known, self)
+        w.done.connect(self._on_link_done)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _on_link_done(self, results, errors):
+        self.link_btn.setEnabled(True)
+        self.link_btn.setText("Download by Link")
+        if not results:
+            QMessageBox.warning(self, "Download by Link", "\n".join(errors) or "Nothing to download.")
+            return
+        have = {(d["appid"], d["id"]) for d in ws_load_downloads()
+                if os.path.isdir(workshop_item_dir(d["appid"], d["id"]))}
+        first_appid, first_game = results[0][0], results[0][1]
+        if self.appid != first_appid or self.stack.currentIndex() != 1:
+            self.open_game({"appid": first_appid, "title": first_game})
+        self.tab_btns[1].setChecked(True)
+        self.inner.setCurrentIndex(1)
+        added = skipped = 0
+        for appid, game, it in results:
+            if (appid, it["id"]) in have:
+                skipped += 1
+            elif self.enqueue(it, appid, game):
+                added += 1
+            else:
+                skipped += 1
+        lines = [f"Added {added} mod(s) to the queue."]
+        if skipped:
+            lines.append(f"Skipped {skipped} that are already downloaded or queued.")
+        if errors:
+            lines.append("")
+            lines.extend(errors)
+        QMessageBox.information(self, "Download by Link", "\n".join(lines))
+
     # ------------------------------------------------------------ queue
     def _refresh_tab_titles(self):
         active = sum(1 for q in self.queue if q["status"] in ("queued", "downloading"))
@@ -13238,17 +13681,20 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         n = len(self._downloads_for_game())
         self.tab_btns[2].setText(f"Downloaded ({n})" if n else "Downloaded")
 
-    def enqueue(self, it):
-        if any(q["id"] == it["id"] and q["appid"] == self.appid and q["status"] in ("queued", "downloading")
+    def enqueue(self, it, appid=None, game=None):
+        appid = self.appid if appid is None else appid
+        game = self.game_title if game is None else game
+        if any(q["id"] == it["id"] and q["appid"] == appid and q["status"] in ("queued", "downloading")
                for q in self.queue):
-            return
-        self.queue.append({"appid": self.appid, "game": self.game_title, "id": it["id"], "title": it["title"],
-                           "preview": it["preview"], "author": it.get("author", ""),
+            return False
+        self.queue.append({"appid": appid, "game": game, "id": it["id"], "title": it["title"],
+                           "preview": it.get("preview", ""), "author": it.get("author", ""),
                            "status": "queued", "msg": "", "line": "", "pct": None, "w": None})
         self._rebuild_queue()
         self._refresh_card_states()
         self._refresh_tab_titles()
         self._pump()
+        return True
 
     def _pump(self):
         if self.worker and self.worker.isRunning():
