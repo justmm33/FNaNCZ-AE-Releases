@@ -1403,8 +1403,9 @@ def set_accent(color):
         pass
 
 def apply_accent_to_icon(color):
-    """Recolors assets/icon.png to match the accent. The original is kept once as assets/icon_default.png
-    and every recolor starts from it, so Reset restores the exact original. Returns True if icon.png changed."""
+    """Recolors assets/icon.png to match the accent: the icon's background becomes exactly the chosen colour and
+    the other shades move with it. The original is kept once as assets/icon_default.png and every recolor starts
+    from it, so Reset restores the exact original. Returns True if icon.png changed."""
     import colorsys
     try:
         icon, orig = asset_path("icon.png"), asset_path("icon_default.png")
@@ -1421,19 +1422,43 @@ def apply_accent_to_icon(color):
         if max(img.width(), img.height()) > 512:
             img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
-        base, target = QColor("#a666ff"), QColor(color)
-        shift = (max(target.hslHue(), 0) - base.hslHue()) / 360.0
-        bs = base.hslSaturation() / 255.0
-        ratio = (target.hslSaturation() / 255.0) / bs if bs else 1.0
+        target = QColor(color)
+        th, tl, ts = colorsys.rgb_to_hls(target.redF(), target.greenF(), target.blueF())
         ptr = img.bits()
         ptr.setsize(img.sizeInBytes())
-        data, cache = bytearray(ptr), {}
-        for i in range(0, len(data), 4):                      # bytes are B, G, R, A
+        data = bytearray(ptr)                                  # bytes are B, G, R, A
+        # the icon's background = its most common opaque colour (bucketed, then averaged)
+        buckets = {}
+        for i in range(0, len(data), 4):
+            if data[i + 3] < 200:
+                continue
+            k = (data[i] >> 3, data[i + 1] >> 3, data[i + 2] >> 3)
+            e = buckets.get(k)
+            if e is None:
+                buckets[k] = [1, data[i], data[i + 1], data[i + 2]]
+            else:
+                e[0] += 1; e[1] += data[i]; e[2] += data[i + 1]; e[3] += data[i + 2]
+        if buckets:
+            n, sb, sg, sr = max(buckets.values(), key=lambda e: e[0])
+            bh, bl, bs = colorsys.rgb_to_hls(sr / n / 255.0, sg / n / 255.0, sb / n / 255.0)
+        else:
+            stock = QColor("#a666ff")
+            bh, bl, bs = colorsys.rgb_to_hls(stock.redF(), stock.greenF(), stock.blueF())
+        shift = th - bh
+
+        def remap(v, b, t):            # piecewise linear: 0 -> 0, background value -> chosen value, 1 -> 1
+            if b <= 0.0 or b >= 1.0:
+                return v
+            return v * t / b if v <= b else t + (v - b) * (1.0 - t) / (1.0 - b)
+
+        cache = {}
+        for i in range(0, len(data), 4):
             key = (data[i], data[i + 1], data[i + 2])
             new = cache.get(key)
             if new is None:
                 h, l, sat = colorsys.rgb_to_hls(key[2] / 255.0, key[1] / 255.0, key[0] / 255.0)
-                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, l, min(1.0, sat * ratio))
+                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, min(1.0, max(0.0, remap(l, bl, tl))),
+                                              min(1.0, max(0.0, remap(sat, bs, ts))))
                 new = cache[key] = (round(b * 255), round(g * 255), round(r * 255))
             data[i], data[i + 1], data[i + 2] = new
         out = QImage(bytes(data), img.width(), img.height(), img.bytesPerLine(), QImage.Format.Format_ARGB32).copy()
@@ -8300,18 +8325,151 @@ def _game_name_for_args(args):
     return None
 
 _running = {}  # game name -> Popen of the running game
+_tracked_members = {}   # game name -> {pid: psutil.Process} of every process currently counted as that game
 
-def _track_playing(name, proc):
+# helpers a game can leave behind or start that must not keep "playing" on (browsers it opened, wine/console helpers)
+_TRACK_IGNORE = {
+    "conhost.exe", "werfault.exe", "explorer.exe", "svchost.exe", "services.exe", "winedevice.exe", "plugplay.exe",
+    "rpcss.exe", "wineserver", "xdg-open", "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "iexplore.exe", "chrome", "chromium", "firefox", "brave", "microsoft-edge",
+}
+_TRACK_GRACE = 8.0      # seconds with no game process alive before the game counts as closed (covers exe -> exe hand-offs)
+
+def _game_folder_for(args, cwd):
+    """The game's own folder (used to recognise the next .exe it starts), or None if it can't be told apart safely."""
+    folder = None
+    if isinstance(cwd, str) and os.path.isdir(cwd):
+        folder = cwd
+    else:
+        for a in args:
+            if isinstance(a, str) and os.path.isabs(a) and os.path.isfile(a) and \
+                    a.lower().endswith((".exe", ".sh", ".x86_64", ".appimage", ".bat", ".cmd")):
+                folder = os.path.dirname(a)
+                break
+    if not folder:
+        return None
+    f = os.path.normcase(os.path.abspath(folder))
+    try:
+        roots = {os.path.normcase(os.path.abspath(r)) for r in library_roots()}
+    except Exception:
+        roots = set()
+    if f in roots or os.path.dirname(f) == f or f == os.path.normcase(os.path.expanduser("~")):
+        return None     # the shared library folder, a drive root or home would match unrelated programs
+    return f
+
+def _watch_game(name, proc, folder, t0):
+    """Blocks until the game is really over. Unlike proc.wait() this survives a launcher/stub that starts the real
+    .exe and quits: any process started by the game (even after its parent died), or started from the game's folder
+    after the launch, keeps the game counted as running. Over once nothing is left for _TRACK_GRACE seconds."""
+    import psutil
+    me = os.getpid()
+    fol = (folder + os.sep) if folder else None
+    members = {}
+    ever = {proc.pid}
+    rejected = {}                 # pid -> create_time of processes already checked and found unrelated
+    try:
+        members[proc.pid] = psutil.Process(proc.pid)
+    except psutil.Error:
+        pass
+    _tracked_members[name] = members
+
+    def ignored(p_):
+        try:
+            return p_.name().lower() in _TRACK_IGNORE
+        except psutil.Error:
+            return True
+
+    def in_folder(p_):
+        try:
+            exe = p_.exe()
+            if exe and os.path.normcase(exe).startswith(fol):
+                return True
+            return any(os.path.normcase(a).startswith(fol) for a in p_.cmdline())
+        except psutil.Error:
+            return False
+
+    def refresh():
+        alive, stack = {}, []
+        for pid, p_ in list(members.items()):
+            try:
+                if p_.is_running() and p_.status() != psutil.STATUS_ZOMBIE:
+                    alive[pid] = p_
+                    stack.append(p_)
+            except psutil.Error:
+                pass
+        while stack:                                   # everything the game started
+            p_ = stack.pop()
+            try:
+                kids = p_.children()
+            except psutil.Error:
+                continue
+            for c in kids:
+                if c.pid in alive or c.pid == me or ignored(c):
+                    continue
+                alive[c.pid] = c
+                ever.add(c.pid)
+                stack.append(c)
+        try:                                           # started by a member that already quit, or from the game's folder
+            for c in psutil.process_iter(["pid", "ppid", "create_time"]):
+                pid, ct = c.info["pid"], c.info["create_time"] or 0
+                if pid in alive or pid == me or ct < t0 - 2 or rejected.get(pid) == ct:
+                    continue
+                if c.info["ppid"] in ever or (fol and in_folder(c)):
+                    if not ignored(c):
+                        alive[pid] = c
+                        ever.add(pid)
+                        continue
+                rejected[pid] = ct
+        except Exception:
+            pass
+        members.clear()
+        members.update(alive)
+        return bool(alive)
+
+    gone_at = None
+    try:
+        while True:
+            try:
+                proc.poll()                            # also reaps the original process
+            except Exception:
+                pass
+            try:
+                ok = refresh()
+            except Exception:
+                ok = proc.poll() is None
+            if ok:
+                gone_at = None
+                time.sleep(1.0)
+            else:
+                if gone_at is None:
+                    gone_at = time.time()
+                if time.time() - gone_at >= _TRACK_GRACE:
+                    break
+                time.sleep(0.5)
+    finally:
+        if _tracked_members.get(name) is members:
+            del _tracked_members[name]
+
+def _track_playing(name, proc, folder=None):
     name = pretty_game_name(name)
     _running[name] = proc
     _now_playing["name"] = name
     for cb in _playing_listeners:
         cb()
+    t0 = time.time()
     def wait():
         try:
-            proc.wait()
+            try:
+                import psutil  # noqa: F401
+            except ImportError:
+                proc.wait()                            # without psutil only the launched process itself can be followed
+            else:
+                _watch_game(name, proc, folder, t0)
         except Exception:
-            pass
+            try:
+                proc.wait()
+            except Exception:
+                pass
         if _running.get(name) is proc:
             del _running[name]
         if _now_playing["name"] == name:
@@ -8330,7 +8488,7 @@ class _TrackedPopen(_RealPopen):
             if isinstance(args, (list, tuple)):
                 name = _game_name_for_args(args)
                 if name:
-                    _track_playing(name, self)
+                    _track_playing(name, self, _game_folder_for(args, k.get("cwd")))
         except Exception:
             pass
 
@@ -11049,7 +11207,7 @@ class SteamInviteDialog(QDialog):
         form.addRow("Game", self.name_edit)
         form.addRow("Join link", self.link_edit)
         lay.addLayout(form)
-        hint = QLabel("Paste the game's steam join link.)
+        hint = QLabel("Paste the game's steam join link.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888888; font-size:11px;")
         lay.addWidget(hint)
@@ -11319,12 +11477,21 @@ from PyQt6.QtCore import QEvent
 
 def stop_game(name):
     proc = _running.get(name)
-    if not proc or proc.poll() is not None:
+    extra = list(_tracked_members.get(name, {}).values())
+    if not proc or (proc.poll() is not None and not extra):
         return
     try:
         import psutil
-        parent = psutil.Process(proc.pid)
-        procs = parent.children(recursive=True) + [parent]
+        roots = [psutil.Process(proc.pid)] if proc.poll() is None else []
+        roots += extra                      # processes the game handed off to
+        found = {}
+        for r_ in roots:
+            try:
+                for q_ in r_.children(recursive=True) + [r_]:
+                    found[q_.pid] = q_
+            except Exception:
+                pass
+        procs = list(found.values())
         for p_ in procs:
             try:
                 p_.terminate()
@@ -18501,11 +18668,45 @@ class _FriendsDim(QWidget):
     def mousePressEvent(self, _e):
         self.clicked.emit()
 
+_FO_STOCK_ACCENT = "#a666ff"          # the stock purple the panel's shades were designed around
+
+def _fo_tint(color):
+    """Moves one of the panel's stock purple shades onto the launcher accent: same lightness, same
+    saturation (scaled to the accent), hue taken from the accent. Stock purple in -> unchanged."""
+    import colorsys
+    acc = QColor(THEMES["dark"]["accent"])
+    if not acc.isValid() or acc.name() == _FO_STOCK_ACCENT:
+        return color
+    c = color.lower()
+    if c == "#a97cff":                                   # main purple -> the accent itself
+        return acc.name()
+    if c == "#b794ff":                                   # its hover shade
+        return THEMES["dark"]["accent_hover"]
+    src = QColor(c)
+    if not src.isValid():
+        return color
+    base_h = QColor("#a97cff").hslHueF()
+    acc_h = acc.hslHueF() if acc.hslSaturation() > 0 else base_h
+    ratio = min(1.0, acc.hslSaturationF())
+    h, l, s = colorsys.rgb_to_hls(src.redF(), src.greenF(), src.blueF())
+    h = (h + (acc_h - base_h)) % 1.0 if acc_h >= 0 and base_h >= 0 else h
+    r, g, b = colorsys.hls_to_rgb(h, l, min(1.0, s * ratio))
+    return QColor(round(r * 255), round(g * 255), round(b * 255)).name()
+
+def _fo_tint_css(css):
+    """Runs a whole stylesheet through _fo_tint (hex colours and the purple rgba header wash)."""
+    acc = QColor(THEMES["dark"]["accent"])
+    if not acc.isValid() or acc.name() == _FO_STOCK_ACCENT:
+        return css
+    css = re.sub(r"rgba\(169,124,255,([0-9.]+)\)",
+                 lambda m: f"rgba({acc.red()},{acc.green()},{acc.blue()},{m.group(1)})", css)
+    return re.sub(r"#[0-9a-fA-F]{6}", lambda m: _fo_tint(m.group(0)), css)
+
 def _fo_status(d):
     """-> (text, color, group) group: 0 in game, 1 online, 2 offline."""
     s, _c = _friend_status(d)
     if s.startswith("Playing"):
-        return s, "#a97cff", 0
+        return s, _fo_tint("#a97cff"), 0
     if s == "Online":
         return s, "#4ade80", 1
     if s == "Idle":
@@ -18527,8 +18728,8 @@ def _fo_avatar(path, letter, size, dot=None):
         p.drawPixmap(0, 0, src.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                                       Qt.TransformationMode.SmoothTransformation))
     else:
-        p.fillRect(0, 0, size, size, QColor("#3a2f66"))
-        p.setPen(QColor("#d6c5ff"))
+        p.fillRect(0, 0, size, size, QColor(_fo_tint("#3a2f66")))
+        p.setPen(QColor(_fo_tint("#d6c5ff")))
         f = QFont()
         f.setPixelSize(int(size * 0.42))
         f.setBold(True)
@@ -18538,7 +18739,7 @@ def _fo_avatar(path, letter, size, dot=None):
     if dot:
         d = max(10, int(size * 0.32))
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#1b1824"))                      # ring in the card colour
+        p.setBrush(QColor(_fo_tint("#1b1824")))                      # ring in the card colour
         p.drawEllipse(size - d, size - d, d, d)
         p.setBrush(QColor(dot))
         p.drawEllipse(size - d + 2, size - d + 2, d - 4, d - 4)
@@ -18554,13 +18755,13 @@ def _fo_clear(layout):
             _fo_clear(it.layout())
             it.layout().deleteLater()
 
-def _fo_icon(kind, color="#b8b0cc", size=20):
+def _fo_icon(kind, color=None, size=20):
     """Draws back / close / send icons so they never depend on font glyphs."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color), 2.0 * size / 20)
+    pen = QPen(QColor(color or _fo_tint("#b8b0cc")), 2.0 * size / 20)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     p.setPen(pen)
@@ -18641,7 +18842,7 @@ class _FriendsPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(320, 400)
         self.resize(420, 620)
-        self.setStyleSheet(self.STYLE)
+        self.setStyleSheet(_fo_tint_css(self.STYLE))      # follows the launcher accent colour
         self.friends, self.uid, self.fname = {}, None, ""
         self._sig, self._bubbles = None, []
         self._inviting = False
@@ -18743,7 +18944,7 @@ class _FriendsPanel(QWidget):
         self._note_timer.setSingleShot(True)
         self._note_timer.timeout.connect(self.note.hide)
         invite = QPushButton()
-        invite.setIcon(_fo_icon("game", "#d6c5ff"))
+        invite.setIcon(_fo_icon("game", _fo_tint("#d6c5ff")))
         invite.setIconSize(QSize(20, 20))
         invite.setObjectName("Invite")
         invite.setFixedSize(36, 36)
@@ -20184,15 +20385,23 @@ def _pt_fmt(seconds):
     hours, minutes = divmod(minutes, 60)
     return f"Played: {hours} h {minutes} min" if hours < 100 else f"Played: {hours} h"
 
+def _pt_wait(name, proc, timeout):
+    """proc.wait(timeout), but a game that handed off to another .exe still counts as running."""
+    end = time.time() + timeout
+    while _running.get(name) is proc:
+        if time.time() >= end:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(0.5)
+
 def _pt_session(name, proc):
-    """Counts the time a launched game's process is alive. Saved every 30 s so a crash/quit loses almost nothing."""
+    """Counts the time a launched game is running (including after it hands off to another .exe). Saved every 30 s so a crash/quit loses almost nothing."""
     key = _pt_key(name)
     def run():
         start = last = time.time()
         _pt_active[key] = last
         while True:
             try:
-                proc.wait(timeout=30)
+                _pt_wait(name, proc, 30)
                 done = True
             except subprocess.TimeoutExpired:
                 done = False
@@ -20210,8 +20419,8 @@ def _pt_session(name, proc):
 
 _pt_prev_track_playing = _track_playing
 
-def _track_playing(name, proc):
-    _pt_prev_track_playing(name, proc)
+def _track_playing(name, proc, folder=None):
+    _pt_prev_track_playing(name, proc, folder)
     try:
         _pt_session(pretty_game_name(name), proc)
     except Exception:
