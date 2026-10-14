@@ -1403,8 +1403,9 @@ def set_accent(color):
         pass
 
 def apply_accent_to_icon(color):
-    """Recolors assets/icon.png to match the accent. The original is kept once as assets/icon_default.png
-    and every recolor starts from it, so Reset restores the exact original. Returns True if icon.png changed."""
+    """Recolors assets/icon.png to match the accent: the icon's background becomes exactly the chosen colour and
+    the other shades move with it. The original is kept once as assets/icon_default.png and every recolor starts
+    from it, so Reset restores the exact original. Returns True if icon.png changed."""
     import colorsys
     try:
         icon, orig = asset_path("icon.png"), asset_path("icon_default.png")
@@ -1421,19 +1422,43 @@ def apply_accent_to_icon(color):
         if max(img.width(), img.height()) > 512:
             img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
-        base, target = QColor("#a666ff"), QColor(color)
-        shift = (max(target.hslHue(), 0) - base.hslHue()) / 360.0
-        bs = base.hslSaturation() / 255.0
-        ratio = (target.hslSaturation() / 255.0) / bs if bs else 1.0
+        target = QColor(color)
+        th, tl, ts = colorsys.rgb_to_hls(target.redF(), target.greenF(), target.blueF())
         ptr = img.bits()
         ptr.setsize(img.sizeInBytes())
-        data, cache = bytearray(ptr), {}
-        for i in range(0, len(data), 4):                      # bytes are B, G, R, A
+        data = bytearray(ptr)                                  # bytes are B, G, R, A
+        # the icon's background = its most common opaque colour (bucketed, then averaged)
+        buckets = {}
+        for i in range(0, len(data), 4):
+            if data[i + 3] < 200:
+                continue
+            k = (data[i] >> 3, data[i + 1] >> 3, data[i + 2] >> 3)
+            e = buckets.get(k)
+            if e is None:
+                buckets[k] = [1, data[i], data[i + 1], data[i + 2]]
+            else:
+                e[0] += 1; e[1] += data[i]; e[2] += data[i + 1]; e[3] += data[i + 2]
+        if buckets:
+            n, sb, sg, sr = max(buckets.values(), key=lambda e: e[0])
+            bh, bl, bs = colorsys.rgb_to_hls(sr / n / 255.0, sg / n / 255.0, sb / n / 255.0)
+        else:
+            stock = QColor("#a666ff")
+            bh, bl, bs = colorsys.rgb_to_hls(stock.redF(), stock.greenF(), stock.blueF())
+        shift = th - bh
+
+        def remap(v, b, t):            # piecewise linear: 0 -> 0, background value -> chosen value, 1 -> 1
+            if b <= 0.0 or b >= 1.0:
+                return v
+            return v * t / b if v <= b else t + (v - b) * (1.0 - t) / (1.0 - b)
+
+        cache = {}
+        for i in range(0, len(data), 4):
             key = (data[i], data[i + 1], data[i + 2])
             new = cache.get(key)
             if new is None:
                 h, l, sat = colorsys.rgb_to_hls(key[2] / 255.0, key[1] / 255.0, key[0] / 255.0)
-                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, l, min(1.0, sat * ratio))
+                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, min(1.0, max(0.0, remap(l, bl, tl))),
+                                              min(1.0, max(0.0, remap(sat, bs, ts))))
                 new = cache[key] = (round(b * 255), round(g * 255), round(r * 255))
             data[i], data[i + 1], data[i + 2] = new
         out = QImage(bytes(data), img.width(), img.height(), img.bytesPerLine(), QImage.Format.Format_ARGB32).copy()
