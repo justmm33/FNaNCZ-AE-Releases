@@ -16,9 +16,9 @@ import threading
 import time
 from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtCore import (Qt, QTimer, QVariantAnimation, QSequentialAnimationGroup, QEasingCurve,
-                          QRectF, QObject, pyqtSignal, pyqtSlot)
+                          QRectF, QPointF, QUrl, QObject, pyqtSignal, pyqtSlot)
 from PyQt6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPixmap, QPen, QPainterPath, QGuiApplication,
-                         QFontDatabase)
+                         QFontDatabase, QMovie, QDesktopServices)
 
 W, H = 400, 110
 SCALE = 2 / 3   # overall size; 1.0 = original, lower = smaller
@@ -37,6 +37,13 @@ AVATAR_COLOR = QColor("#b18cff")
 _accent_hex = ""   # set by set_accent(); sent along to the XWayland helper so its toasts match
 
 
+_DARK_DEFAULTS = dict(BG=QColor("#1c1c1c"), STRIPE=QColor(255, 255, 255, 9), TEXT=QColor("white"),
+                      ACCENT=QColor("#a97cff"), NAME=QColor("#9b6cff"), AVATAR=QColor("#b18cff"))
+TEXT_COLOR = QColor("white")   # the white "is playing" part
+_accent_base = None            # QColor chosen in the launcher (None = the built-in purple)
+_light = False                 # light mode: light gray toast with dark text
+
+
 def _readable(c):
     """Lifts a dark accent so text in that colour stays readable on the toast's dark background."""
     h, s, l, a = c.getHslF()
@@ -45,16 +52,47 @@ def _readable(c):
     return QColor.fromHslF(max(h, 0.0), s, 0.55, a)
 
 
+def _readable_light(c):
+    """Darkens a bright accent so text in that colour stays readable on the light toast."""
+    h, s, l, a = c.getHslF()
+    if l <= 0.42:
+        return QColor(c)
+    return QColor.fromHslF(max(h, 0.0), s, 0.42, a)
+
+
+def _apply_colors():
+    """Recomputes every toast colour from the accent + light/dark mode."""
+    global BG, STRIPE, TEXT_COLOR, ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR
+    d = _DARK_DEFAULTS
+    if _light:
+        BG, STRIPE, TEXT_COLOR = QColor("#e4e4e4"), QColor(0, 0, 0, 12), QColor("#1c1c1c")   # gray -> light gray
+    else:
+        BG, STRIPE, TEXT_COLOR = QColor(d["BG"]), QColor(d["STRIPE"]), QColor(d["TEXT"])
+    base = _accent_base
+    if base is None and not _light:
+        ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR = QColor(d["ACCENT"]), QColor(d["NAME"]), QColor(d["NAME"]), QColor(d["AVATAR"])
+        return
+    base = base or QColor(d["ACCENT"])
+    ACCENT = QColor(base)
+    NAME_COLOR = GAME_COLOR = _readable_light(base) if _light else _readable(base)
+    AVATAR_COLOR = QColor(base) if _light else _readable(base).lighter(115)
+
+
 def set_accent(color):
     """Recolours the toasts (bar, username, game name, fallback avatar) to the launcher's accent colour."""
-    global ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR, _accent_hex
+    global _accent_base, _accent_hex
     c = QColor(color)
     if not c.isValid():
         return
-    _accent_hex = c.name()
-    ACCENT = c
-    NAME_COLOR = GAME_COLOR = _readable(c)
-    AVATAR_COLOR = _readable(c).lighter(115)
+    _accent_base, _accent_hex = c, c.name()
+    _apply_colors()
+
+
+def set_light(flag):
+    """Light mode on/off: light gray toast with dark text instead of the dark one."""
+    global _light
+    _light = bool(flag)
+    _apply_colors()
 
 
 _font_family = {"name": None, "tried": False}
@@ -103,21 +141,182 @@ def _make_font(px, bold):
     return f
 
 
+# ---- Apple emoji drawn as pictures inside the toast text (the OS font would draw its own emoji otherwise)
+import re
+import urllib.request
+
+_EL = (r"(?:[\U0001F1E6-\U0001F1FF]{2}"                                   # flag
+       r"|[0-9#*]\uFE0F?\u20E3"                                           # keycap
+       r"|(?:[\U0001F300-\U0001FAFF\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615\u2648-\u2653"
+       r"\u267F\u2693\u26A1\u26AA\u26AB\u26BD\u26BE\u26C4\u26C5\u26CE\u26D4\u26EA\u26F2\u26F3\u26F5\u26FA\u26FD"
+       r"\u2705\u270A\u270B\u2728\u274C\u274E\u2753-\u2755\u2757\u2795-\u2797\u27B0\u27BF\u2B1B\u2B1C\u2B50\u2B55]"
+       r"|[\u00A9\u00AE\u203C\u2049\u2122\u2139\u2190-\u21FF\u2300-\u23FF\u24C2\u25A0-\u25FF\u2600-\u27BF"
+       r"\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299]\uFE0F)"
+       r"[\U0001F3FB-\U0001F3FF]?\uFE0F?[\U000E0020-\U000E007F]*)")
+_EMOJI_TEXT_RE = re.compile(_EL + r"(?:\u200D" + _EL + r")*")
+
+
+emoji_dir = ""            # folder of the emoji PNG cache (shared with the launcher); set by main.py / the helper's JSON
+_emoji_pm = {}
+_emoji_busy = set()
+_emoji_failed = {}
+_APPLE_EMOJI_URLS = (
+    "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/img-apple-64/{code}.png",
+    "https://raw.githubusercontent.com/iamcal/emoji-data/master/img-apple-64/{code}.png",
+    "https://cdn.jsdelivr.net/npm/emoji-datasource-apple@15.0.1/img/apple/64/{code}.png",
+)
+_TWEMOJI_URLS = (
+    "https://raw.githubusercontent.com/jdecked/twemoji/v15.1.0/assets/72x72/{code}.png",
+    "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{code}.png",
+)
+
+
+def set_emoji_dir(path):
+    global emoji_dir
+    if path:
+        emoji_dir = str(path)
+
+
+def _emoji_code(ch):
+    cps = [f"{ord(c):x}" for c in ch]
+    if "200d" not in cps:
+        cps = [c for c in cps if c != "fe0f"]
+    return "-".join(cps)
+
+
+def _emoji_fetch(code, path):
+    def work():
+        data = None
+        parts = code.split("-")
+        variants = [code, code + "-fe0f"] + ([parts[0] + "-fe0f-" + "-".join(parts[1:])] if len(parts) > 1 else [])
+        try:
+            for url in _APPLE_EMOJI_URLS:
+                for c in variants:
+                    try:
+                        with urllib.request.urlopen(urllib.request.Request(
+                                url.format(code=c), headers={"User-Agent": "Mozilla/5.0"}), timeout=10) as r:
+                            blob = r.read()
+                        if blob[:4] == b"\x89PNG":
+                            data = blob
+                            break
+                    except Exception:
+                        pass
+                if data:
+                    break
+            if not data:
+                for url in _TWEMOJI_URLS:
+                    try:
+                        with urllib.request.urlopen(urllib.request.Request(
+                                url.format(code=code), headers={"User-Agent": "Mozilla/5.0"}), timeout=10) as r:
+                            blob = r.read()
+                        if blob[:4] == b"\x89PNG":
+                            data = blob
+                            break
+                    except Exception:
+                        pass
+            if data:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".part", "wb") as f:
+                    f.write(data)
+                os.replace(path + ".part", path)
+            else:
+                _emoji_failed[code] = time.time()
+        except Exception:
+            _emoji_failed[code] = time.time()
+        finally:
+            _emoji_busy.discard(code)
+    _emoji_busy.add(code)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _emoji_png(ch):
+    code = _emoji_code(ch)
+    pm = _emoji_pm.get(code)
+    if pm is not None:
+        return pm
+    if not emoji_dir:
+        return None
+    path = os.path.join(emoji_dir, code + ".png")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        pm = QPixmap(path)
+        if not pm.isNull():
+            _emoji_pm[code] = pm
+            return pm
+    elif code not in _emoji_busy and time.time() - _emoji_failed.get(code, 0) > 60:
+        _emoji_fetch(code, path)
+    return None
+
+
+def _emoji_w(font):
+    return int((font.pixelSize() if font.pixelSize() > 0 else 16) * 1.05)
+
+
+def _segments(text):
+    out, pos = [], 0
+    for mt in _EMOJI_TEXT_RE.finditer(text):
+        if mt.start() > pos:
+            out.append((text[pos:mt.start()], False))
+        out.append((mt.group(0), True))
+        pos = mt.end()
+    if pos < len(text):
+        out.append((text[pos:], False))
+    return out
+
+
+def _text_w(font, text):
+    fm = QFontMetrics(font)
+    if not _EMOJI_TEXT_RE.search(text):
+        return fm.horizontalAdvance(text)
+    ew = _emoji_w(font)
+    return sum(ew if em else fm.horizontalAdvance(seg) for seg, em in _segments(text))
+
+
+def _draw_text(p, rect, text, flags=Qt.AlignmentFlag.AlignVCenter):
+    """Left-aligned, vertically centred text where every emoji is its Apple picture."""
+    if not _EMOJI_TEXT_RE.search(text):
+        p.drawText(rect, flags, text)
+        return
+    font = p.font()
+    fm = QFontMetrics(font)
+    ew = _emoji_w(font)
+    x = rect.x()
+    for seg, em in _segments(text):
+        if em:
+            r = QRectF(x, rect.y() + (rect.height() - ew) / 2, ew, ew)
+            pm = _emoji_png(seg)
+            if pm is not None:
+                p.drawPixmap(r, pm, QRectF(pm.rect()))
+            else:
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, seg)
+            x += ew
+        else:
+            w = fm.horizontalAdvance(seg)
+            p.drawText(QRectF(x, rect.y(), w + 2, rect.height()), flags, seg)
+            x += w
+
+
 def _fit_font(text, px, max_w, bold=True):
     """Largest font (up to px) that fits max_w."""
     while px > 9:
         f = _make_font(px, bold)
-        if QFontMetrics(f).horizontalAdvance(text) <= max_w:
+        if _text_w(f, text) <= max_w:
             return f
         px -= 1
     return _make_font(9, bold)
 
 
 class PlayingToast(QWidget):
-    def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing "):
+    def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None):
         super().__init__()
         self.user, self.game, self.prefix = user, game, prefix
         self.avatar = QPixmap(avatar_path) if avatar_path else None
+        self.movie, self.image, self.ibox = None, None, None   # picture under the text (png / jpg / gif ...)
+        if image_path:
+            self._load_image(image_path)
+        self.h = H + (self.ibox[1] + 8 if self.ibox else 0)    # total height, unscaled
+        self.th = int(self.h * SCALE)
+        if self.ibox:
+            duration_ms = max(duration_ms, 6000)
         flags = (Qt.WindowType.FramelessWindowHint
                  | Qt.WindowType.WindowStaysOnTopHint
                  | Qt.WindowType.Tool
@@ -128,9 +327,9 @@ class PlayingToast(QWidget):
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedSize(SW + MARGIN, SH)
+        self.setFixedSize(SW + MARGIN, self.th)
         self.duration_ms = duration_ms
-        self.slot, self.on_close = 0, None   # slot 0 = bottom; higher slots stack upwards
+        self.offset, self.on_close = 0, None   # offset = height of the toasts below this one (stack goes upwards)
         self._off = float(SW + MARGIN)   # how far the toast is pushed right (hidden = SW + MARGIN)
         self._finished = False
         self._raise_timer = None
@@ -139,10 +338,36 @@ class PlayingToast(QWidget):
         self._off = float(v)
         self.update()
 
-    def set_slot(self, i):
-        self.slot = i
+    def _load_image(self, path):
+        """Loads a picture (animated for .gif) and works out how big it is drawn under the text."""
+        pm = None
+        if str(path).lower().endswith(".gif"):
+            mv = QMovie(str(path))
+            if mv.isValid():
+                mv.jumpToFrame(0)
+                pm = mv.currentPixmap()
+                if not pm.isNull():
+                    self.movie = mv
+        if self.movie is None:
+            pm = QPixmap(str(path))
+        if pm is None or pm.isNull():
+            self.movie = None
+            return
+        aw, ah = W - BAR_W - 19, 200
+        k = min(aw / pm.width(), ah / pm.height(), 1.0)
+        bw, bh = max(1, int(pm.width() * k)), max(1, int(pm.height() * k))
+        self.ibox = (bw, bh)
+        if self.movie is None:
+            self.image = pm.scaled(bw * 2, bh * 2, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+
+    def set_offset(self, off):
+        self.offset = off
         scr = QApplication.primaryScreen().availableGeometry()
-        self.move(scr.right() + 1 - (SW + MARGIN), scr.bottom() - SH - MARGIN - i * (SH + GAP))
+        self.move(scr.right() + 1 - (SW + MARGIN), scr.bottom() - self.th - MARGIN - off)
+
+    def set_slot(self, i):                    # kept for compatibility
+        self.set_offset(i * (SH + GAP))
 
     def _done(self):
         if self._finished:                       # may be reached twice (animation end + being dropped from the stack)
@@ -150,6 +375,9 @@ class PlayingToast(QWidget):
         self._finished = True
         if self._raise_timer is not None:
             self._raise_timer.stop()
+        self._stop_emoji_timer()
+        if self.movie is not None:
+            self.movie.stop()
         anim = getattr(self, "_anim", None)
         if anim is not None:
             anim.stop()
@@ -159,16 +387,45 @@ class PlayingToast(QWidget):
             cb()
         self.deleteLater()
 
+    def _stop_emoji_timer(self):
+        try:
+            t = getattr(self, "_emoji_timer", None)
+            if t is not None:
+                t.stop()
+        except RuntimeError:
+            pass
+
     def dismiss(self):
         """Closes the toast right now (used when the stack is full)."""
         self._done()
 
+    def slide_out(self):
+        """Stops the countdown and slides the toast back out the way it came in, then closes it."""
+        if self._finished or getattr(self, "_leaving", False):
+            return
+        self._leaving = True
+        anim = getattr(self, "_anim", None)
+        if anim is not None:
+            anim.stop()
+        out = QVariantAnimation(self)
+        out.setDuration(SLIDE_MS)
+        out.setStartValue(float(self._off))
+        out.setEndValue(float(SW + MARGIN))
+        out.setEasingCurve(QEasingCurve.Type.InCubic)
+        out.valueChanged.connect(self._set_off)
+        out.finished.connect(self._done)
+        out.start()
+        self._anim = out  # keep alive
+
     def popup(self):
         """Slides in from the right screen edge, waits, then slides back out. The window itself stays
         put (it never moves off the monitor); only the drawing inside it slides."""
-        self.set_slot(self.slot)
+        self.set_offset(self.offset)
         hidden = float(SW + MARGIN)
         self.show()
+        if self.movie is not None:
+            self.movie.frameChanged.connect(lambda _f: self.update())
+            self.movie.start()
         if QGuiApplication.platformName() == "xcb":
             # keep the toast above fullscreen / always-on-top windows (X11 and XWayland)
             self._raise_timer = QTimer(self)
@@ -186,6 +443,11 @@ class PlayingToast(QWidget):
         a_out.setEndValue(hidden)
         a_out.setEasingCurve(QEasingCurve.Type.InCubic)
         a_out.valueChanged.connect(self._set_off)
+        if _EMOJI_TEXT_RE.search(str(self.user) + str(self.prefix) + str(self.game)):
+            self._emoji_timer = QTimer(self)             # repaint while the emoji pictures download
+            self._emoji_timer.timeout.connect(self.update)
+            self._emoji_timer.start(300)
+            QTimer.singleShot(6000, self._stop_emoji_timer)
         grp = QSequentialAnimationGroup(self)
         grp.addAnimation(a_in)
         grp.addPause(self.duration_ms)
@@ -197,18 +459,20 @@ class PlayingToast(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        h = self.h
         p.translate(self._off, 0)
         p.scale(SCALE, SCALE)
-        p.setClipRect(QRectF(0, 0, W, H))
-        p.fillRect(0, 0, W, H, BG)
+        p.setClipRect(QRectF(0, 0, W, h))
+        p.fillRect(0, 0, W, h, BG)
 
         # diagonal stripes
         p.setPen(QPen(STRIPE, 16))
-        for x in range(-H, W + H, 64):
-            p.drawLine(x, H, x + H, 0)
+        for x in range(-h, W + h, 64):
+            p.drawLine(x, h, x + h, 0)
 
         # accent bar
-        p.fillRect(0, 0, BAR_W, H, ACCENT)
+        p.fillRect(0, 0, BAR_W, h, ACCENT)
 
         # avatar (circle) = profile picture
         d = 78
@@ -230,28 +494,221 @@ class PlayingToast(QWidget):
         max_w = W - tx - 12
         p.setPen(NAME_COLOR)
         p.setFont(_fit_font(self.user, 25, max_w))
-        p.drawText(QRectF(tx, 18, max_w, 36), Qt.AlignmentFlag.AlignVCenter, self.user)
+        _draw_text(p, QRectF(tx, 18, max_w, 36), self.user)
 
         prefix = self.prefix
         f2 = _fit_font(prefix + self.game, 20, max_w)
         p.setFont(f2)
-        px = QFontMetrics(f2).horizontalAdvance(prefix)
-        p.setPen(QColor("white"))
-        p.drawText(QRectF(tx, 54, px, 30), Qt.AlignmentFlag.AlignVCenter, prefix)
+        px = _text_w(f2, prefix)
+        p.setPen(TEXT_COLOR)
+        _draw_text(p, QRectF(tx, 54, px, 30), prefix)
         p.setPen(GAME_COLOR)
-        p.drawText(QRectF(tx + px, 54, max_w - px, 30), Qt.AlignmentFlag.AlignVCenter, self.game)
+        _draw_text(p, QRectF(tx + px, 54, max_w - px, 30), self.game)
+
+        # picture sent by the friend (png / jpg / gif ...), under the text
+        if self.ibox:
+            bw, bh = self.ibox
+            rr = QRectF(BAR_W + 7 + ((W - BAR_W - 19) - bw) / 2, H - 4, bw, bh)
+            clip = QPainterPath()
+            clip.addRoundedRect(rr, 8, 8)
+            p.save()
+            p.setClipPath(clip)
+            src = self.movie.currentPixmap() if self.movie is not None else self.image
+            if src is not None and not src.isNull():
+                p.drawPixmap(rr, src, QRectF(src.rect()))
+            p.restore()
 
 
-def _linux_notify(user, game, prefix):
+INV_H = 150                      # invite toast height (unscaled): cover on the left, text + two buttons on the right
+INV_COVER = (BAR_W + 10, 15, 80, 120)
+
+
+# main.py sets this to a callable(link) that starts the game first (when it isn't open) and then accepts the invite.
+# Without it (e.g. inside the XWayland helper process) the join link is just opened.
+invite_accept_hook = None
+
+
+def _accept_invite(link):
+    hook = invite_accept_hook
+    if hook is not None:
+        try:
+            hook(link)
+            return
+        except Exception:
+            pass
+    QDesktopServices.openUrl(QUrl(link))
+
+
+class InviteToast(PlayingToast):
+    """'<friend> invited you to play <game>' with the game's cover and clickable Accept / Dismiss buttons.
+    Accept opens the Steam join link, exactly like accepting an invite in Steam. Unlike the other toasts this one takes
+    mouse clicks (it still never takes keyboard focus away from the game)."""
+
+    def __init__(self, user, game, link, avatar_path=None, cover_path=None, duration_ms=20000):
+        super().__init__(user, game, avatar_path, duration_ms=duration_ms, prefix="invited you to play ")
+        self.link = link if str(link).startswith("steam://") else ""
+        self.cover = QPixmap(cover_path) if cover_path else None
+        self.h = INV_H
+        self.th = int(self.h * SCALE)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowTransparentForInput)
+        self.setFixedSize(SW + MARGIN, self.th)
+        self.setMouseTracking(True)
+        tx = INV_COVER[0] + INV_COVER[2] + 12
+        self._accept_r = QRectF(tx, 96, 130, 38)
+        self._dismiss_r = QRectF(tx + 138, 96, 119, 38)
+        self._hover = None
+
+    # ---- clicks (the toast is drawn scaled and slid sideways, so map the mouse back to toast coordinates)
+    def _which(self, e):
+        pt = QPointF((e.position().x() - self._off) / SCALE, e.position().y() / SCALE)
+        if self._accept_r.contains(pt):
+            return "accept"
+        if self._dismiss_r.contains(pt):
+            return "dismiss"
+        return None
+
+    def mouseMoveEvent(self, e):
+        w = self._which(e)
+        if w != self._hover:
+            self._hover = w
+            self.setCursor(Qt.CursorShape.PointingHandCursor if w else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, e):
+        self._hover = None
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if getattr(self, "_leaving", False):
+            return
+        w = self._which(e)
+        if w == "accept" and self.link:
+            _accept_invite(self.link)
+            self.slide_out()
+        elif w == "dismiss":
+            self.slide_out()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        h = self.h
+        p.translate(self._off, 0)
+        p.scale(SCALE, SCALE)
+        p.setClipRect(QRectF(0, 0, W, h))
+        p.fillRect(0, 0, W, h, BG)
+        p.setPen(QPen(STRIPE, 16))
+        for x in range(-h, W + h, 64):
+            p.drawLine(x, h, x + h, 0)
+        p.fillRect(0, 0, BAR_W, h, ACCENT)
+
+        # cover
+        cx, cy, cw, ch = INV_COVER
+        r = QRectF(cx, cy, cw, ch)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 8, 8)
+        p.save()
+        p.setClipPath(clip)
+        if self.cover is not None and not self.cover.isNull():
+            pm = self.cover.scaled(cw * 2, ch * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(r, pm, QRectF((pm.width() - cw * 2) / 2, (pm.height() - ch * 2) / 2, cw * 2, ch * 2))
+        else:
+            p.fillRect(r, AVATAR_COLOR)
+            p.setPen(QColor("white"))
+            p.setFont(_make_font(40, True))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.game[:1] or "?").upper())
+        p.restore()
+
+        # sender: small avatar + name, then "invited you to play", then the game
+        tx = cx + cw + 12
+        max_w = W - tx - 12
+        d = 26
+        ar = QRectF(tx, 12, d, d)
+        apath = QPainterPath()
+        apath.addEllipse(ar)
+        if self.avatar and not self.avatar.isNull():
+            p.save()
+            p.setClipPath(apath)
+            p.drawPixmap(ar.topLeft(), self.avatar.scaled(d * 2, d * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                                          Qt.TransformationMode.SmoothTransformation).scaled(
+                d, d, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            p.restore()
+        else:
+            p.fillPath(apath, AVATAR_COLOR)
+        nx = tx + d + 8
+        p.setPen(NAME_COLOR)
+        p.setFont(_fit_font(self.user, 20, W - nx - 12))
+        _draw_text(p, QRectF(nx, 10, W - nx - 12, 30), self.user)
+        p.setPen(TEXT_COLOR)
+        p.setFont(_make_font(15, False))
+        p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, "invited you to play")
+        p.setPen(GAME_COLOR)
+        p.setFont(_fit_font(self.game, 21, max_w))
+        _draw_text(p, QRectF(tx, 64, max_w, 28), self.game)
+
+        # buttons
+        for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
+                                         (self._dismiss_r, "Dismiss", False, "dismiss")):
+            hot = self._hover == key
+            bp = QPainterPath()
+            bp.addRoundedRect(rect, 8, 8)
+            if primary:
+                col = QColor(ACCENT).lighter(115) if hot else QColor(ACCENT)
+                p.fillPath(bp, col)
+                txt = QColor("white") if col.lightnessF() < 0.6 else QColor("#111111")
+            else:
+                p.fillPath(bp, QColor(128, 128, 128, 80 if hot else 40))
+                txt = TEXT_COLOR
+            p.setPen(txt)
+            p.setFont(_make_font(16, True))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+
+def _linux_notify(user, game, prefix, icon=None, link=None):
     """Plain desktop notification (libnotify) - the fallback when no positioned toast window is possible,
     e.g. on a Wayland session where the XWayland helper can't start."""
     exe = shutil.which("notify-send")
     if not exe:
         return False
     body = html.escape((str(prefix) + str(game)).strip())
+    cmd = [exe, "-a", "NCZ Games Launcher", "-t", "5000", "-i", icon or "applications-games", str(user), body]
+    if link and str(link).startswith("steam://"):
+        try:
+            helptext = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=3)
+            has_actions = "--action" in (helptext.stdout + helptext.stderr)
+        except Exception:
+            has_actions = False
+        if has_actions:                       # notify-send prints the clicked action's name when it is closed
+            cmd = [exe, "-a", "NCZ Games Launcher", "-t", "20000", "-i", icon or "applications-games",
+                   "-A", "join=Accept", str(user), body]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                return False
+
+            def wait():
+                try:
+                    out = proc.communicate(timeout=60)[0] or ""
+                except Exception:
+                    return
+                if out.strip() == "join":
+                    if invite_accept_hook is not None:
+                        try:
+                            QTimer.singleShot(0, lambda l=str(link): invite_accept_hook(l))   # back on the GUI thread
+                            return
+                        except Exception:
+                            pass
+                    try:
+                        subprocess.Popen(["xdg-open", str(link)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except OSError:
+                        pass
+            threading.Thread(target=wait, daemon=True).start()
+            return True
     try:
-        subprocess.Popen([exe, "-a", "NCZ Games Launcher", "-t", "5000", "-i", "applications-games",
-                          str(user), body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except OSError:
         return False
@@ -299,10 +756,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix in pending:
-            self._show_local(user, game, avatar, prefix)
+        for user, game, avatar, prefix, image, link in pending:
+            self._show_local(user, game, avatar, prefix, image, link)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -315,36 +772,55 @@ class OverlayManager:
                 self._spawn_helper()
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
-                                         "prefix": prefix, "accent": _accent_hex}) + "\n")
+                                         "prefix": prefix, "image": image or "", "link": link or "",
+                                         "accent": _accent_hex, "light": _light,
+                                         "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix))
+                self._pending.append((user, game, avatar_path, prefix, image, link))
             return True
         except (OSError, ValueError):
             self._proc = None
             self._helper_failed = True
             return False
 
-    def notify_playing(self, user, game, avatar_path=None, prefix="is playing "):
-        """Shows '<user> <prefix><game>' (game part is highlighted purple)."""
+    def notify_playing(self, user, game, avatar_path=None, prefix="is playing ", image=None):
+        """Shows '<user> <prefix><game>' (game part is highlighted purple). image: path of a picture (png / jpg /
+        gif ...) to show under the text."""
         if self.mode == "off":
             return
-        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix):
+        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image):
             return
-        self._show_local(user, game, avatar_path, prefix)
+        self._show_local(user, game, avatar_path, prefix, image)
 
-    def _show_local(self, user, game, avatar_path, prefix):
+    def notify_invite(self, user, game, link, avatar_path=None, image=None):
+        """'<user> invited you to play <game>' with an Accept button that opens the Steam join link.
+        image: path of the game's cover."""
+        if self.mode == "off":
+            return
+        prefix = "invited you to play "
+        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, link):
+            return
+        self._show_local(user, game, avatar_path, prefix, image, link)
+
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
-            if _linux_notify(user, game, prefix):
+            if _linux_notify(user, game, prefix, image, link):
                 return
         # "inject" backend is a later phase; use the window backend for now.
         live = [x for x in self._toasts if x.isVisible()]
         while len(live) >= MAX_STACK:          # keep the stack on screen: drop the oldest
             live.pop(0).dismiss()
-        t = PlayingToast(user, game, avatar_path, prefix=prefix)
-        t.slot = len(live)                     # new toasts stack on top of the ones still showing
+        if link:
+            t = InviteToast(user, game, link, avatar_path, image)
+        else:
+            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image)
+        avail = QApplication.primaryScreen().availableGeometry().height() - 2 * MARGIN
+        while live and sum(x.th + GAP for x in live) + t.th > avail:    # tall picture toasts: keep the stack on screen
+            live.pop(0).dismiss()
+        t.offset = sum(x.th + GAP for x in live)    # new toasts stack on top of the ones still showing
         t.on_close = lambda t=t: self._closed(t)
         self._toasts = live + [t]
         t.popup()
@@ -354,8 +830,10 @@ class OverlayManager:
         self._relayout()
 
     def _relayout(self):
-        for i, x in enumerate(self._toasts):
-            x.set_slot(i)
+        off = 0
+        for x in self._toasts:
+            x.set_offset(off)
+            off += x.th + GAP
 
 
 overlay = OverlayManager()
@@ -644,10 +1122,18 @@ class _ServerBridge(QObject):
 
     @pyqtSlot(dict)
     def on_got(self, d):
+        if d.get("emoji_dir"):
+            set_emoji_dir(d["emoji_dir"])
         if d.get("accent"):
             set_accent(str(d["accent"]))
+        if "light" in d:
+            set_light(bool(d["light"]))
+        if d.get("link"):
+            overlay.notify_invite(str(d.get("user", "")), str(d.get("game", "")), str(d["link"]),
+                                  d.get("avatar") or None, d.get("image") or None)
+            return
         overlay.notify_playing(str(d.get("user", "")), str(d.get("game", "")), d.get("avatar") or None,
-                               str(d.get("prefix", "is playing ")))
+                               str(d.get("prefix", "is playing ")), d.get("image") or None)
 
 
 def run_server():
