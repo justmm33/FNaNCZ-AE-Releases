@@ -18649,6 +18649,53 @@ def _caption_icon(restore):
         icon.addPixmap(pm, mode)
     return icon
 
+def _restart_icon():
+    """Circular 'restart' arrow, drawn so it doesn't depend on a font."""
+    icon = QIcon()
+    for mode, color in ((QIcon.Mode.Normal, _theme_state["nav_text"]), (QIcon.Mode.Active, _theme_state["nav_active"])):
+        pm = QPixmap(24, 24)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 1.3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(QRectF(1.8, 1.8, 8.4, 8.4), 30 * 16, 300 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color))
+        p.drawPolygon([QPointF(10.64, 6.37), QPointF(11.07, 9.62), QPointF(7.61, 7.62)])
+        p.end()
+        icon.addPixmap(pm, mode)
+    return icon
+
+def restart_launcher(window):
+    """Starts a fresh copy of the launcher and closes this one. The new copy takes over through the normal
+    'a newer launcher replaces the running one' path, so it waits for this process to let go of the instance lock."""
+    frozen = getattr(sys, "frozen", False)
+    args = [a for a in sys.argv[1:] if a not in ("--startup", "--friends")]   # --startup would make it bail out
+    cmd = [sys.executable] + args if frozen else [sys.executable, os.path.abspath(__file__)] + args
+    env = dict(os.environ)
+    if frozen:
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # a onefile build must unpack itself again
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = 0x00000008 | 0x00000200       # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True, **kwargs)
+    except Exception as e:
+        QMessageBox.warning(window, "Restart", f"Couldn't restart the launcher:\n{e}")
+        return
+    window._really_quit = True          # skip "close to tray"
+    tray = getattr(window, "_tray", None)
+    if tray is not None:
+        tray.hide()
+    QApplication.instance().quit()
+    QTimer.singleShot(3000, lambda: os._exit(0))    # don't hang on a stuck background thread
+
 class _WindowStateWatcher(QObject):
     def __init__(self, window, callback):
         super().__init__(window)
@@ -18728,7 +18775,23 @@ def _frameless_init(self):
     refresh_max_btn()
     _theme_listeners.append(refresh_max_btn)   # redraw the glyph when the theme changes
 
+    restart_btn = QPushButton()
+    restart_btn.setObjectName("RestartButton")
+    restart_btn.setToolTip("Restart launcher")
+    restart_btn.setFixedSize(40, 32)
+    restart_btn.setIconSize(QSize(12, 12))
+    restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    restart_btn.setStyleSheet(
+        "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
+        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
+    restart_btn.clicked.connect(lambda: restart_launcher(self))
+    restart_btn.setIcon(_restart_icon())
+    _theme_listeners.append(lambda: restart_btn.setIcon(_restart_icon()))   # redraw when the theme changes
+
     bar.layout().addSpacing(8)
+    bar.layout().addWidget(restart_btn)
+    bar.layout().addSpacing(6)
     bar.layout().addWidget(min_btn)
     bar.layout().addWidget(max_btn)
     bar.layout().addWidget(exit_btn)
