@@ -11049,8 +11049,7 @@ class SteamInviteDialog(QDialog):
         form.addRow("Game", self.name_edit)
         form.addRow("Join link", self.link_edit)
         lay.addLayout(form)
-        hint = QLabel("Paste the game's join link (a steam://joinlobby/ or steam://connect/ link) or a server ip:port. "
-                      "Your friend's Join button then opens Steam and joins, the same as accepting an invite in Steam.")
+        hint = QLabel("Paste the game's steam join link.)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888888; font-size:11px;")
         lay.addWidget(hint)
