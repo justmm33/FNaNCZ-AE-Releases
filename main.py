@@ -12785,6 +12785,9 @@ class WorkshopPage(QWidget):
         self.card_list = []
         self.game_cards = []
         self.dl_rows = []
+        self._shown_items = {}
+        self.list_mode = False
+        self.selected = {}     # item id -> item dict (the list being built for export)
         self._cols = (0, 0)
         self.setObjectName("Content")
 
@@ -12801,8 +12804,15 @@ class WorkshopPage(QWidget):
         self.back_btn.setFlat(True)
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.clicked.connect(self.show_picker)
+        self.import_btn = QPushButton("Import List")
+        self.import_btn.setToolTip("Import a .nczlist file: its mods are added to the queue and downloaded")
+        self.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_btn.setFixedHeight(30)
+        self.import_btn.clicked.connect(self.import_list)
         head.addWidget(title)
         head.addWidget(self.game_label, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addSpacing(16)
+        head.addWidget(self.import_btn)
         head.addStretch()
         head.addWidget(self.back_btn)
         outer.addLayout(head)
@@ -12881,10 +12891,36 @@ class WorkshopPage(QWidget):
         go.setObjectName("Primary")
         go.setFixedHeight(36)
         go.clicked.connect(self.search)
+        self.list_btn = QPushButton("List mode")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setFixedHeight(36)
+        self.list_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.list_btn.setToolTip("Select mods to export as a .nczlist file")
+        self.list_btn.toggled.connect(self.set_list_mode)
         bar.addWidget(self.search_edit, 1)
         bar.addWidget(self.sort_combo)
         bar.addWidget(go)
+        bar.addWidget(self.list_btn)
         bl.addLayout(bar)
+        self.list_bar = QWidget()
+        lb = QHBoxLayout(self.list_bar)
+        lb.setContentsMargins(0, 0, 0, 0)
+        lb.setSpacing(8)
+        self.list_info = QLabel()
+        self.list_info.setObjectName("RowDesc")
+        sel_all = QPushButton("Select all shown")
+        sel_all.clicked.connect(self.select_all_shown)
+        sel_none = QPushButton("Clear selection")
+        sel_none.clicked.connect(self.clear_selection)
+        self.export_btn = QPushButton("Export list")
+        self.export_btn.setObjectName("Primary")
+        self.export_btn.clicked.connect(self.export_list)
+        lb.addWidget(self.list_info, 1)
+        lb.addWidget(sel_all)
+        lb.addWidget(sel_none)
+        lb.addWidget(self.export_btn)
+        self.list_bar.hide()
+        bl.addWidget(self.list_bar)
         sc2 = self._scroll()
         self.browse_container = QWidget()
         self.browse_container.setObjectName("GridContainer")
@@ -12970,6 +13006,7 @@ class WorkshopPage(QWidget):
         self.stack.addWidget(gv)
         self.back_btn.hide()
         self._apply_css()
+        self._refresh_list_bar()
         self._rebuild_games()
         QApplication.instance().aboutToQuit.connect(self._shutdown)
 
@@ -12991,6 +13028,7 @@ QPushButton#WsTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
 QPushButton#WsTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
 QFrame#WsCard {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 12px; }}
 QFrame#WsCard:hover {{ border: 1px solid {t['accent']}; }}
+QFrame#WsCard[sel="true"] {{ background: {t['hover']}; border: 1px solid {t['accent']}; }}
 QFrame#WsRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
 QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t['subtext']}; }}
 """)
@@ -13120,6 +13158,8 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self._rebuild_games()
 
     def open_game(self, g):
+        if self.appid != g["appid"]:
+            self.selected.clear()
         self.appid, self.game_title = g["appid"], g["title"]
         self.game_label.setText(self.game_title)
         self.back_btn.show()
@@ -13142,6 +13182,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             frame.setParent(None)
             frame.deleteLater()
         self.cards, self.card_list, self.seen_ids = {}, [], set()
+        self._shown_items = {}
         self._fetch(1)
 
     def _fetch(self, page):
@@ -13166,6 +13207,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         new = [it for it in items if it["id"] not in self.seen_ids]
         for it in new:
             self.seen_ids.add(it["id"])
+            self._shown_items[it["id"]] = it
             card = self._make_item_card(it)
             self.card_list.append(card)
         self._layout_grid(self.browse_grid, self.card_list, self._calc_cols(self.CARD_W))
@@ -13177,9 +13219,11 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self.more_btn.setVisible(len(items) >= 9 and bool(new))
 
     def _make_item_card(self, it):
-        card = QFrame()
+        card = _WsClickFrame()
         card.setObjectName("WsCard")
+        card.setProperty("sel", False)
         card.setFixedWidth(self.CARD_W)
+        card.clicked.connect(lambda it=it: self._card_clicked(it))
         v = QVBoxLayout(card)
         v.setContentsMargins(8, 8, 8, 10)
         v.setSpacing(6)
@@ -13201,7 +13245,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         btn = QPushButton("Download")
         btn.setObjectName("Primary")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(lambda _c=False, it=it: self.enqueue(it))
+        btn.clicked.connect(lambda _c=False, it=it: self._card_clicked(it, from_button=True))
         view = QPushButton("View")
         view.setFlat(True)
         view.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -13220,8 +13264,16 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         done = {d["id"] for d in self._downloads_for_game()}
         active = {q["id"]: q["status"] for q in self.queue
                   if q["appid"] == self.appid and q["status"] in ("queued", "downloading")}
-        for item_id, (_f, btn) in self.cards.items():
-            if item_id in active:
+        for item_id, (frame, btn) in self.cards.items():
+            picked = self.list_mode and item_id in self.selected
+            if bool(frame.property("sel")) != picked:
+                frame.setProperty("sel", picked)
+                frame.style().unpolish(frame)
+                frame.style().polish(frame)
+            if self.list_mode:
+                btn.setText("Remove from list" if picked else "Add to list")
+                btn.setEnabled(True)
+            elif item_id in active:
                 btn.setText("Downloading..." if active[item_id] == "downloading" else "Queued")
                 btn.setEnabled(False)
             elif item_id in done:
@@ -13231,6 +13283,126 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 btn.setText("Download")
                 btn.setEnabled(True)
 
+    # ------------------------------------------------------------ lists (.nczlist import / export)
+    def _card_clicked(self, it, from_button=False):
+        if self.list_mode:
+            if it["id"] in self.selected:
+                del self.selected[it["id"]]
+            else:
+                self.selected[it["id"]] = {"id": it["id"], "title": it["title"],
+                                           "preview": it.get("preview", ""), "author": it.get("author", "")}
+            self._refresh_card_states()
+            self._refresh_list_bar()
+        elif from_button:
+            self.enqueue(it)
+
+    def set_list_mode(self, on):
+        self.list_mode = bool(on)
+        self.list_bar.setVisible(self.list_mode)
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def _refresh_list_bar(self):
+        n = len(self.selected)
+        self.list_info.setText(f"List mode: pick the mods you want, then press Export list ({n} selected)"
+                               if n else "List mode: pick the mods you want, then press Export list")
+        self.export_btn.setText(f"Export list ({n})" if n else "Export list")
+        self.export_btn.setEnabled(n > 0)
+
+    def select_all_shown(self):
+        for item_id in self.cards:
+            if item_id in self.selected:
+                continue
+            it = self._shown_items.get(item_id)
+            if it:
+                self.selected[item_id] = {"id": it["id"], "title": it["title"],
+                                          "preview": it.get("preview", ""), "author": it.get("author", "")}
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def clear_selection(self):
+        self.selected.clear()
+        self._refresh_card_states()
+        self._refresh_list_bar()
+
+    def export_list(self):
+        if not self.selected or self.appid is None:
+            return
+        safe = re.sub(r"[^\w\- ]+", "", self.game_title).strip().replace(" ", "_") or "workshop"
+        start_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        path, _f = QFileDialog.getSaveFileName(self, "Export Workshop list",
+                                               os.path.join(start_dir, f"{safe}.nczlist"),
+                                               "NCZ Workshop list (*.nczlist)")
+        if not path:
+            return
+        if not path.lower().endswith(".nczlist"):
+            path += ".nczlist"
+        data = {"format": "nczlist", "version": 1, "appid": self.appid, "game": self.game_title,
+                "created": int(time.time()), "items": list(self.selected.values())}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            QMessageBox.warning(self, "Export list", f"Couldn't save the list:\n{e}")
+            return
+        QMessageBox.information(self, "Export list",
+                                f"Saved {len(self.selected)} mod(s) to:\n{path}")
+
+    def import_list(self):
+        start_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        path, _f = QFileDialog.getOpenFileName(self, "Import Workshop list", start_dir,
+                                               "NCZ Workshop list (*.nczlist);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            appid = int(data["appid"])
+            raw = data["items"]
+            if not isinstance(raw, list):
+                raise ValueError("items is not a list")
+        except Exception:
+            QMessageBox.warning(self, "Import list", "That doesn't look like a valid .nczlist file.")
+            return
+        game = str(data.get("game") or "").strip()
+        if not game:
+            game = next((g["title"] for g in _ws_installed_games() if g["appid"] == appid), f"App {appid}")
+        items, seen = [], set()
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            item_id = str(r.get("id", "")).strip()
+            if not item_id.isdigit() or item_id in seen:
+                continue
+            seen.add(item_id)
+            items.append({"id": item_id, "title": str(r.get("title") or f"Workshop item {item_id}"),
+                          "preview": str(r.get("preview") or ""), "author": str(r.get("author") or "")})
+        if not items:
+            QMessageBox.information(self, "Import list", "The list is empty.")
+            return
+        have = {d["id"] for d in ws_load_downloads()
+                if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))}
+        # jump to that game's Queue tab so the downloads are visible
+        self.open_game({"appid": appid, "title": game})
+        self.tab_btns[1].setChecked(True)
+        self.inner.setCurrentIndex(1)
+        added = skipped = 0
+        for it in items:
+            if it["id"] in have:
+                skipped += 1
+            elif self.enqueue(it, appid, game):
+                added += 1
+            else:
+                skipped += 1
+        msg = f"Added {added} mod(s) to the queue for {game}."
+        if skipped:
+            msg += f"\nSkipped {skipped} that are already downloaded or queued."
+        QMessageBox.information(self, "Import list", msg)
+
     # ------------------------------------------------------------ queue
     def _refresh_tab_titles(self):
         active = sum(1 for q in self.queue if q["status"] in ("queued", "downloading"))
@@ -13238,17 +13410,20 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         n = len(self._downloads_for_game())
         self.tab_btns[2].setText(f"Downloaded ({n})" if n else "Downloaded")
 
-    def enqueue(self, it):
-        if any(q["id"] == it["id"] and q["appid"] == self.appid and q["status"] in ("queued", "downloading")
+    def enqueue(self, it, appid=None, game=None):
+        appid = self.appid if appid is None else appid
+        game = self.game_title if game is None else game
+        if any(q["id"] == it["id"] and q["appid"] == appid and q["status"] in ("queued", "downloading")
                for q in self.queue):
-            return
-        self.queue.append({"appid": self.appid, "game": self.game_title, "id": it["id"], "title": it["title"],
-                           "preview": it["preview"], "author": it.get("author", ""),
+            return False
+        self.queue.append({"appid": appid, "game": game, "id": it["id"], "title": it["title"],
+                           "preview": it.get("preview", ""), "author": it.get("author", ""),
                            "status": "queued", "msg": "", "line": "", "pct": None, "w": None})
         self._rebuild_queue()
         self._refresh_card_states()
         self._refresh_tab_titles()
         self._pump()
+        return True
 
     def _pump(self):
         if self.worker and self.worker.isRunning():
