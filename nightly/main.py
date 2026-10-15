@@ -2898,8 +2898,8 @@ class SettingsPage(QWidget):
         srv_text.addWidget(srv_desc)
         self.server_combo = QComboBox()
         self.server_combo.setFixedWidth(200)
-        self.server_combo.addItem("SteamRIP", "1")
-        self.server_combo.addItem("FitGirl", "2")
+        self.server_combo.addItem("Server 1", "1")
+        self.server_combo.addItem("Server 2", "2")
         self.server_combo.setCurrentIndex(max(self.server_combo.findData(load_launcher_settings().get("download_server", "1")), 0))
         self.server_combo.currentIndexChanged.connect(self.on_server_changed)
         srv_row.addLayout(srv_text, 1)
@@ -10380,6 +10380,44 @@ def emoji_store():
             pass
     return _emoji_store_obj
 
+def _glyph_icon(kind, size=16, color=None):
+    """Vector icon (plus / cross / dots) painted with the theme's button text colour. Used instead of text glyphs,
+    which the global QPushButton padding squeezed out of small buttons (and some fonts lack)."""
+    from PyQt6.QtCore import QPointF
+    c = QColor(color) if color else QColor(QApplication.palette().color(QPalette.ColorRole.ButtonText))
+    s2 = size * 2
+    pm = QPixmap(s2, s2)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(c, s2 * 0.11)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    m = s2 * 0.22
+    if kind == "plus":
+        p.drawLine(QPointF(s2 / 2, m), QPointF(s2 / 2, s2 - m))
+        p.drawLine(QPointF(m, s2 / 2), QPointF(s2 - m, s2 / 2))
+    elif kind == "cross":
+        p.drawLine(QPointF(m, m), QPointF(s2 - m, s2 - m))
+        p.drawLine(QPointF(s2 - m, m), QPointF(m, s2 - m))
+    elif kind == "dots":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        for y in (0.25, 0.5, 0.75):
+            p.drawEllipse(QPointF(s2 / 2, s2 * y), s2 * 0.075, s2 * 0.075)
+    p.end()
+    pm.setDevicePixelRatio(2.0)
+    return QIcon(pm)
+
+
+def _icon_button(btn, kind, w, h, icon_size=16):
+    btn.setText("")
+    btn.setIcon(_glyph_icon(kind, icon_size))
+    btn.setIconSize(QSize(icon_size, icon_size))
+    btn.setFixedSize(w, h)
+    btn.setStyleSheet("padding:0;")
+
+
 def _emoji_button(ch, size, parent=None):
     """A flat button that shows the Apple emoji image for ch (the plain character until the image arrives)."""
     btn = QPushButton(ch, parent)
@@ -11608,9 +11646,9 @@ class FriendsPage(QWidget):
         rb.setContentsMargins(10, 4, 6, 4)
         self.reply_label = QLabel("")
         self.reply_label.setStyleSheet("color:#888888;")
-        cancel_reply = QPushButton("\u2715")
+        cancel_reply = QPushButton()
+        _icon_button(cancel_reply, "cross", 24, 24, 12)
         cancel_reply.setFlat(True)
-        cancel_reply.setFixedSize(24, 24)
         cancel_reply.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_reply.setToolTip("Cancel reply (Esc)")
         cancel_reply.clicked.connect(self.cancel_reply)
@@ -11633,8 +11671,8 @@ class FriendsPage(QWidget):
         lay.addWidget(self.chat_status)
 
         send_row = QHBoxLayout()
-        self.attach_btn = QPushButton("+")
-        self.attach_btn.setFixedSize(36, 34)
+        self.attach_btn = QPushButton()
+        _icon_button(self.attach_btn, "plus", 36, 34, 16)
         self.attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.attach_btn.setToolTip("Attach images or videos (you can also paste or drop them)")
         self.attach_btn.clicked.connect(self.pick_attachments)
@@ -11924,9 +11962,9 @@ class FriendsPage(QWidget):
             name = str(a["name"])
             cl.addWidget(thumb)
             cl.addWidget(QLabel(name if len(name) <= 18 else name[:15] + "..."))
-            rm = QPushButton("\u2715")
+            rm = QPushButton()
+            _icon_button(rm, "cross", 22, 22, 10)
             rm.setFlat(True)
-            rm.setFixedSize(22, 22)
             rm.setCursor(Qt.CursorShape.PointingHandCursor)
             rm.setToolTip("Remove")
             rm.clicked.connect(lambda _=False, n=i: self._remove_attachment(n))
@@ -20097,16 +20135,19 @@ def _overlay_classify(text):
     return msg, ""
 
 class _OvImageBridge(QObject):
-    done = pyqtSignal(str, str, str, str, str)      # name, highlight, avatar, prefix, picture path ("" = none)
+    done = pyqtSignal(str, str, str, str, str, str)  # name, highlight, avatar, prefix, picture path ("" = none), badge path
 
 _ov_image_bridge = None
 
-def _overlay_show(name, hl, avatar, prefix, image=None):
+def _overlay_show(name, hl, avatar, prefix, image=None, badge=None):
     _overlay.set_mode("window")          # no injected game running: use the window toast
     try:
-        _overlay.notify_playing(name, hl, avatar, prefix, image=image or None)
-    except TypeError:                    # an older overlay.py without picture support
-        _overlay.notify_playing(name, hl, avatar, prefix)
+        _overlay.notify_playing(name, hl, avatar, prefix, image=image or None, badge=badge or None)
+    except TypeError:                    # an older overlay.py without the sender badge
+        try:
+            _overlay.notify_playing(name, hl, avatar, prefix, image=image or None)
+        except TypeError:                # an older overlay.py without picture support
+            _overlay.notify_playing(name, hl, avatar, prefix)
 
 class _OvInviteBridge(QObject):
     done = pyqtSignal(str, str, str, str, str)      # sender name, game, avatar path, cover path, join link
@@ -20142,6 +20183,24 @@ def _overlay_show_invite(uid, name, inv, avatar):
         bridge.done.emit(name, inv["game"] or "a game", avatar or "", cover or "", inv["link"])
     threading.Thread(target=work, daemon=True).start()
 
+def _overlay_group_look(page, gid, group_name, msg):
+    """Group chat message -> (group icon file, sender picture file, sender uid, sender name)."""
+    g = (getattr(page, "groups", None) or {}).get(gid) or {}
+    try:
+        icon = _grp_icon_of(gid, g) or _grp_letter_icon(gid, group_name)
+    except Exception:
+        icon = None
+    sender = msg.get("from") if isinstance(msg, dict) else None
+    prof = {}
+    if sender:
+        gp = getattr(page, "group_page", None)
+        for src in ((gp.profiles if gp else {}), page.friends, {u: c[1] for u, c in _grp_prof_cache.items()}):
+            if src.get(sender):
+                prof = src[sender]
+                break
+    photo = _friend_avatar_file(sender, prof.get("photo")) if sender and prof.get("photo") else None
+    return icon, photo, sender, (_grp_name_of(prof) if prof else "")
+
 def _overlay_friend_event(page, name, text, uid):
     """Every friend notification (playing / online / friend request / message) -> overlay toast.
     A message with a picture (png / jpg / gif ...) shows the picture in the toast; a video says "sent a video"."""
@@ -20154,14 +20213,26 @@ def _overlay_friend_event(page, name, text, uid):
         return
     prefix, hl = _overlay_classify(text)
     inv = parse_invite(str(msg.get("text") or "")) if isinstance(msg, dict) else None
+    g_icon = g_badge = None
+    inviter = None                           # group chat: the toast names whoever wrote, not the group
+    if isinstance(uid, str) and uid.startswith("group:"):
+        g_icon, g_badge, s_uid, s_name = _overlay_group_look(page, uid[6:], name, msg)
+        if s_uid and s_name:
+            inviter = (s_uid, s_name, g_badge)
     if inv and hasattr(_overlay, "notify_invite"):
         if mode == "inject":                 # the injected in-game toast is text only, so the clickable one comes on top
             try:
                 from overlay import send_to_injected
-                send_to_injected(name, hl, prefix)
+                if inviter:
+                    send_to_injected(inviter[1], inv.get("game") or "a game", "invited you to play ")
+                else:
+                    send_to_injected(name, hl, prefix)
             except Exception:
                 pass
-        _overlay_show_invite(uid, name, inv, _friend_avatar_file(uid, ((page.friends.get(uid) or {}).get("photo"))))
+        if inviter:
+            _overlay_show_invite(inviter[0], inviter[1], inv, inviter[2])
+        else:
+            _overlay_show_invite(uid, name, inv, g_icon or _friend_avatar_file(uid, ((page.friends.get(uid) or {}).get("photo"))))
         return
     att = None
     if isinstance(msg, dict):
@@ -20180,13 +20251,13 @@ def _overlay_friend_event(page, name, text, uid):
         if send_to_injected(name, hl, prefix):
             return                       # shown inside the game (text only)
     info = (page.friends.get(uid) or page.requests.get(uid) or {})
-    avatar = _friend_avatar_file(uid, info.get("photo"))
+    avatar = g_icon or _friend_avatar_file(uid, info.get("photo"))
     if att is None or att.get("k") == "vid":
-        _overlay_show(name, hl, avatar, prefix)
+        _overlay_show(name, hl, avatar, prefix, badge=g_badge)
         return
     if _ov_image_bridge is None:         # picture: download it (cached on disk) off the GUI thread, then show the toast
         _ov_image_bridge = _OvImageBridge()
-        _ov_image_bridge.done.connect(lambda n, h, a, p, i: _overlay_show(n, h, a, p, i))
+        _ov_image_bridge.done.connect(lambda n, h, a, p, i, b: _overlay_show(n, h, a, p, i, b))
     bridge = _ov_image_bridge
 
     def work():
@@ -20194,7 +20265,7 @@ def _overlay_friend_event(page, name, text, uid):
             path = cloud_fetch_media(uid, att)
         except Exception:
             path = ""
-        bridge.done.emit(name, hl, avatar or "", prefix, path)
+        bridge.done.emit(name, hl, avatar or "", prefix, path, g_badge or "")
     threading.Thread(target=work, daemon=True).start()
 
 _ov_prev_launch_exe = _launch_exe
@@ -22191,6 +22262,1673 @@ def _pt_init(self):
     QTimer.singleShot(3000, self.sync_playtime)
 
 AdaptiveApp.__init__ = _pt_init
+
+# ================================================================ group chats (Friends tab)
+# Group chats live inside the Friends tab: a "Group chats" box on the friends list, and a chat page with a
+# Discord-style member list on the right. Roles: owner > admin > moderator > member.
+#   owner  : everything (rename, delete group, make admins, kick/ban/timeout anyone)
+#   admin  : add members, rename, manage mods/members, kick/ban/timeout mods + members, unban
+#   mod    : add members, kick/ban/timeout plain members, delete messages
+#   member : chat (replies, reactions, images/videos, emoji, game invites)
+# Everything is also enforced by the database rules (see group-chat-rules.json), not just by this UI.
+from PyQt6.QtWidgets import (QMenu, QDialog, QLineEdit, QLabel, QPushButton, QFrame, QScrollArea, QVBoxLayout,
+                             QHBoxLayout, QWidget, QMessageBox, QInputDialog, QListWidget, QListWidgetItem,
+                             QApplication, QGridLayout, QFileDialog)
+
+GROUP_RANK = {"owner": 3, "admin": 2, "mod": 1, "member": 0}
+GROUP_ROLE_LABEL = {"owner": "Owner", "admin": "Admin", "mod": "Moderator", "member": "Member"}
+GROUP_ROLE_PLURAL = {"owner": "Owner", "admin": "Admins", "mod": "Moderators", "member": "Members"}
+GROUP_ROLE_COLOR = {"owner": "#f59e0b", "admin": "#ef4444", "mod": "#22c55e", "member": None}
+GROUP_MAX_MEMBERS = 50
+GROUP_TIMEOUT_CHOICES = (("60 seconds", 60), ("5 minutes", 300), ("10 minutes", 600), ("1 hour", 3600),
+                         ("1 day", 86400), ("1 week", 604800))
+_GID_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def group_can_manage(my_role, target_role):
+    """Kick / ban / timeout: you need to be a moderator or higher and outrank the target."""
+    return GROUP_RANK.get(my_role, 0) >= 1 and GROUP_RANK.get(my_role, 0) > GROUP_RANK.get(target_role, 0)
+
+
+def group_can_set_role(my_role, target_role, new_role):
+    if new_role == target_role or "owner" in (target_role, new_role):
+        return False
+    if my_role == "owner":
+        return True
+    return my_role == "admin" and target_role in ("mod", "member") and new_role in ("mod", "member")
+
+
+# ---- cloud
+def _grp_clean(raw):
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    members = raw.get("members") if isinstance(raw.get("members"), dict) else {}
+    bans = raw.get("bans") if isinstance(raw.get("bans"), dict) else {}
+    tos = raw.get("timeouts") if isinstance(raw.get("timeouts"), dict) else {}
+    icon = meta.get("icon")
+    return {"name": str(meta.get("name") or "Group")[:40], "owner": meta.get("owner") or "",
+            "icon": icon if isinstance(icon, str) and len(icon) <= MAX_PHOTO_CHARS else "",
+            "members": {u: r for u, r in members.items() if r in GROUP_RANK},
+            "bans": {u: True for u, v in bans.items() if v},
+            "timeouts": {u: v for u, v in tos.items() if isinstance(v, (int, float))}}
+
+
+def _grp_drop_index(token, uid, gid):
+    try:
+        _http_json(_fdb(f"usergroups/{uid}/{gid}", token), "DELETE")
+    except CloudError:
+        pass
+
+
+def cloud_fetch_groups():
+    """({gid: group}, {gids that couldn't be loaded this round})."""
+    token, uid = get_id_token()
+    idx = _http_json(_fdb(f"usergroups/{uid}", token))
+    ids = [g for g in (idx if isinstance(idx, dict) else {}) if _GID_RE.match(str(g))]
+
+    def one(gid):
+        try:
+            return gid, _http_json(_fdb(f"groups/{gid}", token))
+        except CloudError as e:
+            return gid, ("gone" if e.code == "Permission denied" else "fail")
+
+    out, failed = {}, set()
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for gid, raw in ex.map(one, ids):
+            if raw == "fail":
+                failed.add(gid)
+            elif isinstance(raw, dict) and isinstance(raw.get("members"), dict) and uid in raw["members"]:
+                out[gid] = _grp_clean(raw)
+            else:                                    # kicked / banned / group deleted: forget the stale entry
+                _grp_drop_index(token, uid, gid)
+    return out, failed
+
+
+def cloud_fetch_group(gid):
+    """The group, or None when we're no longer in it."""
+    token, uid = get_id_token()
+    try:
+        raw = _http_json(_fdb(f"groups/{gid}", token))
+    except CloudError as e:
+        if e.code == "Permission denied":
+            _grp_drop_index(token, uid, gid)
+            return None
+        raise
+    if not isinstance(raw, dict) or not isinstance(raw.get("members"), dict) or uid not in raw["members"]:
+        _grp_drop_index(token, uid, gid)
+        return None
+    return _grp_clean(raw)
+
+
+_grp_prof_cache = {}
+
+
+def cloud_fetch_profiles(uids, known=None, ttl=30):
+    """{uid: public profile}. Friends come from `known` (already polled), others are cached for `ttl` seconds."""
+    token, _me = get_id_token()
+    known, out, need, now = known or {}, {}, [], time.time()
+    for u in uids:
+        if known.get(u):
+            out[u] = known[u]
+        elif u in _grp_prof_cache and now - _grp_prof_cache[u][0] < ttl:
+            out[u] = _grp_prof_cache[u][1]
+        else:
+            need.append(u)
+
+    def one(u):
+        try:
+            d = _http_json(_fdb(f"public/{u}", token))
+            return u, (d if isinstance(d, dict) else {})
+        except CloudError:
+            return u, (_grp_prof_cache.get(u) or (0, {}))[1]
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for u, d in ex.map(one, need):
+            _grp_prof_cache[u] = (now, d)
+            out[u] = d
+    return out
+
+
+def cloud_create_group(name, member_uids, icon=None):
+    token, uid = get_id_token()
+    gid = _secrets.token_hex(8)
+    name = (name or "").strip()[:40] or "New group"
+    _http_json(_fdb(f"groups/{gid}/meta", token), "PUT", {"name": name, "owner": uid, "created": {".sv": "timestamp"}})
+    _http_json(_fdb(f"groups/{gid}/members/{uid}", token), "PUT", "owner")
+    _http_json(_fdb(f"usergroups/{uid}/{gid}", token), "PUT", True)
+    for m in list(member_uids)[:GROUP_MAX_MEMBERS - 1]:
+        try:
+            cloud_group_add_member(gid, m)
+        except CloudError:
+            pass
+    if icon:
+        try:
+            cloud_group_set_icon(gid, icon)
+        except CloudError:
+            pass
+    return gid
+
+
+def cloud_group_add_member(gid, other):
+    token, _uid = get_id_token()
+    if _http_json(_fdb(f"groups/{gid}/bans/{other}", token)):
+        raise CloudError("That person is banned from this group.", "BANNED")
+    _http_json(_fdb(f"groups/{gid}/members/{other}", token), "PUT", "member")
+    _http_json(_fdb(f"usergroups/{other}/{gid}", token), "PUT", True)
+
+
+def cloud_group_set_role(gid, target, role):
+    token, _uid = get_id_token()
+    if role not in GROUP_RANK or role == "owner":
+        raise CloudError("Invalid role.", "BAD_ROLE")
+    _http_json(_fdb(f"groups/{gid}/members/{target}", token), "PUT", role)
+
+
+def _grp_remove(token, gid, target):
+    _http_json(_fdb(f"groups/{gid}/timeouts/{target}", token), "DELETE")
+    _http_json(_fdb(f"usergroups/{target}/{gid}", token), "DELETE")
+    _http_json(_fdb(f"groups/{gid}/members/{target}", token), "DELETE")
+
+
+def cloud_group_kick(gid, target):
+    token, _uid = get_id_token()
+    _grp_remove(token, gid, target)
+
+
+def cloud_group_ban(gid, target):
+    token, _uid = get_id_token()
+    _http_json(_fdb(f"groups/{gid}/bans/{target}", token), "PUT", True)    # first: the rules need their role to exist
+    _grp_remove(token, gid, target)
+
+
+def cloud_group_unban(gid, target):
+    token, _uid = get_id_token()
+    _http_json(_fdb(f"groups/{gid}/bans/{target}", token), "DELETE")
+
+
+def cloud_group_timeout(gid, target, seconds):
+    token, _uid = get_id_token()
+    _http_json(_fdb(f"groups/{gid}/timeouts/{target}", token), "PUT", int(time.time() * 1000) + int(seconds) * 1000)
+
+
+def cloud_group_remove_timeout(gid, target):
+    token, _uid = get_id_token()
+    _http_json(_fdb(f"groups/{gid}/timeouts/{target}", token), "DELETE")
+
+
+def cloud_group_rename(gid, name):
+    token, _uid = get_id_token()
+    name = (name or "").strip()[:40]
+    if not name:
+        raise CloudError("The group needs a name.", "NO_NAME")
+    _http_json(_fdb(f"groups/{gid}/meta/name", token), "PUT", name)
+
+
+def cloud_group_set_icon(gid, icon):
+    """icon: base64 png (see prepare_avatar_png), or None to remove it."""
+    token, _uid = get_id_token()
+    if icon:
+        if not _decode_photo(icon):
+            raise CloudError("Couldn't read that image.", "BAD_IMAGE")
+        _http_json(_fdb(f"groups/{gid}/meta/icon", token), "PUT", icon)
+    else:
+        _http_json(_fdb(f"groups/{gid}/meta/icon", token), "DELETE")
+
+
+def cloud_group_leave(gid):
+    token, uid = get_id_token()
+    _http_json(_fdb(f"groups/{gid}/members/{uid}", token), "DELETE")
+    _http_json(_fdb(f"usergroups/{uid}/{gid}", token), "DELETE")
+
+
+def cloud_group_delete(gid):
+    token, uid = get_id_token()
+    raw = _http_json(_fdb(f"groups/{gid}", token))
+    members = raw.get("members") if isinstance(raw, dict) and isinstance(raw.get("members"), dict) else {}
+    for m in members:
+        if m != uid:
+            _http_json(_fdb(f"usergroups/{m}/{gid}", token), "DELETE")
+            _http_json(_fdb(f"groups/{gid}/members/{m}", token), "DELETE")
+    for path in (f"groupchats/{gid}", f"groupmedia/{gid}", f"groups/{gid}/bans", f"groups/{gid}/timeouts",
+                 f"groups/{gid}/meta", f"groups/{gid}/members/{uid}", f"usergroups/{uid}/{gid}"):
+        _http_json(_fdb(path, token), "DELETE")
+
+
+def cloud_get_group_messages(gid):
+    token, uid = get_id_token()
+    data = _http_json(_fdb(f"groupchats/{gid}", token, 'orderBy=%22%24key%22&limitToLast=80'))
+    if not isinstance(data, dict):
+        return uid, [], None
+    keys = [k for k in sorted(data) if isinstance(data[k], dict)]
+    for k in keys:
+        data[k]["_key"] = k
+    return uid, [data[k] for k in keys], (keys[-1] if keys else None)
+
+
+def cloud_get_group_last(gids):
+    """{gid: (message key, message)} for the newest message of each group."""
+    token, _uid = get_id_token()
+
+    def one(gid):
+        try:
+            data = _http_json(_fdb(f"groupchats/{gid}", token, 'orderBy=%22%24key%22&limitToLast=1'))
+            if isinstance(data, dict) and data:
+                k = sorted(data)[-1]
+                if isinstance(data[k], dict):
+                    return gid, (k, data[k])
+            return gid, ("", None)
+        except CloudError:
+            return gid, None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return {g: v for g, v in ex.map(one, gids) if v}
+
+
+def cloud_send_group_message(gid, text, attachments=None, reply=None):
+    token, uid = get_id_token()
+    atts = []
+    for a in (attachments or [])[:CHAT_MAX_ATTACH]:
+        aid = _secrets.token_hex(8)
+        b64 = base64.b64encode(a["data"]).decode("ascii")
+        pieces = [b64[i:i + CHAT_CHUNK_CHARS] for i in range(0, len(b64), CHAT_CHUNK_CHARS)]
+        for i, piece in enumerate(pieces):
+            _http_json(_fdb(f"groupmedia/{gid}/{aid}/c/{i}", token), "PUT", piece, timeout=300)
+        _http_json(_fdb(f"groupmedia/{gid}/{aid}/m", token), "PUT", a["mime"])
+        _http_json(_fdb(f"groupmedia/{gid}/{aid}/n", token), "PUT", len(pieces))
+        atts.append({"id": aid, "k": a["kind"], "n": str(a["name"])[:80], "x": a["ext"],
+                     "s": a["size"], "w": a["w"], "h": a["h"]})
+    msg = {"from": uid, "text": (text or "")[:500], "ts": {".sv": "timestamp"}}
+    if atts:
+        msg["att"] = atts
+    if isinstance(reply, dict) and reply.get("k"):
+        msg["re"] = {"k": str(reply["k"]), "f": str(reply.get("f", "")),
+                     "t": str(reply.get("t", ""))[:100], "a": str(reply.get("a", ""))}
+    _http_json(_fdb(f"groupchats/{gid}", token), "POST", msg)
+
+
+def cloud_set_group_reaction(gid, msg_key, code, on):
+    if not _EMOJI_CODE_RE.match(code or "") or not msg_key:
+        return
+    token, uid = get_id_token()
+    url = _fdb(f"groupchats/{gid}/{msg_key}/rx/{code}/{uid}", token)
+    if on:
+        _http_json(url, "PUT", True)
+    else:
+        _http_json(url, "DELETE")
+
+
+def cloud_delete_group_message(gid, msg_key):
+    token, _uid = get_id_token()
+    _http_json(_fdb(f"groupchats/{gid}/{msg_key}", token), "DELETE")
+
+
+def _grp_fetch_media(gid, att):
+    path = _att_cache_path(att)
+    if not path or not _GID_RE.match(str(gid)):
+        raise CloudError("This attachment is invalid.", "BAD_ATT")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    token, _uid = get_id_token()
+    base = f"groupmedia/{gid}/{att['id']}"
+    count = _http_json(_fdb(f"{base}/n", token), timeout=60)
+    if not (isinstance(count, int) and 0 < count <= 64):
+        raise CloudError("This attachment is no longer available.", "GONE")
+    parts = []
+    for i in range(count):
+        piece = _http_json(_fdb(f"{base}/c/{i}", token), timeout=180)
+        if not isinstance(piece, str):
+            raise CloudError("This attachment is no longer available.", "GONE")
+        parts.append(piece)
+    data = base64.b64decode("".join(parts))
+    if not data or len(data) > 40 * 1024 * 1024:
+        raise CloudError("This attachment is invalid.", "BAD_ATT")
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+
+# the chat view / overlay ask for media with the "other person"; for a group that's "group:<gid>"
+_grp_prev_fetch_media = cloud_fetch_media
+
+
+def cloud_fetch_media(other, att):
+    if isinstance(other, str) and other.startswith("group:"):
+        return _grp_fetch_media(other[6:], att)
+    return _grp_prev_fetch_media(other, att)
+
+
+# ---- message rows: sender name above other people's bubbles, delete for mods/authors, invite covers
+_grp_prev_msgrow_init = _MsgRow.__init__
+
+
+def _grp_msgrow_init(self, chat, m, me, mine):
+    _grp_prev_msgrow_init(self, chat, m, me, mine)
+    if not getattr(chat, "group_mode", False) or mine:
+        return
+    uid = m.get("from")
+    lab = QLabel(chat.names.get(uid) or "Unknown")
+    color = (getattr(chat, "name_colors", None) or {}).get(uid)
+    lab.setStyleSheet("font-size:11px; font-weight:bold;" + (f"color:{color};" if color else ""))
+    outer = self.layout()
+    for i in range(outer.count()):
+        col = outer.itemAt(i).layout()
+        if col is not None:
+            col.insertWidget(0, lab, 0, Qt.AlignmentFlag.AlignLeft)
+            break
+
+
+_MsgRow.__init__ = _grp_msgrow_init
+
+_grp_prev_msgrow_ctx = _MsgRow.contextMenuEvent
+
+
+def _grp_msgrow_ctx(self, e):
+    chat = self.chat
+    if not getattr(chat, "group_mode", False) or not self.key:
+        return _grp_prev_msgrow_ctx(self, e)
+    menu = QMenu(self)
+    a_reply = menu.addAction("Reply")
+    a_react = menu.addAction("Add reaction...")
+    text = str(self.m.get("text", "") or "")
+    a_copy = menu.addAction("Copy text") if text else None
+    a_del = None
+    if self.mine or getattr(chat, "can_moderate", False):
+        menu.addSeparator()
+        a_del = menu.addAction("Delete message")
+    act = menu.exec(e.globalPos())
+    if act is None:
+        return
+    if act is a_reply:
+        chat.reply_requested.emit(self.m)
+    elif act is a_react:
+        self._pick_reaction(self.bubble)
+    elif a_copy is not None and act is a_copy:
+        QApplication.clipboard().setText(text)
+    elif a_del is not None and act is a_del and getattr(chat, "delete_cb", None):
+        chat.delete_cb(self.key)
+
+
+_MsgRow.contextMenuEvent = _grp_msgrow_ctx
+
+_grp_prev_invite_card = _MsgRow._invite_card
+
+
+def _grp_invite_card(self, inv, mine):
+    chat = self.chat
+    if getattr(chat, "group_mode", False) and not mine:     # the cover comes from the sender's published covers
+        saved = chat.other_uid
+        chat.other_uid = self.m.get("from")
+        try:
+            return _grp_prev_invite_card(self, inv, mine)
+        finally:
+            chat.other_uid = saved
+    return _grp_prev_invite_card(self, inv, mine)
+
+
+_MsgRow._invite_card = _grp_invite_card
+
+
+# ---- small UI helpers
+def _grp_avatar(label, path, letter, size):
+    pic = CreditsPage.circular_pixmap(path, size * 2) if path else None
+    if pic:
+        apply_avatar(label, path, letter, size)
+        return
+    label.clear()
+    label.setText(letter)
+    label.setStyleSheet(f"background:{THEMES['dark']['accent']}; color:#ffffff; border-radius:{size // 2}px; "
+                        f"font-weight:bold; font-size:{max(11, size // 2)}px;")
+
+
+def _grp_name_of(p):
+    return (p or {}).get("username") or "Unknown"
+
+
+# ---- group icons: stored in groups/<gid>/meta/icon as a base64 png (same format as profile pictures)
+def _grp_cache_dir():
+    path = os.path.join(os.path.dirname(get_launcher_settings_path()), "group_icons")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _grp_icon_file(gid, icon):
+    """Writes a group's icon to disk (once per change) and returns the path, or None when it has none."""
+    if not icon or not _GID_RE.match(str(gid)):
+        return None
+    import zlib
+    import glob
+    raw = _decode_photo(icon)
+    if not raw:
+        return None
+    tag = format(zlib.crc32(icon.encode("ascii", "ignore")) & 0xffffffff, "08x")
+    folder = _grp_cache_dir()
+    path = os.path.join(folder, f"{gid}_{tag}.png")
+    if not os.path.exists(path):
+        for old in glob.glob(os.path.join(folder, f"{gid}_*.png")):      # an older icon of this group
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        with open(path, "wb") as f:
+            f.write(raw)
+    return path
+
+
+def _grp_icon_of(gid, g):
+    return _grp_icon_file(gid, (g or {}).get("icon"))
+
+
+def _grp_letter_icon(gid, name):
+    """Round accent-coloured picture with the group's first letter, for groups without an icon (used by the overlay)."""
+    letter = (name or "?")[:1].upper() or "?"
+    accent = THEMES["dark"]["accent"]
+    path = os.path.join(_grp_cache_dir(), f"letter_{ord(letter[0]):x}_{accent.lstrip('#')}.png")
+    if not os.path.exists(path):
+        pm = QPixmap(256, 256)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(accent))
+        p.drawEllipse(0, 0, 256, 256)
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(136)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(0, 0, 256, 256), Qt.AlignmentFlag.AlignCenter, letter)
+        p.end()
+        pm.save(path, "PNG")
+    return path
+
+
+def _grp_circle_from_bytes(raw, size):
+    """Round pixmap from png/jpg bytes (the preview of an icon that was just picked)."""
+    src = QPixmap()
+    if not src.loadFromData(raw):
+        return None
+    scaled = src.scaled(size * 2, size * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(size * 2, size * 2)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    clip = QPainterPath()
+    clip.addEllipse(0, 0, size * 2, size * 2)
+    p.setClipPath(clip)
+    p.drawPixmap((size * 2 - scaled.width()) // 2, (size * 2 - scaled.height()) // 2, scaled)
+    p.end()
+    out.setDevicePixelRatio(2.0)
+    return out
+
+
+class _GrpClickLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+class _PickCard(QFrame):
+    """A friend as a selectable card: profile picture, name, status. Click to (de)select."""
+    toggled = pyqtSignal(bool)
+    W, H = 112, 128
+
+    def __init__(self, uid, name, avatar_path, status, color):
+        super().__init__()
+        self.uid, self.name, self._on = uid, name, False
+        self._accent = THEMES["dark"]["accent"]
+        self.setObjectName("PickCard")
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 12, 6, 8)
+        lay.setSpacing(3)
+        av = QLabel("?")
+        av.setFixedSize(56, 56)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _grp_avatar(av, avatar_path, name[:1].upper(), 56)
+        fm = av.fontMetrics()
+        n = QLabel(fm.elidedText(name, Qt.TextElideMode.ElideRight, self.W - 16))
+        n.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        n.setStyleSheet("font-weight:bold;")
+        s = QLabel(fm.elidedText(status, Qt.TextElideMode.ElideRight, self.W - 16))
+        s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        s.setStyleSheet(f"color:{color}; font-size:10px;")
+        lay.addWidget(av, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(n)
+        lay.addWidget(s)
+        lay.addStretch()
+        self.check = QLabel("\u2713", self)
+        self.check.setFixedSize(20, 20)
+        self.check.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.check.setStyleSheet(f"background:{self._accent}; color:#ffffff; border-radius:10px; font-weight:bold;")
+        self.check.move(self.W - 26, 6)
+        self.check.hide()
+        for w in (av, n, s, self.check):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._restyle()
+
+    def _restyle(self):
+        c = QColor(self._accent)
+        if self._on:
+            self.setStyleSheet(f"#PickCard{{background:rgba({c.red()},{c.green()},{c.blue()},0.18); "
+                               f"border:2px solid {self._accent}; border-radius:12px;}}")
+        else:
+            self.setStyleSheet("#PickCard{background:rgba(128,128,128,0.14); border:2px solid transparent; "
+                               "border-radius:12px;} #PickCard:hover{background:rgba(128,128,128,0.26);}")
+        self.check.setVisible(self._on)
+
+    def selected(self):
+        return self._on
+
+    def set_selected(self, on):
+        if on != self._on:
+            self._on = on
+            self._restyle()
+            self.toggled.emit(on)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.set_selected(not self._on)
+        super().mouseReleaseEvent(e)
+
+
+class _GroupFriendsDialog(QDialog):
+    """Pick friends as cards with their profile pictures (and, for a new group, name it and choose its icon).
+    values() -> (name, [picked uids]); .icon -> base64 png of the chosen group icon, or None."""
+    COLS = 4
+
+    def __init__(self, parent, title, friends, ask_name=False, button="Add"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(self.COLS * (_PickCard.W + 8) + 52, 540 if ask_name else 470)
+        self._button, self._require = button, not ask_name
+        self.icon, self._icon_raw, self._cards = None, None, []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+        self.name_edit = None
+        if ask_name:
+            top = QHBoxLayout()
+            top.setSpacing(14)
+            self.icon_lbl = _GrpClickLabel("?")
+            self.icon_lbl.setFixedSize(76, 76)
+            self.icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.icon_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.icon_lbl.setToolTip("Choose a group icon")
+            self.icon_lbl.clicked.connect(self._pick_icon)
+            right = QVBoxLayout()
+            right.setSpacing(6)
+            right.addWidget(QLabel("Group name"))
+            self.name_edit = QLineEdit()
+            self.name_edit.setMaxLength(40)
+            self.name_edit.setPlaceholderText("e.g. Friday night squad")
+            self.name_edit.textChanged.connect(self._refresh_icon)
+            right.addWidget(self.name_edit)
+            btns = QHBoxLayout()
+            self.icon_btn = QPushButton("Choose icon...")
+            self.icon_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.icon_btn.clicked.connect(self._pick_icon)
+            self.icon_rm = QPushButton("Remove")
+            self.icon_rm.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.icon_rm.clicked.connect(self._clear_icon)
+            self.icon_rm.hide()
+            btns.addWidget(self.icon_btn)
+            btns.addWidget(self.icon_rm)
+            btns.addStretch()
+            right.addLayout(btns)
+            top.addWidget(self.icon_lbl)
+            top.addLayout(right, 1)
+            lay.addLayout(top)
+            self._refresh_icon()
+
+        head = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search friends")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._reflow)
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("RowDesc")
+        head.addWidget(self.search, 1)
+        head.addWidget(self.count_lbl)
+        lay.addLayout(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        holder = QWidget()
+        self.grid = QGridLayout(holder)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(8)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        scroll.setWidget(holder)
+        lay.addWidget(scroll, 1)
+        self.empty = QLabel("No friends match your search.")
+        self.empty.setObjectName("RowDesc")
+        self.empty.hide()
+        lay.addWidget(self.empty)
+
+        order = sorted(friends.items(), key=lambda kv: (_friend_status(kv[1])[0] == "Offline", _grp_name_of(kv[1]).lower()))
+        for uid, d in order:
+            status, color = _friend_status(d)
+            card = _PickCard(uid, _grp_name_of(d), _friend_avatar_file(uid, d.get("photo")) if d.get("photo") else None,
+                             status, color)
+            card.toggled.connect(lambda _on: self._update_count())
+            self._cards.append(card)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.ok = QPushButton(button)
+        self.ok.setObjectName("Primary")
+        self.ok.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(self.ok)
+        lay.addLayout(row)
+        self._reflow()
+        self._update_count()
+
+    # -- icon
+    def _refresh_icon(self):
+        if self._icon_raw:
+            pic = _grp_circle_from_bytes(self._icon_raw, 76)
+            if pic:
+                self.icon_lbl.setText("")
+                self.icon_lbl.setPixmap(pic)
+                self.icon_lbl.setStyleSheet("background: transparent;")
+                return
+        letter = ((self.name_edit.text().strip() if self.name_edit else "")[:1] or "+").upper()
+        self.icon_lbl.setPixmap(QPixmap())
+        _grp_avatar(self.icon_lbl, None, letter, 76)
+
+    def _pick_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a group icon", "",
+                                              "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+        if not path:
+            return
+        try:
+            raw = prepare_avatar_png(path)
+        except CloudError as e:
+            QMessageBox.warning(self, "Group icon", str(e))
+            return
+        self._icon_raw = raw
+        self.icon = base64.b64encode(raw).decode("ascii")
+        self.icon_rm.show()
+        self._refresh_icon()
+
+    def _clear_icon(self):
+        self._icon_raw, self.icon = None, None
+        self.icon_rm.hide()
+        self._refresh_icon()
+
+    # -- cards
+    def _reflow(self, *_):
+        needle = self.search.text().strip().lower()
+        while self.grid.count():
+            self.grid.takeAt(0)
+        shown = 0
+        for card in self._cards:
+            if needle in card.name.lower():
+                self.grid.addWidget(card, shown // self.COLS, shown % self.COLS)
+                card.show()
+                shown += 1
+            else:
+                card.hide()
+        self.empty.setVisible(bool(self._cards) and shown == 0)
+
+    def _update_count(self):
+        n = sum(1 for c in self._cards if c.selected())
+        self.count_lbl.setText(f"{n} selected" if n else "")
+        self.ok.setText(f"{self._button} ({n})" if n else self._button)
+        self.ok.setEnabled(n > 0 or not self._require)
+
+    def values(self):
+        picked = [c.uid for c in self._cards if c.selected()]
+        return (self.name_edit.text().strip() if self.name_edit else ""), picked
+
+
+class _GroupBansDialog(QDialog):
+    def __init__(self, parent, names, on_unban):
+        super().__init__(parent)
+        self.setWindowTitle("Banned users")
+        self.setMinimumWidth(340)
+        self._on_unban = on_unban
+        lay = QVBoxLayout(self)
+        self.list = QListWidget()
+        self.list.setMinimumHeight(200)
+        for uid, name in sorted(names.items(), key=lambda kv: kv[1].lower()):
+            it = QListWidgetItem(name)
+            it.setData(Qt.ItemDataRole.UserRole, uid)
+            self.list.addItem(it)
+        lay.addWidget(self.list)
+        self.info = QLabel("Nobody is banned." if not names else "Select someone to unban them.")
+        self.info.setObjectName("RowDesc")
+        lay.addWidget(self.info)
+        row = QHBoxLayout()
+        row.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        self.unban_btn = QPushButton("Unban")
+        self.unban_btn.setObjectName("Primary")
+        self.unban_btn.clicked.connect(self._unban)
+        row.addWidget(close)
+        row.addWidget(self.unban_btn)
+        lay.addLayout(row)
+
+    def _unban(self):
+        it = self.list.currentItem()
+        if not it:
+            return
+        uid = it.data(Qt.ItemDataRole.UserRole)
+
+        def done(err):
+            if err:
+                self.info.setText(err)
+                return
+            self.list.takeItem(self.list.row(it))
+            self.info.setText("Unbanned." if self.list.count() else "Nobody is banned.")
+        self._on_unban(uid, done)
+
+
+# ---- the group chat page
+class GroupChatPage(QWidget):
+    _done = pyqtSignal(object, object, object)
+
+    # the DM page already knows how to run jobs, reply, attach, paste, drop and pick emoji: reuse it as is
+    _run = FriendsPage._run
+    _signed_in = FriendsPage._signed_in
+    start_reply = FriendsPage.start_reply
+    _show_reply = FriendsPage._show_reply
+    cancel_reply = FriendsPage.cancel_reply
+    pick_attachments = FriendsPage.pick_attachments
+    add_files = FriendsPage.add_files
+    _on_image_pasted = FriendsPage._on_image_pasted
+    _queue_prepare = FriendsPage._queue_prepare
+    _on_prepared = FriendsPage._on_prepared
+    _remove_attachment = FriendsPage._remove_attachment
+    _refresh_att_bar = FriendsPage._refresh_att_bar
+    dropEvent = FriendsPage.dropEvent
+    _emoji_for_input = FriendsPage._emoji_for_input
+    _set_status = FriendsPage._set_status
+
+    def __init__(self, fp):
+        super().__init__()
+        self.setObjectName("Content")
+        self.fp = fp
+        self.gid = None
+        self.g = {}
+        self.profiles = {}
+        self._msgs, self._me, self._sig = [], (load_account() or {}).get("uid"), ""
+        self._members_sig = None
+        self._pending, self._preparing, self._att_seq = [], 0, 0
+        self._reply, self._sending, self._rx_inflight = None, False, 0
+        self.setAcceptDrops(True)
+        self._done.connect(lambda cb, res, err: cb(res, err))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        head = QHBoxLayout()
+        back = QPushButton("< Friends")
+        back.setCursor(Qt.CursorShape.PointingHandCursor)
+        back.setFixedWidth(100)
+        back.clicked.connect(self.close_group)
+        self.h_avatar = _GrpClickLabel("?")
+        self.h_avatar.setFixedSize(44, 44)
+        self.h_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.h_avatar.clicked.connect(self._avatar_clicked)
+        hc = QVBoxLayout()
+        hc.setSpacing(0)
+        self.h_name = QLabel("")
+        self.h_name.setObjectName("PageTitle")
+        self.h_sub = QLabel("")
+        self.h_sub.setObjectName("RowDesc")
+        hc.addWidget(self.h_name)
+        hc.addWidget(self.h_sub)
+        self.add_btn = QPushButton("Add members")
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.clicked.connect(self.add_members)
+        self.menu_btn = QPushButton()
+        _icon_button(self.menu_btn, "dots", 36, 36, 18)
+        self.menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_btn.setToolTip("Group settings")
+        self.menu_btn.clicked.connect(self._open_menu)
+        head.addWidget(back)
+        head.addSpacing(10)
+        head.addWidget(self.h_avatar)
+        head.addSpacing(8)
+        head.addLayout(hc, 1)
+        head.addWidget(self.add_btn)
+        head.addWidget(self.menu_btn)
+        outer.addLayout(head)
+        outer.addSpacing(8)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        chat = QVBoxLayout()
+        self.chat_view = ChatView()
+        self.chat_view.group_mode = True
+        self.chat_view.delete_cb = self.delete_message
+        self.chat_view.reply_requested.connect(self.start_reply)
+        self.chat_view.react_requested.connect(self.toggle_reaction)
+        chat.addWidget(self.chat_view, 1)
+
+        self.reply_bar = QFrame()
+        self.reply_bar.setObjectName("ReplyBar")
+        self.reply_bar.setStyleSheet("#ReplyBar{background:rgba(128,128,128,0.18); border-radius:8px;}")
+        rb = QHBoxLayout(self.reply_bar)
+        rb.setContentsMargins(10, 4, 6, 4)
+        self.reply_label = QLabel("")
+        self.reply_label.setStyleSheet("color:#888888;")
+        cancel_reply = QPushButton()
+        _icon_button(cancel_reply, "cross", 24, 24, 12)
+        cancel_reply.setFlat(True)
+        cancel_reply.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_reply.clicked.connect(self.cancel_reply)
+        rb.addWidget(self.reply_label, 1)
+        rb.addWidget(cancel_reply)
+        self.reply_bar.hide()
+        chat.addWidget(self.reply_bar)
+
+        self.att_bar = QWidget()
+        self.att_row = QHBoxLayout(self.att_bar)
+        self.att_row.setContentsMargins(0, 0, 0, 0)
+        self.att_row.setSpacing(6)
+        self.att_row.addStretch()
+        self.att_bar.hide()
+        chat.addWidget(self.att_bar)
+
+        self.chat_status = QLabel("")
+        self.chat_status.setStyleSheet("color:#888888; font-size:11px;")
+        self.chat_status.hide()
+        chat.addWidget(self.chat_status)
+
+        send_row = QHBoxLayout()
+        self.attach_btn = QPushButton()
+        _icon_button(self.attach_btn, "plus", 36, 34, 16)
+        self.attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.attach_btn.setToolTip("Attach images or videos (you can also paste or drop them)")
+        self.attach_btn.clicked.connect(self.pick_attachments)
+        self.chat_input = _ChatInput()
+        self.chat_input.setPlaceholderText("Write a message...")
+        self.chat_input.setMaxLength(500)
+        self.chat_input.setAcceptDrops(False)
+        self.chat_input.returnPressed.connect(self.send_message)
+        self.chat_input.image_pasted.connect(self._on_image_pasted)
+        self.chat_input.files_pasted.connect(self.add_files)
+        self.chat_input.escaped.connect(self.cancel_reply)
+        self.emoji_btn = _emoji_button("\U0001F642", 22)
+        self.emoji_btn.setToolTip("Emoji")
+        self.emoji_btn.clicked.connect(self._emoji_for_input)
+        self.invite_btn = QPushButton("Invite to Game")
+        self.invite_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.invite_btn.clicked.connect(self.invite_to_game)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setObjectName("Primary")
+        self.send_btn.clicked.connect(self.send_message)
+        for w, s in ((self.attach_btn, 0), (self.chat_input, 1), (self.invite_btn, 0), (self.emoji_btn, 0),
+                     (self.send_btn, 0)):
+            send_row.addWidget(w, s)
+        chat.addLayout(send_row)
+        chat.addSpacing(16)
+        body.addLayout(chat, 1)
+
+        # members list, like Discord's right-hand panel
+        self.members_panel = QFrame()
+        self.members_panel.setObjectName("Panel")
+        self.members_panel.setFixedWidth(250)
+        mp = QVBoxLayout(self.members_panel)
+        mp.setContentsMargins(8, 10, 8, 10)
+        self.members_title = QLabel("Members")
+        self.members_title.setObjectName("RowTitle")
+        mp.addWidget(self.members_title)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        holder = QWidget()
+        self.members_lay = QVBoxLayout(holder)
+        self.members_lay.setContentsMargins(0, 0, 0, 0)
+        self.members_lay.setSpacing(2)
+        self.members_lay.addStretch()
+        scroll.setWidget(holder)
+        mp.addWidget(scroll, 1)
+        body.addWidget(self.members_panel)
+        outer.addLayout(body, 1)
+
+        self.chat_timer = QTimer(self)
+        self.chat_timer.setInterval(2000)
+        self.chat_timer.timeout.connect(self.load_messages)
+        self.group_timer = QTimer(self)
+        self.group_timer.setInterval(4000)
+        self.group_timer.timeout.connect(self._load_group)
+        self.tick_timer = QTimer(self)
+        self.tick_timer.setInterval(1000)
+        self.tick_timer.timeout.connect(self._update_composer)
+
+    # -- helpers
+    @property
+    def current_uid(self):          # the borrowed DM helpers only check that a chat is open
+        return self.gid
+
+    @staticmethod
+    def _sig_of(msgs):
+        return json.dumps(msgs, sort_keys=True, default=str)
+
+    def _my_role(self):
+        return self.g.get("members", {}).get(self._me, "member")
+
+    def _chat_names(self):
+        names = {u: _grp_name_of(p) for u, p in self.profiles.items()}
+        if self._me:
+            names[self._me] = "You"
+        return names
+
+    def _name(self, uid):
+        return "You" if uid == self._me else _grp_name_of(self.profiles.get(uid))
+
+    def _timeout_left(self):
+        until = self.g.get("timeouts", {}).get(self._me)
+        return max(0.0, until / 1000.0 - time.time()) if isinstance(until, (int, float)) else 0.0
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    # -- open / close
+    def open_group(self, gid):
+        g = self.fp.groups.get(gid)
+        if not g:
+            return
+        self.gid, self.g = gid, g
+        self._me = (load_account() or {}).get("uid")
+        self.profiles = {}
+        self._msgs, self._sig, self._members_sig = [], "", None
+        self._pending = []
+        self._refresh_att_bar()
+        self.cancel_reply()
+        self._set_status("")
+        self.chat_view.other_uid = "group:" + gid
+        self.chat_view.reset()
+        self._apply_group()
+        self.fp.stack.setCurrentWidget(self)
+        self.load_messages()
+        self._load_group()
+        for t in (self.chat_timer, self.group_timer, self.tick_timer):
+            t.start()
+
+    def close_group(self):
+        for t in (self.chat_timer, self.group_timer, self.tick_timer):
+            t.stop()
+        self.gid = None
+        self.fp.stack.setCurrentIndex(0)
+        self.fp.refresh()
+
+    def _removed(self):
+        if not self.gid:
+            return
+        self.close_group()
+        self.fp.status_label.setText("You're no longer in that group.")
+
+    # -- group data
+    def _load_group(self):
+        gid = self.gid
+        if not gid:
+            return
+        known = dict(self.fp.friends)
+
+        def work():
+            g = cloud_fetch_group(gid)
+            return g, (cloud_fetch_profiles(sorted(g["members"]), known) if g else {})
+
+        def done(res, err):
+            if err or gid != self.gid:
+                return
+            g, profs = res
+            if g is None:
+                self._removed()
+                return
+            self.g = g
+            self.fp.groups[gid] = g
+            self.profiles.update(profs)
+            self._apply_group()
+        self._run(work, done, key=("group", gid))
+
+    def _apply_group(self):
+        g, my = self.g, self._my_role()
+        self.h_name.setText(g.get("name", "Group"))
+        n = len(g.get("members", {}))
+        self.h_sub.setText(f"{n} member{'s' if n != 1 else ''} \u2022 You are {GROUP_ROLE_LABEL.get(my, 'Member').lower()}")
+        _grp_avatar(self.h_avatar, _grp_icon_of(self.gid, g), (g.get("name") or "?")[:1].upper(), 44)
+        can_icon = GROUP_RANK[my] >= 2
+        self.h_avatar.setCursor(Qt.CursorShape.PointingHandCursor if can_icon else Qt.CursorShape.ArrowCursor)
+        self.h_avatar.setToolTip("Change group icon" if can_icon else "")
+        self.add_btn.setVisible(GROUP_RANK[my] >= 1)
+        cv = self.chat_view
+        cv.can_moderate = GROUP_RANK[my] >= 1
+        cv.name_colors = {u: GROUP_ROLE_COLOR[r] for u, r in g.get("members", {}).items() if GROUP_ROLE_COLOR[r]}
+        self.members_title.setText(f"Members \u2014 {n}")
+        self._rebuild_members()
+        self._update_composer()
+
+    def _update_composer(self):
+        if not self.gid:
+            return
+        left = int(self._timeout_left())
+        on = left <= 0
+        for w in (self.chat_input, self.emoji_btn, self.send_btn, self.invite_btn):
+            w.setEnabled(on)
+        self.attach_btn.setEnabled(on and not self._sending)
+        self.chat_input.setPlaceholderText("Write a message..." if on else
+                                           f"You're timed out. You can talk again in {left // 60}:{left % 60:02d}")
+
+    # -- member list
+    def _online(self, uid):
+        return _friend_status(self.profiles.get(uid) or {})[0] != "Offline"
+
+    def _rebuild_members(self):
+        members, now = self.g.get("members", {}), time.time()
+        tos = self.g.get("timeouts", {})
+        sig = json.dumps([sorted(members.items()),
+                          [(u, bool(isinstance(tos.get(u), (int, float)) and tos[u] / 1000.0 > now)) for u in sorted(members)],
+                          [(u, _friend_status(self.profiles.get(u) or {})[0], _grp_name_of(self.profiles.get(u)),
+                            len((self.profiles.get(u) or {}).get("photo") or "")) for u in sorted(members)]])
+        if sig == self._members_sig:
+            return
+        self._members_sig = sig
+        while self.members_lay.count() > 1:
+            w = self.members_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        pos = 0
+        for role in ("owner", "admin", "mod", "member"):
+            uids = sorted((u for u, r in members.items() if r == role),
+                          key=lambda u: (not self._online(u), self._name(u).lower()))
+            if not uids:
+                continue
+            title = QLabel(f"{GROUP_ROLE_PLURAL[role].upper()} \u2014 {len(uids)}")
+            title.setStyleSheet("color:#888888; font-size:10px; font-weight:bold; padding:8px 4px 2px 4px;")
+            self.members_lay.insertWidget(pos, title)
+            pos += 1
+            for u in uids:
+                self.members_lay.insertWidget(pos, self._member_row(u, role))
+                pos += 1
+
+    def _member_row(self, uid, role):
+        p = self.profiles.get(uid) or {}
+        name = self._name(uid)
+        status, color = _friend_status(p)
+        offline = status == "Offline"
+        timed_out = isinstance(self.g.get("timeouts", {}).get(uid), (int, float)) and \
+            self.g["timeouts"][uid] / 1000.0 > time.time()
+        btn = QPushButton()
+        btn.setFixedHeight(46)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFlat(True)
+        btn.setStyleSheet("QPushButton{border:none;border-radius:8px;text-align:left;}"
+                          "QPushButton:hover{background:rgba(128,128,128,0.22);}")
+        r = QHBoxLayout(btn)
+        r.setContentsMargins(6, 0, 6, 0)
+        av = QLabel("?")
+        av.setFixedSize(32, 32)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _grp_avatar(av, _friend_avatar_file(uid, p.get("photo")) if p.get("photo") else None, name[:1].upper(), 32)
+        c = QVBoxLayout()
+        c.setSpacing(0)
+        n = QLabel(name + ("  \u23F3" if timed_out else ""))
+        rc = GROUP_ROLE_COLOR[role]
+        n.setStyleSheet("font-weight:bold;" + (f"color:{rc};" if rc and not offline else "") +
+                        ("color:#888888;" if offline else ""))
+        s = QLabel(status)
+        s.setStyleSheet(f"color:{color}; font-size:11px;")
+        c.addStretch()
+        c.addWidget(n)
+        c.addWidget(s)
+        c.addStretch()
+        r.addWidget(av)
+        r.addLayout(c, 1)
+        for w in (av, n, s):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        btn.setToolTip(f"{GROUP_ROLE_LABEL[role]}" + (" (timed out)" if timed_out else ""))
+        btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        btn.customContextMenuRequested.connect(lambda pt, u=uid, b=btn: self._member_menu(u, b.mapToGlobal(pt)))
+        btn.clicked.connect(lambda _=False, u=uid, b=btn: self._member_menu(u, b.mapToGlobal(QPoint(b.width() - 10, b.height() - 4))))
+        return btn
+
+    def _member_menu(self, uid, global_pos):
+        role = self.g.get("members", {}).get(uid)
+        my = self._my_role()
+        if not role or uid == self._me:
+            return
+        menu = QMenu(self)
+        head = menu.addAction(f"{self._name(uid)} \u2014 {GROUP_ROLE_LABEL[role]}")
+        head.setEnabled(False)
+        actions = []
+        for new, label in (("admin", "Make Admin"), ("mod", "Make Moderator"), ("member", "Set as Member")):
+            if group_can_set_role(my, role, new):
+                actions.append((menu.addAction(label), lambda n=new: self._set_role(uid, n)))
+        if group_can_manage(my, role):
+            menu.addSeparator()
+            if isinstance(self.g.get("timeouts", {}).get(uid), (int, float)) and self.g["timeouts"][uid] / 1000.0 > time.time():
+                actions.append((menu.addAction("Remove timeout"), lambda: self._remove_timeout(uid)))
+            sub = menu.addMenu("Timeout")
+            for label, secs in GROUP_TIMEOUT_CHOICES:
+                actions.append((sub.addAction(label), lambda s=secs, l=label: self._timeout(uid, s, l)))
+            actions.append((menu.addAction("Kick from group"), lambda: self._kick(uid)))
+            actions.append((menu.addAction("Ban from group"), lambda: self._ban(uid)))
+        if not actions:
+            return
+        chosen = menu.exec(global_pos)
+        for act, fn in actions:
+            if act is chosen:
+                fn()
+                break
+
+    # -- moderation actions
+    def _do(self, fn, ok_text=""):
+        gid = self.gid
+
+        def done(res, err):
+            self._set_status(err or ok_text)
+            if gid == self.gid:
+                self._load_group()
+        self._run(fn, done)
+
+    def _confirm(self, text):
+        return QMessageBox.question(self, "Group", text) == QMessageBox.StandardButton.Yes
+
+    def _set_role(self, uid, role):
+        gid = self.gid
+        self._do(lambda: cloud_group_set_role(gid, uid, role), f"{self._name(uid)} is now {GROUP_ROLE_LABEL[role].lower()}.")
+
+    def _timeout(self, uid, secs, label):
+        gid = self.gid
+        self._do(lambda: cloud_group_timeout(gid, uid, secs), f"{self._name(uid)} was timed out for {label}.")
+
+    def _remove_timeout(self, uid):
+        gid = self.gid
+        self._do(lambda: cloud_group_remove_timeout(gid, uid), f"{self._name(uid)}'s timeout was removed.")
+
+    def _kick(self, uid):
+        gid = self.gid
+        if self._confirm(f"Kick {self._name(uid)} from the group? They can be added again later."):
+            self._do(lambda: cloud_group_kick(gid, uid), f"{self._name(uid)} was kicked.")
+
+    def _ban(self, uid):
+        gid = self.gid
+        if self._confirm(f"Ban {self._name(uid)}? They are removed and can't be added back until unbanned."):
+            self._do(lambda: cloud_group_ban(gid, uid), f"{self._name(uid)} was banned.")
+
+    # -- header menu
+    def _open_menu(self):
+        my = self._my_role()
+        menu = QMenu(self)
+        acts = {}
+        if GROUP_RANK[my] >= 1:
+            acts[menu.addAction("Add members...")] = self.add_members
+        if GROUP_RANK[my] >= 2:
+            acts[menu.addAction("Rename group...")] = self.rename_group
+            acts[menu.addAction("Change group icon...")] = self.change_icon
+            if self.g.get("icon"):
+                acts[menu.addAction("Remove group icon")] = self.remove_icon
+            acts[menu.addAction("Banned users...")] = self.show_bans
+        if GROUP_RANK[my] >= 1:
+            menu.addSeparator()
+        if my == "owner":
+            acts[menu.addAction("Delete group")] = self.delete_group
+        else:
+            acts[menu.addAction("Leave group")] = self.leave_group
+        chosen = menu.exec(self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height())))
+        if chosen in acts:
+            acts[chosen]()
+
+    def add_members(self):
+        gid, g = self.gid, self.g
+        room = GROUP_MAX_MEMBERS - len(g.get("members", {}))
+        cands = {u: d for u, d in self.fp.friends.items() if u not in g.get("members", {}) and u not in g.get("bans", {})}
+        if room <= 0:
+            QMessageBox.information(self, "Group", f"A group can have up to {GROUP_MAX_MEMBERS} members.")
+            return
+        if not cands:
+            QMessageBox.information(self, "Group", "All your friends are already in this group (or are banned from it).")
+            return
+        dlg = _GroupFriendsDialog(self, "Add members", cands)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        picked = dlg.values()[1][:room]
+        if not picked:
+            return
+
+        def work():
+            for u in picked:
+                cloud_group_add_member(gid, u)
+        self._do(work, f"Added {len(picked)} member{'s' if len(picked) != 1 else ''}.")
+
+    def rename_group(self):
+        gid = self.gid
+        name, ok = QInputDialog.getText(self, "Rename group", "Group name:", text=self.g.get("name", ""))
+        if ok and name.strip():
+            self._do(lambda: cloud_group_rename(gid, name), "Group renamed.")
+
+    def _avatar_clicked(self):
+        if GROUP_RANK[self._my_role()] >= 2:
+            self.change_icon()
+
+    def change_icon(self):
+        gid = self.gid
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a group icon", "",
+                                              "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+        if not path:
+            return
+
+        def work():
+            cloud_group_set_icon(gid, base64.b64encode(prepare_avatar_png(path)).decode("ascii"))
+        self._do(work, "Group icon updated.")
+
+    def remove_icon(self):
+        gid = self.gid
+        self._do(lambda: cloud_group_set_icon(gid, None), "Group icon removed.")
+
+    def show_bans(self):
+        gid, bans = self.gid, list(self.g.get("bans", {}))
+        known = dict(self.fp.friends)
+
+        def done(profs, err):
+            if err or gid != self.gid:
+                self._set_status(err or "")
+                return
+            names = {u: _grp_name_of(profs.get(u)) for u in bans}
+
+            def unban(uid, cb):
+                self._run(lambda: cloud_group_unban(gid, uid), lambda r, e: (cb(e), self._load_group()))
+            _GroupBansDialog(self, names, unban).exec()
+        self._run(lambda: cloud_fetch_profiles(bans, known), done)
+
+    def leave_group(self):
+        gid = self.gid
+        if not self._confirm("Leave this group?"):
+            return
+
+        def done(res, err):
+            if err:
+                self._set_status(err)
+                return
+            self.fp.groups.pop(gid, None)
+            self.close_group()
+        self._run(lambda: cloud_group_leave(gid), done)
+
+    def delete_group(self):
+        gid = self.gid
+        if not self._confirm("Delete this group for everyone? All messages are lost."):
+            return
+
+        def done(res, err):
+            if err:
+                self._set_status(err)
+                return
+            self.fp.groups.pop(gid, None)
+            self.close_group()
+        self._run(lambda: cloud_group_delete(gid), done)
+
+    # -- messages
+    def _render_chat(self):
+        self.chat_view.other_uid = "group:" + self.gid
+        self.chat_view.set_messages(self._me, self._msgs, self._chat_names())
+
+    def load_messages(self, force=False):
+        gid = self.gid
+        if not gid or not self.isVisible() and not force:
+            return
+
+        def done(res, err):
+            if err or gid != self.gid:
+                return
+            if self._rx_inflight > 0 and not force:
+                return
+            me, msgs, _last = res
+            sig = self._sig_of(msgs)
+            if sig == self._sig:
+                return
+            self._sig, self._me, self._msgs = sig, me, msgs
+            self._render_chat()
+            missing = sorted({m.get("from") for m in msgs if m.get("from")} - set(self.profiles))
+            if missing:                                         # people who left but wrote earlier
+                known = dict(self.fp.friends)
+                self._run(lambda: cloud_fetch_profiles(missing, known),
+                          lambda r, e: self._on_authors(gid, r) if not e else None)
+        self._run(lambda: cloud_get_group_messages(gid), done, key=("gmsgs", gid))
+
+    def _on_authors(self, gid, profs):
+        if gid == self.gid and profs:
+            self.profiles.update(profs)
+            self._render_chat()
+
+    def send_message(self):
+        gid = self.gid
+        if not gid or self._sending or self._timeout_left() > 0:
+            return
+        if self._preparing:
+            self._set_status("Still preparing your files...")
+            return
+        text = self.chat_input.text().strip()
+        atts = list(self._pending)
+        if not text and not atts:
+            return
+        reply = self._reply
+        self.chat_input.clear()
+        self._pending = []
+        self._refresh_att_bar()
+        self.cancel_reply()
+        if atts:
+            self._sending = True
+            self.attach_btn.setEnabled(False)
+            self._set_status(f"Uploading {len(atts)} file{'s' if len(atts) != 1 else ''}...")
+
+        def done(res, err):
+            if atts:
+                self._sending = False
+                self.attach_btn.setEnabled(True)
+            if err:
+                self._set_status(err)
+                if gid == self.gid:
+                    if not self.chat_input.text():
+                        self.chat_input.setText(text)
+                    if atts and not self._pending:
+                        self._pending = atts
+                        self._refresh_att_bar()
+                    if reply and not self._reply:
+                        self._show_reply(reply)
+            else:
+                self._set_status("")
+            self.load_messages(force=True)
+            self._load_group()           # e.g. we were just timed out / removed
+        self._run(lambda: cloud_send_group_message(gid, text, atts, reply), done)
+
+    def delete_message(self, key):
+        gid = self.gid
+        if not gid or not self._confirm("Delete this message?"):
+            return
+
+        def done(res, err):
+            self._set_status(err or "")
+            self.load_messages(force=True)
+        self._run(lambda: cloud_delete_group_message(gid, key), done)
+
+    def toggle_reaction(self, key, code):
+        gid = self.gid
+        if not gid or not self._me or not _EMOJI_CODE_RE.match(code or ""):
+            return
+        msg = next((m for m in self._msgs if m.get("_key") == key), None)
+        if msg is None:
+            return
+        rx = dict(msg["rx"]) if isinstance(msg.get("rx"), dict) else {}
+        users = dict(rx[code]) if isinstance(rx.get(code), dict) else {}
+        on = not users.get(self._me)
+        if on:
+            users[self._me] = True
+        else:
+            users.pop(self._me, None)
+        if users:
+            rx[code] = users
+        else:
+            rx.pop(code, None)
+        if rx:
+            msg["rx"] = rx
+        else:
+            msg.pop("rx", None)
+        self._sig = self._sig_of(self._msgs)
+        self._render_chat()
+        self._rx_inflight += 1
+
+        def done(res, err):
+            self._rx_inflight = max(0, self._rx_inflight - 1)
+            if err:
+                self._set_status(err)
+            self.load_messages(force=True)
+        self._run(lambda: cloud_set_group_reaction(gid, key, code, on), done)
+
+    # -- game invites (same one-click flow as in a DM)
+    def _send_invite(self, game, link, appid):
+        gid = self.gid
+        text = make_invite_text(game, link, appid)
+
+        def done(res, err):
+            self._set_status(err or "")
+            self.load_messages(force=True)
+        self._run(lambda: cloud_send_group_message(gid, text), done)
+
+    def invite_to_game(self):
+        gid = self.gid
+        if not gid or self._sending:
+            return
+        clip = normalize_steam_join(QApplication.clipboard().text())
+        self._set_status("Finding your game and join link...")
+
+        def done(info, err):
+            if gid != self.gid:
+                return
+            info = info or {}
+            game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "")
+            if game and link:
+                self._send_invite(game, link, appid)
+                return
+            self._set_status("")
+            if not game:
+                note = "No game is running right now, so enter the game and its join link."
+            elif clip:
+                note = f"Found {game}. Used the link from your clipboard; check it, then send."
+            else:
+                note = f"Found {game}, but Steam has no join link for it right now."
+            dlg = SteamInviteDialog(self, game, link or clip, appid, note)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            g, l, a = dlg.values()
+            self._send_invite(g, l, a)
+        self._run(detect_invite_info, done, key="ginvite-detect")
+
+
+# ---- hook into the Friends tab
+def _grp_rebuild_rows(fp):
+    lay = fp.grp_rows
+    while lay.count():
+        w = lay.takeAt(0).widget()
+        if w:
+            w.deleteLater()
+    if not fp.groups:
+        empty = QLabel("No group chats yet. Press \"New group\" to start one with your friends.")
+        empty.setObjectName("RowDesc")
+        empty.setWordWrap(True)
+        lay.addWidget(empty)
+        return
+    me = (load_account() or {}).get("uid")
+    for gid, g in sorted(fp.groups.items(), key=lambda kv: kv[1]["name"].lower()):
+        btn = QPushButton()
+        btn.setFixedHeight(52)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        r = QHBoxLayout(btn)
+        r.setContentsMargins(10, 0, 10, 0)
+        av = QLabel("?")
+        av.setFixedSize(36, 36)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _grp_avatar(av, _grp_icon_of(gid, g), g["name"][:1].upper(), 36)
+        c = QVBoxLayout()
+        c.setSpacing(0)
+        n = QLabel(g["name"])
+        n.setObjectName("RowTitle")
+        cnt = len(g["members"])
+        s = QLabel(f"{cnt} member{'s' if cnt != 1 else ''} \u2022 {GROUP_ROLE_LABEL.get(g['members'].get(me), 'Member')}")
+        s.setObjectName("RowDesc")
+        c.addStretch()
+        c.addWidget(n)
+        c.addWidget(s)
+        c.addStretch()
+        r.addWidget(av)
+        r.addLayout(c, 1)
+        for w in (av, n, s):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        btn.clicked.connect(lambda _=False, i=gid: fp.group_page.open_group(i))
+        lay.addWidget(btn)
+
+
+def _grp_refresh(fp):
+    if not fp._signed_in():
+        if fp.groups:
+            fp.groups, fp._grp_prev_last = {}, None
+            _grp_rebuild_rows(fp)
+        return
+
+    def done(res, err):
+        if err:
+            return
+        groups, failed = res
+        for gid in failed:                              # a failed fetch must not make a group vanish
+            if gid in fp.groups:
+                groups.setdefault(gid, fp.groups[gid])
+        changed = json.dumps(groups, sort_keys=True) != json.dumps(fp.groups, sort_keys=True)
+        fp.groups = groups
+        if changed:
+            _grp_rebuild_rows(fp)
+        gp = fp.group_page
+        if gp.gid and gp.gid not in groups:
+            gp._removed()
+    fp._run(cloud_fetch_groups, done, key="groups")
+
+
+def _grp_author(fp, uid):
+    for src in (fp.group_page.profiles, fp.friends, {u: c[1] for u, c in _grp_prof_cache.items()}):
+        if src.get(uid):
+            return _grp_name_of(src[uid])
+    return "Someone"
+
+
+def _grp_poll_last(fp):
+    if not fp.groups or not fp._signed_in():
+        return
+    ids = list(fp.groups)
+
+    def done(last, err):
+        if err:
+            return
+        me = (load_account() or {}).get("uid")
+        prev, gp = fp._grp_prev_last, fp.group_page
+        if prev is not None:
+            for gid, (key, msg) in last.items():
+                old = prev.get(gid)
+                if old is None or msg is None or key <= old or msg.get("from") == me or gid not in fp.groups:
+                    continue
+                if gp.gid == gid and gp.isVisible() and fp.window().isActiveWindow():
+                    continue
+                author = _grp_author(fp, msg.get("from"))
+                text = f"{author}: {chat_preview(msg)}"
+                fp.__dict__.setdefault("_ov_msgs", {})["group:" + gid] = msg
+                fp.friend_event.emit(fp.groups[gid]["name"], text if len(text) <= 100 else text[:97] + "...",
+                                     "group:" + gid)
+        merged = dict(prev or {})
+        merged.update({gid: key for gid, (key, _m) in last.items()})
+        fp._grp_prev_last = {gid: k for gid, k in merged.items() if gid in fp.groups}
+    fp._run(lambda: cloud_get_group_last(ids), done, key="groups-last")
+
+
+def _grp_new_group(fp):
+    if not fp._signed_in():
+        QMessageBox.information(fp, "Group chats", "Sign in from the profile button (bottom left) first.")
+        return
+    if not fp.friends:
+        QMessageBox.information(fp, "Group chats", "Add a friend first, then you can start a group with them.")
+        return
+    dlg = _GroupFriendsDialog(fp, "New group chat", fp.friends, ask_name=True, button="Create")
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return
+    name, picked = dlg.values()
+    icon = dlg.icon
+
+    def done(gid, err):
+        if err:
+            fp.status_label.setText(err)
+            return
+        def opened(res, e):
+            if not e:
+                groups, _failed = res
+                fp.groups = groups
+                _grp_rebuild_rows(fp)
+                if gid in groups:
+                    fp.group_page.open_group(gid)
+        fp._run(cloud_fetch_groups, opened)
+    fp._run(lambda: cloud_create_group(name, picked, icon), done)
+
+
+def _grp_attach(fp):
+    fp.groups, fp._grp_prev_last = {}, None
+    page = fp.stack.widget(0)
+    lay = page.layout()
+    box = QFrame()
+    box.setObjectName("Panel")
+    bl = QVBoxLayout(box)
+    bl.setContentsMargins(22, 14, 22, 14)
+    head = QHBoxLayout()
+    title = QLabel("Group chats")
+    title.setObjectName("RowTitle")
+    new_btn = QPushButton("New group")
+    new_btn.setObjectName("Primary")
+    new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    new_btn.clicked.connect(lambda: _grp_new_group(fp))
+    head.addWidget(title, 1)
+    head.addWidget(new_btn)
+    bl.addLayout(head)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setMaximumHeight(190)
+    holder = QWidget()
+    fp.grp_rows = QVBoxLayout(holder)
+    fp.grp_rows.setContentsMargins(0, 0, 0, 0)
+    fp.grp_rows.setSpacing(6)
+    scroll.setWidget(holder)
+    bl.addWidget(scroll)
+    idx = next((i for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), QScrollArea)), lay.count())
+    lay.insertWidget(idx, box)
+    lay.insertSpacing(idx + 1, 10)
+    _grp_rebuild_rows(fp)
+
+    fp.group_page = GroupChatPage(fp)
+    fp.stack.addWidget(fp.group_page)
+
+    fp._grp_timer = QTimer(fp)
+    fp._grp_timer.setInterval(10000)
+    fp._grp_timer.timeout.connect(lambda: _grp_refresh(fp))
+    fp._grp_timer.start()
+    fp._grp_msg_timer = QTimer(fp)
+    fp._grp_msg_timer.setInterval(3000)
+    fp._grp_msg_timer.timeout.connect(lambda: _grp_poll_last(fp))
+    fp._grp_msg_timer.start()
+    QTimer.singleShot(3500, lambda: _grp_refresh(fp))
+
+
+_grp_prev_fp_init = FriendsPage.__init__
+
+
+def _grp_fp_init(self, *a, **k):
+    _grp_prev_fp_init(self, *a, **k)
+    _grp_attach(self)
+
+
+FriendsPage.__init__ = _grp_fp_init
+
+_grp_prev_fp_refresh = FriendsPage.refresh
+
+
+def _grp_fp_refresh(self):
+    _grp_prev_fp_refresh(self)
+    if hasattr(self, "group_page"):
+        _grp_refresh(self)
+
+
+FriendsPage.refresh = _grp_fp_refresh
+
 
 if __name__ == "__main__":
     main()
