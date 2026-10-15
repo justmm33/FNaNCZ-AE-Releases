@@ -543,7 +543,8 @@ def load_launcher_settings():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
-                "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff"}
+                "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff",
+                "download_server": "1"}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -574,6 +575,8 @@ def load_launcher_settings():
                 for _k in ("start_minimized", "close_to_tray"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
+                if loaded.get("download_server") in ("1", "2"):
+                    settings["download_server"] = loaded["download_server"]
                 if isinstance(loaded.get("accent_color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", loaded["accent_color"]):
                     settings["accent_color"] = loaded["accent_color"].lower()
                 key = loaded.get("steamgriddb_api_key", "")
@@ -1237,6 +1240,12 @@ QPushButton#ProfileButton:checked { background: rgba(166,102,255,0.18); border: 
 QPushButton#ProfileButton QLabel { color: $nav_active; }
 QLabel#Avatar { background: $accent; color: #ffffff; border-radius: 18px; font-size: 15px; font-weight: bold; }
 QLabel#AvatarLarge { background: $accent; color: #ffffff; border-radius: 40px; font-size: 32px; font-weight: bold; }
+QLabel#SyncAvatar { background: $accent; color: #ffffff; border-radius: 28px; font-size: 22px; font-weight: bold; }
+QFrame#SyncCard { background: $panel; border: 1px solid $border; border-radius: 12px; }
+QFrame#SyncCard:hover { border: 1px solid $accent; }
+QFrame#SyncCard[selected="true"] { border: 2px solid $accent; }
+QLabel#SyncName { font-size: 14px; font-weight: 600; }
+QLabel#SyncStatus { font-size: 12px; }
 QLabel#ProfileName { font-size: 13px; font-weight: 600; }
 QLabel#ProfileSub { color: $nav_text; font-size: 11px; }
 
@@ -2818,6 +2827,33 @@ class SettingsPage(QWidget):
         cur_panel_layout.addLayout(cur_row)
         layout.addWidget(cur_panel)
         layout.addSpacing(12)
+
+        srv_panel = QFrame()
+        srv_panel.setObjectName("Panel")
+        srv_panel_layout = QVBoxLayout(srv_panel)
+        srv_panel_layout.setContentsMargins(22, 18, 22, 18)
+        srv_row = QHBoxLayout()
+        srv_text = QVBoxLayout()
+        srv_text.setSpacing(2)
+        srv_name = QLabel("Download server")
+        srv_name.setObjectName("RowTitle")
+        srv_desc = QLabel("SteamRIP downloads directly. FitGirl Repacks downloads it as a repacked torrent "
+                          "(needs: pip install libtorrent)")
+        srv_desc.setObjectName("RowDesc")
+        srv_desc.setWordWrap(True)
+        srv_text.addWidget(srv_name)
+        srv_text.addWidget(srv_desc)
+        self.server_combo = QComboBox()
+        self.server_combo.setFixedWidth(200)
+        self.server_combo.addItem("SteamRIP", "1")
+        self.server_combo.addItem("FitGirl", "2")
+        self.server_combo.setCurrentIndex(max(self.server_combo.findData(load_launcher_settings().get("download_server", "1")), 0))
+        self.server_combo.currentIndexChanged.connect(self.on_server_changed)
+        srv_row.addLayout(srv_text, 1)
+        srv_row.addWidget(self.server_combo)
+        srv_panel_layout.addLayout(srv_row)
+        layout.addWidget(srv_panel)
+        layout.addSpacing(12)
         layout.addWidget(self._build_library_panel())
 
         if sys.platform.startswith("linux"):
@@ -3087,6 +3123,11 @@ class SettingsPage(QWidget):
     def on_wine_d3d_changed(self):
         settings = load_launcher_settings()
         settings["wine_d3d"] = self.d3d_combo.currentData()
+        save_launcher_settings(settings)
+
+    def on_server_changed(self):
+        settings = load_launcher_settings()
+        settings["download_server"] = self.server_combo.currentData()
         save_launcher_settings(settings)
 
     def on_currency_changed(self):
@@ -7476,7 +7517,9 @@ FirebaseDownloadWorker.run = _new_fb_run
 # Every game except Five Nights at NCZ / NCZFront opens PW_BASE_URL + game-slug (e.g. .../dying-light-the-beast).
 # Playwright clicks through to the file host, copies the final download link (plus the cookies the host needs),
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
-PW_BASE_URL = "https://steamrip.com/"                   # <-- change this
+PW_BASE_URL = "https://steamrip.com/"                   # <-- server 1 (direct download): change this
+PW_BASE_URL_2 = "https://fitgirl-repacks.site/"                # <-- server 2 (magnet -> torrent): change this
+PW_MAGNET_TEXT = r"\[?\s*magnet\s*\]?"                    # label of the magnet button on a server 2 game page
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
@@ -7495,14 +7538,18 @@ PW_SLUG_OVERRIDES = (
     (r"risk of rain (2|two)\b.*", "risk-of-rain-two"),
 )
 
+def pw_server():
+    return "2" if load_launcher_settings().get("download_server") == "2" else "1"
+
 def pw_game_url(title):
+    base = PW_BASE_URL_2 if pw_server() == "2" else PW_BASE_URL
     t = title.lower().replace("'", "")
     plain = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", t)).strip()
     for pattern, slug in PW_SLUG_OVERRIDES:
         if re.fullmatch(pattern, plain):
-            return PW_BASE_URL.rstrip("/") + "/" + slug
+            return base.rstrip("/") + "/" + slug
     slug = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
-    return PW_BASE_URL.rstrip("/") + "/" + slug
+    return base.rstrip("/") + "/" + slug
 
 # Describes the block around a DOWNLOAD HERE button (its label, logo, link...): which host does it mention?
 PW_LABEL_JS = r"""el => {
@@ -7518,7 +7565,7 @@ PW_LABEL_JS = r"""el => {
 }"""
 
 def _pw_host_ok(url, hosts):
-    if not url or url.startswith(("about:", "blob:", "data:")):
+    if not url or url.startswith(("about:", "blob:", "data:", "magnet:")):
         return True
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in hosts if h)
@@ -7604,7 +7651,7 @@ def _pw_through_relay(self, context, tab, p):
 
 def _pw_guard(context, page):
     """Watches every tab: a popup that lands anywhere unexpected is closed, the main tab is sent back."""
-    allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname,) + tuple(PW_ALLOWED_HOSTS) + tuple(PW_RELAY_HOSTS)
+    allowed = (urllib.parse.urlparse(PW_BASE_URL).hostname, urllib.parse.urlparse(PW_BASE_URL_2).hostname) + tuple(PW_ALLOWED_HOSTS) + tuple(PW_RELAY_HOSTS)
     state = {"closed": 0, "blocked": [], "allow": set()}  # extra tabs closed so far, the blocked URLs, hosts allowed later
     def ok(url):
         return _pw_host_ok(url, allowed + tuple(state["allow"]))
@@ -7826,6 +7873,163 @@ def _pw_find_link(self, start_url):
         finally:
             browser.close()
 
+_MAGNET_RX = re.compile(r"magnet:\?[^\s\"'<>]+", re.IGNORECASE)
+
+def _pw_scan_magnet(page):
+    """Looks for a magnet link in the page's links / data attributes / raw HTML (any frame)."""
+    for fr in page.frames:
+        try:
+            href = fr.evaluate("""() => {
+                const a = document.querySelector('a[href^="magnet:"]');
+                if (a) return a.getAttribute('href');
+                const d = document.querySelector('[data-magnet],[data-clipboard-text^="magnet:"]');
+                return d ? (d.getAttribute('data-magnet') || d.getAttribute('data-clipboard-text')) : '';
+            }""")
+            if href and href.lower().startswith("magnet:"):
+                return html_lib.unescape(href)
+            m = _MAGNET_RX.search(fr.content())
+            if m:
+                return html_lib.unescape(m.group(0))
+        except Exception:
+            continue
+    return ""
+
+def _pw_find_magnet(self, start_url):
+    """Server 2: opens the game page in the hidden browser, presses [magnet], returns the magnet link."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
+    with sync_playwright() as p:
+        self.status_update.emit("Starting browser...")
+        browser = p.chromium.launch(headless=PW_HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+        try:
+            context = browser.new_context(user_agent=PW_USER_AGENT)
+            page = context.new_page()
+            _pw_guard(context, page)
+            self.status_update.emit("Opening download page...")
+            page.goto(start_url, timeout=60000)
+            rx = re.compile(PW_MAGNET_TEXT, re.IGNORECASE)
+            for attempt in range(1, 9):
+                if self._is_cancelled:
+                    raise RuntimeError("CANCELLED")
+                self.status_update.emit(f"Finding magnet link (attempt {attempt})...")
+                magnet = _pw_scan_magnet(page)
+                if magnet:
+                    return magnet
+                btn = _pw_find_visible(page, rx)   # the [magnet] button/link
+                if btn is not None:
+                    _pw_press(btn)                 # JS pages only fill the link in after the click
+                page.wait_for_timeout(1500)
+                magnet = _pw_scan_magnet(page)
+                if magnet:
+                    return magnet
+            raise RuntimeError("Couldn't find a [magnet] link on " + start_url)
+        finally:
+            browser.close()
+
+def _fb_torrent(self, magnet):
+    """Downloads a magnet link with libtorrent into <downloads>/<title>.torrent (re-running resumes it).
+    Returns (staging_dir, content_path)."""
+    try:
+        import libtorrent as lt
+    except ImportError:
+        raise RuntimeError("libtorrent isn't installed. Run: pip install libtorrent")
+    stage = os.path.join(DOWNLOAD_DIR, sanitize_folder_name(self.title) + ".torrent")
+    os.makedirs(stage, exist_ok=True)
+    ses = lt.session({"listen_interfaces": "0.0.0.0:6881,[::]:6881", "enable_dht": True,
+                      "enable_lsd": True, "enable_upnp": True, "enable_natpmp": True})
+    flag = lambda k: self.__dict__.get(k, False)   # not self._is_cancelled: that one blocks while paused
+    handle = None
+    try:
+        params = lt.parse_magnet_uri(magnet)
+        params.save_path = stage
+        handle = ses.add_torrent(params)
+        self.status_update.emit("Getting torrent info...")
+        deadline = time.time() + 300
+        while not handle.status().has_metadata:
+            if flag("_cancel_flag"):
+                raise RuntimeError("CANCELLED")
+            if time.time() > deadline:
+                raise RuntimeError("Couldn't get the torrent info (no peers found).")
+            time.sleep(0.5)
+        info = handle.torrent_file() if hasattr(handle, "torrent_file") else handle.get_torrent_info()
+        total, name = info.total_size(), info.name()
+        paused = False
+        while True:
+            if flag("_cancel_flag"):
+                raise RuntimeError("CANCELLED")
+            if flag("_paused") != paused:
+                paused = flag("_paused")
+                handle.pause() if paused else handle.resume()
+            if paused:
+                time.sleep(0.3)
+                continue
+            st = handle.status()
+            self.progress.emit(int(st.total_done), int(total), float(st.download_rate))
+            if st.is_finished or st.is_seeding:
+                break
+            time.sleep(0.5)
+        return stage, os.path.join(stage, name)
+    finally:
+        try:
+            if handle is not None:
+                ses.remove_torrent(handle)   # no seeding
+        except Exception:
+            pass
+        del ses
+
+def _find_setup_exe(folder):
+    """setup.exe (or the shallowest setup*.exe) inside the game folder, else None."""
+    best = None
+    for root, dirs, files in os.walk(folder):
+        depth = os.path.relpath(root, folder).count(os.sep) + (0 if root == folder else 1)
+        if depth > 2:
+            dirs[:] = []
+            continue
+        for f in files:
+            low = f.lower()
+            if low.endswith(".exe") and low.startswith("setup") and "unins" not in low:
+                key = (low != "setup.exe", depth, len(low))
+                if best is None or key < best[0]:
+                    best = (key, os.path.join(root, f))
+    return best[1] if best else None
+
+def _run_setup_exe(exe):
+    """Starts the installer (directly on Windows, through wine on Linux). Returns True if it was started."""
+    try:
+        cwd = os.path.dirname(exe)
+        if sys.platform.startswith("win"):
+            os.startfile(exe)
+            return True
+        found = find_wine()
+        if not found:
+            return False
+        launch_wine(found[0], exe, cwd)
+        return True
+    except Exception:
+        return False
+
+def _fb_install_torrent(self, stage, content):
+    """Moves what the torrent downloaded into the game's folder (an archive is extracted first)."""
+    target = installed_game_dir(sanitize_folder_name(self.title))
+    os.makedirs(target, exist_ok=True)
+    self.status_update.emit("Installing...")
+    if os.path.isfile(content):
+        if content.lower().endswith((".zip", ".rar")):
+            extract_archive(content, target)
+        else:
+            shutil.move(content, os.path.join(target, os.path.basename(content)))
+    else:
+        for entry in os.listdir(content):
+            dst = os.path.join(target, entry)
+            if os.path.isdir(dst):
+                shutil.rmtree(dst, ignore_errors=True)
+            elif os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(os.path.join(content, entry), dst)
+    shutil.rmtree(stage, ignore_errors=True)
+
 def _fb_stream(self, url, headers, relink=None):
     """Downloads url; relink() (optional) finds a brand-new link if this one dies mid-download."""
     def name(response, u):
@@ -7839,6 +8043,18 @@ def _fb_pw_run(self):
     dest_path = self.existing_zip_path if self.existing_zip_path and os.path.exists(self.existing_zip_path) else None
     fresh = False
     try:
+        if not dest_path and pw_server() == "2":       # server 2: [magnet] -> torrent
+            magnet = _pw_find_magnet(self, pw_game_url(self.title))
+            stage, content = _fb_torrent(self, magnet)
+            _fb_install_torrent(self, stage, content)
+            game_dir = installed_game_dir(sanitize_folder_name(self.title))
+            setup = _find_setup_exe(game_dir)
+            if setup:
+                self.status_update.emit("Starting setup.exe...")
+                self.setup_exe = setup
+                self.setup_started = _run_setup_exe(setup)
+            self.finished.emit(game_dir)
+            return
         if not dest_path:
             url, headers = _pw_find_link(self, pw_game_url(self.title))
             self.download_url = url  # bridged: the copied link becomes this download's link
@@ -7854,6 +8070,8 @@ def _fb_pw_run(self):
         self.finished.emit(dest_path)
     except Exception as e:
         if self._is_cancelled or str(e) == "CANCELLED":
+            if pw_server() == "2":
+                shutil.rmtree(os.path.join(DOWNLOAD_DIR, sanitize_folder_name(self.title) + ".torrent"), ignore_errors=True)
             self.failed.emit("CANCELLED")
             return
         msg = str(e)
@@ -7869,6 +8087,22 @@ def _fb_pw_run(self):
         self.failed.emit(msg)
 
 FirebaseDownloadWorker.run = _fb_pw_run
+
+_card_on_finished_orig = DownloadCard.on_finished
+def _card_on_finished_setup(self, path):
+    _card_on_finished_orig(self, path)
+    setup = getattr(self.worker, "setup_exe", None)
+    if not setup:
+        return
+    self.status_label.setText("Run setup")
+    started = getattr(self.worker, "setup_started", False)
+    QMessageBox.information(
+        self, "Finish installing " + self.title,
+        ("Download finished. setup.exe was started for you.\n\nFollow the installer to set up the game."
+         if started else
+         "Download finished, but setup.exe couldn't be started automatically "
+         "(on Linux it needs wine).\n\nRun it yourself to set up the game:\n" + setup))
+DownloadCard.on_finished = _card_on_finished_setup
 
 
 def _new_game_worker_run(self):
@@ -8585,6 +8819,25 @@ _window_state = {"minimized": False}
 def is_idle():
     return _window_state["minimized"]
 
+def workshop_mods_for_game(appid):
+    """[{'id', 'title'}] for the Workshop mods of one game that are downloaded on this PC."""
+    out = []
+    try:
+        for d in ws_load_downloads():
+            if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"])):
+                out.append({"id": str(d["id"]), "title": str(d.get("title") or "")[:120]})
+    except Exception:
+        pass
+    return out
+
+def workshop_parse_mods(raw):
+    """[(id, title)] from a shared mod list, tolerant of Firebase turning lists into dicts."""
+    found = []
+    for r in (raw.values() if isinstance(raw, dict) else raw if isinstance(raw, list) else []):
+        if isinstance(r, dict) and str(r.get("id", "")).isdigit():
+            found.append((str(r["id"]), str(r.get("title") or "")))
+    return found
+
 def cloud_publish_presence():
     token, uid = get_id_token()
     username, avatar = load_profile_cache()
@@ -8614,6 +8867,47 @@ def cloud_accept_friend(other):
     _http_json(_fdb(f"friends/{uid}/{other}", token), "PUT", True)
     _http_json(_fdb(f"friends/{other}/{uid}", token), "PUT", True)
     _http_json(_fdb(f"requests/{uid}/{other}", token), "DELETE")
+
+def _my_display_name():
+    username, _avatar = load_profile_cache()
+    return username or (load_account() or {}).get("email", "").split("@")[0] or "Player"
+
+# --- mod sharing: A asks B, B's launcher pops up a yes/no, and only on yes B's mod list is written for A.
+def cloud_modshare_send_request(friend, appid, game):
+    token, uid = get_id_token()
+    _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token), "DELETE")   # drop any stale answer
+    _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "PUT",
+               {"appid": int(appid), "game": str(game)[:80], "username": _my_display_name(),
+                "time": {".sv": "timestamp"}})
+
+def cloud_modshare_check_reply(friend):
+    """The friend's answer if there is one (and clears the exchange), else None."""
+    token, uid = get_id_token()
+    data = _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token))
+    if not isinstance(data, dict):
+        return None
+    _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token), "DELETE")
+    _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "DELETE")
+    return data
+
+def cloud_modshare_cancel_request(friend):
+    token, uid = get_id_token()
+    _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "DELETE")
+
+def cloud_modshare_fetch_requests():
+    token, uid = get_id_token()
+    data = _http_json(_fdb(f"modshare_requests/{uid}", token))
+    return data if isinstance(data, dict) else {}
+
+def cloud_modshare_answer(requester, appid, game, accept):
+    token, uid = get_id_token()
+    reply = {"appid": int(appid), "game": str(game)[:80], "accepted": bool(accept),
+             "time": {".sv": "timestamp"}}
+    if accept:
+        reply["username"] = _my_display_name()
+        reply["mods"] = workshop_mods_for_game(int(appid))
+    _http_json(_fdb(f"modshare_replies/{requester}/{uid}", token), "PUT", reply)
+    _http_json(_fdb(f"modshare_requests/{uid}/{requester}", token), "DELETE")
 
 def cloud_decline_friend(other):
     token, uid = get_id_token()
@@ -10465,6 +10759,10 @@ class FriendsPage(QWidget):
         self.msg_timer.setInterval(2000)
         self.msg_timer.timeout.connect(self._poll_messages)
         self.msg_timer.start()
+        self.modshare_timer = QTimer(self)      # a friend asking to sync mods: check every 3 s
+        self.modshare_timer.setInterval(3000)
+        self.modshare_timer.timeout.connect(self._poll_modshare)
+        self.modshare_timer.start()
         _playing_listeners.append(self._playing_changed)
         QTimer.singleShot(3000, self.heartbeat)
 
@@ -10586,6 +10884,43 @@ class FriendsPage(QWidget):
             friends = cloud_fetch_friends()
             return code, friends, cloud_fetch_requests(), cloud_fetch_last_messages(list(friends))
         self._run(work, self._on_fetched, key="refresh")
+
+    def _poll_modshare(self):
+        if self._signed_in():
+            self._run(cloud_modshare_fetch_requests, self._on_modshare_requests, key="modshare")
+
+    def _on_modshare_requests(self, res, err):
+        if err or not res:
+            return
+        shown = self.__dict__.setdefault("_modshare_shown", set())
+        for uid, d in res.items():
+            if uid in shown or not isinstance(d, dict):
+                continue
+            t = d.get("time")
+            if isinstance(t, (int, float)) and time.time() * 1000 - t > 15 * 60 * 1000:
+                self._run(lambda u=uid: cloud_modshare_answer(u, d.get("appid") or 0, d.get("game") or "", False),
+                          lambda r, e: None)       # too old: the asker gave up long ago
+                shown.add(uid)
+                continue
+            try:
+                appid = int(d.get("appid"))
+            except (TypeError, ValueError):
+                continue
+            game = str(d.get("game") or "a game")
+            name = (self.friends.get(uid, {}).get("username") or d.get("username") or "A friend")
+            shown.add(uid)
+            self.friend_event.emit(name, f"wants to sync mods on {game}", uid)
+            box = QMessageBox(self.window())
+            box.setWindowTitle("Share mods")
+            box.setText(f"Share mods on {game} with {name}?")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            accept = box.exec() == QMessageBox.StandardButton.Yes
+            def answered(r, e, uid=uid):
+                shown.discard(uid)
+                if e:
+                    QMessageBox.warning(self.window(), "Share mods", f"Couldn't send your answer: {e}")
+            self._run(lambda u=uid, a=appid, g=game, ok=accept: cloud_modshare_answer(u, a, g, ok), answered)
 
     def _poll_messages(self):
         if not self.friends or not self._signed_in():
@@ -12753,6 +13088,170 @@ def ws_parse_item_ids(text):
             ids.append(fid)
     return ids
 
+class _SyncFriendCard(QFrame):
+    """One friend as a clickable card: profile picture, username and status."""
+    picked = pyqtSignal(str)
+    confirmed = pyqtSignal(str)
+
+    def __init__(self, uid, name, status, color, avatar_path):
+        super().__init__()
+        self.uid, self.name = uid, name
+        self.setObjectName("SyncCard")
+        self.setProperty("selected", False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(84)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 10, 14, 10)
+        h.setSpacing(12)
+        av = QLabel("?")
+        av.setObjectName("SyncAvatar")
+        av.setFixedSize(56, 56)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        apply_avatar(av, avatar_path, name[:1].upper(), 56)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        n = QLabel(name)
+        n.setObjectName("SyncName")
+        n.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        n.setToolTip(name)
+        st = QLabel(f"\u25CF  {status}")
+        st.setObjectName("SyncStatus")
+        st.setStyleSheet(f"color: {color};")
+        st.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        col.addStretch()
+        col.addWidget(n)
+        col.addWidget(st)
+        col.addStretch()
+        h.addWidget(av)
+        h.addLayout(col, 1)
+        for w in (av, n, st):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def set_selected(self, on):
+        self.setProperty("selected", bool(on))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def mousePressEvent(self, _e):
+        self.picked.emit(self.uid)
+
+    def mouseDoubleClickEvent(self, _e):
+        self.confirmed.emit(self.uid)
+
+def _pick_sync_friend(parent, rows, game):
+    """Card picker. rows = [(uid, name, status, color, avatar_path)]. Returns the chosen uid or None."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Sync mods with friend")
+    dlg.resize(580, 470)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(24, 22, 24, 20)
+    lay.setSpacing(12)
+    title = QLabel("Sync mods with friend")
+    title.setObjectName("PageTitle")
+    sub = QLabel(f"Request a friend to share their {game} mods with you, they have to accept first")
+    sub.setObjectName("RowDesc")
+    sub.setWordWrap(True)
+    lay.addWidget(title)
+    lay.addWidget(sub)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    holder = QWidget()
+    grid = QGridLayout(holder)
+    grid.setContentsMargins(0, 4, 0, 4)
+    grid.setSpacing(10)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
+    cards, state = [], {"uid": None}
+    go = QPushButton("Pick a friend")
+    go.setObjectName("Primary")
+    go.setFixedHeight(34)
+    go.setEnabled(False)
+
+    def pick(uid):
+        state["uid"] = uid
+        for c in cards:
+            c.set_selected(c.uid == uid)
+        go.setEnabled(True)
+        go.setText("Ask " + next(c.name for c in cards if c.uid == uid))
+
+    for i, (uid, name, status, color, avatar) in enumerate(rows):
+        c = _SyncFriendCard(uid, name, status, color, avatar)
+        c.picked.connect(pick)
+        c.confirmed.connect(lambda u: (pick(u), dlg.accept()))
+        cards.append(c)
+        grid.addWidget(c, i // 2, i % 2)
+    grid.setRowStretch((len(rows) + 1) // 2, 1)
+    scroll.setWidget(holder)
+    lay.addWidget(scroll, 1)
+    note = QLabel("Your friend needs the launcher open to answer. The request expires after 2 minutes.")
+    note.setObjectName("RowDesc")
+    note.setWordWrap(True)
+    lay.addWidget(note)
+    btns = QHBoxLayout()
+    btns.addStretch()
+    cancel = QPushButton("Cancel")
+    cancel.setFixedHeight(34)
+    cancel.clicked.connect(dlg.reject)
+    go.clicked.connect(dlg.accept)
+    btns.addWidget(cancel)
+    btns.addWidget(go)
+    lay.addLayout(btns)
+    return state["uid"] if dlg.exec() == QDialog.DialogCode.Accepted else None
+
+class WorkshopFriendsWorker(QThread):
+    """Fetches the friend list (with each friend's shared Workshop mods) from the cloud."""
+    done = pyqtSignal(dict, str)   # {uid: public profile}, error text
+
+    def run(self):
+        try:
+            self.done.emit(cloud_fetch_friends(), "")
+        except CloudError as e:
+            self.done.emit({}, str(e))
+        except Exception as e:
+            self.done.emit({}, f"Couldn't reach your friends: {e}")
+
+class WorkshopModshareWorker(QThread):
+    """Sends a mod-share request to a friend and waits for their yes/no."""
+    done = pyqtSignal(dict, str)   # friend's answer, error ("timeout" / "cancelled" / message)
+    TIMEOUT = 120
+
+    def __init__(self, friend_uid, appid, game, parent=None):
+        super().__init__(parent)
+        self.friend, self.appid, self.game = friend_uid, appid, game
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            cloud_modshare_send_request(self.friend, self.appid, self.game)
+        except Exception as e:
+            self.done.emit({}, str(e) or "Couldn't send the request.")
+            return
+        deadline, err = time.time() + self.TIMEOUT, "timeout"
+        while time.time() < deadline:
+            if self._cancelled:
+                err = "cancelled"
+                break
+            try:
+                reply = cloud_modshare_check_reply(self.friend)
+            except Exception:
+                reply = None        # a hiccup: keep waiting
+            if reply is not None:
+                self.done.emit(reply, "")
+                return
+            for _ in range(6):
+                if self._cancelled:
+                    break
+                time.sleep(0.5)
+        try:
+            cloud_modshare_cancel_request(self.friend)
+        except Exception:
+            pass
+        self.done.emit({}, err)
+
 class WorkshopLinkWorker(QThread):
     """Looks up pasted Workshop items (title, preview, game) through Steam's public item-details API."""
     done = pyqtSignal(list, list)   # [(appid, game title, item dict)], [error strings]
@@ -12976,8 +13475,16 @@ class WorkshopPage(QWidget):
         self.link_btn.clicked.connect(self.download_by_link)
         head.addSpacing(16)
         head.addWidget(self.import_btn)
+        self.sync_btn = QPushButton("Sync with friend")
+        self.sync_btn.setToolTip("Ask a friend to share their mods for this game: they get a yes/no popup, "
+                                 "and if they accept, the mods you're missing are checked and downloaded")
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.setFixedHeight(30)
+        self.sync_btn.clicked.connect(self.sync_with_friend)
         head.addSpacing(8)
         head.addWidget(self.link_btn)
+        head.addSpacing(8)
+        head.addWidget(self.sync_btn)
         head.addStretch()
         head.addWidget(self.back_btn)
         outer.addLayout(head)
@@ -13087,7 +13594,13 @@ class WorkshopPage(QWidget):
         self.export_btn = QPushButton("Export list")
         self.export_btn.setObjectName("Primary")
         self.export_btn.clicked.connect(self.export_list)
+        from PyQt6.QtWidgets import QCheckBox
+        self.disable_others_cb = QCheckBox("Automatically disable other enabled mods")
+        self.disable_others_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.disable_others_cb.setToolTip("When someone imports this list, their other enabled mods "
+                                          "(Garry's Mod addons) are disabled first")
         lb.addWidget(self.list_info, 1)
+        lb.addWidget(self.disable_others_cb)
         lb.addWidget(sel_all)
         lb.addWidget(sel_none)
         lb.addWidget(self.export_btn)
@@ -13564,6 +14077,8 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             path += ".nczlist"
         data = {"format": "nczlist", "version": 1, "appid": self.appid, "game": self.game_title,
                 "created": int(time.time()), "items": list(self.selected.values())}
+        if self.disable_others_cb.isChecked():
+            data["disable_others"] = True
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -13607,6 +14122,11 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         if not items:
             QMessageBox.information(self, "Import list", "The list is empty.")
             return
+        disabled_msg = ""
+        if data.get("disable_others") is True:
+            disabled_msg = self._apply_disable_others(appid)
+            if disabled_msg is None:  # user cancelled the import
+                return
         have = {d["id"] for d in ws_load_downloads()
                 if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))}
         # jump to that game's Queue tab so the downloads are visible
@@ -13624,7 +14144,180 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         msg = f"Added {added} mod(s) to the queue for {game}."
         if skipped:
             msg += f"\nSkipped {skipped} that are already downloaded or queued."
+        if disabled_msg:
+            msg += "\n\n" + disabled_msg
         QMessageBox.information(self, "Import list", msg)
+
+    def _apply_disable_others(self, appid):
+        """Handle a list's 'disable_others' flag. Returns a status line ('' if nothing to do),
+        or None if the user cancelled the import."""
+        if appid != 4000:
+            return ""  # only Garry's Mod addons can be enabled/disabled by the launcher
+        root = find_gmod_root()
+        if not root:
+            return ""
+        base = os.path.join(root, "garrysmod", "addons")
+        off = os.path.join(base, "disabled")
+        try:
+            names = [n for n in os.listdir(base)
+                     if n != "disabled" and not n.startswith(".") and os.path.isdir(os.path.join(base, n))]
+        except OSError:
+            return ""
+        if not names:
+            return ""
+        if QMessageBox.question(
+                self, "Import list",
+                f"This list wants to disable your other enabled mods.\n\n"
+                f"{len(names)} Garry's Mod addon(s) will be moved to the disabled folder "
+                f"(you can re-enable them in the Addon Manager).\n\nContinue?") \
+                != QMessageBox.StandardButton.Yes:
+            return None
+        os.makedirs(off, exist_ok=True)
+        moved, failed = 0, 0
+        for n in names:
+            dst = os.path.join(off, n + GmodAddonManagerPage.DISABLED_SUFFIX)
+            try:
+                if os.path.exists(dst):
+                    raise OSError("already exists")
+                shutil.move(os.path.join(base, n), dst)
+                moved += 1
+            except Exception:
+                failed += 1
+        line = f"Disabled {moved} other enabled addon(s)."
+        if failed:
+            line += f" {failed} couldn't be moved."
+        return line
+
+    # ------------------------------------------------------------ sync with friend
+    def sync_with_friend(self):
+        waiting = getattr(self, "_sync_wait", None)
+        if waiting is not None and waiting.isRunning():     # second click while waiting = cancel
+            waiting.cancel()
+            self.sync_btn.setEnabled(False)
+            self.sync_btn.setText("Cancelling...")
+            return
+        if not cloud_configured() or load_account() is None:
+            QMessageBox.information(self, "Sync with friend",
+                                    "Log in to your account first (Account page), then add a friend with their friend code.")
+            return
+        if self.appid is None or self.stack.currentIndex() != 1:
+            QMessageBox.information(self, "Sync with friend",
+                                    "Open a game first, then press Sync with friend so I know which game's mods to ask for.")
+            return
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Loading friends...")
+        w = WorkshopFriendsWorker(self)
+        w.done.connect(self._on_sync_friends)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _reset_sync_btn(self):
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("Sync with friend")
+
+    def _on_sync_friends(self, friends, err):
+        self._reset_sync_btn()
+        if err:
+            QMessageBox.warning(self, "Sync with friend", err)
+            return
+        if not friends:
+            QMessageBox.information(self, "Sync with friend",
+                                    "You don't have any friends added yet. Add one with their friend code on the Friends page.")
+            return
+        rows = []   # (uid, name, status, color, avatar_path)
+        for uid, prof in friends.items():
+            prof = prof or {}
+            status, color = _friend_status(prof)
+            try:
+                avatar = _friend_avatar_file(uid, prof.get("photo"))
+            except Exception:
+                avatar = None
+            rows.append((uid, str(prof.get("username") or "Friend"), status, color, avatar))
+        rows.sort(key=lambda r: (r[2] == "Offline", r[1].lower()))
+        appid, game = self.appid, self.game_title
+        uid = _pick_sync_friend(self, rows, game)
+        if uid is None:
+            return
+        name = next(r[1] for r in rows if r[0] == uid)
+        self._sync_friend = name
+        w = WorkshopModshareWorker(uid, appid, game, self)
+        w.done.connect(self._on_sync_reply)
+        self._sync_wait = w
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        self.sync_btn.setText(f"Waiting for {name}... (click to cancel)")
+        w.start()
+
+    def _on_sync_reply(self, reply, err):
+        self._sync_wait = None
+        self._reset_sync_btn()
+        name = getattr(self, "_sync_friend", "Your friend")
+        if err == "cancelled":
+            return
+        if err == "timeout":
+            QMessageBox.information(self, "Sync with friend",
+                                    f"{name} didn't answer in time. Ask them to open the launcher and try again.")
+            return
+        if err:
+            QMessageBox.warning(self, "Sync with friend", err)
+            return
+        game = str(reply.get("game") or self.game_title)
+        if not reply.get("accepted"):
+            QMessageBox.information(self, "Sync with friend", f"{name} declined to share their mods.")
+            return
+        mods = workshop_parse_mods(reply.get("mods"))
+        if not mods:
+            QMessageBox.information(self, "Sync with friend", f"{name} has no downloaded mods for {game}.")
+            return
+        try:
+            appid = int(reply.get("appid"))
+        except (TypeError, ValueError):
+            appid = self.appid
+        have = {d["id"] for d in ws_load_downloads()
+                if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))}
+        have |= {q["id"] for q in self.queue
+                 if q["appid"] == appid and q["status"] in ("queued", "downloading")}
+        missing = [i for i, _t in mods if i not in have]
+        if not missing:
+            QMessageBox.information(self, "Sync with friend",
+                                    f"You're already in sync: you have all {len(mods)} of {name}'s {game} mods.")
+            return
+        self._sync_total = len(mods)
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Checking Workshop...")
+        w = WorkshopLinkWorker(list(dict.fromkeys(missing)),
+                               {g["appid"]: g["title"] for g in _ws_installed_games()}, self)
+        w.done.connect(self._on_sync_done)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _on_sync_done(self, results, errors):
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("Sync with friend")
+        total = getattr(self, "_sync_total", 0)
+        if not results:
+            QMessageBox.warning(self, "Sync with friend",
+                                "\n".join(errors) or "None of the missing mods could be found on the Workshop.")
+            return
+        first_appid, first_game = results[0][0], results[0][1]
+        if self.appid != first_appid or self.stack.currentIndex() != 1:
+            self.open_game({"appid": first_appid, "title": first_game})
+        self.tab_btns[1].setChecked(True)
+        self.inner.setCurrentIndex(1)
+        added = 0
+        for appid, game, it in results:
+            if self.enqueue(it, appid, game):
+                added += 1
+        lines = [f"{getattr(self, '_sync_friend', 'Your friend')} has {total} mod(s). You were missing {len(results) + len(errors)}.",
+                 f"Found {len(results)} on the Workshop and added {added} to the queue."]
+        if errors:
+            lines.append(f"\n{len(errors)} couldn't be downloaded:")
+            lines.extend(errors[:10])
+            if len(errors) > 10:
+                lines.append(f"...and {len(errors) - 10} more")
+        QMessageBox.information(self, "Sync with friend", "\n".join(lines))
 
     # ------------------------------------------------------------ download by link
     def download_by_link(self):
