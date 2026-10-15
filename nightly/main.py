@@ -1956,6 +1956,7 @@ class PingWorker(QThread):
 
 # ---------------------------------------------------------------- common redistributables
 REDIST_DIRNAME = "_CommonRedist"
+SERVER2_REDIST_DIRNAME = "_Redist"        # server 2 games: a _Redist folder near the game exe
 REDIST_DOWNLOADS = [
     # (name, url, file name)
     ("Visual C++ 2015-2022 (x64)", "https://aka.ms/vs/17/release/vc_redist.x64.exe", "vc_redist.x64.exe"),
@@ -1996,6 +1997,45 @@ def collect_redist_installers(redist_dir):
             seen.add(key)
             items.append((f, os.path.join(base, f)))
     return items
+
+def _redist_run_args(filename):
+    """Like _redist_silent_args, but an installer we don't know runs with no switches (its own window)."""
+    a = _redist_silent_args(filename)
+    return [] if a is None else a
+
+def collect_all_redist_exes(folder):
+    """[(file name, path)] of EVERY .exe/.msi under a _Redist folder (uninstallers aside), one per file name."""
+    seen, items = set(), []
+    for base, _dirs, files in os.walk(folder):
+        for f in sorted(files):
+            low = f.lower()
+            if not low.endswith((".exe", ".msi")) or "unins" in low or low in seen:
+                continue
+            seen.add(low)
+            items.append((f, os.path.join(base, f)))
+    return items
+
+def find_server2_redist_folder(exe, up=3, down=3):
+    """A _Redist folder near the game's exe: searches the exe's folder and up to `up` folders above it,
+    each down to `down` levels deep. Nearest wins. Returns None if there isn't one."""
+    if not exe:
+        return None
+    base = os.path.dirname(os.path.abspath(exe))
+    for level in range(up + 1):
+        if level and (_too_broad(base) or not os.path.isdir(base)):
+            break
+        for root, dirs, _files in os.walk(base):
+            depth = 0 if root == base else os.path.relpath(root, base).count(os.sep) + 1
+            for d in sorted(dirs):
+                if d.lower() == SERVER2_REDIST_DIRNAME.lower():
+                    return os.path.join(root, d)
+            if depth >= down:
+                dirs[:] = []
+        parent = os.path.dirname(base)
+        if parent == base:
+            break
+        base = parent
+    return None
 
 def download_common_redist(dest_dir, report=None):
     """Downloads the standard redistributables into dest_dir (normally <game folder>/_CommonRedist).
@@ -2075,7 +2115,7 @@ def _run_redist_installer(path, wine=None, proton=None):
             env["WINEPREFIX"] = os.path.join(compat, "pfx")
             r = subprocess.run([tricks, "-q"] + _WINETRICKS_DX, env=env, capture_output=True, timeout=3600)
             return _redist_check(r, {0})
-        a = _redist_silent_args(os.path.basename(path))
+        a = _redist_run_args(os.path.basename(path))
         cmd = [tool, "run", "msiexec", "/i", path, "/qn", "/norestart"] if a == "msi" else [tool, "run", path] + a
         return _redist_check(subprocess.run(cmd, env=env, capture_output=True, timeout=3600))
     if path == "winetricks":     # Linux stand-in for the DirectX installers (they don't work under wine)
@@ -2088,14 +2128,15 @@ def _run_redist_installer(path, wine=None, proton=None):
             env["WINE"] = wine
         r = subprocess.run([tricks, "-q"] + _WINETRICKS_DX, env=env, capture_output=True, timeout=3600)
         return _redist_check(r, {0})
-    args = _redist_silent_args(os.path.basename(path))
+    args = _redist_run_args(os.path.basename(path))
     if sys.platform.startswith("win"):
         if args == "msi":
             exe, arg_str = "msiexec", f'/i "{path}" /qn /norestart'
         else:
             exe, arg_str = path, " ".join(args)
         q = lambda t: t.replace("'", "''")
-        ps = (f"$p = Start-Process -FilePath '{q(exe)}' -ArgumentList '{q(arg_str)}' -Verb RunAs -Wait -PassThru; "
+        arg_part = f" -ArgumentList '{q(arg_str)}'" if arg_str else ""
+        ps = (f"$p = Start-Process -FilePath '{q(exe)}'{arg_part} -Verb RunAs -Wait -PassThru; "
               "exit $p.ExitCode")
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
                            timeout=1800, creationflags=0x08000000)
@@ -2107,24 +2148,30 @@ def _run_redist_installer(path, wine=None, proton=None):
     r = subprocess.run(cmd, env=wine_game_env(), capture_output=True, timeout=1800)
     return _redist_check(r)
 
-def install_game_redist(game_dir, wine=None, report=None, item_done=None, proton=None):
+def install_game_redist(game_dir, wine=None, report=None, item_done=None, proton=None, redist_dir=None, all_exes=False):
     """Installs the redists in <game_dir>/_CommonRedist; downloads them into that folder if it's missing/empty.
     Windows: runs them directly (asks for admin). Linux: runs them with wine.
     report(text, value, maximum) = progress; item_done(name, ok) = one installer finished. Returns a summary."""
     report = report or (lambda *a: None)
     item_done = item_done or (lambda *a: None)
-    if not game_dir or not os.path.isdir(game_dir):
+    if not redist_dir and (not game_dir or not os.path.isdir(game_dir)):
         raise RuntimeError("This game isn't installed.")
     if not sys.platform.startswith("win") and not wine and not proton:
         raise RuntimeError("Wine isn't installed, so the Windows redistributables can't be installed.")
-    redist_dir = os.path.join(game_dir, REDIST_DIRNAME)
-    report(f"Looking in {REDIST_DIRNAME}...", 0, 0)
-    items = collect_redist_installers(redist_dir) if os.path.isdir(redist_dir) else []
-    source = f"the game's {REDIST_DIRNAME} folder"
+    if redist_dir:      # server 2 games: the _Redist folder found near the game's exe
+        label = SERVER2_REDIST_DIRNAME
+        source = f"the game's {label} folder"
+    else:
+        redist_dir = os.path.join(game_dir, REDIST_DIRNAME)
+        label = REDIST_DIRNAME
+        source = f"the game's {label} folder"
+    report(f"Looking in {label}...", 0, 0)
+    collect = collect_all_redist_exes if all_exes else collect_redist_installers   # server 2: every exe in _Redist
+    items = collect(redist_dir) if os.path.isdir(redist_dir) else []
     if not items:
         download_common_redist(redist_dir, report)
-        items = collect_redist_installers(redist_dir)
-        source = f"a download into {REDIST_DIRNAME}"
+        items = collect(redist_dir)
+        source = f"a download into {label}"
     if not sys.platform.startswith("win"):
         # wine has DirectX built in and Microsoft's DirectX installers fail under it; winetricks adds the d3dx DLLs instead
         had_dx = any(_is_dx_setup(n) for n, _p in items)
@@ -2159,16 +2206,17 @@ class _RedistWorker(QThread):
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, game_dir, wine, proton=None):
+    def __init__(self, game_dir, wine, proton=None, redist_dir=None):
         super().__init__()
-        self.game_dir, self.wine, self.proton = game_dir, wine, proton
+        self.game_dir, self.wine, self.proton, self.redist_dir = game_dir, wine, proton, redist_dir
 
     def run(self):
         try:
             text = install_game_redist(self.game_dir, self.wine,
                                        report=lambda t, v, m: self.progress.emit(t, int(v), int(m)),
                                        item_done=lambda n, ok, d="": self.item.emit(n, bool(ok), d),
-                                       proton=self.proton)
+                                       proton=self.proton, redist_dir=self.redist_dir,
+                                       all_exes=bool(self.redist_dir))
         except Exception as e:
             self.failed.emit(str(e))
         else:
@@ -2176,7 +2224,7 @@ class _RedistWorker(QThread):
 
 class RedistDialog(QDialog):
     """Progress window for installing a game's common redistributables."""
-    def __init__(self, title, game_dir, wine, parent=None, proton=None):
+    def __init__(self, title, game_dir, wine, parent=None, proton=None, redist_dir=None):
         super().__init__(parent)
         self.setWindowTitle("Common Redistributables")
         self.setModal(True)
@@ -2239,7 +2287,7 @@ class RedistDialog(QDialog):
         layout.addSpacing(10)
         layout.addLayout(row)
 
-        self.worker = _RedistWorker(game_dir, wine, proton)
+        self.worker = _RedistWorker(game_dir, wine, proton, redist_dir)
         self.worker.progress.connect(self._on_progress)
         self.worker.item.connect(self._on_item)
         self.worker.done.connect(self._on_done)
@@ -2295,7 +2343,7 @@ class RedistDialog(QDialog):
         self.exec()
         self.worker.wait()
 
-def install_redist_for_game(app, game_dir_func, title, launch_func=None):
+def install_redist_for_game(app, game_dir_func, title, launch_func=None, library_redist=False):
     """Menu action: installs the common redistributables for one game (resolved at click time).
     launch_func() -> (exe, compat tool): if the game runs on a Proton tool, installs into its Proton prefix."""
     game_dir = game_dir_func()
@@ -2305,7 +2353,12 @@ def install_redist_for_game(app, game_dir_func, title, launch_func=None):
         exe, tool = launch_func()
         if exe and compat_tool_kind(tool) == "proton":
             proton = (tool, compat_data_dir_for(exe))
-    RedistDialog(title, game_dir, wine, app, proton).run()
+    redist_dir = None
+    if library_redist:      # server 2: the _Redist folder near the game's exe (3 folders up / 3 deep), else one beside the exe
+        exe = installed_exe_for(title)
+        if exe:
+            redist_dir = find_server2_redist_folder(exe) or os.path.join(os.path.dirname(exe), SERVER2_REDIST_DIRNAME)
+    RedistDialog(title, game_dir, wine, app, proton, redist_dir).run()
 
 def _ae_launch_info(game_id, game_name):
     cfg = GAME_INFO.get(game_id)
@@ -2837,8 +2890,8 @@ class SettingsPage(QWidget):
         srv_text.setSpacing(2)
         srv_name = QLabel("Download server")
         srv_name.setObjectName("RowTitle")
-        srv_desc = QLabel("SteamRIP downloads directly. FitGirl Repacks downloads it as a repacked torrent "
-                          "(needs: pip install libtorrent)")
+        srv_desc = QLabel("SteamRIP downloads directly. FitGirl downloads it as a repacked torrent "
+                          "")
         srv_desc.setObjectName("RowDesc")
         srv_desc.setWordWrap(True)
         srv_text.addWidget(srv_name)
@@ -6589,14 +6642,28 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                 game_dir = _safe_installed_game_dir(title_text)
                 if os.path.exists(game_dir):
                     shutil.rmtree(game_dir, ignore_errors=True)
+                forget_installed_exe(title_text)
                 update_steam_card_state()
 
+            def locate_steam_game():
+                if locate_installed_game(self, title_text):
+                    update_steam_card_state()
+
+            def open_steam_game_location():
+                exe = installed_exe_for(title_text)
+                if exe:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(exe)))
+                else:
+                    self.open_game_location(sanitize_folder_name(title_text))
+
             menu.addAction("Uninstall").triggered.connect(uninstall_steam_game)
-            menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(sanitize_folder_name(title_text)))
+            menu.addAction("Locate Game").triggered.connect(lambda _c=False: locate_steam_game())
+            menu.addAction("Open Game Location").triggered.connect(lambda _c=False: open_steam_game_location())
             menu.addAction("Install Common Redist").triggered.connect(
                 lambda _c=False, t=title_text, a=appid: install_redist_for_game(
                     self, lambda: _safe_installed_game_dir(t), t,
-                    lambda: (find_best_game_exe(_safe_installed_game_dir(t), t), load_compat_config().get(str(a), ""))))
+                    lambda: (find_best_game_exe(_safe_installed_game_dir(t), t), load_compat_config().get(str(a), "")),
+                    library_redist=bool(installed_exe_for(t))))   # server 2 (setup.exe) games -> _Redist near the game exe
 
             copy_action = menu.addAction("Copy Game ID")
             copy_action.triggered.connect(lambda _c=False, a=appid: QApplication.clipboard().setText(str(a)))
@@ -8010,6 +8077,361 @@ def _run_setup_exe(exe):
     except Exception:
         return False
 
+# ---------------------------------------------------------------- server 2: run setup.exe, find where it installed, find the game .exe
+def installed_exes_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "installed_exes.json")
+
+def _load_installed_exes():
+    try:
+        with open(installed_exes_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def record_installed_exe(title, exe):
+    with _versions_lock:
+        data = _load_installed_exes()
+        data[title] = exe
+        data[sanitize_folder_name(title)] = exe
+        path = installed_exes_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+
+# The library looks for a game's exe inside its game folder. Server 2 games install wherever setup.exe put them,
+# so the exe recorded after setup wins; anything else behaves exactly as before.
+_find_best_game_exe_orig = find_best_game_exe
+def find_best_game_exe(root, title):
+    try:
+        data = _load_installed_exes()
+        exe = data.get(title) or data.get(sanitize_folder_name(title))
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return _find_best_game_exe_orig(root, title)
+
+def installed_exe_for(title):
+    data = _load_installed_exes()
+    exe = data.get(title) or data.get(sanitize_folder_name(title))
+    return exe if exe and os.path.isfile(exe) else None
+
+def forget_installed_exe(title):
+    with _versions_lock:
+        data = _load_installed_exes()
+        if data.pop(title, None) is None and data.pop(sanitize_folder_name(title), None) is None:
+            return
+        data.pop(sanitize_folder_name(title), None)
+        path = installed_exes_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+def locate_installed_game(parent, title, start=""):
+    """Lets the user point the launcher at an already installed game's .exe. Returns True if one was chosen."""
+    if not start:
+        cur = installed_exe_for(title)
+        start = os.path.dirname(cur) if cur else ""
+    picked, _ = QFileDialog.getOpenFileName(parent, "Select the installed game's .exe", start,
+                                            "Executables (*.exe);;All files (*)")
+    if not picked:
+        return False
+    record_installed_exe(title, picked)
+    try:
+        invalidate_library_roots()
+    except Exception:
+        pass
+    return True
+
+_SETUP_BAD_EXE = ("unins", "uninstall", "crash", "redist", "dxsetup", "dxwebsetup", "setup", "install", "updater",
+                  "helper", "dotnet", "oalinst", "directx", "vc_redist", "vcredist", "ndp", "7z", "notification")
+_SETUP_SKIP_DIRS = ("redist", "directx", "dotnet", "_commonredist", "commonredist", "vcredist", "__installer")
+
+def _norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+def _is_inside(path, folder):
+    p, f = _norm(path), _norm(folder)
+    return p == f or p.startswith(f.rstrip("\\/") + os.sep)
+
+def _ignored_install_path(p, setup_dir):
+    """Temp folders, system folders and the setup folder itself are never the install location."""
+    n = _norm(p)
+    if _is_inside(n, setup_dir):
+        return True
+    for bad in (os.environ.get("TEMP"), os.environ.get("TMP"), os.environ.get("WINDIR"), os.environ.get("SystemRoot"),
+                "/tmp", "/proc", "/dev", "/usr", "/lib", "/lib64", "/etc", "/sys", "/run", "/var", "/bin", "/opt"):
+        if bad and _is_inside(n, bad):
+            return True
+    low = n.replace("\\", "/")
+    return any(x in low for x in ("/appdata/local/temp", "/$recycle.bin", "/windows/installer", "/winsxs",
+                                  "/programdata/microsoft", "/drive_c/windows"))
+
+def _too_broad(p):
+    """Folders we must never treat as 'the game folder' (drive roots, Program Files itself, home...)."""
+    n = _norm(p)
+    if os.path.dirname(n) == n:
+        return True
+    broad = [os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA", "APPDATA",
+                                         "ProgramData", "USERPROFILE", "SystemDrive")]
+    broad += [os.path.expanduser("~"), os.path.join(_wine_prefix(), "drive_c"),
+              os.path.join(_wine_prefix(), "drive_c", "Program Files"),
+              os.path.join(_wine_prefix(), "drive_c", "Program Files (x86)")]
+    try:
+        broad += library_roots()
+    except Exception:
+        pass
+    if os.environ.get("LOCALAPPDATA"):
+        broad.append(os.path.join(os.environ["LOCALAPPDATA"], "Programs"))
+    return any(b and _norm(b) == n for b in broad)
+
+def _pick_game_exe(folder, title, max_depth=4):
+    """The game's .exe inside an install folder: installers, uninstallers, redists and crash handlers are skipped,
+    then the name closest to the title wins (bigger and shallower break ties)."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    best, best_key = None, None
+    for root, dirs, files in os.walk(folder):
+        depth = 0 if root == folder else os.path.relpath(root, folder).count(os.sep) + 1
+        dirs[:] = [d for d in dirs if not any(s in d.lower() for s in _SETUP_SKIP_DIRS)] if depth < max_depth else []
+        for f in files:
+            low = f.lower()
+            if not low.endswith(".exe") or any(w in low for w in _SETUP_BAD_EXE):
+                continue
+            full = os.path.join(root, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            stem = set(re.findall(r"[a-z0-9]+", os.path.splitext(low)[0]))
+            key = (len(tokens & stem), -depth, size)
+            if best_key is None or key > best_key:
+                best, best_key = full, key
+    return best
+
+def _uninstall_snapshot():
+    """Windows: {key: {InstallLocation, DisplayIcon, UninstallString}} for every entry in Apps & Features."""
+    out = {}
+    if not sys.platform.startswith("win"):
+        return out
+    try:
+        import winreg
+    except ImportError:
+        return out
+    path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive, flag in ((winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+                       (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+                       (winreg.HKEY_CURRENT_USER, 0)):
+        try:
+            key = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | flag)
+        except OSError:
+            continue
+        with key:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(key, name) as sub:
+                        d = {}
+                        for v in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                            try:
+                                d[v] = str(winreg.QueryValueEx(sub, v)[0])
+                            except OSError:
+                                pass
+                        out[(int(hive), flag, name)] = d
+                except OSError:
+                    pass
+    return out
+
+def _uninstall_entry_dir(d):
+    loc = (d.get("InstallLocation") or "").strip().strip('"')
+    if loc and os.path.isdir(loc):
+        return loc
+    for k in ("DisplayIcon", "UninstallString"):
+        v = (d.get(k) or "").strip()
+        m = re.match(r'^"([^"]+)"', v) or re.match(r"^(.+?\.exe)", v, re.I)
+        if m:
+            p = os.path.dirname(m.group(1).split(",")[0])
+            if p and os.path.isdir(p):
+                return p
+    return None
+
+def _watch_roots():
+    """[(folder, depth)] where a fresh install may appear."""
+    roots = []
+    if sys.platform.startswith("win"):
+        for k in ("ProgramFiles", "ProgramFiles(x86)"):
+            if os.environ.get(k):
+                roots.append((os.environ[k], 2))
+        if os.environ.get("LOCALAPPDATA"):
+            roots.append((os.path.join(os.environ["LOCALAPPDATA"], "Programs"), 2))
+        try:
+            import ctypes
+            mask = ctypes.windll.kernel32.GetLogicalDrives()
+            for i in range(26):
+                drv = chr(65 + i) + ":\\"
+                if mask & (1 << i) and ctypes.windll.kernel32.GetDriveTypeW(drv) == 3:   # fixed drives only
+                    roots.append((drv, 1))
+        except Exception:
+            pass
+    else:
+        c = os.path.join(_wine_prefix(), "drive_c")
+        roots += [(os.path.join(c, "Program Files"), 2), (os.path.join(c, "Program Files (x86)"), 2), (c, 1)]
+    try:
+        roots += [(r, 1) for r in library_roots()]
+    except Exception:
+        pass
+    return roots
+
+def _dir_snapshot(roots):
+    seen = set()
+    def walk(path, depth):
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            seen.add(_norm(e.path))
+                            if depth > 1:
+                                walk(e.path, depth - 1)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    for r, d in roots:
+        walk(r, d)
+    return seen
+
+def _start_setup(exe):
+    """Starts setup.exe and returns (pid, popen or None). Windows asks for admin rights itself if the installer wants them."""
+    cwd = os.path.dirname(exe)
+    if sys.platform.startswith("win"):
+        try:
+            p = subprocess.Popen([exe], cwd=cwd)
+            return p.pid, p
+        except OSError as e:
+            if getattr(e, "winerror", 0) != 740:        # 740 = needs elevation
+                raise
+        import ctypes
+        from ctypes import wintypes
+        class SEI(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG), ("hwnd", wintypes.HWND),
+                        ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                        ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                        ("lpIDList", ctypes.c_void_p), ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                        ("dwHotKey", wintypes.DWORD), ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+        sei = SEI()
+        sei.cbSize = ctypes.sizeof(sei)
+        sei.fMask = 0x40                                # SEE_MASK_NOCLOSEPROCESS
+        sei.lpVerb, sei.lpFile, sei.lpDirectory, sei.nShow = "runas", exe, cwd, 1
+        k32 = ctypes.windll.kernel32
+        k32.GetProcessId.argtypes, k32.GetProcessId.restype = [wintypes.HANDLE], wintypes.DWORD
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) or not sei.hProcess:
+            raise OSError("setup.exe was not started (admin prompt declined?)")
+        pid = int(k32.GetProcessId(sei.hProcess))
+        k32.CloseHandle(sei.hProcess)
+        return pid, None
+    found = find_wine()
+    if not found:
+        raise OSError("wine not found")
+    p = subprocess.Popen([found[0], exe], cwd=cwd, env=wine_game_env())
+    return p.pid, p
+
+def _run_setup_and_find_install(worker, setup_exe, title):
+    """Runs ONLY setup.exe, waits until it (and everything it spawned) has closed, and works out where it installed:
+      1. new Apps & Features entries (InstallLocation / icon / uninstaller folder)   [Windows]
+      2. new folders in Program Files, the library folders and the drive roots
+      3. folders the installer processes had files open in while running
+    Returns (started, install_dir, game_exe)."""
+    setup_dir = os.path.dirname(setup_exe)
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    reg_before = _uninstall_snapshot()
+    roots = _watch_roots()
+    dirs_before = _dir_snapshot(roots)
+    try:
+        pid, _popen = _start_setup(setup_exe)
+    except Exception:
+        return False, None, None
+
+    worker.status_update.emit("Setup is running...\nFinish the installer. The launcher will find the game when it closes.")
+    observed = []                       # folders the installer had files open in
+    if psutil is not None:
+        known, idle = {}, 0
+        try:
+            known[pid] = psutil.Process(pid)
+        except Exception:
+            pass
+        while idle < 3:                 # ~2s with nothing alive = the installer is really done
+            if getattr(worker, "_is_cancelled", False):
+                return True, None, None
+            alive = False
+            for p in list(known.values()):
+                try:
+                    if not p.is_running():
+                        continue
+                    alive = True
+                    for c in p.children(recursive=True):
+                        known.setdefault(c.pid, c)
+                    for f in p.open_files():
+                        d = os.path.dirname(f.path)
+                        if d not in observed and not _ignored_install_path(d, setup_dir):
+                            observed.append(d)
+                except Exception:
+                    pass
+            idle = 0 if alive else idle + 1
+            time.sleep(0.7)
+    else:                               # no psutil: wait on the process we started
+        while _popen is not None and _popen.poll() is None:
+            if getattr(worker, "_is_cancelled", False):
+                return True, None, None
+            time.sleep(0.7)
+        time.sleep(2)
+
+    worker.status_update.emit("Setup closed. Looking for the game's .exe...")
+    cands = []
+    def add(p):
+        if p and os.path.isdir(p) and not _too_broad(p) and not _ignored_install_path(p, setup_dir) \
+                and _norm(p) not in [_norm(c) for c in cands]:
+            cands.append(p)
+    reg_after = _uninstall_snapshot()
+    for k, d in reg_after.items():
+        if reg_before.get(k) != d:
+            add(_uninstall_entry_dir(d))
+    for p in sorted(_dir_snapshot(roots) - dirs_before, key=lambda s: s.count(os.sep)):
+        add(p)
+    for d in sorted(observed, key=lambda s: -s.count(os.sep)):      # deepest first, then climb up
+        cur = d
+        for _ in range(3):
+            if _too_broad(cur):
+                break
+            add(cur)
+            cur = os.path.dirname(cur)
+    for folder in cands:
+        exe = _pick_game_exe(folder, title)
+        if exe:
+            return True, folder, exe
+    return True, None, None
+
+def _delete_folder_async(path):
+    def onerr(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except Exception:
+            pass
+    threading.Thread(target=lambda: shutil.rmtree(path, onerror=onerr), daemon=True).start()
+
 def _fb_install_torrent(self, stage, content):
     """Moves what the torrent downloaded into the game's folder (an archive is extracted first)."""
     target = installed_game_dir(sanitize_folder_name(self.title))
@@ -8050,9 +8472,13 @@ def _fb_pw_run(self):
             game_dir = installed_game_dir(sanitize_folder_name(self.title))
             setup = _find_setup_exe(game_dir)
             if setup:
-                self.status_update.emit("Starting setup.exe...")
+                # Only setup.exe is launched. When it closes, the game's .exe is searched for where it installed.
                 self.setup_exe = setup
-                self.setup_started = _run_setup_exe(setup)
+                self.setup_dir = os.path.dirname(setup)
+                self.status_update.emit("Starting setup.exe...")
+                self.setup_started, self.install_dir, self.game_exe = _run_setup_and_find_install(self, setup, self.title)
+                if self.game_exe:
+                    record_installed_exe(self.title, self.game_exe)
             self.finished.emit(game_dir)
             return
         if not dest_path:
@@ -8094,14 +8520,50 @@ def _card_on_finished_setup(self, path):
     setup = getattr(self.worker, "setup_exe", None)
     if not setup:
         return
-    self.status_label.setText("Run setup")
-    started = getattr(self.worker, "setup_started", False)
-    QMessageBox.information(
-        self, "Finish installing " + self.title,
-        ("Download finished. setup.exe was started for you.\n\nFollow the installer to set up the game."
-         if started else
-         "Download finished, but setup.exe couldn't be started automatically "
-         "(on Linux it needs wine).\n\nRun it yourself to set up the game:\n" + setup))
+    w = self.worker
+    started = getattr(w, "setup_started", False)
+    exe = getattr(w, "game_exe", None)
+    setup_dir = getattr(w, "setup_dir", os.path.dirname(setup))
+
+    def locate_game():
+        start = os.path.dirname(getattr(w, "game_exe", "") or "") or getattr(w, "install_dir", None) or ""
+        if locate_installed_game(self, self.title, start):
+            w.game_exe = installed_exe_for(self.title)
+            self.status_label.setText("Installed")
+
+    if not started:
+        self.status_label.setText("Run setup")
+        QMessageBox.information(
+            self, "Finish installing " + self.title,
+            "Download finished, but setup.exe couldn't be started automatically "
+            "(on Linux it needs wine).\n\nRun it yourself to set up the game:\n" + setup)
+        return
+    if not exe:
+        self.status_label.setText("Setup closed")
+        if QMessageBox.question(
+                self, "Game not found",
+                "Setup closed, but the launcher couldn't tell where the game was installed.\n\n"
+                "Do you want to pick the game's .exe yourself?\n"
+                "(The setup folder is kept. You can also use \"Locate Game\" in the game's 3-dot menu.)") == QMessageBox.StandardButton.Yes:
+            locate_game()
+        return
+    self.status_label.setText("Installed")
+    # Delete the setup folder only if the game isn't inside it and it isn't a folder the launcher needs.
+    safe = (os.path.isdir(setup_dir) and not _too_broad(setup_dir)
+            and not _is_inside(exe, setup_dir)
+            and not (getattr(w, "install_dir", None) and _is_inside(setup_dir, w.install_dir)))
+    if not safe:
+        QMessageBox.information(self, "Installed " + self.title, "Installed. Game:\n" + exe)
+        return
+    if QMessageBox.question(
+            self, "Delete setup files?",
+            "Installed. Game:\n" + exe + "\n\nDelete the setup folder now?\n" + setup_dir
+    ) == QMessageBox.StandardButton.Yes:
+        _delete_folder_async(setup_dir)
+        try:
+            invalidate_library_roots()
+        except Exception:
+            pass
 DownloadCard.on_finished = _card_on_finished_setup
 
 
