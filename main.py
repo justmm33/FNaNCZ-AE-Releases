@@ -22360,6 +22360,7 @@ def cloud_fetch_group(gid):
 
 
 _grp_prof_cache = {}
+_grp_av_cache = {}      # uid -> (hash of the photo, file path)
 
 
 def cloud_fetch_profiles(uids, known=None, ttl=30):
@@ -22604,18 +22605,29 @@ _grp_prev_msgrow_init = _MsgRow.__init__
 
 def _grp_msgrow_init(self, chat, m, me, mine):
     _grp_prev_msgrow_init(self, chat, m, me, mine)
-    if not getattr(chat, "group_mode", False) or mine:
+    if not getattr(chat, "group_mode", False):
         return
     uid = m.get("from")
-    lab = QLabel(chat.names.get(uid) or "Unknown")
-    color = (getattr(chat, "name_colors", None) or {}).get(uid)
-    lab.setStyleSheet("font-size:11px; font-weight:bold;" + (f"color:{color};" if color else ""))
     outer = self.layout()
-    for i in range(outer.count()):
-        col = outer.itemAt(i).layout()
-        if col is not None:
-            col.insertWidget(0, lab, 0, Qt.AlignmentFlag.AlignLeft)
-            break
+    if not mine:                                    # sender name above other people's bubbles
+        lab = QLabel(chat.names.get(uid) or "Unknown")
+        color = (getattr(chat, "name_colors", None) or {}).get(uid)
+        lab.setStyleSheet("font-size:11px; font-weight:bold;" + (f"color:{color};" if color else ""))
+        for i in range(outer.count()):
+            col = outer.itemAt(i).layout()
+            if col is not None:
+                col.insertWidget(0, lab, 0, Qt.AlignmentFlag.AlignLeft)
+                break
+    # profile picture: left of received messages, right of your own
+    av = QLabel("?")
+    av.setFixedSize(34, 34)
+    av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    letter = (getattr(chat, "avatar_letters", None) or {}).get(uid) or "?"
+    _grp_avatar(av, (getattr(chat, "avatars", None) or {}).get(uid), letter, 34)
+    if mine:
+        outer.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
+    else:
+        outer.insertWidget(0, av, 0, Qt.AlignmentFlag.AlignTop)
 
 
 _MsgRow.__init__ = _grp_msgrow_init
@@ -23065,6 +23077,7 @@ class GroupChatPage(QWidget):
         self.profiles = {}
         self._msgs, self._me, self._sig = [], (load_account() or {}).get("uid"), ""
         self._members_sig = None
+        self._av_sig = None
         self._pending, self._preparing, self._att_seq = [], 0, 0
         self._reply, self._sending, self._rx_inflight = None, False, 0
         self.setAcceptDrops(True)
@@ -23248,6 +23261,7 @@ class GroupChatPage(QWidget):
         self._me = (load_account() or {}).get("uid")
         self.profiles = {}
         self._msgs, self._sig, self._members_sig = [], "", None
+        self._av_sig = None
         self._pending = []
         self._refresh_att_bar()
         self.cancel_reply()
@@ -23296,6 +23310,8 @@ class GroupChatPage(QWidget):
             self.fp.groups[gid] = g
             self.profiles.update(profs)
             self._apply_group()
+            if self._msgs and self._av_sig_of() != self._av_sig:      # pictures arrived / changed: redraw the messages
+                self._render_chat()
         self._run(work, done, key=("group", gid))
 
     def _apply_group(self):
@@ -23575,9 +23591,37 @@ class GroupChatPage(QWidget):
         self._run(lambda: cloud_group_delete(gid), done)
 
     # -- messages
+    def _av_sig_of(self):
+        return json.dumps(sorted((u, len((p or {}).get("photo") or ""), _grp_name_of(p)[:1])
+                                 for u, p in self.profiles.items()))
+
+    def _chat_avatars(self):
+        """{uid: picture file} and {uid: letter} for the pictures beside the messages."""
+        files, letters = {}, {}
+        for u, p in self.profiles.items():
+            letters[u] = _grp_name_of(p)[:1].upper()
+            photo = (p or {}).get("photo")
+            if not photo:
+                continue
+            c = _grp_av_cache.get(u)
+            if c and c[0] == hash(photo) and os.path.exists(c[1]):
+                files[u] = c[1]
+                continue
+            path = _friend_avatar_file(u, photo)
+            if path:
+                _grp_av_cache[u] = (hash(photo), path)
+                files[u] = path
+        mine = load_profile_cache()[1]
+        if self._me and mine and os.path.exists(mine):          # your own picture straight from this PC
+            files[self._me] = mine
+        return files, letters
+
     def _render_chat(self):
-        self.chat_view.other_uid = "group:" + self.gid
-        self.chat_view.set_messages(self._me, self._msgs, self._chat_names())
+        cv = self.chat_view
+        cv.other_uid = "group:" + self.gid
+        cv.avatars, cv.avatar_letters = self._chat_avatars()
+        self._av_sig = self._av_sig_of()
+        cv.set_messages(self._me, self._msgs, self._chat_names())
 
     def load_messages(self, force=False):
         gid = self.gid
