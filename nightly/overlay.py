@@ -306,10 +306,12 @@ def _fit_font(text, px, max_w, bold=True):
 
 
 class PlayingToast(QWidget):
-    def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None):
+    def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None,
+                 badge_path=None):
         super().__init__()
         self.user, self.game, self.prefix = user, game, prefix
         self.avatar = QPixmap(avatar_path) if avatar_path else None
+        self.badge = QPixmap(badge_path) if badge_path else None   # small round picture on the avatar (group chats: who wrote)
         self.movie, self.image, self.ibox = None, None, None   # picture under the text (png / jpg / gif ...)
         if image_path:
             self._load_image(image_path)
@@ -488,6 +490,22 @@ class PlayingToast(QWidget):
             p.restore()
         else:
             p.fillPath(path, AVATAR_COLOR)
+
+        # sender badge: in a group chat the big avatar is the group icon and this is the person who wrote
+        if self.badge is not None and not self.badge.isNull():
+            bd = 32
+            br = QRectF(r.right() - 10 - bd / 2, r.bottom() - 10 - bd / 2, bd, bd)
+            p.save()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(BG)
+            p.drawEllipse(br.adjusted(-3, -3, 3, 3))          # ring that separates it from the group icon
+            bp = QPainterPath()
+            bp.addEllipse(br)
+            p.setClipPath(bp)
+            bpm = self.badge.scaled(bd * 2, bd * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                    Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(br, bpm, QRectF(bpm.rect()))
+            p.restore()
 
         # text: username (purple), "is playing" (white), game (purple)
         tx = int(r.right()) + 10
@@ -756,10 +774,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix, image, link in pending:
-            self._show_local(user, game, avatar, prefix, image, link)
+        for user, game, avatar, prefix, image, link, badge in pending:
+            self._show_local(user, game, avatar, prefix, image, link, badge)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -773,25 +791,27 @@ class OverlayManager:
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
+                                         "badge": badge or "",
                                          "accent": _accent_hex, "light": _light,
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix, image, link))
+                self._pending.append((user, game, avatar_path, prefix, image, link, badge))
             return True
         except (OSError, ValueError):
             self._proc = None
             self._helper_failed = True
             return False
 
-    def notify_playing(self, user, game, avatar_path=None, prefix="is playing ", image=None):
+    def notify_playing(self, user, game, avatar_path=None, prefix="is playing ", image=None, badge=None):
         """Shows '<user> <prefix><game>' (game part is highlighted purple). image: path of a picture (png / jpg /
-        gif ...) to show under the text."""
+        gif ...) to show under the text. badge: path of a small round picture drawn on the avatar's corner (used
+        for group chats: avatar = group icon, badge = the person who wrote)."""
         if self.mode == "off":
             return
-        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image):
+        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, None, badge):
             return
-        self._show_local(user, game, avatar_path, prefix, image)
+        self._show_local(user, game, avatar_path, prefix, image, None, badge)
 
     def notify_invite(self, user, game, link, avatar_path=None, image=None):
         """'<user> invited you to play <game>' with an Accept button that opens the Steam join link.
@@ -803,7 +823,7 @@ class OverlayManager:
             return
         self._show_local(user, game, avatar_path, prefix, image, link)
 
-    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None):
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
@@ -816,7 +836,7 @@ class OverlayManager:
         if link:
             t = InviteToast(user, game, link, avatar_path, image)
         else:
-            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image)
+            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge)
         avail = QApplication.primaryScreen().availableGeometry().height() - 2 * MARGIN
         while live and sum(x.th + GAP for x in live) + t.th > avail:    # tall picture toasts: keep the stack on screen
             live.pop(0).dismiss()
@@ -1133,7 +1153,8 @@ class _ServerBridge(QObject):
                                   d.get("avatar") or None, d.get("image") or None)
             return
         overlay.notify_playing(str(d.get("user", "")), str(d.get("game", "")), d.get("avatar") or None,
-                               str(d.get("prefix", "is playing ")), d.get("image") or None)
+                               str(d.get("prefix", "is playing ")), d.get("image") or None,
+                               badge=d.get("badge") or None)
 
 
 def run_server():
