@@ -575,7 +575,7 @@ def load_launcher_settings():
                 for _k in ("start_minimized", "close_to_tray"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
-                if loaded.get("download_server") in ("1", "2"):
+                if loaded.get("download_server") in ("1", "2", "3", "ask"):
                     settings["download_server"] = loaded["download_server"]
                 if isinstance(loaded.get("accent_color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", loaded["accent_color"]):
                     settings["accent_color"] = loaded["accent_color"].lower()
@@ -2890,22 +2890,49 @@ class SettingsPage(QWidget):
         srv_text.setSpacing(2)
         srv_name = QLabel("Download server")
         srv_name.setObjectName("RowTitle")
-        srv_desc = QLabel("SteamRIP downloads directly. FitGirl downloads it as a repacked torrent "
-                          "")
+        srv_desc = QLabel("SteamRIP downloads directly. FitGirl downloads it as a repacked torrent. "
+                          "AnkerGames downloads directly after you solve a captcha. \"Ask every time\" shows a popup for each download "
+                          "where you pick the server (servers that don't have the game are greyed out).")
         srv_desc.setObjectName("RowDesc")
         srv_desc.setWordWrap(True)
         srv_text.addWidget(srv_name)
         srv_text.addWidget(srv_desc)
         self.server_combo = QComboBox()
         self.server_combo.setFixedWidth(200)
-        self.server_combo.addItem("Server 1", "1")
-        self.server_combo.addItem("Server 2", "2")
+        self.server_combo.addItem("SteamRIP", "1")
+        self.server_combo.addItem("FitGirl", "2")
+        self.server_combo.addItem("AnkerGames", "3")
+        self.server_combo.addItem("Ask every time", "ask")
         self.server_combo.setCurrentIndex(max(self.server_combo.findData(load_launcher_settings().get("download_server", "1")), 0))
         self.server_combo.currentIndexChanged.connect(self.on_server_changed)
         srv_row.addLayout(srv_text, 1)
         srv_row.addWidget(self.server_combo)
         srv_panel_layout.addLayout(srv_row)
         layout.addWidget(srv_panel)
+        layout.addSpacing(12)
+
+        upd_panel = QFrame()
+        upd_panel.setObjectName("Panel")
+        upd_panel_layout = QVBoxLayout(upd_panel)
+        upd_panel_layout.setContentsMargins(22, 18, 22, 18)
+        upd_row = QHBoxLayout()
+        upd_text = QVBoxLayout()
+        upd_text.setSpacing(2)
+        upd_name = QLabel("Launcher updates")
+        upd_name.setObjectName("RowTitle")
+        upd_desc = QLabel("Check for a newer version of the launcher right now.")
+        upd_desc.setObjectName("RowDesc")
+        upd_desc.setWordWrap(True)
+        upd_text.addWidget(upd_name)
+        upd_text.addWidget(upd_desc)
+        self.check_update_btn = QPushButton("Check for updates")
+        self.check_update_btn.setFixedWidth(200)
+        self.check_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_update_btn.clicked.connect(self.on_check_updates)
+        upd_row.addLayout(upd_text, 1)
+        upd_row.addWidget(self.check_update_btn)
+        upd_panel_layout.addLayout(upd_row)
+        layout.addWidget(upd_panel)
         layout.addSpacing(12)
         layout.addWidget(self._build_library_panel())
 
@@ -3177,6 +3204,36 @@ class SettingsPage(QWidget):
         settings = load_launcher_settings()
         settings["wine_d3d"] = self.d3d_combo.currentData()
         save_launcher_settings(settings)
+
+    def on_check_updates(self):
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("Checking...")
+        sig = _ManualUpdateSignal(self)
+        self._manual_update_sig = sig
+
+        def done(res):
+            self.check_update_btn.setEnabled(True)
+            self.check_update_btn.setText("Check for updates")
+            win = self.window()
+            if res == "updated":
+                show_updated_dialog(win)
+            elif res == "current":
+                QMessageBox.information(self, "Check for updates", "You're on the latest version.")
+            elif res == "frozen":
+                QMessageBox.information(self, "Check for updates",
+                                        "This is a packaged build, so it can't update itself. Download the newest "
+                                        "version from the releases page.")
+            else:
+                QMessageBox.warning(self, "Check for updates", "Couldn't check for updates:\n" + res[7:])
+        sig.result.connect(done)
+
+        def work():
+            try:
+                res = manual_update_check()
+            except Exception as e:
+                res = "error: " + str(e)
+            sig.result.emit(res)
+        threading.Thread(target=work, daemon=True).start()
 
     def on_server_changed(self):
         settings = load_launcher_settings()
@@ -4079,6 +4136,7 @@ def fetch_steam_details(appid, currency="EGP"):
         cents = (info.get("price_overview") or {}).get("final")
         price = format_price(cents / 100, currency) if cents else ""
     shots = []
+    shot_urls = []
     for shot in (info.get("screenshots") or [])[:5]:
         try:
             raw = _http_get(shot.get("path_thumbnail"), timeout=10)
@@ -4091,6 +4149,7 @@ def fetch_steam_details(appid, currency="EGP"):
                 shots.append(bytes(buf.data()))
             else:
                 shots.append(raw)
+            shot_urls.append(shot.get("path_full") or shot.get("path_thumbnail"))
         except Exception:
             continue
     platforms = info.get("platforms") or {}
@@ -4113,6 +4172,7 @@ def fetch_steam_details(appid, currency="EGP"):
         price=price,
         price_flag=(get_flag_file(currency) if price and not info.get("is_free") else ""),
         shots=shots,
+        shot_urls=shot_urls,
     )
 
 # ---------------------------------------------------------------- system requirements + "can I run it"
@@ -4984,15 +5044,33 @@ class StoreDetailPage(QWidget):
             chip.setStyleSheet(self.CHIP_STYLE)
             self.chips_row.addWidget(chip)
         self.chips_row.addStretch()
-        for raw in d["shots"]:
+        self._shot_urls = list(d.get("shot_urls") or [])
+        self._shot_labels = {}
+        for n, raw in enumerate(d["shots"]):
             pm = QPixmap()
             if pm.loadFromData(raw):
-                shot = QLabel()
+                shot = _FanClickable()
                 shot.setPixmap(pm.scaledToHeight(160, Qt.TransformationMode.SmoothTransformation))
+                if n < len(self._shot_urls):
+                    shot.setToolTip("Click to enlarge")
+                    shot.clicked.connect(lambda i=n: self._open_store_viewer(i))
+                    self._shot_labels[self._shot_urls[n]] = shot
                 self.shots_row.addWidget(shot)
         self.shots_row.addStretch()
         self._set_extras_visible(bool(d["shots"]))
         self._show_requirements(d)
+
+    def _open_store_viewer(self, index):
+        urls = getattr(self, "_shot_urls", None)
+        if urls:
+            _FanShotViewer(urls, min(index, len(urls) - 1), self.window(),
+                           on_full=self._swap_in_full_shot).exec()   # downloads the full res image
+
+    def _swap_in_full_shot(self, url, pm):
+        """A full res screenshot finished downloading: replace its low res thumbnail on the page."""
+        lab = getattr(self, "_shot_labels", {}).get(url)
+        if lab is not None and not pm.isNull():
+            lab.setPixmap(pm.scaledToHeight(160, Qt.TransformationMode.SmoothTransformation))
 
     def _show_requirements(self, d):
         reqs, system = d.get("reqs") or {}, d.get("system") or {}
@@ -6565,6 +6643,22 @@ def find_best_game_exe(root, title):
 
 _original_create_steam_card = AdaptiveApp.create_steam_card
 
+class _BuildCheckSignal(QObject):
+    done = pyqtSignal(str)
+
+def _find_layout_with(layout, widget):
+    """The (sub)layout that directly holds widget, or None."""
+    if layout is None:
+        return None
+    if layout.indexOf(widget) >= 0:
+        return layout
+    for i in range(layout.count()):
+        sub = layout.itemAt(i).layout()
+        found = _find_layout_with(sub, widget) if sub is not None else None
+        if found is not None:
+            return found
+    return None
+
 def _patched_create_steam_card(self, appid, title_text, cover_path):
     _original_create_steam_card(self, appid, title_text, cover_path)
     card = self.steam_cards.get(appid)
@@ -6578,6 +6672,66 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
         btn_play = card.findChild(QPushButton, "Primary")
         status_label = card.findChild(QLabel, "CardStatus")
         
+        upd = {"btn": None, "sig": None, "checking": False}
+
+        def _remove_update_button():
+            b = upd["btn"]
+            if b is not None:
+                upd["btn"] = None
+                try:
+                    b.setParent(None)
+                    b.deleteLater()
+                except Exception:
+                    pass
+
+        def _show_update_button():
+            if upd["btn"] is not None:
+                return
+            lay = _find_layout_with(card.layout(), btn_play)
+            if lay is None:
+                return
+            b = QPushButton("Update")
+            b.setFixedHeight(38)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("A newer build is available on server " + build_server(get_installed_build(title_text)))
+            b.clicked.connect(_do_update)
+            lay.insertWidget(lay.indexOf(btn_play) + 1, b, 1)
+            upd["btn"] = b
+
+        def _do_update(_c=False):
+            src = build_server(get_installed_build(title_text))      # the server this copy was installed from
+            if load_launcher_settings().get("download_server") not in (src, "ask"):
+                QMessageBox.information(self, "Update", f"Updates for this copy come from Server {src}. Switch the download "
+                                        f"server to {src} in Settings, then press Update again.")
+                return
+            card_widget = DownloadCard(title_text, pw_game_url(title_text, src), 0, cover_path, self, existing_zip_path=None)
+            card_widget.worker.finished.connect(lambda _p: update_steam_card_state())
+            self.downloads_page.add_download_card(card_widget)
+            self.nav_group.button(6).setChecked(True)
+            self.pages.setCurrentWidget(self.downloads_page)
+
+        def _refresh_update_button(installed):
+            """Server 1 and 3 games remember the build they were installed from; if the site shows a different one,
+            Launch gets an Update button next to it."""
+            if not installed:
+                _remove_update_button()
+                return
+            have = get_installed_build(title_text)
+            if not have or upd["checking"]:
+                return
+            if upd["sig"] is None:
+                upd["sig"] = _BuildCheckSignal()
+                def on_site(build):
+                    upd["checking"] = False
+                    if build and build != get_installed_build(title_text):
+                        _show_update_button()
+                    else:
+                        _remove_update_button()
+                upd["sig"].done.connect(on_site)
+            upd["checking"] = True
+            sig = upd["sig"]
+            threading.Thread(target=lambda: sig.done.emit(fetch_site_build(title_text, build_server(have))), daemon=True).start()
+
         def update_steam_card_state():
             game_dir = _safe_installed_game_dir(title_text)
             exe_path = find_best_game_exe(game_dir, title_text)
@@ -6607,7 +6761,9 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                         QMessageBox.warning(self, "Platform", "Launching Windows games is not supported on this platform.")
                 
                 btn_play.clicked.connect(launch_game)
+                _refresh_update_button(True)
             else:
+                _refresh_update_button(False)
                 btn_play.setText("Install")
                 if status_label:
                     status_label.setText("Steam game")
@@ -6891,6 +7047,12 @@ class DownloadCard(QFrame):
         self.action_btn.setFixedSize(80, 28)
         self.action_btn.clicked.connect(self.cancel_download)
         bottom_row.addWidget(self.action_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFixedSize(80, 28)
+        self.clear_btn.setToolTip("Remove this card from the list")
+        self.clear_btn.clicked.connect(self.clear_card)
+        self.clear_btn.hide()   # shown once the download is finished or failed (Cancel covers running ones)
+        bottom_row.addWidget(self.clear_btn)
         layout.addLayout(bottom_row)
 
         main_layout.addLayout(layout, 1)
@@ -6907,6 +7069,21 @@ class DownloadCard(QFrame):
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
+
+    def clear_card(self):
+        parent = self.parentWidget()
+        self.setParent(None)
+        self.deleteLater()
+        page = parent
+        while page is not None and not hasattr(page, "empty_label"):
+            page = page.parentWidget()
+        try:
+            lay = getattr(page, "container_layout", None)
+            if page is not None and lay is not None and not any(
+                    isinstance(lay.itemAt(i).widget(), DownloadCard) for i in range(lay.count())):
+                page.empty_label.show()
+        except Exception:
+            pass
 
     def toggle_pause(self):
         if not hasattr(self.worker, "pause"):
@@ -6958,6 +7135,7 @@ class DownloadCard(QFrame):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.action_btn.setText("Open Folder")
+        self.clear_btn.show()
         try:
             self.action_btn.clicked.disconnect()
         except Exception:
@@ -6976,6 +7154,7 @@ class DownloadCard(QFrame):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.action_btn.setText("Copy Error")
+        self.clear_btn.show()
         try:
             self.action_btn.clicked.disconnect()
         except Exception:
@@ -7586,6 +7765,7 @@ FirebaseDownloadWorker.run = _new_fb_run
 # cancels the browser's own download, and the launcher's normal downloader fetches that link.
 PW_BASE_URL = "https://steamrip.com/"                   # <-- server 1 (direct download): change this
 PW_BASE_URL_2 = "https://fitgirl-repacks.site/"                # <-- server 2 (magnet -> torrent): change this
+PW_BASE_URL_3 = "https://ankergames.net/game/"                        # <-- server 3 (Download x2, captcha, direct download): change this
 PW_MAGNET_TEXT = r"\[?\s*magnet\s*\]?"                    # label of the magnet button on a server 2 game page
 PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
@@ -7596,6 +7776,107 @@ PW_HEADLESS = True                                     # True hides the browser;
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
 
+# ---------------------------------------------------------------- "Ask every time": pick the server in a popup for each download
+PW_SERVER_NAMES = {"1": ("SteamRIP", "direct download"), "2": ("FitGirl", "repacked torrent"),
+                   "3": ("AnkerGames", "direct download after a captcha")}
+
+def _pw_probe_server(title, sid):
+    """Does this server have the game? 'ok', '404' (not there) or 'unknown' (blocked / offline / couldn't tell)."""
+    try:
+        req = urllib.request.Request(pw_game_url(title, sid), headers={"User-Agent": PW_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read(1)
+        return "ok"
+    except urllib.error.HTTPError as e:
+        return "404" if e.code in (404, 410) else "unknown"     # 403 etc. (captcha walls) are not proof the game is missing
+    except Exception:
+        return "unknown"
+
+class _ServerPickDialog(QDialog):
+    probed = pyqtSignal(str, str)
+
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.setWindowTitle("Choose download server")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self.chosen = ""
+        self.title_text = title
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        head = QLabel(f"Where do you want to download {title} from?")
+        head.setObjectName("RowTitle")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        self.btns = {}
+        for sid, (name, desc) in PW_SERVER_NAMES.items():
+            b = QPushButton(f"{name}\n{desc}  -  checking...")
+            b.setMinimumHeight(56)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet("QPushButton:disabled { color: #777777; }")
+            b.clicked.connect(lambda _=False, i=sid: self._pick(i))
+            lay.addWidget(b)
+            self.btns[sid] = b
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(cancel)
+        self.probed.connect(self._on_probed)
+        for sid in self.btns:
+            threading.Thread(target=self._probe, args=(sid,), daemon=True).start()
+
+    def _probe(self, sid):
+        state = _pw_probe_server(self.title_text, sid)
+        try:
+            self.probed.emit(sid, state)
+        except RuntimeError:
+            pass      # the popup was closed already
+
+    def _on_probed(self, sid, state):
+        b = self.btns[sid]
+        name, desc = PW_SERVER_NAMES[sid]
+        if state == "404":
+            b.setText(f"{name}\nNot found (404)")
+            b.setEnabled(False)            # greyed out
+        elif state == "ok":
+            b.setText(f"{name}\n{desc}  -  available")
+        else:
+            b.setText(f"{name}\n{desc}  -  couldn't check")
+
+    def _pick(self, sid):
+        self.chosen = sid
+        self.accept()
+
+class _ServerAsker(QObject):
+    request = pyqtSignal(object, object, object)      # title, result box, done event
+
+    def __init__(self):
+        super().__init__()
+        self.request.connect(self._show)              # created in the GUI thread, so _show runs there
+
+    def _show(self, title, box, ev):
+        try:
+            dlg = _ServerPickDialog(QApplication.activeWindow(), title)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                box["v"] = dlg.chosen
+        except Exception:
+            pass
+        finally:
+            ev.set()
+
+_PW_ASKER = _ServerAsker()
+
+def _pw_ask_server(worker):
+    """Called from the download thread: shows the popup in the GUI thread and waits for the pick."""
+    box, ev = {"v": ""}, threading.Event()
+    _PW_ASKER.request.emit(worker.title, box, ev)
+    while not ev.wait(0.3):
+        if worker.__dict__.get("_cancel_flag"):
+            raise RuntimeError("CANCELLED")
+    if box["v"] not in ("1", "2", "3"):
+        raise RuntimeError("CANCELLED")
+    return box["v"]
+
+
 _fb_direct_run = FirebaseDownloadWorker.run  # previous behaviour, still used for the NCZ games
 
 # Games whose page on PW_BASE_URL doesn't match their title: (regex on the lowercase title, slug to use instead).
@@ -7605,11 +7886,17 @@ PW_SLUG_OVERRIDES = (
     (r"risk of rain (2|two)\b.*", "risk-of-rain-two"),
 )
 
-def pw_server():
-    return "2" if load_launcher_settings().get("download_server") == "2" else "1"
+_pw_tls = threading.local()      # the server picked in the "Ask every time" popup, per download thread
 
-def pw_game_url(title):
-    base = PW_BASE_URL_2 if pw_server() == "2" else PW_BASE_URL
+def pw_server():
+    v = getattr(_pw_tls, "server", None)
+    if v in ("1", "2", "3"):
+        return v
+    v = load_launcher_settings().get("download_server")
+    return v if v in ("2", "3") else "1"     # "ask" is resolved per download before anything calls this
+
+def pw_game_url(title, server=None):
+    base = {"2": PW_BASE_URL_2, "3": PW_BASE_URL_3}.get(server or pw_server(), PW_BASE_URL)
     t = title.lower().replace("'", "")
     plain = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", t)).strip()
     for pattern, slug in PW_SLUG_OVERRIDES:
@@ -7828,6 +8115,10 @@ def _pw_find_link(self, start_url):
             guard = _pw_guard(context, page)
             self.status_update.emit("Opening download page...")
             page.goto(start_url, timeout=60000)
+            try:
+                self._pw_build = parse_build(page.title())   # "(game) ... (Build 123)" -> 123
+            except Exception:
+                self._pw_build = ""
 
             target = None
             idx, bad, order = 0, set(), None  # idx = which DOWNLOAD HERE button to click; bad = ones to skip (MegaDB)
@@ -7939,6 +8230,598 @@ def _pw_find_link(self, start_url):
             return url, headers
         finally:
             browser.close()
+
+# ---------------------------------------------------------------- build numbers (server 1 update check)
+_BUILD_RX = re.compile(r"\(?\bbuild\s*#?\s*([0-9][\w.\-]*)", re.IGNORECASE)
+
+def parse_build(text):
+    m = _BUILD_RX.search(text or "")
+    return m.group(1) if m else ""
+
+def installed_builds_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "installed_builds.json")
+
+def _load_installed_builds():
+    try:
+        with open(installed_builds_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def get_installed_build(title):
+    data = _load_installed_builds()
+    return data.get(title) or data.get(sanitize_folder_name(title)) or ""
+
+def record_installed_build(title, build):
+    if not build:
+        return
+    with _versions_lock:
+        data = _load_installed_builds()
+        data[title] = build
+        data[sanitize_folder_name(title)] = build
+        path = installed_builds_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+
+# Server 3 shows the version in a green box ("V 19i") above the first Download button.
+_S3_VER_BOX_RX = re.compile(r">\s*V\s*([0-9][\w.\-]*)\s*<", re.IGNORECASE)                       # <span>V 19i</span>
+_S3_VER_TEXT_RX = re.compile(r"\b(?:version|ver\.?)\s*[:#]?\s*v?\s*([0-9][\w.\-]*)", re.IGNORECASE)   # fallback: "Version 19i"
+S3_BUILD_PREFIX = "s3:"       # server 3 builds are saved as "s3:19i" so they're never compared with a server 1 build
+
+def parse_s3_version(html):
+    """Version from the green box on a server 3 game page ('' if it isn't there)."""
+    m = _S3_VER_BOX_RX.search(html or "")
+    if not m:
+        m = _S3_VER_TEXT_RX.search(re.sub(r"<[^>]+>", " ", html or ""))
+    return m.group(1) if m else ""
+
+def build_server(build):
+    """Which server a saved build came from: '3' or '1'."""
+    return "3" if (build or "").startswith(S3_BUILD_PREFIX) else "1"
+
+def fetch_site_build(title, server="1"):
+    """Build number currently shown on the server's page for this game ('' if it can't be read).
+    Server 1: the number in the page title. Server 3: the version in the green box (returned as 's3:<version>')."""
+    try:
+        url = pw_game_url(title, "3" if server == "3" else "1")
+        req = urllib.request.Request(url, headers={"User-Agent": PW_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read(400000).decode("utf-8", "ignore")
+        if server == "3":
+            ver = parse_s3_version(html)
+            return S3_BUILD_PREFIX + ver if ver else ""
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+        return parse_build(html_lib.unescape(m.group(1))) if m else ""
+    except Exception:
+        return ""
+
+# ---------------------------------------------------------------- server 3: Download, Download, then your own browser on a redirect / new tab
+class _PwRedirect(Exception):
+    """The site redirected us off itself or opened a new tab (captcha / verification). args[0] is that page."""
+
+_PW_MAYBE_LATER_RX = re.compile(r"^\s*maybe\s*later\s*$", re.IGNORECASE)
+
+def _pw_s3_dismiss(pg):
+    """Clicks a 'Maybe later' button if one is showing. True if one was clicked."""
+    try:
+        btn = _pw_find_visible(pg, _PW_MAYBE_LATER_RX)
+        if btn is not None:
+            _pw_press(btn)
+            pg.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _pw_s3_press_download(pg, exact=False):
+    """Presses a Download button. With exact=True only a button whose whole text is 'Download' is pressed
+    (nothing like 'Download Now', 'Download Free' or 'Download Manager')."""
+    _pw_s3_dismiss(pg)
+    rx = re.compile(r"^\s*download\s*$" if exact else r"download", re.IGNORECASE)
+    btn = _pw_find_visible(pg, rx)
+    if btn is None:
+        return False
+    _pw_press(btn)
+    return True
+
+def _pw_s3_describe(pg):
+    """What the page looked like, for the error message when nothing happens."""
+    try:
+        frames = [fr.url for fr in pg.frames[1:]][:6]
+    except Exception:
+        frames = []
+    return (f"Page: {pg.url}\nButtons: {', '.join(_pw_visible_labels(pg)) or 'none'}\n"
+            f"Frames: {', '.join(frames) or 'none'}")
+
+def _pw_s3_attempt(self, start_url):
+    """Hidden browser: Download, Download (exact). The moment the browser is on any page that isn't the original
+    game page (a redirect, or a new tab), _PwRedirect is raised with that page (it is then finished in the user's
+    own browser).
+    If a download starts right in the hidden browser instead, returns (download_url, headers)."""
+    from playwright.sync_api import sync_playwright
+    got = {}
+
+    def norm(url):
+        """host + path of a URL (no scheme, query, fragment, 'www.' or trailing slash), to compare pages."""
+        u = urllib.parse.urlparse(url or "")
+        return ((u.hostname or "").lower().removeprefix("www.") + u.path.rstrip("/")).lower()
+
+    original = norm(start_url)
+
+    def moved(url):
+        """True when url is a real web page that is NOT the original game page."""
+        return (url or "").startswith(("http://", "https://")) and norm(url) != original
+
+    def watch_ctx(ctx):
+        def hook(pg):
+            pg.on("download", lambda d, _p=pg: got.setdefault("d", (d, _p)))
+        for pg in ctx.pages:
+            hook(pg)
+        ctx.on("page", hook)
+    def newest(ctx, fallback):
+        live = [pg for pg in ctx.pages if not pg.is_closed()]
+        return live[-1] if live else fallback
+    def check_cancel():
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+
+    with sync_playwright() as p:
+        self.status_update.emit("Starting browser...")
+        browser = p.chromium.launch(headless=False, args=["--headless=new", "--disable-blink-features=AutomationControlled"])   # hidden, but the real browser: the site only redirects / shows the captcha to that
+        try:
+            context = browser.new_context(user_agent=PW_USER_AGENT, accept_downloads=True)
+            page = context.new_page()
+            watch_ctx(context)
+            def find_redirect():
+                """The URL to finish in the user's browser, or ''. That is whatever page the browser is on when it
+                isn't the original game page anymore: the main tab after a redirect, or a new tab. The main tab
+                wins. Waits for the page to load so the final address is used."""
+                try:
+                    if not page.is_closed() and moved(page.url):
+                        page.wait_for_load_state("domcontentloaded", timeout=8000)
+                        page.wait_for_timeout(1500)
+                        if moved(page.url):
+                            return page.url
+                except Exception:
+                    pass
+                for pg in list(context.pages):
+                    if pg is page or pg.is_closed() or not moved(pg.url):   # still about:blank / original page: skip
+                        continue
+                    try:
+                        pg.wait_for_load_state("domcontentloaded", timeout=8000)
+                        pg.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+                    if not pg.is_closed() and moved(pg.url):
+                        return pg.url
+                return ""
+
+            def redirected():
+                url = find_redirect()
+                if url:
+                    raise _PwRedirect(url)
+
+            self.status_update.emit("Opening download page...")
+            page.goto(start_url, timeout=60000)
+            try:
+                page.wait_for_timeout(1000)       # the green version box can be drawn by scripts
+                self._pw_build = parse_s3_version(page.content())
+            except Exception:
+                self._pw_build = ""
+            cur = page
+            try:
+                for n in (1, 2):
+                    check_cancel()
+                    self.status_update.emit(f"Clicking Download ({n}/2)...")
+                    deadline = time.time() + 30
+                    while not _pw_s3_press_download(cur, exact=(n == 2)):   # 2nd press: only a button that says exactly "Download"
+                        check_cancel()
+                        redirected()
+                        if time.time() > deadline:
+                            raise RuntimeError(f"Couldn't find the Download button on {cur.url}")
+                        cur.wait_for_timeout(700)
+                    settle_end = time.time() + 3
+                    while time.time() < settle_end and "d" not in got:
+                        redirected()
+                        cur.wait_for_timeout(300)
+                    cur = newest(context, cur)
+                    if "d" in got:
+                        break
+
+                if "d" not in got:
+                    self.status_update.emit("Waiting for a redirect or new tab...")
+                    end = time.time() + 90
+                    while "d" not in got:
+                        check_cancel()
+                        redirected()
+                        if time.time() > end:
+                            raise RuntimeError("The site neither redirected, opened a new tab nor started a download.\n"
+                                               + _pw_s3_describe(newest(context, cur)))
+                        now_pg = newest(context, cur)
+                        _pw_s3_dismiss(now_pg)
+                        now_pg.wait_for_timeout(500)
+            except _PwRedirect as e:
+                try:
+                    e.cookies = context.cookies()     # keep the session so the visible browser continues where we left off
+                except Exception:
+                    e.cookies = []
+                raise    # the hidden browser closes first, then _pw_find_link_s3 opens that page in a visible browser
+
+            download, src = got["d"]
+            url = download.url
+            cookies = "; ".join(f"{c['name']}={c['value']}" for c in src.context.cookies(url))
+            try:
+                download.cancel()      # the launcher downloads it itself
+            except Exception:
+                pass
+            headers = {"User-Agent": PW_USER_AGENT, "Referer": src.url or start_url}
+            if cookies:
+                headers["Cookie"] = cookies
+            return url, headers
+        finally:
+            browser.close()
+
+# --- hand-off: the page we were redirected / sent to opens in the default browser, and the launcher takes over once a download shows up
+PW_BROWSER_DOWNLOAD_DIRS = ()    # extra folders to watch if your browser saves somewhere unusual
+_PW_PARTIAL_EXT = (".crdownload", ".part", ".opdownload", ".download")   # Chrome/Edge/Brave, Firefox, Opera, Safari
+_PW_ARCHIVE_EXT = (".zip", ".rar", ".7z")
+
+def _win_downloads_dir():
+    try:
+        import ctypes
+        from ctypes import wintypes
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                        ("Data4", ctypes.c_ubyte * 8)]
+        guid = GUID(0x374DE290, 0x123F, 0x4565, (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+        buf = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(buf)) == 0:
+            path = buf.value
+            ctypes.windll.ole32.CoTaskMemFree(buf)
+            return path or ""
+    except Exception:
+        pass
+    return ""
+
+def _pw_browser_download_dirs():
+    """Folders where the user's browser is likely to save files."""
+    cands = []
+    if sys.platform.startswith("win"):
+        cands.append(_win_downloads_dir())
+    elif sys.platform.startswith("linux"):
+        cands.append(_run_quiet(["xdg-user-dir", "DOWNLOAD"]))
+    cands += [os.path.join(os.path.expanduser("~"), "Downloads"), DOWNLOAD_DIR] + list(PW_BROWSER_DOWNLOAD_DIRS)
+    out = []
+    for d in cands:
+        if d and os.path.isdir(d) and os.path.normcase(os.path.abspath(d)) not in [os.path.normcase(os.path.abspath(x)) for x in out]:
+            out.append(d)
+    return out
+
+def _pw_list_files(dirs):
+    """{path: (size, mtime)} for the files directly inside these folders."""
+    out = {}
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_file(follow_symlinks=False):
+                            st = e.stat()
+                            out[e.path] = (st.st_size, st.st_mtime)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return out
+
+def _pw_s3_browser_handoff(self, url, wait_minutes=30):
+    """Opens url in the default browser and waits for a new download to appear in the browser's download folder
+    (a .crdownload / .part file, or a finished archive). Shows its progress, and returns the finished file's path."""
+    dirs = _pw_browser_download_dirs()
+    if not dirs:
+        raise RuntimeError("Couldn't find your browser's download folder.")
+    before = set(_pw_list_files(dirs))
+    t0 = time.time()
+    self.status_update.emit("Finish the page in your browser (captcha, then download). The launcher picks the download up automatically.")
+    webbrowser.open(url)
+
+    def check_cancel():
+        if self._is_cancelled:
+            raise RuntimeError("CANCELLED")
+
+    def new_files():
+        files = _pw_list_files(dirs)
+        return {p: v for p, v in files.items() if p not in before}
+
+    def settle(path):
+        """Waits until the finished file stops changing size, then returns it."""
+        last, steady = -1, 0
+        while steady < 3:
+            check_cancel()
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                raise RuntimeError("The downloaded file disappeared.")
+            steady = steady + 1 if size == last else 0
+            last = size
+            time.sleep(1.0)
+        return path
+
+    deadline = t0 + wait_minutes * 60
+    partial, last_size, last_t = None, 0, time.time()
+    while True:
+        check_cancel()
+        if time.time() > deadline:
+            raise RuntimeError("No download started in your browser. If your browser asks where to save each file, "
+                               "turn that off (or add its folder to PW_BROWSER_DOWNLOAD_DIRS).")
+        fresh = new_files()
+        if partial is None:
+            partials = [p for p, v in fresh.items() if p.lower().endswith(_PW_PARTIAL_EXT)]
+            if partials:
+                partial = max(partials, key=lambda p: fresh[p][0])
+                last_size, last_t = 0, time.time()
+                self.status_update.emit("Download started in your browser, tracking it...")
+            else:
+                done = [p for p in fresh if p.lower().endswith(_PW_ARCHIVE_EXT)]   # one that finished before we looked
+                if done:
+                    return settle(max(done, key=lambda p: fresh[p][0]))
+                time.sleep(1.0)
+                continue
+        # a download is running: follow its size
+        if os.path.exists(partial):
+            size = os.path.getsize(partial)
+            now = time.time()
+            speed = max(0.0, (size - last_size) / max(now - last_t, 0.001))
+            last_size, last_t = size, now
+            self.progress.emit(int(size), 0, float(speed))
+            time.sleep(1.0)
+            continue
+        # the partial file is gone: the browser renamed it to the finished file (or the download was cancelled)
+        base = partial[:-len(next(e for e in _PW_PARTIAL_EXT if partial.lower().endswith(e)))]
+        end = time.time() + 15
+        final = None
+        while time.time() < end and final is None:
+            fresh = new_files()
+            if base in fresh and not base.lower().endswith(_PW_PARTIAL_EXT):
+                final = base
+            else:
+                rest = [p for p, v in fresh.items() if not p.lower().endswith(_PW_PARTIAL_EXT) and v[1] >= t0 - 2]
+                if rest:
+                    final = max(rest, key=lambda p: fresh[p][0])
+            if final is None:
+                time.sleep(1.0)
+        if final:
+            return settle(final)
+        partial = None   # cancelled or restarted in the browser: keep waiting for a new download
+
+def _pw_adopt_local_file(path):
+    """Moves a browser-downloaded archive into the launcher's downloads folder when that is instant (same drive);
+    otherwise it is used right where it is."""
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        dest = os.path.join(DOWNLOAD_DIR, os.path.basename(path))
+        if os.path.abspath(dest) == os.path.abspath(path) or os.path.exists(dest):
+            return path
+        if os.stat(path).st_dev == os.stat(DOWNLOAD_DIR).st_dev:
+            os.replace(path, dest)
+            return dest
+    except OSError:
+        pass
+    return path
+
+def _pw_real_browser_exe():
+    """Path of an installed Chrome / Edge / Chromium (the real thing passes Cloudflare), or ''."""
+    cands = []
+    if sys.platform.startswith("win"):
+        for base in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"), os.environ.get("LOCALAPPDATA")):
+            if base:
+                cands += [os.path.join(base, r"Google\Chrome\Application\chrome.exe"),
+                          os.path.join(base, r"Microsoft\Edge\Application\msedge.exe"),
+                          os.path.join(base, r"BraveSoftware\Brave-Browser\Application\brave.exe")]
+    elif sys.platform == "darwin":
+        cands += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+    for name in ("google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"):
+        w = shutil.which(name)
+        if w:
+            cands.append(w)
+    return next((c for c in cands if c and os.path.isfile(c)), "")
+
+def _pw_free_port():
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+class _MiniWS:
+    """Tiny WebSocket client (no extra package needed), just enough to talk to Chrome's DevTools port."""
+    def __init__(self, host, port, path):
+        import socket, base64 as _b64
+        self.sock = socket.create_connection((host, port), timeout=10)
+        key = _b64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        self.buf = b""
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("DevTools handshake failed")
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise RuntimeError("DevTools refused the connection")
+
+    def _read(self, n):
+        self.sock.settimeout(15)
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("DevTools connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, text):
+        data = text.encode()
+        n = len(data)
+        head = bytearray([0x81])
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        mask = os.urandom(4)
+        self.sock.settimeout(10)
+        self.sock.sendall(bytes(head) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self, timeout=1.0):
+        """Next text message, or None if nothing arrived within timeout."""
+        import select
+        if not self.buf and not select.select([self.sock], [], [], timeout)[0]:
+            return None
+        msg = b""
+        while True:
+            b1, b2 = self._read(2)
+            op, n = b1 & 0x0F, b2 & 0x7F
+            if n == 126:
+                n = int.from_bytes(self._read(2), "big")
+            elif n == 127:
+                n = int.from_bytes(self._read(8), "big")
+            payload = self._read(n)
+            if op == 8:
+                raise RuntimeError("DevTools connection closed")
+            if op == 9:      # ping -> pong
+                self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + b"\0\0\0\0" + payload[:125])
+                continue
+            if op in (0, 1, 2):
+                msg += payload
+                if b1 & 0x80:
+                    return msg.decode("utf-8", "replace")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
+    """Opens url in your real, normally launched Chrome / Edge / Brave and does NOT automate it at all (no Playwright
+    attached to the page, no navigation by script), so Cloudflare's captcha sees a normal browser. The launcher only
+    listens on the browser-level DevTools port for 'a download is about to start': that event carries the download
+    link. The browser's own download is denied, the link + the browser's cookies / user agent are copied, and
+    (url, headers) is returned so the launcher downloads the file itself."""
+    exe = _pw_real_browser_exe()
+    if not exe:
+        raise RuntimeError("Couldn't find Chrome, Edge or Brave on this PC. Install one of them for server 3.")
+    port = _pw_free_port()
+    profile = os.path.join(os.path.dirname(get_launcher_settings_path()), "server3_browser_profile")   # kept, so a solved captcha is remembered
+    os.makedirs(profile, exist_ok=True)
+    self.status_update.emit("Opening the page in your browser. Finish the captcha / verification there...")
+    proc = subprocess.Popen([exe, f"--remote-debugging-port={port}", f"--remote-debugging-address=127.0.0.1",
+                             f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", url],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ws = None
+    try:
+        info = None
+        for _ in range(60):          # wait for the debug port to come up
+            if proc.poll() is not None:
+                raise RuntimeError("The browser closed right away. Close other windows of it that use the same profile and retry.")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as r:
+                    info = json.loads(r.read().decode())
+                break
+            except Exception:
+                time.sleep(0.5)
+        if not info:
+            raise RuntimeError("Couldn't connect to the browser window.")
+        ua = info.get("User-Agent") or PW_USER_AGENT
+        wsu = urllib.parse.urlparse(info["webSocketDebuggerUrl"])
+        ws = _MiniWS(wsu.hostname, wsu.port, wsu.path)
+        ids = {"n": 0}
+        def call(method, params=None, wait=False):
+            ids["n"] += 1
+            mid = ids["n"]
+            ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            if not wait:
+                return None
+            end = time.time() + 10
+            while time.time() < end:
+                m = ws.recv(1.0)
+                if m:
+                    d = json.loads(m)
+                    if d.get("id") == mid:
+                        return d.get("result") or {}
+            return {}
+        # Browser-level only: deny the browser's own download, but report it (with its link) first
+        call("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": True})
+
+        dl_url = ""
+        deadline = time.time() + wait_minutes * 60
+        while not dl_url:
+            if self._is_cancelled:
+                raise RuntimeError("CANCELLED")
+            if time.time() > deadline:
+                raise RuntimeError("No download started in the browser window.")
+            if proc.poll() is not None:
+                raise RuntimeError("The browser window was closed before a download started.")
+            m = ws.recv(0.5)
+            if not m:
+                continue
+            d = json.loads(m)
+            if d.get("method") == "Browser.downloadWillBegin":
+                dl_url = (d.get("params") or {}).get("url") or ""
+
+        if dl_url.startswith(("blob:", "data:")):
+            raise RuntimeError("The browser's download has no direct link (it's a blob), so the launcher can't take it over.")
+        ref = url
+        try:      # the page the download came from
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+                pages = [t for t in json.loads(r.read().decode()) if t.get("type") == "page" and str(t.get("url", "")).startswith("http")]
+            if pages:
+                ref = pages[-1]["url"]
+        except Exception:
+            pass
+        host = (urllib.parse.urlparse(dl_url).hostname or "").lower()
+        path = urllib.parse.urlparse(dl_url).path or "/"
+        pairs = []
+        for c in (call("Storage.getCookies", wait=True).get("cookies") or []):
+            dom = (c.get("domain") or "").lower().lstrip(".")
+            if dom and (host == dom or host.endswith("." + dom)) and path.startswith(c.get("path") or "/"):
+                pairs.append(f"{c['name']}={c['value']}")
+        headers = {"User-Agent": ua, "Referer": ref}
+        if pairs:
+            headers["Cookie"] = "; ".join(pairs)
+        self.status_update.emit("Got the download link from your browser, downloading it in the launcher...")
+        return dl_url, headers
+    finally:
+        if ws:
+            ws.close()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+def _pw_find_link_s3(self, start_url):
+    """Server 3. Stays in the hidden Playwright browser (Download, Download) until the site redirects away from the
+    original game URL (or opens a new tab). THEN that page is opened in a visible browser window, the download it
+    starts is captured: its link is copied, the browser download is cancelled and the launcher downloads from the
+    link itself. Returns (download_url, headers) like the other servers."""
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError:
+        # no Playwright: fall back to the old behaviour (your default browser downloads it, the launcher watches the folder)
+        return _pw_s3_browser_handoff(self, start_url), None
+    try:
+        return _pw_s3_attempt(self, start_url)       # a download started right in the hidden browser
+    except _PwRedirect as r:
+        target = r.args[0]
+        self.status_update.emit("Redirected, opening it in your browser...")
+        return _pw_s3_capture_in_browser(self, target, getattr(r, "cookies", []))
 
 _MAGNET_RX = re.compile(r"magnet:\?[^\s\"'<>]+", re.IGNORECASE)
 
@@ -8464,7 +9347,10 @@ def _fb_pw_run(self):
         return _fb_direct_run(self)
     dest_path = self.existing_zip_path if self.existing_zip_path and os.path.exists(self.existing_zip_path) else None
     fresh = False
+    _pw_tls.server = None
     try:
+        if not dest_path and load_launcher_settings().get("download_server") == "ask":
+            _pw_tls.server = _pw_ask_server(self)      # popup: pick a server for this download
         if not dest_path and pw_server() == "2":       # server 2: [magnet] -> torrent
             magnet = _pw_find_magnet(self, pw_game_url(self.title))
             stage, content = _fb_torrent(self, magnet)
@@ -8482,10 +9368,15 @@ def _fb_pw_run(self):
             self.finished.emit(game_dir)
             return
         if not dest_path:
-            url, headers = _pw_find_link(self, pw_game_url(self.title))
-            self.download_url = url  # bridged: the copied link becomes this download's link
-            dest_path = _fb_stream(self, url, headers, lambda: _pw_find_link(self, pw_game_url(self.title)))
-            fresh = True
+            find = _pw_find_link_s3 if pw_server() == "3" else _pw_find_link
+            url, headers = find(self, pw_game_url(self.title))
+            if headers is None:      # server 3 hand-off: the user's own browser downloaded it, url is the local file
+                dest_path = _pw_adopt_local_file(url)
+                fresh = False
+            else:
+                self.download_url = url  # bridged: the copied link becomes this download's link
+                dest_path = _fb_stream(self, url, headers, lambda: find(self, pw_game_url(self.title)))
+                fresh = True
         if self._is_cancelled:
             if fresh and os.path.exists(dest_path):
                 os.remove(dest_path)
@@ -8493,6 +9384,18 @@ def _fb_pw_run(self):
             return
         self.status_update.emit("Extracting...")
         extract_archive(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+        if pw_server() == "1":
+            try:
+                record_installed_build(self.title, getattr(self, "_pw_build", "") or "")
+            except Exception:
+                pass
+        elif pw_server() == "3":
+            try:
+                ver = getattr(self, "_pw_build", "") or fetch_site_build(self.title, "3").removeprefix(S3_BUILD_PREFIX)
+                if ver:
+                    record_installed_build(self.title, S3_BUILD_PREFIX + ver)
+            except Exception:
+                pass
         self.finished.emit(dest_path)
     except Exception as e:
         if self._is_cancelled or str(e) == "CANCELLED":
@@ -12539,15 +13442,39 @@ def companion_update_check():
 class _SelfUpdateSignal(QObject):
     updated = pyqtSignal()
 
+class _ManualUpdateSignal(QObject):
+    result = pyqtSignal(str)    # "updated", "current", "frozen" or "error: ..."
+
+def show_updated_dialog(window):
+    """'Launcher updated' box with a Restart button that relaunches the launcher right away."""
+    box = QMessageBox(window)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle("Launcher updated")
+    box.setText("The launcher has been updated to the latest version.\n\n"
+                "Restart it now to apply the update.")
+    restart = box.addButton("Restart", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    if box.clickedButton() is restart:
+        restart_launcher(window)
+
+def manual_update_check():
+    """Same as the automatic check, but ignores the Automatic Updates switch. Returns a status string."""
+    if getattr(sys, "frozen", False):
+        return "frozen"
+    updated = self_update_check()
+    try:
+        updated = companion_update_check() or updated
+    except Exception:
+        pass
+    return "updated" if updated else "current"
+
 _selfupdate_prev_init = AdaptiveApp.__init__
 
 def _selfupdate_init(self):
     _selfupdate_prev_init(self)
     self._selfupdate_sig = _SelfUpdateSignal(self)
-    self._selfupdate_sig.updated.connect(lambda: QMessageBox.information(
-        self, "Launcher updated",
-        "The launcher has been updated to the latest version.\n\n"
-        "Please restart the tool to apply the update."))
+    self._selfupdate_sig.updated.connect(lambda: show_updated_dialog(self))
     def work():
         if not load_launcher_settings().get("auto_update", True):
             return                       # "Automatic Updates" is turned off in Settings
@@ -12771,7 +13698,7 @@ def safe_addon_name(title, fallback):
     safe = re.sub(r'[<>:"/\\|?*]', "_", title or "").strip().rstrip(".")
     return safe or fallback
 
-def extract_workshop_folder(workshop, addons_dir, log, progress):
+def extract_workshop_folder(workshop, addons_dir, log, progress, delete_source=False):
     files = []
     for folder, _d, names in os.walk(workshop):
         for n in names:
@@ -12782,7 +13709,7 @@ def extract_workshop_folder(workshop, addons_dir, log, progress):
     total, done, skipped, failed = len(files), 0, 0, 0
     if not total:
         log("No .gma or .bin addons found in that folder.", "warn")
-        return
+        return (0, 0, 0)
     for i, path in enumerate(files, 1):
         progress(i - 1, total)
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -12811,6 +13738,10 @@ def extract_workshop_folder(workshop, addons_dir, log, progress):
     msg = f"Total found addons [{total}], extracted [{done}], skipped [{skipped}], failed [{failed}]"
     log(msg, "ok" if not failed else "error")
     log("Extraction complete", "ok")
+    if delete_source and not failed:
+        shutil.rmtree(workshop, ignore_errors=True)   # the unextracted copy isn't needed any more
+        log("Deleted the unextracted workshop files", "info")
+    return (done, skipped, failed)
 
 class GmodExtractWorker(QThread):
     log = pyqtSignal(str, str)
@@ -12988,7 +13919,8 @@ QPushButton#GmodTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
 QPushButton#GmodTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
 QFrame#GmodRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
 QFrame#GmodRow:hover {{ border: 1px solid {t['accent']}; }}
-QPushButton#GmodToggle {{ background: {t['button']}; color: {t['subtext']}; border-radius: 13px;
+QPushButton#GmodDelete {{ padding: 0 14px; font-size: 12px; min-width: 52px; }}
+QPushButton#GmodToggle {{ background: {t['button']}; color: {t['subtext']}; border-radius: 15px;
     padding: 0 14px; min-width: 70px; font-size: 12px; }}
 QPushButton#GmodToggle:hover {{ background: {t['button_hover']}; }}
 QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: #ffffff; }}
@@ -13087,7 +14019,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
     def _add_row(self, real, enabled):
         frame = QFrame()
         frame.setObjectName("GmodRow")
-        frame.setFixedHeight(52)
+        frame.setFixedHeight(56)
         h = QHBoxLayout(frame)
         h.setContentsMargins(18, 0, 12, 0)
         h.setSpacing(12)
@@ -13098,16 +14030,44 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
         btn = QPushButton()
         btn.setObjectName("GmodToggle")
         btn.setCheckable(True)
-        btn.setFixedHeight(26)
+        btn.setFixedHeight(30)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn = QPushButton("Delete")
+        del_btn.setObjectName("GmodDelete")
+        del_btn.setFixedHeight(30)
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setToolTip("Delete this addon from disk")
         h.addWidget(name, 1)
         h.addWidget(btn)
+        h.addWidget(del_btn)
         row = {"real": real, "frame": frame, "btn": btn, "name": self._clean(real)}
         btn.setChecked(enabled)
         btn.setText("Enabled" if enabled else "Disabled")
         btn.toggled.connect(lambda checked, r=row: self.on_toggle(r, checked))
+        del_btn.clicked.connect(lambda _c=False, r=row: self.delete_addon(r))
         self.list_layout.insertWidget(self.list_layout.count() - 1, frame)
         self.rows.append(row)
+
+    def delete_addon(self, row):
+        if QMessageBox.question(self, "Delete addon", f"Delete \"{row['name']}\" from disk?\nThis can't be undone.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        base = self.addons_dir()
+        path = os.path.join(base if row["btn"].isChecked() else os.path.join(base, "disabled"), row["real"])
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            elif os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Addon Manager", f"Couldn't delete addon: {e}")
+            return
+        if row in self.rows:
+            self.rows.remove(row)
+        self.list_layout.removeWidget(row["frame"])
+        row["frame"].setParent(None)
+        row["frame"].deleteLater()
+        self.apply_addon_filter()
 
     def apply_addon_filter(self, *_):
         q = self.filter_edit.text().strip().lower()
@@ -15111,16 +16071,22 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             QMessageBox.information(self, "Garry's Mod", "Garry's Mod isn't installed in the launcher.")
             return
         msgs = []
+        result = None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             addons = os.path.join(root, "garrysmod", "addons")
             os.makedirs(addons, exist_ok=True)
-            extract_workshop_folder(workshop_item_dir(d["appid"], d["id"]), addons,
-                                    lambda t, k: msgs.append(t), lambda a, b: None)
+            result = extract_workshop_folder(workshop_item_dir(d["appid"], d["id"]), addons,
+                                             lambda t, k: msgs.append(t), lambda a, b: None, delete_source=True)
         except Exception as e:
             msgs.append(f"Error: {e}")
         finally:
             QApplication.restoreOverrideCursor()
+        if result and result[0] + result[1] > 0 and not result[2] and not os.path.isdir(workshop_item_dir(d["appid"], d["id"])):
+            ws_save_downloads([x for x in ws_load_downloads()
+                               if not (x["id"] == d["id"] and x["appid"] == d["appid"])])
+            self._rebuild_downloaded()
+            self._refresh_card_states()
         QMessageBox.information(self, "Install to Garry's Mod", "\n".join(msgs[:-1][-5:] or msgs))
 
 _ws_prev_init = AdaptiveApp.__init__
@@ -16460,8 +17426,9 @@ class _FanClickable(QLabel):
 
 class _FanShotViewer(QDialog):
     """Full size screenshot viewer: Left/Right arrows (or the buttons) to browse, Esc to close."""
-    def __init__(self, urls, index, parent=None):
+    def __init__(self, urls, index, parent=None, on_full=None):
         super().__init__(parent)
+        self._on_full = on_full     # called with (url, full res pixmap) once one is downloaded
         self.setWindowTitle("Screenshots")
         self.resize(1120, 720)
         self.setStyleSheet("QDialog { background: #0b0b0d; } QLabel { color: #d7d7dc; } "
@@ -16513,6 +17480,11 @@ class _FanShotViewer(QDialog):
         pm = QPixmap()
         if raw and pm.loadFromData(raw):
             self._cache[url] = pm
+            if self._on_full:
+                try:
+                    self._on_full(url, pm)
+                except Exception:
+                    pass
         if url == self._urls[self._i]:
             self._render() if url in self._cache else self.img.setText("Couldn't load this screenshot.")
 
@@ -21224,16 +22196,125 @@ class _InjectBridge(QObject):
         elif self.chat_uid and time.time() - self._chat_t > 1.5:
             self._load_chat(self.chat_uid)     # keep the open chat fresh
 
+# ---------------------------------------------------------------- F9 screenshot hotkey (saved to <library>/Screenshots)
+def _screenshots_dir():
+    return os.path.join(GAMES_DIR, "Screenshots")
+
+def _start_key_hook_win(vk, callback):
+    """Windows low-level hook that only listens for one key (never blocks it)."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    class KBD(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("extra", ctypes.c_size_t)]
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    u.SetWindowsHookExW.restype = ctypes.c_void_p
+    u.SetWindowsHookExW.argtypes = [ctypes.c_int, PROC, ctypes.c_void_p, wintypes.DWORD]
+    u.CallNextHookEx.restype = ctypes.c_ssize_t
+    u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    k.GetModuleHandleW.restype = ctypes.c_void_p
+    down = [False]                       # ignore key auto-repeat while the key is held
+    def proc(n, w, l):
+        if n >= 0:
+            kb = ctypes.cast(l, ctypes.POINTER(KBD)).contents
+            if kb.vkCode == vk:
+                if w in (0x100, 0x104):
+                    if not down[0]:
+                        callback()
+                    down[0] = True
+                elif w in (0x101, 0x105):
+                    down[0] = False
+        return u.CallNextHookEx(None, n, w, l)
+    cb = PROC(proc)
+    def loop():
+        u.SetWindowsHookExW(13, cb, k.GetModuleHandleW(None), 0)
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+    threading.Thread(target=loop, daemon=True).start()
+    return cb
+
+def _start_f9_hook_linux(callback):
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        _ov_log(f"pynput unavailable for F9: {e!r}")
+        return None
+    state = {"down": False}
+    def on_press(k):
+        if k == keyboard.Key.f9 and not state["down"]:
+            state["down"] = True
+            callback()
+    def on_release(k):
+        if k == keyboard.Key.f9:
+            state["down"] = False
+    try:
+        lst = keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True)
+        lst.start()
+        return lst
+    except Exception as e:
+        _ov_log(f"F9 listener failed: {e!r}")
+        return None
+
+def _show_screenshot_toast(text):
+    """Overlay toast with just the text (no avatar circle). Uses a text-only toast when overlay.py has one."""
+    if _overlay is None or get_overlay_mode() == "off":
+        return
+    try:
+        _overlay.set_mode("window")
+        for name in ("notify_text", "notify_simple", "notify_message"):
+            fn = getattr(_overlay, name, None)
+            if fn:
+                fn(text)
+                return
+        _overlay.notify_playing(text, "", None, "")
+    except Exception as e:
+        _ov_log(f"screenshot toast failed: {e!r}")
+
+class _ScreenshotTaker(QObject):
+    """F9: grabs the screen and saves it into <library>/Screenshots (only while a launcher game is running)."""
+    req = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.req.connect(self.take, Qt.ConnectionType.QueuedConnection)
+
+    def take(self):
+        game = _now_playing.get("name") or next(iter(_running), None)
+        if not game:
+            return
+        try:
+            shot = QApplication.primaryScreen().grabWindow(0)
+            if shot.isNull():
+                raise RuntimeError("empty grab")
+            folder = _screenshots_dir()
+            os.makedirs(folder, exist_ok=True)
+            safe = re.sub(r'[\\/:*?"<>|]+', "", str(game)).strip() or "Game"
+            path = os.path.join(folder, f"{safe} - {time.strftime('%Y-%m-%d %H-%M-%S')}.png")
+            if not shot.save(path, "PNG"):
+                raise RuntimeError("couldn't write " + path)
+            _ov_log(f"screenshot saved: {path}")
+            _show_screenshot_toast("Screenshot taken")
+        except Exception as e:
+            _ov_log(f"screenshot failed: {e!r}")
+            _show_screenshot_toast("Screenshot failed")
+
 _fo_prev_init = AdaptiveApp.__init__
 
 def _fo_init(self):
     _fo_prev_init(self)
     self._friends_overlay = _FriendsOverlay()
     self._inject_bridge = _InjectBridge()
+    self._shot_taker = _ScreenshotTaker()
     if sys.platform.startswith("win"):
         self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
+        self._f9_hook = _start_key_hook_win(0x78, self._shot_taker.req.emit)
     elif sys.platform.startswith("linux"):
         self._kb_hook = _start_shift_q_hook_linux(self._friends_overlay.toggle_req.emit)
+        self._f9_hook = _start_f9_hook_linux(self._shot_taker.req.emit)
         if self._kb_hook is None and _overlay is not None and get_overlay_mode() != "off":
             QTimer.singleShot(4000, lambda: _overlay.notify_playing(
                 "Shift+Q overlay", "pip install pynput", None, "needs: "))
