@@ -95,7 +95,16 @@ NCZFRONT_URL = "https://occultist-tattling-elevation.ngrok-free.dev/"
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
 FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
 
+def accent_icon_path():
+    """Where the accent-recolored icon lives. assets/ is inside the bundle (re-extracted on every launch), so it
+    can't be saved there; the settings folder survives restarts."""
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "icon_accent.png")
+
 def asset_path(filename):
+    if filename == "icon.png":
+        custom = accent_icon_path()
+        if os.path.exists(custom):
+            return custom
     return os.path.join(ASSETS_DIR, filename)
 
 # ---------------------------------------------------------------- game library (multiple partitions)
@@ -1417,13 +1426,18 @@ def apply_accent_to_icon(color):
     from it, so Reset restores the exact original. Returns True if icon.png changed."""
     import colorsys
     try:
-        icon, orig = asset_path("icon.png"), asset_path("icon_default.png")
+        icon = accent_icon_path()
+        orig = os.path.join(ASSETS_DIR, "icon_default.png")      # the untouched original (older versions kept it here)
         if not os.path.exists(orig):
-            if not os.path.exists(icon):
+            orig = os.path.join(ASSETS_DIR, "icon.png")
+            if not os.path.exists(orig):
                 return False
-            shutil.copyfile(icon, orig)
+        os.makedirs(os.path.dirname(icon), exist_ok=True)
         if QColor(color).name() == "#a666ff":
-            shutil.copyfile(orig, icon)
+            try:
+                os.remove(icon)                      # back to the bundled purple icon
+            except FileNotFoundError:
+                pass
             return True
         img = QImage(orig)
         if img.isNull():
@@ -6452,11 +6466,14 @@ def main():
             sys.exit(0)  # it wouldn't go away: bring it to the front instead
     _start_instance_server(app)                 # listen right away, not only once the window is built
 
+    _saved_accent = load_launcher_settings().get("accent_color", "#a666ff")
+    if QColor(_saved_accent).name() != "#a666ff" and not os.path.exists(accent_icon_path()):
+        apply_accent_to_icon(_saved_accent)     # first launch after the fix / after the icon file was lost
     icon_path = asset_path("icon.png")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    set_accent(load_launcher_settings().get("accent_color", "#a666ff"))
+    set_accent(_saved_accent)
     apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
 
     def on_system_color_scheme_changed(_scheme=None):
@@ -6561,6 +6578,17 @@ def get_steam_download_link(appid):
         pass
     return None, 0
 
+def _rebuild_steam_card_in_place(self, appid, title_text, cover_path):
+    """Rebuilds a library Steam card (new cover etc.) and puts it back in the spot the old one had."""
+    idx = next((i for i, (c, _t) in enumerate(self.cards) if c is self.steam_cards.get(appid)), None)
+    _drop_steam_card_widget(self, appid)   # card only: remove_steam_game() also deleted the library entry + the new cover
+    self.create_steam_card(appid, title_text, cover_path)
+    new_card = self.steam_cards.get(appid)
+    if idx is not None and new_card is not None:
+        pos = next((i for i, (c, _t) in enumerate(self.cards) if c is new_card), None)
+        if pos is not None:
+            self.cards.insert(min(idx, len(self.cards) - 1), self.cards.pop(pos))
+
 def _change_steam_game_cover(self, appid):
     path, _filter = QFileDialog.getOpenFileName(
         self, "Choose Custom Cover", os.path.expanduser("~"),
@@ -6587,11 +6615,77 @@ def _change_steam_game_cover(self, appid):
             if card is old_card:
                 title_text = title
                 break
-        _drop_steam_card_widget(self, appid)   # card only: remove_steam_game() also deleted the library entry + the new cover
-        self.create_steam_card(appid, title_text, saved_cover)
+        _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
         self.apply_filter()
 
 AdaptiveApp.change_steam_game_cover = _change_steam_game_cover
+
+def _fetch_library_cover_bytes(appid, title):
+    """Fresh cover for a library game: SteamGridDB if there's an API key and the game is on it, else Steam's own CDN."""
+    key = get_steamgriddb_key()
+    if key:
+        for lookup in (lambda: fetch_sgdb_cover(appid, key), lambda: fetch_sgdb_cover_by_name(title, key)):
+            try:
+                data = lookup()
+            except Exception:
+                data = None        # bad key / rate limit / offline: fall through to Steam
+            if data:
+                return data
+    for url in steam_cover_urls(appid, ""):
+        try:
+            data = _http_get(url, timeout=12)
+        except Exception:
+            continue
+        if data:
+            return data
+    return None
+
+def _refresh_steam_game_cover(self, appid):
+    busy = self.__dict__.setdefault("_cover_refreshing", set())
+    workers = self.__dict__.setdefault("_cover_refresh_workers", set())
+    if appid in busy:
+        return
+    title_text = next((g["title"] for g in load_steam_library() if g["appid"] == appid), "")
+    busy.add(appid)
+
+    def fail(message):
+        QMessageBox.warning(self, "Refresh Cover", message)
+
+    def finished(data):
+        busy.discard(appid)
+        workers.discard(worker)
+        if not data or not QPixmap().loadFromData(data):
+            fail("Couldn't find a new cover for this game (no connection?).")
+            return
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
+            with open(saved_cover, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            fail(f"Couldn't save the new cover: {e}")
+            return
+        games = load_steam_library()
+        for g in games:
+            if g["appid"] == appid:
+                g["cover"] = saved_cover
+        save_steam_library(games)
+        if appid in self.steam_cards:
+            _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
+            self.apply_filter()
+
+    def failed(message):
+        busy.discard(appid)
+        workers.discard(worker)
+        fail(message)
+
+    worker = TaskWorker(lambda: _fetch_library_cover_bytes(appid, title_text))
+    worker.done.connect(finished)
+    worker.failed.connect(failed)
+    workers.add(worker)
+    worker.start()
+
+AdaptiveApp.refresh_steam_game_cover = _refresh_steam_game_cover
 
 _original_init = AdaptiveApp.__init__
 
@@ -6793,6 +6887,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
             menu = more_btn.menu()
             menu.addSeparator()
             menu.addAction("Change Cover").triggered.connect(lambda _c=False, a=appid: self.change_steam_game_cover(a))
+            menu.addAction("Refresh Cover").triggered.connect(lambda _c=False, a=appid: self.refresh_steam_game_cover(a))
             
             def uninstall_steam_game():
                 game_dir = _safe_installed_game_dir(title_text)
@@ -14158,6 +14253,185 @@ def _gmod_init(self):
 
 AdaptiveApp.__init__ = _gmod_init
 
+# ---------------------------------------------------------------- Garry's Mod: "Apply Fix" menu item
+GMOD_FIX_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gm-fix.py"
+GMOD_FIX_NAME = "gm-fix.py"
+
+def _is_gmod_card(title, appid=None):
+    key = re.sub(r"[^a-z0-9]", "", str(title).lower())
+    return appid == 4000 or "garrysmod" in key or "gmod" in key
+
+def _find_python_for_script():
+    """The launcher itself when run from source; otherwise a python found on PATH (frozen builds)."""
+    if not getattr(sys, "frozen", False):
+        return [sys.executable]
+    for cmd in (["python3"], ["python"], ["py", "-3"]):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+def _download_and_run_gmod_fix(root):
+    """Runs on a worker thread. Downloads gm-fix.py into the GMod folder and runs it there."""
+    py = _find_python_for_script()
+    if not py:
+        raise RuntimeError("Python isn't installed, so the fix script can't run.\nInstall Python 3 and try again.")
+    req = urllib.request.Request(GMOD_FIX_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    if not data.strip():
+        raise RuntimeError("The downloaded fix script was empty.")
+    script = os.path.join(root, GMOD_FIX_NAME)
+    with open(script, "wb") as f:
+        f.write(data)
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(py + [script], cwd=root, stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, errors="replace", timeout=600, **kwargs)
+    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+def _gmod_in_library(root):
+    """True if root is the launcher's own install: <NCZLibrary or other library folder>/Garry's Mod[/...]."""
+    if not root:
+        return False
+    for lib in library_roots():
+        try:
+            rel = os.path.relpath(os.path.abspath(root), os.path.abspath(lib))
+        except ValueError:      # different drive on Windows
+            continue
+        parts = [p for p in rel.replace("\\", "/").split("/") if p]
+        if parts and parts[0] != ".." and "garrysmod" in re.sub(r"[^a-z0-9]", "", parts[0].lower()):
+            return True
+    return False
+
+def _apply_gmod_fix(app, existing=False):
+    """The user picks the folder when the game was added with Add Existing Game, or when it isn't
+    in <library>/Garry's Mod (or can't be found at all)."""
+    root = find_gmod_root()
+    existing = existing or not _gmod_in_library(root)
+    if existing:
+        start = root or os.path.expanduser("~")
+        if root and os.path.isdir(os.path.join(root, "Garry's Mod")):
+            start = os.path.join(root, "Garry's Mod")
+        root = QFileDialog.getExistingDirectory(app, "Choose the folder to apply the fix in", start)
+        if not root:
+            return
+    else:
+        if not root:
+            QMessageBox.information(app, "Apply Fix", "Couldn't find the Garry's Mod folder (the one containing 'garrysmod').")
+            return
+        root = os.path.join(root, "Garry's Mod")
+        if not os.path.isdir(root):
+            QMessageBox.information(app, "Apply Fix", f"This folder doesn't exist:\n{root}")
+            return
+    answer = QMessageBox.question(
+        app, "Apply Fix",
+        f"This downloads {GMOD_FIX_NAME} from GitHub and runs it inside:\n\n{root}\n\nContinue?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+    if answer != QMessageBox.StandardButton.Yes:
+        return
+    ok, value, error = BusyDialog("Applying fix...", lambda: _download_and_run_gmod_fix(root), app).run()
+    if not ok:
+        QMessageBox.warning(app, "Apply Fix", f"Couldn't apply the fix:\n{error}")
+        return
+    code, output = value
+    tail = "\n".join(output.splitlines()[-15:]) if output else "(no output)"
+    if code == 0:
+        ws_cfg_set("gmod_fix_dir", root)     # from now on Launch uses Launch.bat in this folder
+        QMessageBox.information(app, "Apply Fix", f"Fix applied.\n\n{tail}")
+    else:
+        QMessageBox.warning(app, "Apply Fix", f"The fix script exited with code {code}.\n\n{tail}")
+
+GMOD_LAUNCH_BAT = "Launch.bat"
+
+def _gmod_launch_bat():
+    """Launch.bat in the folder the fix was applied in, or None if the fix hasn't been applied / the file is gone."""
+    try:
+        d = ws_cfg_get("gmod_fix_dir", "")
+    except Exception:
+        return None
+    bat = os.path.join(d, GMOD_LAUNCH_BAT) if d else ""
+    return bat if bat and os.path.isfile(bat) else None
+
+def _launch_gmod_bat(app, bat):
+    cwd = os.path.dirname(bat)
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["cmd.exe", "/c", bat], cwd=cwd)
+        elif sys.platform.startswith("linux"):
+            wine = default_wine_path(app)
+            if not wine:
+                QMessageBox.warning(app, "Wine Required", "Wine wasn't found to run Launch.bat.\n"
+                                    "Install it, or download a build in the Wine tab.")
+                return
+            subprocess.Popen([wine, "cmd", "/c", bat], cwd=cwd)
+        else:
+            QMessageBox.warning(app, "Platform", "Launching Windows games is not supported on this platform.")
+    except Exception as e:
+        QMessageBox.warning(app, "Launch Error", f"Couldn't launch the game: {e}")
+
+class _GmodBatLaunchFilter(QObject):
+    """Sits on the card's Launch button: once the fix is applied, a click runs Launch.bat instead of gmod.exe."""
+    def __init__(self, app, button):
+        super().__init__(button)
+        self._app = app
+        self._btn = button
+
+    def eventFilter(self, obj, event):
+        b = self._btn
+        if obj is not b or b.text() != "Launch" or not b.isEnabled():
+            return False
+        t = event.type()
+        hit = False
+        if t == QEvent.Type.MouseButtonRelease:
+            hit = (event.button() == Qt.MouseButton.LeftButton and b.isDown()
+                   and b.rect().contains(event.position().toPoint()))
+        elif t == QEvent.Type.KeyPress:
+            hit = event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        if not hit:
+            return False
+        bat = _gmod_launch_bat()
+        if not bat:
+            return False                 # fix not applied: normal launch
+        b.setDown(False)
+        _launch_gmod_bat(self._app, bat)
+        return True
+
+def _install_gmod_bat_filter(app, card):
+    btn = card.findChild(QPushButton, "Primary") if card is not None else None
+    if btn is None or btn.property("gmodBatFilter"):
+        return
+    btn.setProperty("gmodBatFilter", True)
+    btn.installEventFilter(_GmodBatLaunchFilter(app, btn))
+
+def _add_gmod_fix_action(app, card, existing_fn=lambda: False):
+    _install_gmod_bat_filter(app, card)
+    more = card.findChild(QPushButton, "MoreButton") if card is not None else None
+    if not more or not more.menu():
+        return
+    menu = more.menu()
+    if any(a.text() == "Apply Fix" for a in menu.actions()):
+        return
+    act = menu.addAction("Apply Fix")
+    act.setToolTip(f"Download and run {GMOD_FIX_NAME} in the Garry's Mod folder")
+    act.triggered.connect(lambda _c=False: _apply_gmod_fix(app, existing_fn()))
+
+_gmodfix_prev_steam_card = AdaptiveApp.create_steam_card
+def _gmodfix_create_steam_card(self, appid, title_text, cover_path):
+    _gmodfix_prev_steam_card(self, appid, title_text, cover_path)
+    if _is_gmod_card(title_text, appid):
+        _add_gmod_fix_action(
+            self, self.steam_cards.get(appid),
+            lambda a=appid: any(g.get("appid") == a and g.get("exe_path") for g in load_steam_library()))
+AdaptiveApp.create_steam_card = _gmodfix_create_steam_card
+
+_gmodfix_prev_custom_card = AdaptiveApp.create_custom_card
+def _gmodfix_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
+    _gmodfix_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
+    if _is_gmod_card(title_text):
+        _add_gmod_fix_action(self, getattr(self, "custom_cards", {}).get(game_id), lambda: True)
+AdaptiveApp.create_custom_card = _gmodfix_create_custom_card
+
 # ---------------------------------------------------------------- Steam Workshop tab
 import io as _io
 import tarfile as _tarfile
@@ -15058,6 +15332,9 @@ class WorkshopPage(QWidget):
         sel_all.clicked.connect(self.select_all_shown)
         sel_none = QPushButton("Clear selection")
         sel_none.clicked.connect(self.clear_selection)
+        self.add_links_btn = QPushButton("Add by links")
+        self.add_links_btn.setToolTip("Paste Steam Workshop links (or item IDs) to add many mods to this list at once")
+        self.add_links_btn.clicked.connect(self.add_links_to_list)
         self.export_btn = QPushButton("Export list")
         self.export_btn.setObjectName("Primary")
         self.export_btn.clicked.connect(self.export_list)
@@ -15070,6 +15347,7 @@ class WorkshopPage(QWidget):
         lb.addWidget(self.disable_others_cb)
         lb.addWidget(sel_all)
         lb.addWidget(sel_none)
+        lb.addWidget(self.add_links_btn)
         lb.addWidget(self.export_btn)
         self.list_bar.hide()
         bl.addWidget(self.list_bar)
@@ -15527,6 +15805,53 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self.selected.clear()
         self._refresh_card_states()
         self._refresh_list_bar()
+
+    def add_links_to_list(self):
+        if self.appid is None:
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Add by links",
+            f"Paste Steam Workshop links (or item IDs) for {self.game_title}, one per line:")
+        if not ok or not text.strip():
+            return
+        ids = ws_parse_item_ids(text)
+        if not ids:
+            QMessageBox.warning(self, "Add by links", "I couldn't find a Workshop link or item ID in that text.")
+            return
+        self.add_links_btn.setEnabled(False)
+        self.add_links_btn.setText("Looking up...")
+        w = WorkshopLinkWorker(ids, {self.appid: self.game_title}, self)
+        w.done.connect(self._on_list_links_done)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _on_list_links_done(self, results, errors):
+        self.add_links_btn.setEnabled(True)
+        self.add_links_btn.setText("Add by links")
+        added = dupes = other = 0
+        for appid, _game, it in results:
+            if appid != self.appid:
+                other += 1
+            elif it["id"] in self.selected:
+                dupes += 1
+            else:
+                self.selected[it["id"]] = {"id": it["id"], "title": it["title"],
+                                           "preview": it.get("preview", ""), "author": it.get("author", "")}
+                added += 1
+        self._refresh_card_states()
+        self._refresh_list_bar()
+        lines = [f"Added {added} mod(s) to the list."]
+        if dupes:
+            lines.append(f"{dupes} were already in the list.")
+        if other:
+            lines.append(f"Skipped {other} that belong to a different game than {self.game_title}.")
+        if errors:
+            lines.append("")
+            lines.extend(errors[:10])
+            if len(errors) > 10:
+                lines.append(f"...and {len(errors) - 10} more")
+        QMessageBox.information(self, "Add by links", "\n".join(lines))
 
     def export_list(self):
         if not self.selected or self.appid is None:
