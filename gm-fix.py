@@ -20,8 +20,8 @@ if os.path.exists(api_o_dll_path):
         os.remove(api_o_dll_renamed)
     os.rename(api_o_dll_path, api_o_dll_renamed)
 
-url_api = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api_.dll"
-url_api_o = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api_o_.dll"
+url_api = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api.dll"
+url_api_o = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api_o.dll"
 url_launch = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/Launch.bat"
 
 os.makedirs(bin_dir, exist_ok=True)
