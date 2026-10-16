@@ -20,9 +20,9 @@ if os.path.exists(api_o_dll_path):
         os.remove(api_o_dll_renamed)
     os.rename(api_o_dll_path, api_o_dll_renamed)
 
-url_api = "https://cdn.discordapp.com/attachments/1001156375885393921/1538648383978217542/steam_api.dll?ex=6a8c0339&is=6a8ab1b9&hm=99f5ff8ba1d6f197be1640ed64f6f1d29be00dedcda58c24ca42e9e6dfb924b0&"
-url_api_o = "https://cdn.discordapp.com/attachments/1001156375885393921/1538648383693131846/steam_api_o.dll?ex=6a8c0339&is=6a8ab1b9&hm=692ecc6b7c762f2d59fa50fce6f623c51532131b0d387435aa9cbc6a510869f2&"
-url_launch = "https://cdn.discordapp.com/attachments/1001156375885393921/1538738030527914045/Launch.bat?ex=6a8c56b6&is=6a8b0536&hm=4c233600877a00a9aef3bfe0674d622ee9034912326f42a48762f2687e3c9258&"
+url_api = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api_.dll"
+url_api_o = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/steam_api_o_.dll"
+url_launch = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/Launch.bat"
 
 os.makedirs(bin_dir, exist_ok=True)
 os.makedirs(garrysmod_dir, exist_ok=True)
