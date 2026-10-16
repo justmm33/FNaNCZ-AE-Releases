@@ -307,8 +307,9 @@ def _fit_font(text, px, max_w, bold=True):
 
 class PlayingToast(QWidget):
     def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None,
-                 badge_path=None):
+                 badge_path=None, plain=False):
         super().__init__()
+        self.plain = plain          # text only: no avatar circle (used for "Screenshot taken")
         self.user, self.game, self.prefix = user, game, prefix
         self.avatar = QPixmap(avatar_path) if avatar_path else None
         self.badge = QPixmap(badge_path) if badge_path else None   # small round picture on the avatar (group chats: who wrote)
@@ -475,6 +476,14 @@ class PlayingToast(QWidget):
 
         # accent bar
         p.fillRect(0, 0, BAR_W, h, ACCENT)
+
+        if self.plain:
+            tx = BAR_W + 22
+            max_w = W - tx - 14
+            p.setPen(NAME_COLOR)
+            p.setFont(_fit_font(self.user, 28, max_w))
+            _draw_text(p, QRectF(tx, 0, max_w, H), self.user)
+            return
 
         # avatar (circle) = profile picture
         d = 78
@@ -774,10 +783,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix, image, link, badge in pending:
-            self._show_local(user, game, avatar, prefix, image, link, badge)
+        for user, game, avatar, prefix, image, link, badge, plain in pending:
+            self._show_local(user, game, avatar, prefix, image, link, badge, plain)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -791,12 +800,12 @@ class OverlayManager:
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
-                                         "badge": badge or "",
+                                         "badge": badge or "", "plain": bool(plain),
                                          "accent": _accent_hex, "light": _light,
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix, image, link, badge))
+                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain))
             return True
         except (OSError, ValueError):
             self._proc = None
@@ -813,6 +822,14 @@ class OverlayManager:
             return
         self._show_local(user, game, avatar_path, prefix, image, None, badge)
 
+    def notify_text(self, text):
+        """A toast with just the text (no avatar circle), e.g. 'Screenshot taken'."""
+        if self.mode == "off":
+            return
+        if self._wants_helper() and self._send_to_helper(text, "", None, "", None, None, None, True):
+            return
+        self._show_local(text, "", None, "", None, None, None, True)
+
     def notify_invite(self, user, game, link, avatar_path=None, image=None):
         """'<user> invited you to play <game>' with an Accept button that opens the Steam join link.
         image: path of the game's cover."""
@@ -823,7 +840,7 @@ class OverlayManager:
             return
         self._show_local(user, game, avatar_path, prefix, image, link)
 
-    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None):
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
@@ -836,7 +853,7 @@ class OverlayManager:
         if link:
             t = InviteToast(user, game, link, avatar_path, image)
         else:
-            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge)
+            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge, plain=plain)
         avail = QApplication.primaryScreen().availableGeometry().height() - 2 * MARGIN
         while live and sum(x.th + GAP for x in live) + t.th > avail:    # tall picture toasts: keep the stack on screen
             live.pop(0).dismiss()
@@ -1151,6 +1168,9 @@ class _ServerBridge(QObject):
         if d.get("link"):
             overlay.notify_invite(str(d.get("user", "")), str(d.get("game", "")), str(d["link"]),
                                   d.get("avatar") or None, d.get("image") or None)
+            return
+        if d.get("plain"):
+            overlay.notify_text(str(d.get("user", "")))
             return
         overlay.notify_playing(str(d.get("user", "")), str(d.get("game", "")), d.get("avatar") or None,
                                str(d.get("prefix", "is playing ")), d.get("image") or None,
