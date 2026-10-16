@@ -7886,6 +7886,11 @@ PW_SLUG_OVERRIDES = (
     (r"risk of rain (2|two)\b.*", "risk-of-rain-two"),
 )
 
+# Server 3 has its own, shorter list (servers 1 and 2 keep PW_SLUG_OVERRIDES above).
+PW_SLUG_OVERRIDES_3 = (
+    (r"dying light (2|two)\b.*", "dying-light-2-stay-human"),                    # any edition of Dying Light 2
+)
+
 _pw_tls = threading.local()      # the server picked in the "Ask every time" popup, per download thread
 
 def pw_server():
@@ -7899,9 +7904,11 @@ def pw_game_url(title, server=None):
     base = {"2": PW_BASE_URL_2, "3": PW_BASE_URL_3}.get(server or pw_server(), PW_BASE_URL)
     t = title.lower().replace("'", "")
     plain = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", t)).strip()
-    for pattern, slug in PW_SLUG_OVERRIDES:
+    for pattern, slug in (PW_SLUG_OVERRIDES_3 if base == PW_BASE_URL_3 else PW_SLUG_OVERRIDES):
         if re.fullmatch(pattern, plain):
             return base.rstrip("/") + "/" + slug
+    if base == PW_BASE_URL_3:      # server 3: an apostrophe counts as a space (five-nights-at-freddy-s)
+        t = title.lower().replace("\u2019", "'").replace("'", " ")
     slug = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
     return base.rstrip("/") + "/" + slug
 
