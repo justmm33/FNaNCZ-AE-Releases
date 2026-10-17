@@ -3800,10 +3800,9 @@ class AccountPage(QWidget):
             self.info_label.setText("Cloud sync isn't set up in this build of the launcher yet.")
         elif logged_in:
             self.title_label.setText(username or "Signed in")
-            shown_name = username or acct.get("email", "") or "?"
+            shown_name = username or "?"
             apply_avatar(self.avatar_big, avatar, shown_name[:1].upper(), 80)
             self.info_label.setText(
-                f"{acct.get('email', 'your account')}\n\n"
                 "Use Save Data and Sync Data in each game's ••• menu to move your progress between devices.")
         elif self.signup_mode:
             self.title_label.setText("Create Account")
@@ -5957,7 +5956,7 @@ class AdaptiveApp(QMainWindow):
         acct = load_account() if cloud_configured() else None
         if acct:
             username, avatar = load_profile_cache()
-            name = username or (acct.get("email", "") or "").split("@")[0] or "Account"
+            name = username or "Account"
             apply_avatar(self.avatar_label, avatar, name[:1].upper(), 36)
             self.profile_name.setText(self.profile_name.fontMetrics().elidedText(
                 name, Qt.TextElideMode.ElideRight, 120))
@@ -10692,7 +10691,7 @@ def cloud_publish_presence():
     token, uid = get_id_token()
     username, avatar = load_profile_cache()
     payload = {
-        "username": username or (load_account() or {}).get("email", "").split("@")[0] or "Player",
+        "username": username or "Player",
         "library": friends_library_titles(),
         "playing": _now_playing["name"] or "",
         "idle": is_idle(),
@@ -10722,7 +10721,7 @@ def cloud_accept_friend(other):
 
 def _my_display_name():
     username, _avatar = load_profile_cache()
-    return username or (load_account() or {}).get("email", "").split("@")[0] or "Player"
+    return username or "Player"
 
 # --- mod sharing: A asks B, B's launcher pops up a yes/no, and only on yes B's mod list is written for A.
 def cloud_modshare_send_request(friend, appid, game):
@@ -26206,7 +26205,7 @@ def profile_info_self():
     """Everything the profile page shows for the logged-in user, built from local data (works offline)."""
     acct = load_account() or {}
     username, avatar = load_profile_cache()
-    name = username or acct.get("email", "").split("@")[0] or "Player"
+    name = username or "Player"
     playing = _now_playing.get("name") or ""
     playing = pretty_game_name(playing) if playing else ""
     if playing:
@@ -26235,7 +26234,7 @@ def profile_info_self():
         pass
     return {"uid": acct.get("uid", ""), "name": name, "avatar": avatar, "country": load_profile_country(),
             "status": status, "color": color, "playing": playing, "titles": titles, "covers": covers,
-            "ptime": ptime, "sub": acct.get("email", ""), "is_me": True}
+            "ptime": ptime, "sub": "", "is_me": True}
 
 def profile_info_from_public(uid, d, raw_covers=None):
     """The same dict for somebody else, from their public/<uid> node (+ their published covers)."""
