@@ -584,6 +584,8 @@ def load_launcher_settings():
                 for _k in ("start_minimized", "close_to_tray"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
+                if isinstance(loaded.get("nsfw_revealed"), bool):
+                    settings["nsfw_revealed"] = loaded["nsfw_revealed"]
                 if loaded.get("download_server") in ("1", "2", "3", "ask"):
                     settings["download_server"] = loaded["download_server"]
                 if isinstance(loaded.get("accent_color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", loaded["accent_color"]):
@@ -974,6 +976,132 @@ def validate_username(name):
         return "Username must be 3-20 characters: letters, numbers, _ . or -"
     return ""
 
+# ---- country shown on the profile (two-letter code), with its flag
+COUNTRIES = dict(x.split(":", 1) for x in (
+    "AF:Afghanistan|AL:Albania|DZ:Algeria|AD:Andorra|AO:Angola|AG:Antigua and Barbuda|AR:Argentina|AM:Armenia|"
+    "AU:Australia|AT:Austria|AZ:Azerbaijan|BS:Bahamas|BH:Bahrain|BD:Bangladesh|BB:Barbados|BY:Belarus|BE:Belgium|"
+    "BZ:Belize|BJ:Benin|BT:Bhutan|BO:Bolivia|BA:Bosnia and Herzegovina|BW:Botswana|BR:Brazil|BN:Brunei|BG:Bulgaria|"
+    "BF:Burkina Faso|BI:Burundi|KH:Cambodia|CM:Cameroon|CA:Canada|CV:Cape Verde|CF:Central African Republic|TD:Chad|"
+    "CL:Chile|CN:China|CO:Colombia|KM:Comoros|CG:Congo|CD:DR Congo|CR:Costa Rica|CI:Ivory Coast|HR:Croatia|CU:Cuba|"
+    "CY:Cyprus|CZ:Czechia|DK:Denmark|DJ:Djibouti|DM:Dominica|DO:Dominican Republic|EC:Ecuador|EG:Egypt|"
+    "SV:El Salvador|GQ:Equatorial Guinea|ER:Eritrea|EE:Estonia|SZ:Eswatini|ET:Ethiopia|FJ:Fiji|FI:Finland|FR:France|"
+    "GA:Gabon|GM:Gambia|GE:Georgia|DE:Germany|GH:Ghana|GR:Greece|GD:Grenada|GT:Guatemala|GN:Guinea|GW:Guinea-Bissau|"
+    "GY:Guyana|HT:Haiti|HN:Honduras|HU:Hungary|IS:Iceland|IN:India|ID:Indonesia|IR:Iran|IQ:Iraq|IE:Ireland|IT:Italy|"
+    "JM:Jamaica|JP:Japan|JO:Jordan|KZ:Kazakhstan|KE:Kenya|KI:Kiribati|XK:Kosovo|KW:Kuwait|KG:Kyrgyzstan|LA:Laos|"
+    "LV:Latvia|LB:Lebanon|LS:Lesotho|LR:Liberia|LY:Libya|LI:Liechtenstein|LT:Lithuania|LU:Luxembourg|MG:Madagascar|"
+    "MW:Malawi|MY:Malaysia|MV:Maldives|ML:Mali|MT:Malta|MH:Marshall Islands|MR:Mauritania|MU:Mauritius|MX:Mexico|"
+    "FM:Micronesia|MD:Moldova|MC:Monaco|MN:Mongolia|ME:Montenegro|MA:Morocco|MZ:Mozambique|MM:Myanmar|NA:Namibia|"
+    "NR:Nauru|NP:Nepal|NL:Netherlands|NZ:New Zealand|NI:Nicaragua|NE:Niger|NG:Nigeria|KP:North Korea|"
+    "MK:North Macedonia|NO:Norway|OM:Oman|PK:Pakistan|PW:Palau|PS:Palestine|PA:Panama|PG:Papua New Guinea|"
+    "PY:Paraguay|PE:Peru|PH:Philippines|PL:Poland|PT:Portugal|QA:Qatar|RO:Romania|RU:Russia|RW:Rwanda|"
+    "KN:Saint Kitts and Nevis|LC:Saint Lucia|VC:Saint Vincent and the Grenadines|WS:Samoa|SM:San Marino|"
+    "ST:Sao Tome and Principe|SA:Saudi Arabia|SN:Senegal|RS:Serbia|SC:Seychelles|SL:Sierra Leone|SG:Singapore|"
+    "SK:Slovakia|SI:Slovenia|SB:Solomon Islands|SO:Somalia|ZA:South Africa|KR:South Korea|SS:South Sudan|ES:Spain|"
+    "LK:Sri Lanka|SD:Sudan|SR:Suriname|SE:Sweden|CH:Switzerland|SY:Syria|TW:Taiwan|TJ:Tajikistan|TZ:Tanzania|"
+    "TH:Thailand|TL:Timor-Leste|TG:Togo|TO:Tonga|TT:Trinidad and Tobago|TN:Tunisia|TR:Turkey|TM:Turkmenistan|"
+    "TV:Tuvalu|UG:Uganda|UA:Ukraine|AE:United Arab Emirates|GB:United Kingdom|US:United States|UY:Uruguay|"
+    "UZ:Uzbekistan|VU:Vanuatu|VA:Vatican City|VE:Venezuela|VN:Vietnam|YE:Yemen|ZM:Zambia|ZW:Zimbabwe"
+).split("|"))
+
+def _country_flag_path(code):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"country_{code}.png")
+
+def get_country_flag_file(code):
+    """Flag image for a country code, downloaded once and cached. '' if unavailable (call off the GUI thread)."""
+    code = (code or "").upper()
+    if code not in COUNTRIES:
+        return ""
+    path = _country_flag_path(code)
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return path
+    try:
+        raw = _http_get(f"https://flagcdn.com/w160/{code.lower()}.png",
+                        headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=8)
+        if not QImage.fromData(raw).isNull():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(raw)
+            return path
+    except Exception:
+        pass
+    return ""
+
+# ---- country auto-detected from the IP address when the account has none (never overrides your own choice)
+_country_auto_state = {"uid": None, "next": 0.0}
+
+def _country_manual_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "country_manual.json")
+
+def country_is_manual(uid):
+    try:
+        with open(_country_manual_path(), encoding="utf-8") as f:
+            return uid in json.load(f)
+    except Exception:
+        return False
+
+def mark_country_manual(uid):
+    """The user picked a country (or 'Not shown') themselves, so it is never auto-set for this account again."""
+    try:
+        with open(_country_manual_path(), encoding="utf-8") as f:
+            uids = json.load(f)
+        uids = uids if isinstance(uids, list) else []
+    except Exception:
+        uids = []
+    if uid not in uids:
+        uids.append(uid)
+        try:
+            os.makedirs(os.path.dirname(_country_manual_path()), exist_ok=True)
+            with open(_country_manual_path(), "w", encoding="utf-8") as f:
+                json.dump(uids, f)
+        except OSError:
+            pass
+
+def detect_country_by_ip():
+    """Two-letter country code from the public IP address ('' if it can't be found)."""
+    for url, as_json in (("https://api.country.is/", True), ("https://ipapi.co/country/", False)):
+        try:
+            raw = _http_get(url, timeout=6).decode("utf-8", errors="replace").strip()
+            code = json.loads(raw).get("country") if as_json else raw
+            code = str(code or "").strip().upper()
+            if code in COUNTRIES:
+                return code
+        except Exception:
+            continue
+    return ""
+
+def cloud_autoset_country():
+    """If the account has no country and the user never chose one, sets it from the IP. At most every 30 minutes."""
+    acct = load_account()
+    if not acct or not cloud_configured():
+        return
+    uid, now, st = acct["uid"], time.time(), _country_auto_state
+    if st["uid"] == uid and now < st["next"]:
+        return
+    st.update(uid=uid, next=now + 1800)
+    if country_is_manual(uid):
+        return
+    cloud_pull_profile()                     # the country may already be saved from another device
+    if load_profile_country():
+        return
+    code = detect_country_by_ip()
+    if code:
+        cloud_save_profile(country=code)
+
+def load_profile_country():
+    """The logged-in account's country code ('' if none), from the local profile cache."""
+    acct = load_account()
+    if not acct:
+        return ""
+    try:
+        with open(get_profile_cache_path(), encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("uid") == acct["uid"]:
+            code = str(data.get("country") or "").upper()
+            return code if code in COUNTRIES else ""
+    except Exception:
+        pass
+    return ""
+
 def prepare_avatar_png(path):
     """Centre-crops the image to a square and shrinks it to a small PNG for the cloud."""
     img = QImage(path)
@@ -1013,7 +1141,7 @@ def load_profile_cache():
         pass
     return "", None
 
-def save_profile_cache(uid, username, png_bytes):
+def save_profile_cache(uid, username, png_bytes, country=""):
     folder = os.path.dirname(get_profile_cache_path())
     os.makedirs(folder, exist_ok=True)
     avatar = get_avatar_cache_path()
@@ -1028,7 +1156,8 @@ def save_profile_cache(uid, username, png_bytes):
         except OSError:
             pass
     with open(get_profile_cache_path(), 'w', encoding='utf-8') as f:
-        json.dump({"uid": uid, "username": username or "", "has_photo": bool(png_bytes)}, f)
+        json.dump({"uid": uid, "username": username or "", "has_photo": bool(png_bytes),
+                   "country": country or ""}, f)
 
 def _profile_url(uid, token):
     base = FIREBASE_DB_URL.strip().rstrip("/")
@@ -1042,10 +1171,11 @@ def cloud_pull_profile():
     data = data if isinstance(data, dict) else {}
     username = data.get("username") if isinstance(data.get("username"), str) else ""
     png = _decode_photo(data.get("photo"))
-    save_profile_cache(uid, username, png)
+    country = str(data.get("country") or "").upper()
+    save_profile_cache(uid, username, png, country if country in COUNTRIES else "")
     return username
 
-def cloud_save_profile(username=None, png=None, remove_photo=False):
+def cloud_save_profile(username=None, png=None, remove_photo=False, country=None):
     payload = {"updated": {".sv": "timestamp"}}
     if username is not None:
         payload["username"] = username
@@ -1053,8 +1183,16 @@ def cloud_save_profile(username=None, png=None, remove_photo=False):
         payload["photo"] = base64.b64encode(png).decode("ascii")
     elif remove_photo:
         payload["photo"] = None
+    if country is not None:                     # "" removes the country
+        country = str(country).upper()
+        payload["country"] = country if country in COUNTRIES else None
     token, uid = get_id_token()
     _http_json(_profile_url(uid, token), "PATCH", payload)
+    if country is not None:
+        try:        # friends see it right away instead of at the next presence update
+            _http_json(_fdb(f"public/{uid}", token), "PATCH", {"country": payload["country"]})
+        except CloudError:
+            pass
     return cloud_pull_profile()
 
 def describe_save(text):
@@ -1202,7 +1340,7 @@ THEMES = {
         text="#f2f2f4", subtext="#8d8d96", accent="#a666ff", accent_hover="#bb85ff", accent_press="#8444e0",
         button="#222226", button_hover="#2f2f35", disabled_bg="#18181b", disabled_text="#55555c",
         handle="#34343a", hover="#1c1c20",
-        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
+        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0", accent_fill="rgba(166,102,255,0.18)",
         nav_text="#a0a0a8", nav_active="#ffffff",
         brand="#ffffff", sidebar_border="#1e1e22", nav_fill="rgba(255,255,255,0.05)", nav_fill_hover="rgba(255,255,255,0.10)",
     ),
@@ -1211,7 +1349,7 @@ THEMES = {
         text="#141416", subtext="#6a6a72", accent="#a666ff", accent_hover="#bb85ff", accent_press="#8444e0",
         button="#e4e4e8", button_hover="#d6d6db", disabled_bg="#ececef", disabled_text="#a4a4ab",
         handle="#c4c4cb", hover="#e9e9ed",
-        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0",
+        red="#a666ff", red_hover="#bb85ff", red_press="#8444e0", accent_fill="rgba(166,102,255,0.18)",
         nav_text="#5c5c64", nav_active="#141416", brand="#141416",
         sidebar_border="#d2d2d8", nav_fill="rgba(0,0,0,0.06)", nav_fill_hover="rgba(0,0,0,0.11)",
     ),
@@ -1245,10 +1383,14 @@ QPushButton#ProfileButton { background: $nav_fill; border: 1px solid transparent
 QPushButton#ProfileButton:hover { background: $nav_fill_hover; }
 QPushButton#MinButton, QPushButton#ExitButton { color: $nav_text; }
 QPushButton#MinButton:hover, QPushButton#MinButton:pressed { color: $nav_active; }
-QPushButton#ProfileButton:checked { background: rgba(166,102,255,0.18); border: 1px solid $red; }
+QPushButton#ProfileButton:checked { background: $accent_fill; border: 1px solid $red; }
 QPushButton#ProfileButton QLabel { color: $nav_active; }
 QLabel#Avatar { background: $accent; color: #ffffff; border-radius: 18px; font-size: 15px; font-weight: bold; }
 QLabel#AvatarLarge { background: $accent; color: #ffffff; border-radius: 40px; font-size: 32px; font-weight: bold; }
+QFrame#AccountCard { background: $panel; border: 1px solid $border; border-radius: 16px; }
+QFrame#AvatarRing { background: transparent; border: 2px solid $accent; border-radius: 48px; }
+QPushButton#LogoutButton { background: transparent; color: #e5484d; border: 1px solid rgba(229,72,77,0.55); }
+QPushButton#LogoutButton:hover { background: rgba(229,72,77,0.14); }
 QLabel#SyncAvatar { background: $accent; color: #ffffff; border-radius: 28px; font-size: 22px; font-weight: bold; }
 QFrame#SyncCard { background: $panel; border: 1px solid $border; border-radius: 12px; }
 QFrame#SyncCard:hover { border: 1px solid $accent; }
@@ -1413,7 +1555,8 @@ def set_accent(color):
         c = QColor("#a666ff")
     base, hover, press = c.name(), c.lighter(120).name(), c.darker(125).name()
     for t in THEMES.values():
-        t.update(accent=base, accent_hover=hover, accent_press=press, red=base, red_hover=hover, red_press=press)
+        t.update(accent=base, accent_hover=hover, accent_press=press, red=base, red_hover=hover, red_press=press,
+                 accent_fill=f"rgba({c.red()},{c.green()},{c.blue()},0.18)")
     try:                                     # in-game toasts follow the accent too
         import overlay as _overlay_mod
         _overlay_mod.set_accent(base)
@@ -3562,6 +3705,40 @@ class AccountPage(QWidget):
         layout.addWidget(self.logout_btn)
 
         outer.addWidget(panel, 0, Qt.AlignmentFlag.AlignLeft)
+
+        # logged in: the card above is replaced by your profile (what others see) with the edit buttons on top
+        self.profile_wrap = QWidget()
+        pw = QVBoxLayout(self.profile_wrap)
+        pw.setContentsMargins(0, 0, 0, 0)
+        pw.setSpacing(12)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.p_photo_btn = QPushButton("Change Picture")
+        self.p_photo_btn.clicked.connect(self.change_photo)
+        self.p_name_btn = QPushButton("Edit Username")
+        self.p_name_btn.clicked.connect(self.edit_username)
+        self.p_country_btn = QPushButton("Set Country")
+        self.p_country_btn.clicked.connect(self.edit_country)
+        self.p_remove_btn = QPushButton("Remove Picture")
+        self.p_remove_btn.clicked.connect(self.remove_photo)
+        self.p_logout_btn = QPushButton("Log Out")
+        self.p_logout_btn.setObjectName("LogoutButton")
+        self.p_logout_btn.clicked.connect(self.log_out)
+        for b in (self.p_photo_btn, self.p_name_btn, self.p_country_btn, self.p_remove_btn, self.p_logout_btn):
+            b.setFixedHeight(34)
+        for b in (self.p_photo_btn, self.p_name_btn, self.p_country_btn, self.p_remove_btn):
+            bar.addWidget(b)
+        bar.addStretch()
+        bar.addWidget(self.p_logout_btn)
+        pw.addLayout(bar)
+        self.profile_view = ProfileView()
+        pw.addWidget(self.profile_view, 1)
+        outer.addWidget(self.profile_wrap, 1)
+        self.profile_wrap.hide()
+        self._pf_timer = QTimer(self)
+        self._pf_timer.setInterval(5000)
+        self._pf_timer.timeout.connect(self._tick_profile)
+        self._pf_timer.start()
         outer.addStretch()
 
         self.password_edit.returnPressed.connect(self.submit)
@@ -3604,6 +3781,19 @@ class AccountPage(QWidget):
         self.profile_actions.setVisible(logged_in)
         self.remove_photo_btn.setVisible(logged_in and bool(avatar))
         self.name_btn.setText("Edit Username" if username else "Set Username")
+
+        in_profile = configured and logged_in
+        self.panel.setVisible(not in_profile)
+        self.profile_wrap.setVisible(in_profile)
+        if in_profile:
+            self.p_name_btn.setText("Edit Username" if username else "Set Username")
+            self.p_country_btn.setText("Change Country" if load_profile_country() else "Set Country")
+            self.p_remove_btn.setVisible(bool(avatar))
+            try:
+                self.profile_view.set_info(profile_info_self())
+            except Exception:
+                import traceback
+                traceback.print_exc()
 
         if not configured:
             self.title_label.setText("Cloud Sync")
@@ -3739,6 +3929,28 @@ class AccountPage(QWidget):
         busy = BusyDialog("Saving your username...", lambda: cloud_save_profile(username=text), self)
         ok, _value, error = busy.run()
         self._profile_updated(ok, error, "username")
+
+    def edit_country(self):
+        current = load_profile_country()
+        dlg = CountryDialog(self, current)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        code = dlg.code()
+        mark_country_manual((load_account() or {}).get("uid", ""))     # your own choice wins over the IP guess
+        if code == current:
+            return
+        busy = BusyDialog("Saving your country...", lambda: cloud_save_profile(country=code), self)
+        ok, _value, error = busy.run()
+        self._profile_updated(ok, error, "country")
+
+    def _tick_profile(self):
+        """Keeps 'Currently In-Game' and the hours live while the Account tab is open."""
+        if not (self.isVisible() and self.profile_wrap.isVisible()):
+            return
+        try:
+            self.profile_view.set_info(profile_info_self())
+        except Exception:
+            pass
 
     def sync_profile_async(self):
         """Quietly refreshes the username/picture from the cloud (e.g. after changing them on another device)."""
@@ -4363,7 +4575,7 @@ def _reqs_html(title, items):
     return f"<p style='margin:0 0 6px 0; font-size:14px;'><b>{title}</b></p>" + "<br>".join(rows)
 
 
-def rounded_cover_pixmap(path, width, height, radius):
+def rounded_cover_pixmap(path, width, height, radius, blur=False):
     src = QPixmap(path)
     if src.isNull():
         return None
@@ -4371,6 +4583,11 @@ def rounded_cover_pixmap(path, width, height, radius):
     w, h = width * scale, height * scale
     scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                         Qt.TransformationMode.SmoothTransformation)
+    if blur:    # shrink a lot then smooth-scale back up = heavy blur
+        small = scaled.scaled(max(1, scaled.width() // 24), max(1, scaled.height() // 24),
+                              Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        scaled = small.scaled(scaled.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
     out = QPixmap(w, h)
     out.fill(Qt.GlobalColor.transparent)
     painter = QPainter(out)
@@ -4383,10 +4600,103 @@ def rounded_cover_pixmap(path, width, height, radius):
     out.setDevicePixelRatio(scale)
     return out
 
+# ---- NSFW covers: blurred until the user confirms once, then every cover is revealed for good
+NSFW_DESCRIPTOR_IDS = {3, 4}    # Steam content descriptors: 3 = Adult Only Sexual Content, 4 = Frequent Nudity or Sexual Content
+_nsfw_lock = threading.Lock()
+_nsfw_cache = None              # {appid(str): bool}
+_nsfw_revealed_flag = None
+
+class _NsfwBus(QObject):
+    revealed = pyqtSignal()
+nsfw_bus = _NsfwBus()
+
+def _nsfw_cache_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "nsfw.json")
+
+def nsfw_cached(appid):
+    """True / False if we already know whether this Steam game is NSFW, None if we don't."""
+    global _nsfw_cache
+    with _nsfw_lock:
+        if _nsfw_cache is None:
+            try:
+                with open(_nsfw_cache_path(), encoding="utf-8") as f:
+                    data = json.load(f)
+                _nsfw_cache = data if isinstance(data, dict) else {}
+            except Exception:
+                _nsfw_cache = {}
+        return _nsfw_cache.get(str(appid))
+
+def check_app_nsfw(appid):
+    """Asks Steam for the game's content descriptors (cached on disk). None when Steam gave no answer."""
+    known = nsfw_cached(appid)
+    if known is not None:
+        return known
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
+    data = json.loads(_http_get(url, headers={"Cookie": "birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1"}
+                                ).decode("utf-8", errors="replace"))
+    entry = data.get(str(appid)) or {}
+    if not entry.get("success"):
+        return None
+    ids = ((entry.get("data") or {}).get("content_descriptors") or {}).get("ids") or []
+    flag = bool(set(ids) & NSFW_DESCRIPTOR_IDS)
+    with _nsfw_lock:
+        _nsfw_cache[str(appid)] = flag
+        try:
+            os.makedirs(os.path.dirname(_nsfw_cache_path()), exist_ok=True)
+            with open(_nsfw_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(_nsfw_cache, f)
+        except Exception:
+            pass
+    return flag
+
+def nsfw_revealed():
+    global _nsfw_revealed_flag
+    if _nsfw_revealed_flag is None:
+        _nsfw_revealed_flag = bool(load_launcher_settings().get("nsfw_revealed", False))
+    return _nsfw_revealed_flag
+
+def confirm_reveal_nsfw(parent):
+    """Asks once; on Yes every NSFW cover is revealed permanently."""
+    global _nsfw_revealed_flag
+    answer = QMessageBox.question(
+        parent, "Reveal NSFW cover",
+        "Are you sure you would like to reveal this NSFW cover? You are fully responsible for it.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+    if answer != QMessageBox.StandardButton.Yes:
+        return False
+    settings = load_launcher_settings()
+    settings["nsfw_revealed"] = True
+    save_launcher_settings(settings)
+    _nsfw_revealed_flag = True
+    nsfw_bus.revealed.emit()
+    return True
+
+def update_reveal_button(cover_label, owner, show):
+    """Shows/hides the Reveal button centred on a cover label (created on first use)."""
+    btn = getattr(cover_label, "_reveal_btn", None)
+    if btn is None:
+        if not show:
+            return
+        btn = QPushButton("Reveal", cover_label)
+        btn.setFixedSize(84, 30)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet("QPushButton { background: rgba(0,0,0,170); color: white; border: 1px solid rgba(255,255,255,120);"
+                          " border-radius: 6px; } QPushButton:hover { background: rgba(0,0,0,215); }")
+        btn.clicked.connect(lambda _c=False: confirm_reveal_nsfw(owner))
+        cover_label._reveal_btn = btn
+    if show:
+        btn.move((cover_label.width() - btn.width()) // 2, (cover_label.height() - btn.height()) // 2)
+        btn.show()
+        btn.raise_()
+    else:
+        btn.hide()
+
 class CoverLoader(QObject):
     """Downloads/caches store covers on a few background threads. SteamGridDB first, Steam's own art as fallback."""
     loaded = pyqtSignal(int, str)   # appid, cached image path ("" if nothing was found)
+    nsfw_known = pyqtSignal(int, bool)   # appid, is it NSFW (sent just before `loaded`, so covers never flash unblurred)
     auth_failed = pyqtSignal()
+    CHECK_NSFW = True
 
     def __init__(self):
         super().__init__()
@@ -4425,9 +4735,17 @@ class CoverLoader(QObject):
             path = self._fetch(appid, img_base, key, title)
         except Exception:
             path = ""
+        nsfw = None
+        if self.CHECK_NSFW and path:
+            try:
+                nsfw = check_app_nsfw(appid)
+            except Exception:
+                nsfw = None
         with self._lock:
             self._futures.pop(appid, None)
         try:
+            if nsfw is not None:
+                self.nsfw_known.emit(appid, nsfw)
             self.loaded.emit(appid, path)
         except RuntimeError:
             pass  # window already closed
@@ -4531,6 +4849,8 @@ class StoreCard(QFrame):
         self.appid = appid
         self.title = title
         self.cover_path = ""
+        self.nsfw = False
+        nsfw_bus.revealed.connect(self._on_nsfw_revealed)
         self.setObjectName("GameCard")
         self.setFixedWidth(STORE_CARD_W)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4555,13 +4875,27 @@ class StoreCard(QFrame):
 
     def set_cover(self, path):
         self.cover_path = path or ""
-        pix = rounded_cover_pixmap(path, STORE_COVER_W, STORE_COVER_H, 8) if path else None
+        self._refresh_cover()
+
+    def set_nsfw(self, flag):
+        self.nsfw = bool(flag)
+        self._refresh_cover()
+
+    def _on_nsfw_revealed(self):
+        if self.nsfw:
+            self._refresh_cover()
+
+    def _refresh_cover(self):
+        hidden = self.nsfw and not nsfw_revealed()
+        path = self.cover_path
+        pix = rounded_cover_pixmap(path, self.cover.width(), self.cover.height(), 8, blur=hidden) if path else None
         if pix:
             self.cover.setText("")
             self.cover.setPixmap(pix)
             self.cover.setStyleSheet("background: transparent; border: none;")
         else:
             self.cover.setText("No\ncover")
+        update_reveal_button(self.cover, self, hidden and bool(pix))
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -4720,6 +5054,9 @@ class StoreDetailPage(QWidget):
         self._sim_cards = {}
         self.loader = CoverLoader()
         self.loader.loaded.connect(self._on_sim_cover)
+        self.loader.nsfw_known.connect(self._on_sim_nsfw)
+        self._cover_nsfw = False
+        nsfw_bus.revealed.connect(self._render_detail_cover)
         QApplication.instance().aboutToQuit.connect(self.loader.shutdown)
 
         outer = QVBoxLayout(self)
@@ -4941,6 +5278,47 @@ class StoreDetailPage(QWidget):
         if card is not None:
             card.set_cover(path)
 
+    def _on_sim_nsfw(self, appid, flag):
+        card = self._sim_cards.get(appid)
+        if card is not None:
+            card.nsfw = bool(flag)
+
+    def _render_detail_cover(self):
+        hidden = self._cover_nsfw and not nsfw_revealed()
+        pix = (rounded_cover_pixmap(self._cover_path, self.DETAIL_W, self.DETAIL_H, 12, blur=hidden)
+               if self._cover_path else None)
+        if pix:
+            self.cover.setText("")
+            self.cover.setPixmap(pix)
+        else:
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("No\nCover")
+        update_reveal_button(self.cover, self, hidden and bool(pix))
+
+    def _check_detail_nsfw(self, appid):
+        known = nsfw_cached(appid)
+        if known is not None:
+            self._cover_nsfw = known
+            return
+        self._cover_nsfw = False
+
+        def work():
+            try:
+                return (appid, check_app_nsfw(appid))
+            except Exception:
+                return (appid, None)
+
+        def done(result):
+            got_id, flag = result
+            if got_id == self._appid and flag:
+                self._cover_nsfw = True
+                self._render_detail_cover()
+
+        worker = TaskWorker(work)
+        worker.done.connect(done)
+        _keep_worker(worker)
+        worker.start()
+
     def _load_related(self, appid):
         def work():
             tags, games = [], []
@@ -5012,13 +5390,8 @@ class StoreDetailPage(QWidget):
         self._set_extras_visible(False)
         self.reqs_wrap.hide()
         self._reset_related()
-        pix = rounded_cover_pixmap(cover_path, self.DETAIL_W, self.DETAIL_H, 12) if cover_path else None
-        if pix:
-            self.cover.setText("")
-            self.cover.setPixmap(pix)
-        else:
-            self.cover.setPixmap(QPixmap())
-            self.cover.setText("No\ncover")
+        self._check_detail_nsfw(appid)
+        self._render_detail_cover()
 
         currency = load_launcher_settings().get("currency", "EGP")
 
@@ -5137,6 +5510,7 @@ class StorePage(QWidget):
 
         self.loader = CoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
+        self.loader.nsfw_known.connect(self._on_nsfw_known)
         self.loader.auth_failed.connect(self._on_auth_failed)
         QApplication.instance().aboutToQuit.connect(self._shutdown)
 
@@ -5375,6 +5749,11 @@ class StorePage(QWidget):
         card = self._card_by_id.get(appid)
         if card is not None:
             card.set_cover(path)
+
+    def _on_nsfw_known(self, appid, flag):
+        card = self._card_by_id.get(appid)
+        if card is not None:
+            card.nsfw = bool(flag)      # the cover arrives right after and gets drawn blurred
 
     # ------------------------------------------------------------ tag filter
     def _open_tag_picker(self):
@@ -10306,6 +10685,10 @@ def workshop_parse_mods(raw):
     return found
 
 def cloud_publish_presence():
+    try:
+        cloud_autoset_country()
+    except Exception:
+        pass
     token, uid = get_id_token()
     username, avatar = load_profile_cache()
     payload = {
@@ -10314,6 +10697,8 @@ def cloud_publish_presence():
         "playing": _now_playing["name"] or "",
         "idle": is_idle(),
         "seen": {".sv": "timestamp"},
+        "country": load_profile_country() or None,
+        "ptime": profile_ptime_payload(),
         "photo": None,
     }
     if avatar and os.path.exists(avatar):
@@ -12217,6 +12602,17 @@ class FriendsPage(QWidget):
     code_ready = pyqtSignal(str)
     friend_event = pyqtSignal(str, str, str)
     notif_clicked = pyqtSignal(str)
+    unread_changed = pyqtSignal(int)     # total unread chat messages (friends + groups), drives the navbar badge
+
+    def unread_bump(self, key):
+        d = self.__dict__.setdefault("_unread", {})
+        d[key] = d.get(key, 0) + 1
+        self.unread_changed.emit(sum(d.values()))
+
+    def unread_clear(self, key):
+        d = self.__dict__.setdefault("_unread", {})
+        if d.pop(key, None) is not None:
+            self.unread_changed.emit(sum(d.values()))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -12488,6 +12884,7 @@ class FriendsPage(QWidget):
                 name = self.friends.get(uid, {}).get("username") or "A friend"
                 text = chat_preview(msg)
                 self.__dict__.setdefault("_ov_msgs", {})[uid] = msg      # the overlay toast shows pictures from it
+                self.unread_bump(uid)
                 self.friend_event.emit(name, text if len(text) <= 100 else text[:97] + "...", uid)
         # merge instead of replace: a friend whose fetch failed this round keeps their old baseline
         merged = dict(prev or {})
@@ -12710,6 +13107,7 @@ class FriendsPage(QWidget):
 
     def open_friend(self, uid):
         self.current_uid = uid
+        self.unread_clear(uid)
         self._last_msg_key = ""
         self._msgs = []
         self._pending = []
@@ -17492,6 +17890,7 @@ _OG_RES = (re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](
 
 class FanCoverLoader(CoverLoader):
     """Same loader as the Store, but gets each cover from the game's Game Jolt page."""
+    CHECK_NSFW = False
     def _fetch(self, appid, img_base, key, title):
         folder = get_fan_cover_dir()
         os.makedirs(folder, exist_ok=True)
@@ -24671,6 +25070,7 @@ class GroupChatPage(QWidget):
         if not g:
             return
         self.gid, self.g = gid, g
+        self.fp.unread_clear("group:" + gid)
         self._me = (load_account() or {}).get("uid")
         self.profiles = {}
         self._msgs, self._sig, self._members_sig = [], "", None
@@ -24822,21 +25222,33 @@ class GroupChatPage(QWidget):
         r.addLayout(c, 1)
         for w in (av, n, s):
             w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        btn.setToolTip(f"{GROUP_ROLE_LABEL[role]}" + (" (timed out)" if timed_out else ""))
+        btn.setToolTip(f"{GROUP_ROLE_LABEL[role]}" + (" (timed out)" if timed_out else "") +
+                       "\nClick to view profile, right-click for options")
         btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         btn.customContextMenuRequested.connect(lambda pt, u=uid, b=btn: self._member_menu(u, b.mapToGlobal(pt)))
-        btn.clicked.connect(lambda _=False, u=uid, b=btn: self._member_menu(u, b.mapToGlobal(QPoint(b.width() - 10, b.height() - 4))))
+        btn.clicked.connect(lambda _=False, u=uid: self._open_profile(u))
         return btn
+
+    def _open_profile(self, uid):
+        app = self.window()
+        if hasattr(app, "open_profile_tab"):
+            app.open_profile_tab(uid, self.profiles.get(uid))
 
     def _member_menu(self, uid, global_pos):
         role = self.g.get("members", {}).get(uid)
         my = self._my_role()
-        if not role or uid == self._me:
+        if not role:
             return
         menu = QMenu(self)
         head = menu.addAction(f"{self._name(uid)} \u2014 {GROUP_ROLE_LABEL[role]}")
         head.setEnabled(False)
-        actions = []
+        actions = [(menu.addAction("View Profile"), lambda: self._open_profile(uid))]
+        if uid == self._me:                       # nothing to moderate on yourself
+            chosen = menu.exec(global_pos)
+            if chosen is actions[0][0]:
+                actions[0][1]()
+            return
+        menu.addSeparator()
         for new, label in (("admin", "Make Admin"), ("mod", "Make Moderator"), ("member", "Set as Member")):
             if group_can_set_role(my, role, new):
                 actions.append((menu.addAction(label), lambda n=new: self._set_role(uid, n)))
@@ -25282,6 +25694,7 @@ def _grp_poll_last(fp):
                 author = _grp_author(fp, msg.get("from"))
                 text = f"{author}: {chat_preview(msg)}"
                 fp.__dict__.setdefault("_ov_msgs", {})["group:" + gid] = msg
+                fp.unread_bump("group:" + gid)
                 fp.friend_event.emit(fp.groups[gid]["name"], text if len(text) <= 100 else text[:97] + "...",
                                      "group:" + gid)
         merged = dict(prev or {})
@@ -25385,6 +25798,1116 @@ def _grp_fp_refresh(self):
 
 
 FriendsPage.refresh = _grp_fp_refresh
+
+
+
+# ---------------------------------------------------------------- navbar: Downloads + Settings icon buttons, centred tabs, Credits inside Settings
+def _nav_icon(kind):
+    """Download-tray / gear glyph drawn in the nav colours (grey, white on hover / when selected), no font needed."""
+    import math
+    from PyQt6.QtGui import QPolygonF
+    icon = QIcon()
+    states = ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
+              (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
+              (QIcon.Mode.Normal, QIcon.State.On, _theme_state["nav_active"]),
+              (QIcon.Mode.Active, QIcon.State.On, _theme_state["nav_active"]))
+    for mode, state, color in states:
+        pm = QPixmap(40, 40)
+        pm.setDevicePixelRatio(2.0)         # 20 x 20 logical pixels
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if kind == "download":
+            pen = QPen(QColor(color), 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.drawLine(QPointF(10, 3), QPointF(10, 12))
+            p.drawPolyline([QPointF(5.5, 7.8), QPointF(10, 12.2), QPointF(14.5, 7.8)])
+            p.drawPolyline([QPointF(3.5, 12.5), QPointF(3.5, 16.5), QPointF(16.5, 16.5), QPointF(16.5, 12.5)])
+        else:
+            cx = cy = 10.0
+            teeth, ro, ri = 8, 8.8, 6.6
+            step = 2 * math.pi / teeth
+            pts = []
+            for i in range(teeth):
+                a = i * step
+                for ang, r in ((a - 0.30 * step, ri), (a - 0.17 * step, ro), (a + 0.17 * step, ro), (a + 0.30 * step, ri)):
+                    pts.append(QPointF(cx + r * math.cos(ang), cy + r * math.sin(ang)))
+            gear = QPainterPath()
+            gear.addPolygon(QPolygonF(pts))
+            gear.closeSubpath()
+            hole = QPainterPath()
+            hole.addEllipse(QPointF(cx, cy), 2.9, 2.9)
+            p.fillPath(gear.subtracted(hole), QColor(color))
+        p.end()
+        icon.addPixmap(pm, mode, state)
+    return icon
+
+def _nav_tab_icon(kind):
+    """Small line icon for a top-bar tab, drawn in the nav colours (grey; white on hover / when selected)."""
+    from PyQt6.QtGui import QPolygonF
+    icon = QIcon()
+    states = ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
+              (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
+              (QIcon.Mode.Normal, QIcon.State.On, _theme_state["nav_active"]),
+              (QIcon.Mode.Active, QIcon.State.On, _theme_state["nav_active"]))
+    P = QPointF
+    for mode, state, color in states:
+        pm = QPixmap(40, 40)
+        pm.setDevicePixelRatio(2.0)         # 20 x 20 logical pixels
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "library":                       # four tiles
+            for x, y in ((3, 3), (11, 3), (3, 11), (11, 11)):
+                p.drawRoundedRect(QRectF(x, y, 6, 6), 1.5, 1.5)
+        elif kind == "store":                       # shopping bag
+            p.drawRoundedRect(QRectF(4, 7, 12, 10), 2, 2)
+            p.drawArc(QRectF(7, 3, 6, 8), 0, 180 * 16)
+        elif kind == "fan":                         # game controller
+            p.drawRoundedRect(QRectF(2.5, 6, 15, 9), 4.5, 4.5)
+            p.drawLine(P(6, 8.5), P(6, 12.5))
+            p.drawLine(P(4, 10.5), P(8, 10.5))
+            p.setBrush(QColor(color))
+            p.drawEllipse(P(13, 9.5), 1, 1)
+            p.drawEllipse(P(15, 11.5), 1, 1)
+        elif kind == "friends":                     # two people
+            p.drawEllipse(P(7.5, 6.5), 2.8, 2.8)
+            p.drawArc(QRectF(2, 11.5, 11, 9), 0, 180 * 16)
+            p.drawEllipse(P(14, 7), 2.2, 2.2)
+            p.drawArc(QRectF(11.5, 12, 7, 7), 0, 180 * 16)
+        elif kind == "user":                        # one person
+            p.drawEllipse(P(10, 6.5), 3.2, 3.2)
+            p.drawArc(QRectF(3.5, 12, 13, 10), 0, 180 * 16)
+        elif kind == "workshop":                    # cube
+            p.drawPolygon(QPolygonF([P(10, 2.5), P(16.5, 6.25), P(16.5, 13.75), P(10, 17.5), P(3.5, 13.75), P(3.5, 6.25)]))
+            p.drawPolyline([P(3.5, 6.25), P(10, 10), P(16.5, 6.25)])
+            p.drawLine(P(10, 10), P(10, 17.5))
+        elif kind == "addon":                       # layers
+            p.drawPolygon(QPolygonF([P(3, 7), P(10, 3.5), P(17, 7), P(10, 10.5)]))
+            p.drawPolyline([P(3, 10.5), P(10, 14), P(17, 10.5)])
+            p.drawPolyline([P(3, 14), P(10, 17.5), P(17, 14)])
+        elif kind == "proton":                      # atom
+            for ang in (0, 60, 120):
+                p.save()
+                p.translate(10, 10)
+                p.rotate(ang)
+                p.drawEllipse(P(0, 0), 8, 3.2)
+                p.restore()
+            p.setBrush(QColor(color))
+            p.drawEllipse(P(10, 10), 1.4, 1.4)
+        elif kind == "wine":                        # wine glass
+            p.drawLine(P(5.5, 3), P(14.5, 3))
+            p.drawLine(P(5.5, 3), P(7, 9.5))
+            p.drawLine(P(14.5, 3), P(13, 9.5))
+            p.drawArc(QRectF(7, 7.5, 6, 4), 180 * 16, 180 * 16)
+            p.drawLine(P(10, 11.5), P(10, 16.5))
+            p.drawLine(P(6.5, 16.5), P(13.5, 16.5))
+        p.end()
+        icon.addPixmap(pm, mode, state)
+    return icon
+
+_NAV_TAB_KINDS = {"Library": "library", "Store": "store", "Fan Games": "fan", "Friends": "friends",
+                  "Steam Workshop": "workshop", "Garry's Mod Addon Manager": "addon",
+                  "GE Proton": "proton", "Wine": "wine"}
+
+def _set_tab_icon(btn, kind):
+    btn.setIcon(_nav_tab_icon(kind))
+    btn.setIconSize(QSize(16, 16))
+    def refresh():
+        try:
+            btn.setIcon(_nav_tab_icon(kind))
+        except RuntimeError:                         # the tab was closed
+            pass
+    _theme_listeners.append(refresh)
+
+class _NavCenterFilter(QObject):
+    """Keeps the tab strip centred in the title bar (without running over the logo or the profile button)."""
+    def __init__(self, app, sidebar, center):
+        super().__init__(sidebar)
+        self.app, self.sidebar, self.center = app, sidebar, center
+        sidebar.installEventFilter(self)
+        center.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if (obj is self.sidebar and t in (QEvent.Type.Resize, QEvent.Type.Show)) or \
+           (obj is self.center and t == QEvent.Type.LayoutRequest):
+            QTimer.singleShot(0, self.place)
+        return False
+
+    def place(self):
+        try:
+            s, c = self.sidebar, self.center
+            w = c.sizeHint().width()
+            x = (s.width() - w) // 2
+            brand = s.findChild(QLabel, "Brand")
+            edges = [b.mapTo(s, QPoint(b.width(), 0)).x()
+                     for b in (brand, self.app.nav_group.button(1), self.app.nav_group.button(6))
+                     if b is not None and b.isVisible()]
+            left = (max(edges) + 12) if edges else 0
+            prof = self.app.nav_group.button(3)
+            right = prof.mapTo(s, QPoint(0, 0)).x() - 8 if prof is not None else s.width()
+            x = max(left, min(x, right - w))
+            geo = QRect(x, 0, w, s.height())
+            if c.geometry() != geo:
+                c.setGeometry(geo)
+            if not c.isVisible():
+                c.show()
+            c.raise_()
+        except RuntimeError:
+            pass
+
+class _VisibilityMirror(QObject):
+    """Shows/hides `dst` whenever `src` is explicitly shown/hidden (even while the page itself isn't on screen)."""
+    def __init__(self, src, dst):
+        super().__init__(src)
+        self.dst = dst
+        src.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.ShowToParent:
+            self.dst.setVisible(True)
+        elif t == QEvent.Type.HideToParent:
+            self.dst.setVisible(False)
+        return False
+
+def _repolish(w):
+    w.style().unpolish(w)
+    w.style().polish(w)
+
+def _polish_account_page(page):
+    """Account page: centred card, accent ring around the picture, bigger name, muted details, red Log Out."""
+    panel = page.panel
+    panel.setObjectName("AccountCard")
+    lay = panel.layout()
+    lay.setContentsMargins(24, 28, 24, 24)       # sides stay 24 so the page's text-width maths still holds
+    lay.setSpacing(12)
+
+    idx = lay.indexOf(page.avatar_big)
+    lay.removeWidget(page.avatar_big)
+    ring = QFrame()
+    ring.setObjectName("AvatarRing")
+    ring.setFixedSize(96, 96)
+    rl = QVBoxLayout(ring)
+    rl.setContentsMargins(6, 6, 6, 6)
+    rl.addWidget(page.avatar_big, 0, Qt.AlignmentFlag.AlignCenter)
+    lay.insertWidget(idx, ring, 0, Qt.AlignmentFlag.AlignHCenter)
+    ring.setVisible(not page.avatar_big.isHidden())
+    page._avatar_ring_mirror = _VisibilityMirror(page.avatar_big, ring)
+
+    f = page.title_label.font()
+    f.setPointSize(16)
+    f.setBold(True)
+    page.title_label.setFont(f)
+    page.info_label.setObjectName("RowDesc")
+    page.logout_btn.setObjectName("LogoutButton")
+    for w in (panel, ring, page.info_label, page.logout_btn):
+        _repolish(w)
+    page.layout().setAlignment(panel, Qt.AlignmentFlag.AlignHCenter)
+
+def _rework_navbar(self):
+    sidebar = self.nav_group.button(0).parent()
+    L = sidebar.layout()
+    dl = self.nav_group.button(6)
+    gear = self.nav_group.button(1)
+    cred = self.nav_group.button(2)
+    icon_btns = [b for b in (dl, gear) if b is not None]
+    skip = set(icon_btns) | ({cred} if cred is not None else set())
+
+    mids = []
+    for i in range(L.count()):
+        w = L.itemAt(i).widget()
+        if isinstance(w, QPushButton) and w.objectName() == "NavButton" and w not in skip:
+            mids.append(w)
+    for w in mids + list(skip):
+        L.removeWidget(w)
+    if cred is not None:
+        cred.hide()                                   # Credits now lives at the bottom of Settings
+
+    # Downloads + Settings: small icon buttons right after the "NCZ Games" title
+    brand_row = L.itemAt(0).layout()
+    if brand_row is not None:                         # drop the row's trailing stretch so the icons sit next to the title
+        for i in reversed(range(brand_row.count())):
+            if brand_row.itemAt(i).spacerItem() is not None:
+                brand_row.takeAt(i)
+    pos = 2                                           # after the brand row and its 14px gap
+    for btn, kind, tip in ((dl, "download", "Downloads"), (gear, "gear", "Settings")):
+        if btn is None:
+            continue
+        btn.setObjectName("NavIconButton")
+        btn.setText("")
+        btn.setToolTip(tip)
+        btn.setFixedSize(38, 38)
+        btn.setIconSize(QSize(20, 20))
+        btn.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 8px; padding: 0; }"
+                          " QPushButton:hover { background: rgba(128,128,128,0.18); }"
+                          " QPushButton:checked { background: rgba(128,128,128,0.28); }")
+        btn.setIcon(_nav_icon(kind))
+        _theme_listeners.append(lambda b=btn, k=kind: b.setIcon(_nav_icon(k)))
+        L.insertWidget(pos, btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        pos += 1
+
+    # the remaining tabs go in a strip that is kept centred
+    center = QWidget(sidebar)
+    cl = QHBoxLayout(center)
+    cl.setContentsMargins(0, 0, 0, 0)
+    cl.setSpacing(0)
+    for w in mids:
+        cl.addWidget(w)
+        kind = _NAV_TAB_KINDS.get(w.toolTip())
+        if kind:
+            _set_tab_icon(w, kind)
+    self._nav_center_layout = cl
+
+    fp = getattr(self, "friends_page", None)
+    fbtn = self.nav_group.button(self.pages.indexOf(fp)) if fp is not None else None
+    if fbtn is not None and fbtn in mids and hasattr(fp, "unread_changed"):
+        badge = QLabel()
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedHeight(18)
+        badge.setMinimumWidth(18)
+        badge.setStyleSheet("background: #e5484d; color: white; border-radius: 9px; font-size: 10px;"
+                            " font-weight: bold; padding: 0px 5px;")
+        wrap = QWidget()
+        wl = QHBoxLayout(wrap)
+        wl.setContentsMargins(0, 0, 8, 0)
+        wl.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        wrap.hide()
+        cl.insertWidget(cl.indexOf(fbtn) + 1, wrap)
+
+        def update_badge(n):
+            badge.setText("99+" if n > 99 else str(n))
+            wrap.setVisible(n > 0)
+        fp.unread_changed.connect(update_badge)
+
+        def clear_if_viewing():                       # reading a chat (window focused) clears its unread count
+            try:
+                if not fp.isVisible() or not fp.window().isActiveWindow():
+                    return
+                if fp.stack.currentIndex() == 1 and fp.current_uid:
+                    fp.unread_clear(fp.current_uid)
+                gp = getattr(fp, "group_page", None)
+                if gp is not None and gp.gid and gp.isVisible():
+                    fp.unread_clear("group:" + gp.gid)
+            except RuntimeError:
+                pass
+        self._unread_timer = QTimer(self)
+        self._unread_timer.setInterval(1000)
+        self._unread_timer.timeout.connect(clear_if_viewing)
+        self._unread_timer.start()
+
+    self._nav_center_filter = _NavCenterFilter(self, sidebar, center)
+    center.show()
+    QTimer.singleShot(0, self._nav_center_filter.place)
+    QTimer.singleShot(300, self._nav_center_filter.place)
+
+    # Credits inside Settings (bottom)
+    try:
+        credits = CreditsPage()
+        credits.setObjectName("CreditsSection")
+        credits.layout().setContentsMargins(0, 26, 0, 0)
+        content = self.settings_page._content_layout
+        last = content.itemAt(content.count() - 1)
+        if last is not None and last.spacerItem() is not None:
+            content.insertWidget(content.count() - 1, credits)
+        else:
+            content.addWidget(credits)
+    except Exception:
+        pass
+
+    try:
+        _polish_account_page(self.account_page)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+    # always start in the Library
+    self.pages.setCurrentIndex(0)
+    first = self.nav_group.button(0)
+    if first is not None:
+        first.setChecked(True)
+
+_nav_prev_init = AdaptiveApp.__init__
+
+def _nav_final_init(self):
+    _nav_prev_init(self)
+    try:
+        _rework_navbar(self)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+AdaptiveApp.__init__ = _nav_final_init
+
+# ================================================================ profiles (Steam-style: currently playing, library, country)
+# Opened by clicking a member in a group chat's member list; your own profile is shown in the Account tab.
+# What other people see lives in public/<uid>: username, photo, country, library, playing, and "ptime" (hours per game).
+PF_BLUE = "#3b82f6"
+
+def _pf_fmt_hours(sec):
+    sec = int(sec or 0)
+    if sec <= 0:
+        return ""
+    if sec < 3600:
+        return f"{max(1, sec // 60)} min on record"
+    return f"{sec / 3600:,.1f} hrs on record"
+
+def _pf_fmt_short(sec):
+    sec = int(sec or 0)
+    if sec <= 0:
+        return ""
+    if sec < 3600:
+        return f"{max(1, sec // 60)} min"
+    return f"{sec / 3600:,.1f} h"
+
+def _pf_last_played(ms):
+    try:
+        ms = float(ms)
+        if ms > 0:
+            return "Last played " + time.strftime("%d %b %Y", time.localtime(ms / 1000.0))
+    except Exception:
+        pass
+    return ""
+
+def _pf_file_sig(path):
+    try:
+        return (path, int(os.path.getmtime(path)), os.path.getsize(path))
+    except Exception:
+        return (path, 0, 0)
+
+def profile_ptime_payload():
+    """{key: {"t": title, "s": seconds, "l": last played ms}} for the most played games, published with presence
+    so other people can see your hours. None when nothing has been played (removes the node)."""
+    out = {}
+    try:
+        with _pt_lock:
+            games = list(_pt_load()["games"].items())
+        rows = []
+        for key, g in games:
+            total = int(g.get("own", 0)) + int(g.get("others", 0))
+            if total > 0 and g.get("title"):
+                rows.append((total, int(g.get("last", 0)), key, str(g["title"])))
+        rows.sort(reverse=True)
+        for total, last, key, title in rows[:80]:
+            out[key] = {"t": title[:80], "s": total, "l": last}
+    except Exception:
+        pass
+    return out or None
+
+def profile_info_self():
+    """Everything the profile page shows for the logged-in user, built from local data (works offline)."""
+    acct = load_account() or {}
+    username, avatar = load_profile_cache()
+    name = username or acct.get("email", "").split("@")[0] or "Player"
+    playing = _now_playing.get("name") or ""
+    playing = pretty_game_name(playing) if playing else ""
+    if playing:
+        status, color = "Currently In-Game", GREEN
+    elif is_idle():
+        status, color = "Idle", PF_BLUE
+    else:
+        status, color = "Online", GREEN
+    try:
+        titles = list(friends_library_titles())
+    except Exception:
+        titles = []
+    try:
+        covers = library_cover_paths()
+    except Exception:
+        covers = {}
+    ptime = {}
+    try:
+        with _pt_lock:
+            games = list(_pt_load()["games"].values())
+        for g in games:
+            t = g.get("title")
+            if t:
+                ptime[t] = (_pt_total(t), int(g.get("last", 0)))
+    except Exception:
+        pass
+    return {"uid": acct.get("uid", ""), "name": name, "avatar": avatar, "country": load_profile_country(),
+            "status": status, "color": color, "playing": playing, "titles": titles, "covers": covers,
+            "ptime": ptime, "sub": acct.get("email", ""), "is_me": True}
+
+def profile_info_from_public(uid, d, raw_covers=None):
+    """The same dict for somebody else, from their public/<uid> node (+ their published covers)."""
+    d = d if isinstance(d, dict) else {}
+    raw_covers = raw_covers if isinstance(raw_covers, dict) else {}
+    name = d.get("username") if isinstance(d.get("username"), str) and d.get("username") else "Unknown"
+    lib = d.get("library")
+    if isinstance(lib, dict):
+        lib = list(lib.values())
+    titles = [pretty_game_name(t) for t in lib if isinstance(t, str)] if isinstance(lib, list) else []
+    playing = pretty_game_name(d["playing"]) if isinstance(d.get("playing"), str) and d.get("playing") else ""
+    covers = {}
+    for t in titles + ([playing] if playing and playing not in titles else []):
+        key = _cover_key(t)
+        if raw_covers.get(key):
+            p = _friend_cover_file(uid, key, raw_covers.get(key))
+            if p:
+                covers[t] = p
+    status, color = _friend_status(d)
+    if playing:
+        status = "Currently In-Game"
+    ptime = {}
+    raw = d.get("ptime")
+    for v in (raw.values() if isinstance(raw, dict) else raw if isinstance(raw, list) else []):
+        if isinstance(v, dict) and isinstance(v.get("t"), str) and isinstance(v.get("s"), (int, float)):
+            last = v.get("l")
+            ptime[v["t"]] = (int(v["s"]), int(last) if isinstance(last, (int, float)) else 0)
+    sub = ""
+    if status == "Offline":
+        seen = d.get("seen")
+        if isinstance(seen, (int, float)) and seen > 0:
+            sub = "Last online " + time.strftime("%d %b %Y", time.localtime(seen / 1000.0))
+    photo = d.get("photo")
+    avatar = _friend_avatar_file(uid, photo) if photo else None
+    country = str(d.get("country") or "").upper()
+    return {"uid": uid, "name": name, "avatar": avatar, "country": country if country in COUNTRIES else "",
+            "status": status, "color": color, "playing": playing, "titles": titles, "covers": covers,
+            "ptime": ptime, "sub": sub, "is_me": False}
+
+def profile_fetch_public(uid):
+    """Worker thread: downloads someone's public profile and covers. -> info dict for ProfileView."""
+    token, _me = get_id_token()
+    d = _http_json(_fdb(f"public/{uid}", token))
+    d = d if isinstance(d, dict) else {}
+    try:
+        raw_covers = cloud_fetch_covers(uid)
+    except CloudError:
+        raw_covers = {}
+    return profile_info_from_public(uid, d, raw_covers)
+
+
+class ProfileView(QWidget):
+    """Steam-like profile page: header (picture, name, country, status), Currently In-Game, Recent Activity,
+    the game collection with hours, and a stats card."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._sig = None
+        self._flag_code = ""
+        self.setStyleSheet("#ProfileHeader, #PfCard { background: rgba(128,128,128,0.10); border-radius: 14px; }")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        body = QVBoxLayout(inner)
+        body.setContentsMargins(0, 0, 10, 16)
+        body.setSpacing(16)
+
+        # ---- header
+        self.header = QFrame()
+        self.header.setObjectName("ProfileHeader")
+        hl = QHBoxLayout(self.header)
+        hl.setContentsMargins(24, 22, 24, 22)
+        hl.setSpacing(20)
+        self.ring = QFrame()
+        self.ring.setObjectName("PfRing")
+        self.ring.setFixedSize(104, 104)
+        rl = QVBoxLayout(self.ring)
+        rl.setContentsMargins(6, 6, 6, 6)
+        self.avatar = QLabel("?")
+        self.avatar.setFixedSize(88, 88)
+        self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignCenter)
+        hl.addWidget(self.ring, 0, Qt.AlignmentFlag.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(5)
+        self.name_lbl = QLabel()
+        f = self.name_lbl.font()
+        f.setPointSize(20)
+        f.setBold(True)
+        self.name_lbl.setFont(f)
+        self.country_row = QWidget()
+        cr = QHBoxLayout(self.country_row)
+        cr.setContentsMargins(0, 0, 0, 0)
+        cr.setSpacing(8)
+        self.flag_lbl = QLabel()
+        self.country_lbl = QLabel()
+        cr.addWidget(self.flag_lbl)
+        cr.addWidget(self.country_lbl)
+        cr.addStretch()
+        self.status_lbl = QLabel()
+        self.sub_lbl = QLabel()
+        self.sub_lbl.setObjectName("RowDesc")
+        col.addStretch()
+        col.addWidget(self.name_lbl)
+        col.addWidget(self.country_row)
+        col.addWidget(self.status_lbl)
+        col.addWidget(self.sub_lbl)
+        col.addStretch()
+        hl.addLayout(col, 1)
+        self.action_btn = QPushButton("Add Friend")
+        self.action_btn.setObjectName("Primary")
+        self.action_btn.setFixedHeight(36)
+        self.action_btn.setMinimumWidth(170)
+        self.action_btn.hide()
+        hl.addWidget(self.action_btn, 0, Qt.AlignmentFlag.AlignTop)
+        body.addWidget(self.header)
+
+        # ---- left column: currently in-game, recent activity, game collection
+        cols = QHBoxLayout()
+        cols.setSpacing(16)
+        left = QVBoxLayout()
+        left.setSpacing(16)
+        right = QVBoxLayout()
+        right.setSpacing(16)
+
+        self.game_card = self._card()
+        gl = QHBoxLayout(self.game_card)
+        gl.setContentsMargins(16, 14, 16, 14)
+        gl.setSpacing(14)
+        self.game_cover = QLabel()
+        self.game_cover.setFixedSize(72, 96)
+        self.game_cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gt = QVBoxLayout()
+        gt.setSpacing(3)
+        tag = QLabel("CURRENTLY IN-GAME")
+        tag.setStyleSheet(f"color:{GREEN}; font-size:10px; font-weight:bold;")
+        self.game_name = QLabel()
+        self.game_name.setWordWrap(True)
+        self.game_name.setStyleSheet("font-size:16px; font-weight:bold;")
+        gt.addStretch()
+        gt.addWidget(tag)
+        gt.addWidget(self.game_name)
+        gt.addStretch()
+        gl.addWidget(self.game_cover)
+        gl.addLayout(gt, 1)
+        self.game_card.hide()
+        left.addWidget(self.game_card)
+
+        self.recent_card, self.recent_lay, _t = self._section("Recent Activity")
+        left.addWidget(self.recent_card)
+        self.lib_card, self.lib_lay, self.lib_title = self._section("Game Collection")
+        left.addWidget(self.lib_card)
+        left.addStretch()
+
+        self.stats_card, self.stats_lay, _t = self._section("Stats")
+        self.stats_card.setFixedWidth(250)
+        right.addWidget(self.stats_card)
+        right.addStretch()
+
+        cols.addLayout(left, 1)
+        cols.addLayout(right)
+        body.addLayout(cols)
+        body.addStretch()
+
+    # ---- small builders
+    @staticmethod
+    def _card():
+        card = QFrame()
+        card.setObjectName("PfCard")
+        return card
+
+    def _section(self, title):
+        card = self._card()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 14, 16, 16)
+        v.setSpacing(10)
+        t = QLabel(title.upper())
+        t.setStyleSheet("color:#888888; font-size:10px; font-weight:bold;")
+        v.addWidget(t)
+        content = QVBoxLayout()
+        content.setSpacing(8)
+        v.addLayout(content)
+        return card, content, t
+
+    @staticmethod
+    def _clear(lay):
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    @staticmethod
+    def _muted(text):
+        lbl = QLabel(text)
+        lbl.setObjectName("RowDesc")
+        return lbl
+
+    @staticmethod
+    def _set_cover(label, title, path, w, h, radius):
+        pix = rounded_cover_pixmap(path, w, h, radius) if path and os.path.exists(path) else None
+        if pix:
+            label.setStyleSheet("")
+            label.setText("")
+            label.setPixmap(pix)
+        else:
+            label.setPixmap(QPixmap())
+            label.setText((title or "?")[:1].upper())
+            label.setStyleSheet(f"background:rgba(128,128,128,0.22); border-radius:{radius}px; "
+                                f"font-size:{max(14, w // 3)}px; font-weight:bold;")
+
+    def _tile(self, title, path, secs):
+        tile = QWidget()
+        tile.setFixedWidth(96)
+        v = QVBoxLayout(tile)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        cover = QLabel()
+        cover.setFixedSize(96, 128)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_cover(cover, title, path, 96, 128, 8)
+        name = QLabel()
+        nf = name.font()
+        nf.setPixelSize(11)
+        nf.setBold(True)
+        name.setFont(nf)
+        name.setText(name.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 96))
+        name.setToolTip(title)
+        v.addWidget(cover)
+        v.addWidget(name)
+        short = _pf_fmt_short(secs)
+        if short:
+            hrs = QLabel(short)
+            hrs.setObjectName("RowDesc")
+            hrs.setStyleSheet("font-size:10px;")
+            v.addWidget(hrs)
+        return tile
+
+    def _recent_row(self, title, path, secs, last):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(12)
+        cover = QLabel()
+        cover.setFixedSize(48, 64)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_cover(cover, title, path, 48, 64, 6)
+        t = QVBoxLayout()
+        t.setSpacing(1)
+        n = QLabel(title)
+        n.setStyleSheet("font-weight:bold;")
+        a = self._muted(_pf_fmt_hours(secs))
+        b = self._muted(_pf_last_played(last))
+        t.addStretch()
+        t.addWidget(n)
+        t.addWidget(a)
+        t.addWidget(b)
+        t.addStretch()
+        h.addWidget(cover)
+        h.addLayout(t, 1)
+        return row
+
+    @staticmethod
+    def _stat_row(label, value):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        a = QLabel(label)
+        a.setObjectName("RowDesc")
+        b = QLabel(value)
+        b.setStyleSheet("font-weight:bold;")
+        b.setWordWrap(True)
+        b.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(a)
+        h.addWidget(b, 1)
+        return w
+
+    # ---- country flag (downloaded once, cached; a code badge is shown until it arrives)
+    def _set_country(self, code):
+        code = (code or "").upper()
+        if code not in COUNTRIES:
+            self._flag_code = ""
+            self.country_row.hide()
+            return
+        self.country_row.show()
+        self.country_lbl.setText(COUNTRIES[code])
+        if code == self._flag_code:
+            return
+        self._flag_code = code
+        self.flag_lbl.setPixmap(QPixmap())
+        self.flag_lbl.setText(code)
+        self.flag_lbl.setStyleSheet("background:rgba(128,128,128,0.25); border-radius:4px; padding:1px 5px; "
+                                    "font-size:10px; font-weight:bold;")
+        cached = _country_flag_path(code)
+        if os.path.exists(cached) and os.path.getsize(cached) > 100:
+            self._show_flag(code, cached)
+            return
+        worker = TaskWorker(lambda c=code: get_country_flag_file(c))
+        worker.done.connect(lambda p, c=code: self._show_flag(c, p))
+        _keep_worker(worker)
+        worker.start()
+
+    def _show_flag(self, code, path):
+        try:
+            if code != self._flag_code or not path:
+                return
+            pix = round_flag_pixmap(path, 18)
+            if pix:
+                self.flag_lbl.setStyleSheet("")
+                self.flag_lbl.setText("")
+                self.flag_lbl.setPixmap(pix)
+        except RuntimeError:
+            pass
+
+    # ---- fill
+    def set_info(self, info):
+        name = info.get("name") or "Unknown"
+        color = info.get("color") or "#888888"
+        self.name_lbl.setText(name)
+        self.status_lbl.setText(info.get("status") or "")
+        self.status_lbl.setStyleSheet(f"color:{color}; font-weight:bold;")
+        sub = info.get("sub") or ""
+        self.sub_lbl.setText(sub)
+        self.sub_lbl.setVisible(bool(sub))
+        self.ring.setStyleSheet(f"#PfRing {{ border: 3px solid {color}; border-radius: 52px; background: transparent; }}")
+        self._set_country(info.get("country"))
+
+        titles = list(info.get("titles") or [])
+        covers = info.get("covers") or {}
+        ptime = info.get("ptime") or {}
+        playing = info.get("playing") or ""
+        avatar = info.get("avatar")
+        sig = (info.get("uid"), name, _pf_file_sig(avatar) if avatar else None, tuple(titles),
+               tuple(sorted(covers.items())),
+               tuple(sorted((t, v[0] // 60, v[1]) for t, v in ptime.items())), playing)
+        if sig == self._sig:
+            return
+        self._sig = sig
+
+        _grp_avatar(self.avatar, avatar, name[:1].upper(), 88)
+
+        # currently in-game
+        if playing:
+            self.game_name.setText(playing)
+            self._set_cover(self.game_cover, playing, covers.get(playing), 72, 96, 8)
+            self.game_card.show()
+        else:
+            self.game_card.hide()
+
+        # recent activity: the last few games played, newest first
+        self._clear(self.recent_lay)
+        recent = sorted(((v[1], t) for t, v in ptime.items() if v[1] > 0 and v[0] > 0), reverse=True)[:4]
+        if not recent:
+            self.recent_lay.addWidget(self._muted("No recent activity."))
+        for last, t in recent:
+            self.recent_lay.addWidget(self._recent_row(t, covers.get(t), ptime[t][0], last))
+
+        # game collection: most played first
+        self._clear(self.lib_lay)
+        self.lib_title.setText(f"GAME COLLECTION \u2014 {len(titles)}")
+        if not titles:
+            self.lib_lay.addWidget(self._muted("No games yet."))
+        else:
+            host = QWidget()
+            fl = FlowLayout(host, 12)
+            for t in sorted(titles, key=lambda x: (-ptime.get(x, (0, 0))[0], x.lower())):
+                fl.addWidget(self._tile(t, covers.get(t), ptime.get(t, (0, 0))[0]))
+            self.lib_lay.addWidget(host)
+
+        # stats
+        self._clear(self.stats_lay)
+        total = sum(v[0] for v in ptime.values())
+        self.stats_lay.addWidget(self._stat_row("Games", str(len(titles))))
+        self.stats_lay.addWidget(self._stat_row("Hours on record", f"{total / 3600:,.1f}"))
+        played = [(v[0], t) for t, v in ptime.items() if v[0] > 0]
+        if played:
+            self.stats_lay.addWidget(self._stat_row("Most played", max(played)[1]))
+
+
+def cloud_add_friend_uid(other):
+    """Friend request to a known user id (from their profile). 'sent', or 'accepted' if they had already asked us."""
+    token, uid = get_id_token()
+    if other == uid:
+        raise CloudError("That's you!", "SELF")
+    if _http_json(_fdb(f"friends/{uid}/{other}", token)):
+        raise CloudError("You're already friends.", "ALREADY")
+    if _http_json(_fdb(f"requests/{uid}/{other}", token)):
+        cloud_accept_friend(other)
+        return "accepted"
+    _http_json(_fdb(f"requests/{other}/{uid}", token), "PUT", True)
+    return "sent"
+
+def profile_relation(other):
+    """'self', 'friends', 'incoming' (they already asked you) or 'none'. (Requests you sent can't be read back.)"""
+    token, uid = get_id_token()
+    if other == uid:
+        return "self"
+    if _http_json(_fdb(f"friends/{uid}/{other}", token)):
+        return "friends"
+    if _http_json(_fdb(f"requests/{uid}/{other}", token)):
+        return "incoming"
+    return "none"
+
+
+class ProfilePage(QWidget):
+    """A profile as its own tab in the main window (opened from a group chat's member list)."""
+    name_known = pyqtSignal(str)
+
+    def __init__(self, uid, seed=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Content")
+        self.uid = uid
+        self._loading = False
+        self._relation = ""
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(36, 24, 26, 0)
+        lay.setSpacing(8)
+        self.view = ProfileView()
+        lay.addWidget(self.view, 1)
+        self.note = QLabel("")
+        self.note.setObjectName("RowDesc")
+        lay.addWidget(self.note)
+        self.view.action_btn.clicked.connect(self._add_friend)
+        if isinstance(seed, dict) and seed:        # show what the member list already knows right away
+            try:
+                self.view.set_info(profile_info_from_public(uid, seed))
+            except Exception:
+                pass
+        self.note.setText("Loading profile...")
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(15000)
+        self._reload()
+        self._load_relation()
+
+    def stop(self):
+        self.timer.stop()
+
+    def _tick(self):
+        if self.isVisible():
+            self._reload()
+
+    def _reload(self):
+        if self._loading:
+            return
+        self._loading = True
+        worker = TaskWorker(lambda: profile_fetch_public(self.uid))
+        worker.done.connect(self._on_loaded)
+        worker.failed.connect(self._on_failed)
+        _keep_worker(worker)
+        worker.start()
+
+    def _on_loaded(self, info):
+        self._loading = False
+        try:
+            self.note.setText("")
+            self.view.set_info(info)
+            self.name_known.emit(info.get("name") or "Profile")
+        except RuntimeError:
+            pass
+
+    def _on_failed(self, message):
+        self._loading = False
+        try:
+            self.note.setText(message or "Couldn't load this profile.")
+        except RuntimeError:
+            pass
+
+    # ---- Add Friend
+    def _load_relation(self):
+        worker = TaskWorker(lambda: profile_relation(self.uid))
+        worker.done.connect(self._on_relation)
+        _keep_worker(worker)
+        worker.start()
+
+    def _on_relation(self, rel):
+        self._relation = rel or "none"
+        self._apply_action()
+
+    def _apply_action(self):
+        try:
+            btn = self.view.action_btn
+            rel = self._relation
+            if rel in ("", "self"):
+                btn.hide()
+                return
+            text, enabled = {"friends": ("Friends", False), "sent": ("Request Sent", False),
+                             "incoming": ("Accept Friend Request", True)}.get(rel, ("Add Friend", True))
+            btn.setText(text)
+            btn.setEnabled(enabled)
+            btn.show()
+        except RuntimeError:
+            pass
+
+    def _add_friend(self):
+        btn = self.view.action_btn
+        btn.setEnabled(False)
+        btn.setText("Sending...")
+        worker = TaskWorker(lambda: cloud_add_friend_uid(self.uid))
+        worker.done.connect(self._on_added)
+        worker.failed.connect(self._on_add_failed)
+        _keep_worker(worker)
+        worker.start()
+
+    def _on_added(self, result):
+        try:
+            self._relation = "friends" if result == "accepted" else "sent"
+            self._apply_action()
+            self.note.setText("")
+            if result == "accepted":
+                fp = getattr(self.window(), "friends_page", None)
+                if fp is not None:
+                    fp.refresh()
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _on_add_failed(self, message):
+        try:
+            self._relation = "friends" if "already friends" in (message or "") else "none"
+            self._apply_action()
+            self.note.setText(message or "Couldn't send the friend request.")
+        except RuntimeError:
+            pass
+
+
+# ---- profile tabs: a temporary tab in the top bar per opened profile, closed with the x next to it
+def _pf_open_tab(self, uid, seed=None):
+    acct = load_account() or {}
+    if uid == acct.get("uid"):                     # your own profile lives in the Account tab
+        self.open_account()
+        return
+    tabs = self.__dict__.setdefault("_profile_tabs", {})
+    if not self.__dict__.get("_pf_page_hook"):      # a profile tab disappears as soon as you switch to another page
+        self._pf_page_hook = True
+        self.pages.currentChanged.connect(lambda _i: self._pf_prune_tabs())
+    tab = tabs.get(uid)
+    if tab is None:
+        page = ProfilePage(uid, seed)
+        self.pages.addWidget(page)
+        seq = self.__dict__.get("_profile_tab_seq", 0) + 1
+        self._profile_tab_seq = seq
+        tab_id = 1000 + seq
+        label = (seed or {}).get("username") if isinstance(seed, dict) else None
+        btn = self.make_nav_button(str(label or "Profile")[:20], checkable=True)
+        _set_tab_icon(btn, "user")
+        close = QPushButton("\u00d7")
+        close.setFixedSize(20, 20)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("Close tab")
+        close.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 10px; font-size: 15px; }"
+                            " QPushButton:hover { background: rgba(128,128,128,0.30); }")
+        wrap = QWidget()
+        wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        hl = QHBoxLayout(wrap)
+        hl.setContentsMargins(0, 0, 6, 0)
+        hl.setSpacing(0)
+        hl.addWidget(btn)
+        hl.addWidget(close, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.nav_group.addButton(btn, tab_id)
+        self._nav_center_layout.addWidget(wrap)
+        page.name_known.connect(lambda n, b=btn: (b.setText(n[:20].upper()), b.setToolTip(n)))
+        close.clicked.connect(lambda _=False, u=uid: self._pf_close_tab(u))
+        tab = tabs[uid] = {"page": page, "wrap": wrap, "btn": btn, "id": tab_id}
+        QTimer.singleShot(0, lambda: self._nav_center_filter.place())
+    tab["btn"].setChecked(True)
+    self.pages.setCurrentWidget(tab["page"])
+
+def _pf_prune_tabs(self):
+    cur = self.pages.currentWidget()
+    for u, t in list(self.__dict__.get("_profile_tabs", {}).items()):
+        if t["page"] is not cur:
+            QTimer.singleShot(0, lambda u=u: self._pf_close_tab(u))
+
+def _pf_close_tab(self, uid):
+    tab = self.__dict__.get("_profile_tabs", {}).pop(uid, None)
+    if not tab:
+        return
+    was_current = self.pages.currentWidget() is tab["page"]
+    tab["page"].stop()
+    self.nav_group.removeButton(tab["btn"])
+    self._nav_center_layout.removeWidget(tab["wrap"])
+    tab["wrap"].hide()
+    tab["wrap"].deleteLater()
+    self.pages.removeWidget(tab["page"])
+    tab["page"].deleteLater()
+    QTimer.singleShot(0, lambda: self._nav_center_filter.place())
+    if was_current:
+        fp = getattr(self, "friends_page", None)
+        if fp is not None:
+            b = self.nav_group.button(self.pages.indexOf(fp))
+            if b is not None:
+                b.setChecked(True)
+            self.pages.setCurrentWidget(fp)
+
+_pf_orig_show_page = AdaptiveApp.show_page
+
+def _pf_show_page(self, index):
+    if index >= 1000:                              # a profile tab
+        for tab in self.__dict__.get("_profile_tabs", {}).values():
+            if tab["id"] == index:
+                self.pages.setCurrentWidget(tab["page"])
+        return
+    _pf_orig_show_page(self, index)
+
+AdaptiveApp.show_page = _pf_show_page
+AdaptiveApp.open_profile_tab = _pf_open_tab
+AdaptiveApp._pf_close_tab = _pf_close_tab
+AdaptiveApp._pf_prune_tabs = _pf_prune_tabs
+
+
+class CountryDialog(QDialog):
+    """Pick the country shown on your profile. code() -> two-letter code, or '' for none."""
+
+    def __init__(self, parent=None, current=""):
+        super().__init__(parent)
+        self.setWindowTitle("Country")
+        self.resize(340, 480)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 16)
+        lay.setSpacing(10)
+        hint = QLabel("Choose the country shown on your profile.")
+        hint.setWordWrap(True)
+        hint.setObjectName("RowDesc")
+        lay.addWidget(hint)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search countries")
+        lay.addWidget(self.search)
+        self.list = QListWidget()
+        none = QListWidgetItem("Not shown")
+        none.setData(Qt.ItemDataRole.UserRole, "")
+        self.list.addItem(none)
+        for code, name in sorted(COUNTRIES.items(), key=lambda kv: kv[1]):
+            it = QListWidgetItem(name)
+            it.setData(Qt.ItemDataRole.UserRole, code)
+            self.list.addItem(it)
+            if code == (current or "").upper():
+                self.list.setCurrentItem(it)
+        if self.list.currentItem() is None:
+            self.list.setCurrentRow(0)
+        self.list.scrollToItem(self.list.currentItem())
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setObjectName("Primary")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+        self.search.textChanged.connect(self._filter)
+        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
+
+    def _filter(self, text):
+        text = text.strip().lower()
+        for i in range(self.list.count()):
+            self.list.item(i).setHidden(bool(text) and text not in self.list.item(i).text().lower())
+
+    def code(self):
+        it = self.list.currentItem()
+        return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
 
 
 if __name__ == "__main__":
