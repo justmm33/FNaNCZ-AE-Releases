@@ -10,7 +10,7 @@ import urllib.parse
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
-    sys.exit("Playwright is missing. Run:  pip install playwright && playwright install chromium")
+    sys.exit("Playwright is missing. Run: pip install playwright && playwright install chromium")
 
 # label written to the csv -> Game Jolt tag(s) to pull from
 TAGS = {
@@ -18,6 +18,7 @@ TAGS = {
     "bendy": ["bendy"],
     "fnaf": ["fnaf"],
     "fnf": ["fnf"],
+    "sonic": ["sonic"],
 }
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -25,8 +26,8 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 BASE = "https://gamejolt.com"
 # browse pages tried per tag until one produces a list of games
 PAGE_URLS = ["/games/{sort}/tag-{tag}", "/games/tag-{tag}/{sort}", "/games/tag-{tag}"]
-DELAY = 0.6          # seconds between page requests
-MAX_EMPTY = 3        # stop a tag after this many pages in a row with nothing new
+DELAY = 0.6      # seconds between page requests
+MAX_EMPTY = 3    # stop a tag after this many pages in a row with nothing new
 
 
 def find_games(obj, out=None):
@@ -77,7 +78,7 @@ def scrape_tag(ctx, label, site_tags, sort, count, debug):
         if len(found) >= count:
             break
         page = ctx.new_page()
-        captured = []  # (api_url, games) for every site-api json response that holds a game list
+        captured = []   # (api_url, games) for every site-api json response that holds a game list
 
         def on_response(resp):
             try:
@@ -87,6 +88,7 @@ def scrape_tag(ctx, label, site_tags, sort, count, debug):
                         captured.append((resp.url, games))
             except Exception:
                 pass
+
         page.on("response", on_response)
 
         api_url = None
@@ -101,7 +103,7 @@ def scrape_tag(ctx, label, site_tags, sort, count, debug):
                 if debug:
                     print(f"  [debug] goto failed: {e}")
                 continue
-            for _ in range(60):  # up to ~15s for the game list to arrive
+            for _ in range(60):     # up to ~15s for the game list to arrive
                 if captured:
                     break
                 page.wait_for_timeout(250)
@@ -109,8 +111,9 @@ def scrape_tag(ctx, label, site_tags, sort, count, debug):
                 api_url, first = max(captured, key=lambda c: len(c[1]))
                 add(first)
                 if debug:
-                    print(f"  [debug] game list api: {api_url}  ({len(first)} games on first page)")
+                    print(f"  [debug] game list api: {api_url} ({len(first)} games on first page)")
                 break
+
         if not api_url:
             print(f"\n  {label}: couldn't find a game list for tag '{site_tag}'"
                   + ("" if debug else " (run with --debug --show to see why)"))
@@ -146,7 +149,9 @@ def scrape_tag(ctx, label, site_tags, sort, count, debug):
                     new += add(games)
                 seen_caps = len(captured)
                 idle = 0 if new else idle + 1
+
         page.close()
+
     print(f"  {label}: {len(found)} games" + " " * 30)
     return found
 
@@ -160,7 +165,7 @@ def main():
     ap.add_argument("--debug", action="store_true", help="print which pages/api calls are used")
     args = ap.parse_args()
 
-    merged = {}  # id -> {"name", "slug", "tags"}  (insertion order = tag order, then popularity)
+    merged = {}     # id -> {"name", "slug", "tags"} (insertion order = tag order, then popularity)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.show)
         ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 900})
@@ -174,7 +179,7 @@ def main():
         browser.close()
 
     if not merged:
-        sys.exit("\nNothing was scraped. Re-run with:  python gamejolt_scraper.py --show --debug")
+        sys.exit("\nNothing was scraped. Re-run with: python gamejolt_scraper.py --show --debug")
 
     with open(args.out, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
