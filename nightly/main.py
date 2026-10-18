@@ -9672,12 +9672,14 @@ def _dir_snapshot(roots):
         walk(r, d)
     return seen
 
-def _start_setup(exe):
-    """Starts setup.exe and returns (pid, popen or None). Windows asks for admin rights itself if the installer wants them."""
+def _start_setup(exe, args=None):
+    """Starts setup.exe (with optional command-line args) and returns (pid, popen or None).
+    Windows asks for admin rights itself if the installer wants them."""
     cwd = os.path.dirname(exe)
+    args = list(args or [])
     if sys.platform.startswith("win"):
         try:
-            p = subprocess.Popen([exe], cwd=cwd)
+            p = subprocess.Popen([exe] + args, cwd=cwd)
             return p.pid, p
         except OSError as e:
             if getattr(e, "winerror", 0) != 740:        # 740 = needs elevation
@@ -9694,6 +9696,8 @@ def _start_setup(exe):
         sei.cbSize = ctypes.sizeof(sei)
         sei.fMask = 0x40                                # SEE_MASK_NOCLOSEPROCESS
         sei.lpVerb, sei.lpFile, sei.lpDirectory, sei.nShow = "runas", exe, cwd, 1
+        if args:
+            sei.lpParameters = subprocess.list2cmdline(args)
         k32 = ctypes.windll.kernel32
         k32.GetProcessId.argtypes, k32.GetProcessId.restype = [wintypes.HANDLE], wintypes.DWORD
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -9705,10 +9709,64 @@ def _start_setup(exe):
     found = find_wine()
     if not found:
         raise OSError("wine not found")
-    p = subprocess.Popen([found[0], exe], cwd=cwd, env=wine_game_env())
+    p = subprocess.Popen([found[0], exe] + args, cwd=cwd, env=wine_game_env())
     return p.pid, p
 
-def _run_setup_and_find_install(worker, setup_exe, title):
+def _silent_setup_args(dest):
+    """Inno Setup switches (what server 2 repacks use): no wizard questions, every option default, install into dest.
+    /SILENT still shows the progress window. Installers that don't know these switches just open normally."""
+    if not sys.platform.startswith("win"):
+        dest = "Z:" + dest.replace("/", "\\")               # wine sees the Linux filesystem as drive Z:
+    return ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=" + dest]
+
+def _setup_ask_auto(title, dest, seconds=15):
+    """Called from the download thread: asks whether to let the launcher run setup.exe itself. True = automatic install
+    (also when nobody answers within `seconds`), False = the user wants to run setup.exe by hand."""
+    if _ss_bridge_obj is None:
+        return False
+    result, done = {}, threading.Event()
+
+    def show():
+        try:
+            box = QMessageBox(_ss_parent())
+            box.setWindowTitle("Install " + title)
+            box.setIcon(QMessageBox.Icon.Question)
+            auto_btn = box.addButton("Install now", QMessageBox.ButtonRole.AcceptRole)
+            manual_btn = box.addButton("I'll run setup myself", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(auto_btn)
+            left = {"n": seconds}
+
+            def refresh():
+                box.setText(f"{title} finished downloading.")
+                box.setInformativeText(f"Setup starts by itself in {left['n']} s with the default options and installs the "
+                                       f"game to:\n{dest}")
+            refresh()
+            timer = QTimer(box)
+
+            def tick():
+                left["n"] -= 1
+                if left["n"] <= 0:
+                    timer.stop()
+                    result["auto"] = True
+                    box.accept()
+                else:
+                    refresh()
+            timer.timeout.connect(tick)
+            timer.start(1000)
+            box.exec()
+            timer.stop()
+            if "auto" not in result:
+                result["auto"] = box.clickedButton() is not manual_btn
+        except Exception:
+            result["auto"] = False
+        finally:
+            done.set()
+    _ss_gui(show)
+    if not done.wait(seconds + 60):
+        return True
+    return bool(result.get("auto"))
+
+def _run_setup_and_find_install(worker, setup_exe, title, args=None, dest=None):
     """Runs ONLY setup.exe, waits until it (and everything it spawned) has closed, and works out where it installed:
       1. new Apps & Features entries (InstallLocation / icon / uninstaller folder)   [Windows]
       2. new folders in Program Files, the library folders and the drive roots
@@ -9723,11 +9781,14 @@ def _run_setup_and_find_install(worker, setup_exe, title):
     roots = _watch_roots()
     dirs_before = _dir_snapshot(roots)
     try:
-        pid, _popen = _start_setup(setup_exe)
+        pid, _popen = _start_setup(setup_exe, args)
     except Exception:
         return False, None, None
 
-    worker.status_update.emit("Setup is running...\nFinish the installer. The launcher will find the game when it closes.")
+    if args:
+        worker.status_update.emit("Installing automatically...\nSetup is running with the default options.")
+    else:
+        worker.status_update.emit("Setup is running...\nFinish the installer. The launcher will find the game when it closes.")
     observed = []                       # folders the installer had files open in
     if psutil is not None:
         known, idle = {}, 0
@@ -9762,6 +9823,10 @@ def _run_setup_and_find_install(worker, setup_exe, title):
         time.sleep(2)
 
     worker.status_update.emit("Setup closed. Looking for the game's .exe...")
+    if dest:                                    # automatic install: the folder is known
+        exe = _pick_game_exe(dest, title)
+        if exe:
+            return True, dest, exe
     cands = []
     def add(p):
         if p and os.path.isdir(p) and not _too_broad(p) and not _ignored_install_path(p, setup_dir) \
@@ -9841,8 +9906,14 @@ def _fb_pw_run(self):
                 # Only setup.exe is launched. When it closes, the game's .exe is searched for where it installed.
                 self.setup_exe = setup
                 self.setup_dir = os.path.dirname(setup)
-                self.status_update.emit("Starting setup.exe...")
-                self.setup_started, self.install_dir, self.game_exe = _run_setup_and_find_install(self, setup, self.title)
+                if _setup_ask_auto(self.title, game_dir):
+                    # nobody answered (or "Install now"): setup.exe runs by itself into <library>/<game name>/
+                    self.status_update.emit("Starting setup.exe automatically...")
+                    self.setup_started, self.install_dir, self.game_exe = _run_setup_and_find_install(
+                        self, setup, self.title, args=_silent_setup_args(game_dir), dest=game_dir)
+                else:
+                    self.status_update.emit("Starting setup.exe...")
+                    self.setup_started, self.install_dir, self.game_exe = _run_setup_and_find_install(self, setup, self.title)
                 if self.game_exe:
                     record_installed_exe(self.title, self.game_exe)
             self.finished.emit(game_dir)
@@ -11525,7 +11596,7 @@ _FLAGS_ITEMS = "🏁 🚩 🎌 🏴 🏳️ 🏳️‍🌈 🏴‍☠️ " + " "
 
 EMOJI_CATEGORIES = [
     ("Smileys", "\U0001F600",
-     "😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😛 😜 🤪 😎 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😓 🤗 🤔 🤭 🤫 😶 😐 😑 😬 🙄 😯 😮 😲 🥱 😴 🤤 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕 🤑 🤠 😈 👿 💀 ☠️ 👻 👽 👾 🤖 💩 🤡"),
+     "😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😛 😜 🤪 😎 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😖 ð« 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😓 🤗 🤔 🤭 🤫 😶 😐 😑 😬 🙄 😯 😮 😲 🥱 😴 🤤 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕 🤑 🤠 😈 👿 💀 ☠️ 👻 👽 👾 🤖 💩 🤡"),
     ("Gestures", "\U0001F44D",
      "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ 👋 ✋ 🖖 👏 🙌 👐 🤲 🤝 🙏 ✍️ 💪 🧠 👀 👁️ 👅 👄 🫡 🫶"),
     ("Hearts", "\u2764\uFE0F",
@@ -19978,15 +20049,74 @@ def _fan_installed_exe(title):
 def _fan_update_btn(btn, title):
     btn.setText("Launch" if _fan_installed_exe(title) else "Install")
 
+# Steam never runs Proton directly: it starts it inside the Steam Linux Runtime (a container with its own Vulkan loader and
+# libraries). Running `proton run` straight on the host depends on the system's own (often 32-bit-less) Vulkan setup, which
+# is where the "Vulkan errors" come from. So when the runtime Proton asks for is installed, it is used here too.
+_SLR_BY_APPID = {"1628350": "SteamLinuxRuntime_sniper", "1391110": "SteamLinuxRuntime_soldier"}
+
+def _steam_library_pairs():
+    """[(steam install folder, library folder)] for every Steam install / library on this device."""
+    home = os.path.expanduser("~")
+    roots, pairs = [], []
+    for c in ("~/.local/share/Steam", "~/.steam/steam", "~/.steam/root",
+              "~/.var/app/com.valvesoftware.Steam/.local/share/Steam", "~/.var/app/com.valvesoftware.Steam/data/Steam"):
+        r = os.path.realpath(os.path.expanduser(c))
+        if os.path.isdir(os.path.join(r, "steamapps")) and r not in roots:
+            roots.append(r)
+    for root in roots:
+        pairs.append((root, root))
+        try:
+            with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+            lib = m.group(1).replace("\\\\", "\\")
+            if os.path.isdir(os.path.join(lib, "steamapps")) and (root, lib) not in pairs:
+                pairs.append((root, lib))
+    return pairs
+
+def _proton_runtime_entry(proton):
+    """(runtime entry-point script, Steam folder) of the Steam Linux Runtime this Proton wants, or None if it isn't there."""
+    try:
+        with open(os.path.join(os.path.dirname(proton), "toolmanifest.vdf"), encoding="utf-8", errors="replace") as f:
+            m = re.search(r'"require_tool_appid"\s+"(\d+)"', f.read())
+    except OSError:
+        return None
+    name = _SLR_BY_APPID.get(m.group(1)) if m else None
+    if not name:
+        return None
+    for steam_root, lib in _steam_library_pairs():
+        entry = os.path.join(lib, "steamapps", "common", name, "_v2-entry-point")
+        if os.path.isfile(entry):
+            return entry, steam_root
+    return None
+
 def _launch_spec(app, exe, compat_tool=""):
     """(argv, cwd, extra_env) for starting a game exe the same way the launcher does for its other games."""
     cwd = os.path.dirname(exe)
     if sys.platform.startswith("linux"):
         kind = compat_tool_kind(compat_tool)
         if kind == "proton":
-            return ([compat_tool, "run", exe], cwd,
-                    {"STEAM_COMPAT_DATA_PATH": compat_data_dir_for(exe),
-                     "STEAM_COMPAT_CLIENT_INSTALL_PATH": os.path.expanduser("~/.local/share/Steam")})
+            argv = [compat_tool, "run", exe]
+            env = {"STEAM_COMPAT_DATA_PATH": compat_data_dir_for(exe),
+                   "STEAM_COMPAT_CLIENT_INSTALL_PATH": os.path.expanduser("~/.local/share/Steam")}
+            try:
+                use_runtime = bool(load_launcher_settings().get("use_steam_runtime", True))
+            except Exception:
+                use_runtime = True
+            rt = _proton_runtime_entry(compat_tool) if use_runtime else None
+            if rt:
+                entry, steam_root = rt
+                argv = [entry, "--verb=waitforexitandrun", "--", compat_tool, "waitforexitandrun", exe]
+                env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = steam_root
+                env["STEAM_COMPAT_INSTALL_PATH"] = cwd
+                shared = [p for p in os.environ.get("PRESSURE_VESSEL_FILESYSTEMS_RW", "").split(":") if p]
+                for p in [cwd] + list(library_roots()):     # the container only sees these (plus home, /mnt, /media)
+                    if p and ":" not in p and p not in shared:
+                        shared.append(p)
+                env["PRESSURE_VESSEL_FILESYSTEMS_RW"] = ":".join(shared)
+            return argv, cwd, env
         if kind == "wine" and exe.lower().endswith(".exe"):
             return ([compat_tool, exe], cwd, {})
         if exe.lower().endswith(".sh"):
@@ -26907,6 +27037,1087 @@ class CountryDialog(QDialog):
     def code(self):
         it = self.list.currentItem()
         return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
+
+
+# ================================================================ cloud saves for EVERY game (Firebase)
+# How it works:
+#  * every game the launcher starts is already noticed by the process tracker (_TrackedPopen / _running), so this
+#    hooks the same place: before a game starts it pulls a newer cloud copy of the saves, after it closes it pushes.
+#  * no per-game database: the first time a game is played, the folders it changed (AppData, Documents, Saved Games,
+#    its own folder; inside the Wine/Proton prefix on Linux) are offered once and the picked ones are remembered.
+#  * saves are zipped (max ~5 MB) into users/<uid>/games/sg_<id> with a small sg_<id>_meta next to it (hash, time, device,
+#    the folder list), so a second PC learns where the saves live by itself.
+#  * never overwrites silently: if this PC and the cloud both changed, you pick one. Anything that gets replaced is
+#    first kept as a zip in <launcher folder>/save_backups/<id>/ (last 5).
+import io as _ss_io
+import hashlib as _ss_hash
+
+_SS_PREFIX = "sg_"
+_SS_MAX_ZIP = 5 * 1024 * 1024
+_SS_MAX_RAW = 60 * 1024 * 1024
+_SS_MAX_FILES = 4000
+_SS_MIN_SESSION = 45          # seconds a game must run before the save folders are looked for
+_SS_JUNK_EXT = {".log", ".tmp", ".temp", ".dmp", ".mdmp", ".etl", ".lock", ".lck", ".pid", ".crash", ".pyc", ".cache"}
+_SS_JUNK_DIRS = {"cache", "gpucache", "shadercache", "shader_cache", "code cache", "crashpad", "crashes", "crash",
+                 "crashdumps", "logs", "log", "temp", "tmp", "webcache", "webview", "cef", "blob_storage", "dawncache",
+                 "d3dscache", "dxcache", "glcache", "__pycache__", "unitycache", "crash reports"}
+_SS_SKIP_TOP = {"microsoft", "google", "mozilla", "packages", "temp", "programs", "nvidia", "nvidia corporation",
+                "d3dscache", "crashdumps", "discord", "spotify", "steam", "epicgameslauncher", "ncz_games_launcher",
+                "pip", "npm", "npm-cache", "comms", "connecteddevicesplatform", "publishers", "history", "adobe",
+                "code", "slack", "teams", "jetbrains", "unityhub", "wine", "mesa_shader_cache", "fontconfig", "pulse",
+                "dconf", "gtk-3.0", "gtk-4.0", "google-chrome", "chromium", "flatpak", "trash", "applications",
+                "icons", "mime", "baloo", "qtwebengine", "vlc", "obs-studio", "heroic", "lutris", "bottles",
+                "proton", "protontricks", "winetricks", "applications-merged", "recently-used.xbel"}
+_SS_SAVEY = re.compile(r"sav(e|es|ed|egame|egames)\b|^saves?|profile|userdata|slot|progress|playerprefs", re.I)
+_SS_SAVE_EXT = {".sav", ".save", ".sl2", ".sg", ".es3", ".rpgsave", ".savx", ".dsv", ".sgd", ".slot"}
+_ss_lock = threading.RLock()
+_ss_bridge_obj = None
+
+
+def _ss_dir():
+    return os.path.dirname(get_launcher_settings_path())
+
+def _ss_log(msg):
+    try:
+        path = os.path.join(_ss_dir(), "cloud_saves.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 200000:
+            os.remove(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass
+
+def _ss_fmt_size(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+# ---------------------------------------------------------------- local config (per device)
+def _ss_cfg_path():
+    return os.path.join(_ss_dir(), "cloud_saves.json")
+
+def _ss_cfg_load():
+    data = {}
+    try:
+        with open(_ss_cfg_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        pass
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("games"), dict):
+        data["games"] = {}
+    if not isinstance(data.get("enabled"), bool):
+        data["enabled"] = True
+    return data
+
+def _ss_cfg_save(data):
+    path = _ss_cfg_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+def _ss_game(key):
+    with _ss_lock:
+        g = _ss_cfg_load()["games"].get(key)
+        return dict(g) if isinstance(g, dict) else {}
+
+def _ss_update_game(key, **fields):
+    with _ss_lock:
+        data = _ss_cfg_load()
+        g = data["games"].setdefault(key, {})
+        g.update(fields)
+        _ss_cfg_save(data)
+
+def _ss_enabled():
+    with _ss_lock:
+        return _ss_cfg_load()["enabled"]
+
+def _ss_set_enabled(on):
+    with _ss_lock:
+        data = _ss_cfg_load()
+        data["enabled"] = bool(on)
+        _ss_cfg_save(data)
+
+def _ss_ready():
+    try:
+        return cloud_configured() and load_account() is not None and _ss_enabled()
+    except Exception:
+        return False
+
+def _ss_is_own_sync_game(name):
+    """Five Nights at NCZ AE / 2 already have their own Save Data / Sync Data buttons."""
+    return str(name).strip().lower() in (AE_GAME_NAME.lower(), NCZ2_GAME_NAME.lower())
+
+# ---------------------------------------------------------------- cloud access (Realtime Database, same account as the rest)
+def _ss_node_url(uid, node, token):
+    base = FIREBASE_DB_URL.strip().rstrip("/")
+    return (f"{base}/users/{urllib.parse.quote(uid, safe='')}/games/{urllib.parse.quote(node, safe='')}.json"
+            f"?auth={urllib.parse.quote(token, safe='')}")
+
+def _ss_get(node, timeout=8):
+    token, uid = get_id_token()
+    return _http_json(_ss_node_url(uid, node, token), timeout=timeout)
+
+def _ss_put(node, payload, timeout=90):
+    token, uid = get_id_token()
+    _http_json(_ss_node_url(uid, node, token) + "&print=silent", "PUT", payload, timeout=timeout)
+
+def _ss_meta_get(key, timeout=8):
+    d = _ss_get(_SS_PREFIX + key + "_meta", timeout)
+    return d if isinstance(d, dict) else None
+
+# ---------------------------------------------------------------- where the save folders are (per platform)
+def _ss_documents():
+    try:
+        from PyQt6.QtCore import QStandardPaths
+        p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        if p:
+            return p
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Documents")
+
+def _ss_prefix_user_dir(prefix):
+    users = os.path.join(prefix, "drive_c", "users")
+    try:
+        names = [n for n in sorted(os.listdir(users)) if n.lower() not in ("public", "all users", "default")]
+    except OSError:
+        return None
+    if not names:
+        return None
+    return os.path.join(users, "steamuser" if "steamuser" in names else names[0])
+
+def _ss_anchor_dirs(prefix, game_dir):
+    """anchor name -> folder on THIS device. The same anchor names are stored in the cloud, so a Windows PC and a
+    Linux PC (Wine/Proton) both find the same save folder."""
+    home = os.path.expanduser("~")
+    a = {"gamedir": game_dir}
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        a.update(appdata=os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming"),
+                 localappdata=local, locallow=os.path.join(os.path.dirname(local), "LocalLow"),
+                 documents=_ss_documents(), savedgames=os.path.join(home, "Saved Games"))
+    elif prefix:
+        user = _ss_prefix_user_dir(prefix)
+        if user:
+            docs = os.path.join(user, "Documents")
+            if not os.path.isdir(docs) and os.path.isdir(os.path.join(user, "My Documents")):
+                docs = os.path.join(user, "My Documents")
+            a.update(appdata=os.path.join(user, "AppData", "Roaming"), localappdata=os.path.join(user, "AppData", "Local"),
+                     locallow=os.path.join(user, "AppData", "LocalLow"), documents=docs,
+                     savedgames=os.path.join(user, "Saved Games"))
+    else:
+        a.update(xdg_config=os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"),
+                 xdg_data=os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share"))
+    if not sys.platform.startswith("win"):
+        a["home"] = home                       # manual folders only; never scanned
+    return a
+
+def _ss_resolve(paths, anchors):
+    """[{anchor, rel, file}] -> [(absolute path or None, is_file)]; the index stays the same as in the list."""
+    out = []
+    for p in paths or []:
+        if not isinstance(p, dict):
+            out.append((None, False))
+            continue
+        base = anchors.get(p.get("anchor"))
+        parts = [x for x in str(p.get("rel", "")).split("/") if x and x != ".."]
+        root = os.path.join(base, *parts) if base and (parts or not p.get("file")) else None
+        out.append((root, bool(p.get("file"))))
+    return out
+
+def _ss_to_anchor(path, anchors):
+    """The anchor that contains path (the deepest one wins) -> (anchor, 'rel/path'), or None."""
+    path = os.path.normcase(os.path.abspath(path))
+    best = None
+    for name, base in anchors.items():
+        if not base:
+            continue
+        b = os.path.normcase(os.path.abspath(base))
+        if path == b or path.startswith(b + os.sep):
+            if best is None or len(b) > len(best[1]):
+                best = (name, b)
+    if best is None:
+        return None
+    rel = os.path.relpath(path, best[1])
+    return best[0], ("" if rel == "." else rel.replace(os.sep, "/"))
+
+def _ss_prefix_from_launch(args, env, exe_hint=None):
+    """The Wine/Proton prefix a launch uses, read from the environment the launcher gave the process."""
+    if sys.platform.startswith("win"):
+        return None
+    env = env or {}
+    if env.get("STEAM_COMPAT_DATA_PATH"):
+        return os.path.join(env["STEAM_COMPAT_DATA_PATH"], "pfx")
+    if env.get("WINEPREFIX"):
+        return env["WINEPREFIX"]
+    if any(isinstance(x, str) and x.lower().endswith(".exe") for x in (args or [])):
+        return _wine_prefix()
+    return None
+
+# ---------------------------------------------------------------- files -> zip -> files
+def _ss_collect(entries):
+    """[(root, is_file)] -> sorted [(arcname, abs path)]; arcname starts with the entry's index."""
+    out = []
+    for i, (root, isfile) in enumerate(entries):
+        if not root:
+            continue
+        if isfile:
+            if os.path.isfile(root):
+                out.append((f"{i}/{os.path.basename(root)}", root))
+            continue
+        if not os.path.isdir(root):
+            continue
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d.lower() not in _SS_JUNK_DIRS and not os.path.islink(os.path.join(dp, d)))
+            for fn in sorted(fns):
+                if os.path.splitext(fn)[1].lower() in _SS_JUNK_EXT:
+                    continue
+                p = os.path.join(dp, fn)
+                if os.path.islink(p):
+                    continue
+                out.append((f"{i}/" + os.path.relpath(p, root).replace(os.sep, "/"), p))
+            if len(out) > _SS_MAX_FILES:
+                raise CloudError("Too many files to keep in the cloud. Pick a smaller save folder.", "TOO_BIG")
+    out.sort()
+    return out
+
+def _ss_digest(files):
+    h = _ss_hash.sha256()
+    for arc, p in files:
+        fh = _ss_hash.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                fh.update(chunk)
+        h.update(arc.encode("utf-8", "replace") + b"\0" + fh.digest())
+    return h.hexdigest()
+
+def _ss_pack(files):
+    buf = _ss_io.BytesIO()
+    raw = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for arc, p in files:
+            st = os.stat(p)
+            raw += st.st_size
+            if raw > _SS_MAX_RAW:
+                raise CloudError("These saves are too big to keep in the cloud.", "TOO_BIG")
+            zi = zipfile.ZipInfo(arc, date_time=time.localtime(max(st.st_mtime, 315619200))[:6])
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            with open(p, "rb") as f:
+                z.writestr(zi, f.read())
+    data = buf.getvalue()
+    if len(data) > _SS_MAX_ZIP:
+        raise CloudError(f"These saves are too big to keep in the cloud ({len(data) // 1024} KB zipped, "
+                         f"limit {_SS_MAX_ZIP // 1024} KB).", "TOO_BIG")
+    return data, raw
+
+def _ss_unpack(data, entries):
+    """Writes the zip's files into the entries' folders. Returns how many files were written."""
+    written = 0
+    with zipfile.ZipFile(_ss_io.BytesIO(data)) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            head, _, rel = info.filename.partition("/")
+            try:
+                idx = int(head)
+            except ValueError:
+                continue
+            if idx < 0 or idx >= len(entries) or not entries[idx][0]:
+                continue
+            root, isfile = entries[idx]
+            parts = [x for x in rel.split("/") if x]
+            if not parts or any(x in ("..", ".") or "\\" in x or ":" in x for x in parts):
+                continue
+            if isfile:
+                if len(parts) != 1:
+                    continue
+                target = root
+            else:
+                target = os.path.join(root, *parts)
+                base = os.path.realpath(root)
+                if not os.path.realpath(target).startswith(base + os.sep):
+                    continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            tmp = target + ".ncz-tmp"
+            with open(tmp, "wb") as f:
+                f.write(z.read(info))
+            os.replace(tmp, target)
+            try:
+                ts = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                os.utime(target, (ts, ts))
+            except Exception:
+                pass
+            written += 1
+    return written
+
+def _ss_backup_bytes(key, data, label):
+    d = os.path.join(_ss_dir(), "save_backups", key)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{label}.zip"), "wb") as f:
+        f.write(data)
+    old = sorted(os.listdir(d))
+    for n in old[:-5]:
+        try:
+            os.remove(os.path.join(d, n))
+        except OSError:
+            pass
+
+def _ss_backup_local(key, files):
+    if files:
+        try:
+            _ss_backup_bytes(key, _ss_pack(files)[0], "device")
+        except Exception as e:
+            _ss_log(f"{key}: couldn't back up local saves: {e}")
+
+def _ss_decide(local_digest, has_local, last_sha, cloud_sha):
+    """What to do with this PC's saves and the cloud copy: upload / download / in_sync / conflict / none."""
+    if not cloud_sha:
+        return "upload" if has_local else "none"
+    if has_local and local_digest == cloud_sha:
+        return "in_sync"
+    if not has_local:
+        return "download"
+    if last_sha and local_digest == last_sha:
+        return "download"          # this PC didn't change anything since the last sync, the cloud did
+    if last_sha and cloud_sha == last_sha:
+        return "upload"            # the cloud didn't change, this PC did
+    return "conflict"
+
+# ---------------------------------------------------------------- upload / download (blocking; run in a worker or BusyDialog)
+def _ss_state(key, ctx):
+    g = _ss_game(key)
+    anchors = _ss_anchor_dirs(ctx.get("prefix"), ctx.get("folder"))
+    entries = _ss_resolve(g.get("paths"), anchors)
+    return g, anchors, entries
+
+def _ss_upload(key, name, ctx):
+    g, _anchors, entries = _ss_state(key, ctx)
+    if not g.get("paths"):
+        raise CloudError("No save folder is set for this game yet.", "NO_PATHS")
+    if any(r is None for r, _f in entries):
+        raise CloudError("This device can't see every save folder of this game, so it won't upload "
+                         "(that could erase saves from the cloud).", "PARTIAL")
+    files = _ss_collect(entries)
+    if not files:
+        raise CloudError("No save files found on this device yet - play the game once.", "NOTHING")
+    digest = _ss_digest(files)
+    data, raw = _ss_pack(files)
+    _ss_put(_SS_PREFIX + key, {"zip_b64": base64.b64encode(data).decode("ascii")})
+    _ss_put(_SS_PREFIX + key + "_meta", {
+        "sha256": digest, "updated": {".sv": "timestamp"}, "device": platform.system() or "Unknown",
+        "device_id": str(_pt_load().get("device", "")), "files": len(files), "size": raw, "title": name,
+        "paths": [{"anchor": str(p.get("anchor", "")), "rel": str(p.get("rel", "")), "file": bool(p.get("file"))}
+                  for p in g["paths"]], "fmt": 2}, timeout=30)
+    _ss_update_game(key, last_sha=digest, last_sync=int(time.time() * 1000), last_error="")
+    _ss_log(f"{name}: uploaded {len(files)} files ({len(data) // 1024} KB zipped)")
+    return len(files)
+
+def _ss_download(key, name, ctx, meta=None):
+    meta = meta or _ss_meta_get(key)
+    if not meta:
+        raise CloudError("There's nothing in the cloud for this game yet.", "NOTHING")
+    node = _ss_get(_SS_PREFIX + key, timeout=60)
+    b64 = node.get("zip_b64") if isinstance(node, dict) else None
+    if not b64:
+        raise CloudError("The cloud copy has no data.", "BAD_REPLY")
+    data = base64.b64decode(b64)
+    g, anchors, _e = _ss_state(key, ctx)
+    paths = g.get("paths") or meta.get("paths") or []
+    if isinstance(paths, dict):
+        paths = [paths[k] for k in sorted(paths, key=lambda x: int(x) if str(x).isdigit() else 0)]
+    entries = _ss_resolve(paths, anchors)
+    if not any(r for r, _f in entries):
+        raise CloudError("None of this game's save folders exist on this device.", "NO_TARGET")
+    _ss_backup_local(key, _ss_collect(entries))
+    written = _ss_unpack(data, entries)
+    fields = {"last_sha": meta.get("sha256", ""), "last_sync": int(time.time() * 1000), "last_error": ""}
+    if not g.get("paths"):
+        fields.update(paths=paths, sync=True, title=name)
+    _ss_update_game(key, **fields)
+    _ss_log(f"{name}: restored {written} files from the cloud")
+    return written
+
+def _ss_backup_cloud(key):
+    try:
+        node = _ss_get(_SS_PREFIX + key, timeout=60)
+        if isinstance(node, dict) and node.get("zip_b64"):
+            _ss_backup_bytes(key, base64.b64decode(node["zip_b64"]), "cloud")
+    except Exception as e:
+        _ss_log(f"{key}: couldn't back up the cloud copy: {e}")
+
+# ---------------------------------------------------------------- finding the save folders of a game
+def _ss_save_entry(parts, ext):
+    """For files inside the game's own folder: the save-looking folder (or the file itself), else None."""
+    dirs = parts[:-1]
+    for i in range(len(dirs) - 1, -1, -1):
+        if _SS_SAVEY.search(dirs[i]):
+            return tuple(parts[:i + 1]), False
+    if ext in _SS_SAVE_EXT:
+        return (tuple(dirs), False) if dirs else (tuple(parts), True)
+    if not dirs and _SS_SAVEY.search(parts[-1]):
+        return tuple(parts), True
+    return None
+
+def _ss_detect(name, anchors, t0):
+    """Folders that got new/changed files since t0 (the moment the game started), best guesses first."""
+    deadline = time.time() + 20
+    visited = 0
+    found = {}
+    for anchor, root in anchors.items():
+        if anchor == "home" or not root or not os.path.isdir(root):
+            continue
+        for dp, dns, fns in os.walk(root):
+            if time.time() > deadline or visited > 150000:
+                break
+            rel_dir = os.path.relpath(dp, root)
+            pdir = [] if rel_dir == "." else rel_dir.split(os.sep)
+            dns[:] = [d for d in dns if d.lower() not in _SS_JUNK_DIRS
+                      and not (not pdir and d.lower() in _SS_SKIP_TOP)
+                      and len(pdir) < 7 and not os.path.islink(os.path.join(dp, d))]
+            for fn in fns:
+                visited += 1
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in _SS_JUNK_EXT:
+                    continue
+                p = os.path.join(dp, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if st.st_mtime < t0 - 2 or st.st_size > 100 * 1024 * 1024:
+                    continue
+                parts = pdir + [fn]
+                if anchor == "gamedir":
+                    hit = _ss_save_entry(parts, ext)
+                    if not hit:
+                        continue
+                    entry, isfile = hit
+                else:
+                    depth = 2 if (anchor == "locallow" or (anchor == "documents" and parts[0].lower() in ("my games", "saved games"))) else 1
+                    entry, isfile = (tuple(parts), True) if len(parts) <= depth else (tuple(parts[:depth]), False)
+                k = (anchor, entry, isfile)
+                found[k] = max(found.get(k, 0), st.st_mtime)
+    tokens = [t for t in re.findall(r"[a-z0-9]+", str(name).lower()) if len(t) >= 4]
+    cands = []
+    for (anchor, entry, isfile), newest in found.items():
+        base = anchors[anchor]
+        full = os.path.join(base, *entry)
+        try:
+            files = _ss_collect([(full, isfile)])
+            raw = sum(os.path.getsize(p) for _a, p in files)
+        except Exception:
+            continue
+        if not files or raw > _SS_MAX_RAW:
+            continue
+        low = "/".join(entry).lower()
+        cands.append({"anchor": anchor, "rel": "/".join(entry), "file": isfile, "count": len(files), "size": raw,
+                      "newest": newest, "path": full, "pre": any(t in low for t in tokens) or "save" in low})
+    cands.sort(key=lambda c: (not c["pre"], -c["newest"]))
+    if cands and not any(c["pre"] for c in cands) and len(cands) == 1:
+        cands[0]["pre"] = True
+    return cands[:12]
+
+# ---------------------------------------------------------------- the save folder = the first NEW folder in AppData
+# Before a game's very first launch the folder names directly inside AppData\\Roaming, Local and LocalLow are noted.
+# When the game closes, the first folder that wasn't there before (the earliest created one) is taken as its save folder.
+_SS_APPDATA_ANCHORS = ("appdata", "localappdata", "locallow")
+
+def _ss_appdata_snapshot(anchors):
+    """{(anchor, folder name)} for every folder directly inside the AppData folders right now."""
+    snap = set()
+    for anchor in _SS_APPDATA_ANCHORS:
+        root = anchors.get(anchor)
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            with os.scandir(root) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        snap.add((anchor, e.name))
+        except OSError:
+            pass
+    return snap
+
+def _ss_first_new_folder(anchors, snap):
+    """The earliest-created folder inside AppData that isn't in the snapshot (and holds real files), as a path entry
+    {anchor, rel, file, ...}, or None."""
+    best = None
+    for anchor in _SS_APPDATA_ANCHORS:
+        root = anchors.get(anchor)
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            with os.scandir(root) as it:
+                children = list(it)
+        except OSError:
+            continue
+        for e in children:
+            try:
+                if not e.is_dir(follow_symlinks=False) or (anchor, e.name) in snap:
+                    continue
+                low = e.name.lower()
+                if low in _SS_SKIP_TOP or low in _SS_JUNK_DIRS:
+                    continue
+                st = e.stat(follow_symlinks=False)
+                files = _ss_collect([(e.path, False)])
+                raw = sum(os.path.getsize(p) for _a, p in files)
+            except Exception:
+                continue
+            if not files or raw > _SS_MAX_RAW:
+                continue
+            born = getattr(st, "st_birthtime", None) or st.st_ctime
+            if best is None or born < best[0]:
+                best = (born, {"anchor": anchor, "rel": e.name, "file": False, "count": len(files), "size": raw,
+                               "path": e.path})
+    return best[1] if best else None
+
+# ---------------------------------------------------------------- GUI-thread helper (dialogs must not run on a worker thread)
+def _ss_bridge():
+    global _ss_bridge_obj
+    if _ss_bridge_obj is None:
+        from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+
+        class _Bridge(QObject):
+            call = pyqtSignal(object)
+
+            def __init__(self):
+                super().__init__()
+                self.call.connect(self._run)
+
+            @pyqtSlot(object)
+            def _run(self, fn):
+                try:
+                    fn()
+                except Exception as e:
+                    _ss_log(f"gui callback failed: {e!r}")
+        _ss_bridge_obj = _Bridge()
+    return _ss_bridge_obj
+
+def _ss_gui(fn):
+    if _ss_bridge_obj is not None:
+        _ss_bridge_obj.call.emit(fn)
+    else:
+        _ss_log("couldn't show a cloud-saves window (the launcher window isn't ready)")
+
+def _ss_on_gui_thread():
+    try:
+        from PyQt6.QtCore import QThread
+        app = QApplication.instance()
+        return app is not None and QThread.currentThread() is app.thread()
+    except Exception:
+        return False
+
+def _ss_parent():
+    try:
+        return QApplication.activeWindow()
+    except Exception:
+        return None
+
+def _ss_conflict_box(name, meta, parent):
+    """True = use the cloud copy, False = keep this device's copy."""
+    box = QMessageBox(parent)
+    box.setWindowTitle("Cloud saves")
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText(f"Your {name} saves are different on this device and in the cloud.")
+    box.setInformativeText(
+        f"Cloud copy: {format_cloud_time(meta.get('updated'))} from {meta.get('device', 'another device')}.\n\n"
+        "Pick the one to keep. The other one is backed up first (save_backups folder) and then replaced.")
+    cloud_btn = box.addButton("Use the cloud saves", QMessageBox.ButtonRole.AcceptRole)
+    mine_btn = box.addButton("Keep this device's saves", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(mine_btn)
+    box.exec()
+    return box.clickedButton() is cloud_btn
+
+# ---------------------------------------------------------------- before the game starts
+def _ss_pre_launch(ctx):
+    key, name = ctx["key"], ctx["name"]
+    g = _ss_game(key)
+    try:
+        meta = _ss_meta_get(key, timeout=5)
+    except CloudError as e:
+        _ss_log(f"{name}: skipped the pre-launch check ({e})")
+        return
+    if not meta:
+        return
+    paths = g.get("paths") or meta.get("paths")
+    if isinstance(paths, dict):
+        paths = [paths[k] for k in sorted(paths, key=lambda x: int(x) if str(x).isdigit() else 0)]
+    if not paths:
+        return
+    anchors = _ss_anchor_dirs(ctx.get("prefix"), ctx.get("folder"))
+    entries = _ss_resolve(paths, anchors)
+    if not any(r for r, _f in entries):
+        return
+    files = _ss_collect(entries)
+    digest = _ss_digest(files)
+    action = _ss_decide(digest, bool(files), g.get("last_sha"), meta.get("sha256"))
+    parent = _ss_parent()
+    if action == "conflict":
+        action = "download" if _ss_conflict_box(name, meta, parent) else "keep_mine"
+    if action == "download":
+        ok, _n, err = BusyDialog(f"Getting your {name} saves from the cloud...",
+                                 lambda: _ss_download(key, name, ctx, meta), parent).run()
+        if not ok:
+            _ss_log(f"{name}: download failed: {err}")
+            QMessageBox.warning(parent, "Cloud saves", f"Couldn't get your cloud saves, starting with this device's.\n\n{err}")
+    elif action == "keep_mine":
+        _ss_backup_cloud(key)
+        _ss_update_game(key, paths=paths, sync=True, title=name, last_sha=meta.get("sha256", ""))
+    elif action == "in_sync":
+        _ss_update_game(key, last_sha=digest, last_sync=int(time.time() * 1000))
+
+def _ss_launch_ctx(a, k):
+    args = a[0] if a else k.get("args")
+    if not isinstance(args, (list, tuple)) or not any(isinstance(x, str) and os.path.isabs(x) for x in args):
+        return None
+    name = _game_name_for_args(args)
+    if not name:
+        return None
+    name = pretty_game_name(name)
+    if _ss_is_own_sync_game(name) or not _ss_ready():
+        return None
+    key = _pt_key(name)
+    g = _ss_game(key)
+    if g.get("never"):
+        return None
+    ctx = {"name": name, "key": key, "folder": _game_folder_for(args, k.get("cwd")),
+           "prefix": _ss_prefix_from_launch(args, k.get("env")), "t0": time.time()}
+    if ctx["folder"] is None and isinstance(k.get("cwd"), str):
+        ctx["folder"] = k["cwd"]
+    if ctx["prefix"] != g.get("prefix") or ctx["folder"] != g.get("folder"):
+        _ss_update_game(key, prefix=ctx["prefix"], folder=ctx["folder"], title=name)
+    if _ss_on_gui_thread():
+        _ss_bridge()
+        if g.get("sync") is not False:
+            try:
+                _ss_pre_launch(ctx)
+            except Exception as e:
+                _ss_log(f"{name}: pre-launch failed: {e!r}")
+    if not g.get("paths"):
+        try:
+            ctx["snap"] = _ss_appdata_snapshot(_ss_anchor_dirs(ctx["prefix"], ctx["folder"]))
+        except Exception as e:
+            _ss_log(f"{name}: couldn't note the AppData folders: {e!r}")
+    ctx["t0"] = time.time()
+    return ctx
+
+# ---------------------------------------------------------------- after the game closes
+def _ss_prompt_detect(ctx, cands):
+    """GUI thread: offer the folders that changed while playing."""
+    from PyQt6.QtWidgets import QListWidget as _LW, QListWidgetItem as _LI
+    key, name = ctx["key"], ctx["name"]
+    dlg = QDialog(_ss_parent())
+    dlg.setWindowTitle("Cloud saves")
+    dlg.resize(600, 380)
+    lay = QVBoxLayout(dlg)
+    lbl = QLabel(f"Possible save folders for {name}. Tick the ones that hold your saves and they will be kept in your cloud "
+                 "and restored on your other devices. These folders just changed while you played.")
+    lbl.setWordWrap(True)
+    lay.addWidget(lbl)
+    lst = _LW()
+    for c in cands:
+        it = _LI(f"{c['path']}   ({c['count']} files, {_ss_fmt_size(c['size'])})")
+        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        it.setCheckState(Qt.CheckState.Checked if c["pre"] else Qt.CheckState.Unchecked)
+        lst.addItem(it)
+    lay.addWidget(lst, 1)
+    row = QHBoxLayout()
+    never = QPushButton("Never for this game")
+    later = QPushButton("Not now")
+    ok = QPushButton("Sync selected")
+    ok.setObjectName("Primary")
+    ok.setDefault(True)
+    row.addWidget(never)
+    row.addStretch()
+    row.addWidget(later)
+    row.addWidget(ok)
+    lay.addLayout(row)
+    choice = {"v": "later"}
+    never.clicked.connect(lambda: (choice.update(v="never"), dlg.accept()))
+    later.clicked.connect(dlg.reject)
+    ok.clicked.connect(lambda: (choice.update(v="sync"), dlg.accept()))
+    dlg.exec()
+    if choice["v"] == "never":
+        _ss_update_game(key, never=True, title=name)
+        return
+    if choice["v"] != "sync":
+        _ss_update_game(key, asked=int(_ss_game(key).get("asked", 0)) + 1)
+        return
+    picked = [c for i, c in enumerate(cands) if lst.item(i).checkState() == Qt.CheckState.Checked]
+    if not picked:
+        return
+    _ss_update_game(key, title=name, sync=True, last_sha="",
+                    paths=[{"anchor": c["anchor"], "rel": c["rel"], "file": c["file"]} for c in picked])
+    ok_, _n, err = BusyDialog(f"Saving your {name} saves to the cloud...", lambda: _ss_upload(key, name, ctx), _ss_parent()).run()
+    if ok_:
+        QMessageBox.information(_ss_parent(), "Cloud saves", f"Your {name} saves are now kept in the cloud.")
+    else:
+        _ss_update_game(key, last_error=err)
+        QMessageBox.warning(_ss_parent(), "Cloud saves", f"Couldn't upload yet:\n\n{err}")
+
+def _ss_prompt_conflict_after(ctx, meta):
+    key, name = ctx["key"], ctx["name"]
+    parent = _ss_parent()
+    if _ss_conflict_box(name, meta, parent):
+        fn = lambda: _ss_download(key, name, ctx, meta)
+        msg = f"Getting your {name} saves from the cloud..."
+    else:
+        def fn():
+            _ss_backup_cloud(key)
+            return _ss_upload(key, name, ctx)
+        msg = f"Saving your {name} saves to the cloud..."
+    ok, _n, err = BusyDialog(msg, fn, parent).run()
+    if not ok:
+        _ss_update_game(key, last_error=err)
+        QMessageBox.warning(parent, "Cloud saves", err)
+
+def _ss_after_exit(ctx, duration):
+    key, name = ctx["key"], ctx["name"]
+    if not _ss_ready():
+        return
+    g = _ss_game(key)
+    if g.get("never") or g.get("sync") is False:
+        return
+    anchors = _ss_anchor_dirs(ctx.get("prefix"), ctx.get("folder"))
+    if not g.get("paths"):
+        if duration < _SS_MIN_SESSION or int(g.get("asked", 0)) >= 3:
+            return
+        if ctx.get("snap") is not None:
+            new = _ss_first_new_folder(anchors, ctx["snap"])
+            if new:
+                _ss_log(f"{name}: first new AppData folder is {new['anchor']}/{new['rel']} "
+                        f"({new['count']} files, {_ss_fmt_size(new['size'])})")
+                _ss_update_game(key, title=name, sync=True, never=False, last_sha="",
+                                paths=[{"anchor": new["anchor"], "rel": new["rel"], "file": False}])
+                try:
+                    _ss_upload(key, name, ctx)
+                except Exception as e:
+                    _ss_update_game(key, last_error=str(e))
+                    _ss_log(f"{name}: first upload failed: {e}")
+                return
+        cands = _ss_detect(name, anchors, ctx["t0"])
+        _ss_log(f"{name}: {len(cands)} possible save folders after {int(duration)}s")
+        # existing games (their AppData folder was already there): take the AppData folder that changed while playing,
+        # automatically when it's clear-cut (one name-matching folder, or the only one); otherwise ask
+        appd = [c for c in cands if c["anchor"] in _SS_APPDATA_ANCHORS]
+        likely = [c for c in appd if c["pre"]]
+        pick = likely[0] if len(likely) == 1 else (appd[0] if not likely and len(appd) == 1 else None)
+        if pick:
+            _ss_log(f"{name}: using changed AppData folder {pick['anchor']}/{pick['rel']}")
+            _ss_update_game(key, title=name, sync=True, never=False, last_sha="",
+                            paths=[{"anchor": pick["anchor"], "rel": pick["rel"], "file": pick["file"]}])
+            try:
+                _ss_upload(key, name, ctx)
+            except Exception as e:
+                _ss_update_game(key, last_error=str(e))
+                _ss_log(f"{name}: first upload failed: {e}")
+            return
+        if cands:
+            _ss_gui(lambda: _ss_prompt_detect(ctx, cands))
+        return
+    entries = _ss_resolve(g["paths"], anchors)
+    if any(r is None for r, _f in entries):
+        return
+    files = _ss_collect(entries)
+    if not files:
+        return
+    digest = _ss_digest(files)
+    if digest == g.get("last_sha"):
+        return
+    try:
+        meta = _ss_meta_get(key, timeout=15)
+    except CloudError as e:
+        _ss_update_game(key, last_error=str(e))
+        _ss_log(f"{name}: couldn't check the cloud after playing: {e}")
+        return
+    action = _ss_decide(digest, True, g.get("last_sha"), (meta or {}).get("sha256"))
+    if action == "in_sync":
+        _ss_update_game(key, last_sha=digest, last_sync=int(time.time() * 1000))
+    elif action == "upload":
+        try:
+            _ss_upload(key, name, ctx)
+        except Exception as e:
+            _ss_update_game(key, last_error=str(e))
+            _ss_log(f"{name}: upload failed: {e}")
+    elif action == "conflict":
+        _ss_gui(lambda: _ss_prompt_conflict_after(ctx, meta))
+
+def _ss_watch(proc, ctx):
+    name = ctx["name"]
+
+    def run():
+        end = time.time() + 15
+        while _running.get(name) is not proc and time.time() < end:
+            time.sleep(0.25)
+        if _running.get(name) is not proc:
+            return                          # never counted as running (a helper, not the game)
+        while _running.get(name) is proc:
+            time.sleep(1.0)
+        time.sleep(1.0)
+        if name in _running:
+            return                          # another copy of the same game is still open
+        try:
+            _ss_after_exit(ctx, time.time() - ctx["t0"])
+        except Exception as e:
+            _ss_log(f"{name}: after-exit sync failed: {e!r}")
+    threading.Thread(target=run, daemon=True).start()
+
+_ss_prev_popen_init = _TrackedPopen.__init__
+
+def _ss_popen_init(self, *a, **k):
+    ctx = None
+    try:
+        ctx = _ss_launch_ctx(a, k)
+    except Exception as e:
+        _ss_log(f"launch hook failed: {e!r}")
+    _ss_prev_popen_init(self, *a, **k)
+    if ctx:
+        try:
+            _ss_watch(self, ctx)
+        except Exception as e:
+            _ss_log(f"couldn't watch the game: {e!r}")
+
+_TrackedPopen.__init__ = _ss_popen_init
+
+# ---------------------------------------------------------------- "Cloud Saves..." in every game's menu
+def _ss_ctx_for(title, exe_fn):
+    """(name, key, ctx) for a game card: where its folder / Wine prefix are on this device."""
+    name = pretty_game_name(title)
+    key = _pt_key(name)
+    try:
+        exe = exe_fn() or ""
+    except Exception:
+        exe = ""
+    g0 = _ss_game(key)
+    ctx = {"name": name, "key": key, "folder": g0.get("folder") or (os.path.dirname(exe) if exe else None),
+           "prefix": g0.get("prefix")}
+    if ctx["prefix"] is None and exe and sys.platform.startswith("linux") and exe.lower().endswith(".exe"):
+        pfx = os.path.join(os.path.dirname(exe) + "_compat_data", "pfx")
+        ctx["prefix"] = pfx if os.path.isdir(pfx) else _wine_prefix()
+    return name, key, ctx
+
+def _ss_menu_save(app, title, exe_fn):
+    """"Save Data": upload this device's saves of the game to the account (same flow as the NCZ games)."""
+    name, key, ctx = _ss_ctx_for(title, exe_fn)
+    g = _ss_game(key)
+    if not g.get("paths"):
+        QMessageBox.information(app, "Save Data",
+                                f"The launcher doesn't know where {name} keeps its saves yet.\n\nPlay the game once (it finds the "
+                                "save folder when you close it), or use Cloud Saves... > Add folder.")
+        return
+    anchors = _ss_anchor_dirs(ctx["prefix"], ctx["folder"])
+    try:
+        has_files = bool(_ss_collect(_ss_resolve(g["paths"], anchors)))
+    except Exception:
+        has_files = True                       # let the upload report the real problem
+    if not has_files:
+        QMessageBox.information(app, "Save Data", f"No save files found for {name} on this device yet.")
+        return
+    if not app.ensure_logged_in():
+        return
+    ok, meta, err = BusyDialog("Checking the cloud...", lambda: _ss_meta_get(key, 15), app).run()
+    if not ok:
+        QMessageBox.warning(app, "Cloud Sync", err)
+        return
+    if meta:
+        if QMessageBox.question(app, "Save Data",
+                                f"The cloud already has data for {name}, saved {format_cloud_time(meta.get('updated'))} "
+                                f"from {meta.get('device', 'another device')}.\n\nOverwrite the cloud copy with this device's data?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+    ok, _n, err = BusyDialog("Uploading to the cloud...", lambda: _ss_upload(key, name, ctx), app).run()
+    if ok:
+        QMessageBox.information(app, "Save Data", f"Your {name} data is saved to the cloud.")
+    else:
+        _ss_update_game(key, last_error=err)
+        QMessageBox.warning(app, "Cloud Sync", err)
+
+def _ss_menu_sync(app, title, exe_fn):
+    """"Sync Data": download the account's saves of the game to this device (same flow as the NCZ games)."""
+    name, key, ctx = _ss_ctx_for(title, exe_fn)
+    if not app.ensure_logged_in():
+        return
+    ok, meta, err = BusyDialog("Fetching your cloud data...", lambda: _ss_meta_get(key, 15), app).run()
+    if not ok:
+        QMessageBox.warning(app, "Cloud Sync", err)
+        return
+    if not meta:
+        QMessageBox.information(app, "Sync Data", f"There's nothing in the cloud for {name} yet.\n\n"
+                                                  "Use Save Data on the device that has your progress first.")
+        return
+    if QMessageBox.question(app, "Sync Data",
+                            f"Replace this device's {name} data with the cloud copy from {format_cloud_time(meta.get('updated'))} "
+                            f"({meta.get('device', 'another device')})?\n\nClose the game first. Your current files are "
+                            "backed up first (save_backups folder).",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+        return
+    ok, n, err = BusyDialog("Getting your saves...", lambda: _ss_download(key, name, ctx, meta), app).run()
+    if ok:
+        QMessageBox.information(app, "Sync Data", f"Your {name} data is now up to date on this device ({n} files).")
+    else:
+        QMessageBox.warning(app, "Sync Data", err)
+
+def _ss_open_dialog(app, title, exe_fn):
+    from PyQt6.QtWidgets import QCheckBox as _CB, QListWidget as _LW, QListWidgetItem as _LI
+    name, key, ctx = _ss_ctx_for(title, exe_fn)
+    dlg = QDialog(app)
+    dlg.setWindowTitle(f"Cloud Saves - {name}")
+    dlg.resize(640, 420)
+    lay = QVBoxLayout(dlg)
+    status = QLabel()
+    status.setWordWrap(True)
+    lay.addWidget(status)
+    lst = _LW()
+    lay.addWidget(lst, 1)
+    hint = QLabel("Nothing listed? Just play the game once: when you close it, the launcher finds the folders that changed "
+                  "and asks which ones to keep in the cloud.")
+    hint.setWordWrap(True)
+    hint.setObjectName("RowDesc")
+    lay.addWidget(hint)
+    sync_cb = _CB("Sync this game's saves")
+    all_cb = _CB("Cloud saves are on for all games")
+    lay.addWidget(sync_cb)
+    lay.addWidget(all_cb)
+    row = QHBoxLayout()
+    b_add, b_rm = QPushButton("Add folder..."), QPushButton("Remove")
+    b_up, b_down, b_close = QPushButton("Upload now"), QPushButton("Download now"), QPushButton("Close")
+    for b in (b_add, b_rm):
+        row.addWidget(b)
+    row.addStretch()
+    for b in (b_up, b_down, b_close):
+        row.addWidget(b)
+    lay.addLayout(row)
+
+    def refresh():
+        g = _ss_game(key)
+        anchors = _ss_anchor_dirs(ctx["prefix"], ctx["folder"])
+        lst.clear()
+        for (root, _f), p in zip(_ss_resolve(g.get("paths"), anchors), g.get("paths") or []):
+            lst.addItem(root if root else f"(not on this device: {p.get('anchor')}/{p.get('rel')})")
+        sync_cb.blockSignals(True)
+        sync_cb.setChecked(g.get("sync") is not False and not g.get("never"))
+        sync_cb.blockSignals(False)
+        all_cb.blockSignals(True)
+        all_cb.setChecked(_ss_enabled())
+        all_cb.blockSignals(False)
+        last = f"Last synced {format_cloud_time(g['last_sync'])}." if g.get("last_sync") else "Not synced yet."
+        err = f"  Last problem: {g['last_error']}" if g.get("last_error") else ""
+        login = "" if load_account() is not None else "  Log in to your account to use cloud saves."
+        status.setText(f"{last}{err}{login}")
+        b_up.setEnabled(bool(g.get("paths")))
+        b_down.setEnabled(True)
+        b_rm.setEnabled(bool(g.get("paths")))
+
+    def need_login():
+        if not cloud_configured() or load_account() is None:
+            QMessageBox.information(dlg, "Cloud saves", "Log in to your account first, then try again.")
+            return True
+        return False
+
+    def add_folder():
+        start = (ctx["folder"] or os.path.expanduser("~"))
+        path = QFileDialog.getExistingDirectory(dlg, "Choose the folder that holds the saves", start)
+        if not path:
+            return
+        hit = _ss_to_anchor(path, _ss_anchor_dirs(ctx["prefix"], ctx["folder"]))
+        if not hit:
+            QMessageBox.information(dlg, "Cloud saves", "Pick a folder inside AppData, Documents, Saved Games, your home "
+                                                       "folder or the game's own folder, so it can be found on your other devices.")
+            return
+        g = _ss_game(key)
+        paths = list(g.get("paths") or []) + [{"anchor": hit[0], "rel": hit[1], "file": False}]
+        _ss_update_game(key, paths=paths, sync=True, never=False, title=name, last_sha="")
+        refresh()
+
+    def remove_folder():
+        i = lst.currentRow()
+        g = _ss_game(key)
+        paths = list(g.get("paths") or [])
+        if 0 <= i < len(paths):
+            del paths[i]
+            _ss_update_game(key, paths=paths, last_sha="")
+            refresh()
+
+    def upload():
+        if need_login():
+            return
+        ok, n, err = BusyDialog("Uploading to the cloud...", lambda: _ss_upload(key, name, ctx), dlg).run()
+        QMessageBox.information(dlg, "Cloud saves", f"Saved {n} files to the cloud.") if ok else QMessageBox.warning(dlg, "Cloud saves", err)
+        refresh()
+
+    def download():
+        if need_login():
+            return
+        ok, meta, err = BusyDialog("Checking the cloud...", lambda: _ss_meta_get(key, 15), dlg).run()
+        if not ok:
+            QMessageBox.warning(dlg, "Cloud saves", err)
+            return
+        if not meta:
+            QMessageBox.information(dlg, "Cloud saves", "There's nothing in the cloud for this game yet.")
+            return
+        if QMessageBox.question(dlg, "Cloud saves",
+                                f"Replace this device's saves with the cloud copy from {format_cloud_time(meta.get('updated'))} "
+                                f"({meta.get('device', 'another device')})?\n\nClose the game first. Your current files are backed up.",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        ok, n, err = BusyDialog("Getting your saves...", lambda: _ss_download(key, name, ctx, meta), dlg).run()
+        QMessageBox.information(dlg, "Cloud saves", f"Restored {n} files.") if ok else QMessageBox.warning(dlg, "Cloud saves", err)
+        refresh()
+
+    b_add.clicked.connect(add_folder)
+    b_rm.clicked.connect(remove_folder)
+    b_up.clicked.connect(upload)
+    b_down.clicked.connect(download)
+    b_close.clicked.connect(dlg.accept)
+    sync_cb.toggled.connect(lambda on: _ss_update_game(key, sync=bool(on), never=False if on else _ss_game(key).get("never", False)))
+    all_cb.toggled.connect(lambda on: _ss_set_enabled(bool(on)))
+    refresh()
+    dlg.exec()
+
+_ss_prev_app_init = AdaptiveApp.__init__
+
+def _ss_app_init(self):
+    _ss_prev_app_init(self)
+    try:
+        _ss_bridge()
+    except Exception as e:
+        _ss_log(f"couldn't create the GUI bridge: {e!r}")
+
+AdaptiveApp.__init__ = _ss_app_init
+
+_ss_prev_add_shortcut = _add_shortcut_action
+
+def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
+    _ss_prev_add_shortcut(app, card, title, exe_fn, tool_fn, cover, key)
+    try:
+        if _ss_is_own_sync_game(title):
+            return
+        more = card.findChild(QPushButton, "MoreButton") if card is not None else None
+        if more and more.menu():
+            m = more.menu()
+            m.setToolTipsVisible(True)
+            m.addSeparator()
+            a_save = m.addAction("Save Data")
+            a_sync = m.addAction("Sync Data")
+            a_save.setToolTip("Upload this device's saves to your account")
+            a_sync.setToolTip("Download your account's saves to this device")
+            a_save.triggered.connect(lambda _c=False, t=title, f=exe_fn: _ss_menu_save(app, t, f))
+            a_sync.triggered.connect(lambda _c=False, t=title, f=exe_fn: _ss_menu_sync(app, t, f))
+            a_more = m.addAction("Cloud Saves...")
+            a_more.setToolTip("Choose which folders are kept in the cloud, and turn syncing on or off")
+            a_more.triggered.connect(lambda _c=False, t=title, f=exe_fn: _ss_open_dialog(app, t, f))
+    except Exception as e:
+        _ss_log(f"couldn't add the Cloud Saves menu entry: {e!r}")
 
 
 if __name__ == "__main__":
