@@ -2839,6 +2839,7 @@ class SettingsPage(QWidget):
         acc_name.setObjectName("RowTitle")
         acc_desc = QLabel("Pick the highlight color used across the launcher")
         acc_desc.setObjectName("RowDesc")
+        self.accent_desc = acc_desc
         acc_text.addWidget(acc_name)
         acc_text.addWidget(acc_desc)
         self.accent_btn = QPushButton("Choose...")
@@ -2846,6 +2847,7 @@ class SettingsPage(QWidget):
         self.accent_btn.clicked.connect(self.on_accent_pick)
         accent_reset = QPushButton("Reset")
         accent_reset.setFixedWidth(70)
+        self.accent_reset_btn = accent_reset
         accent_reset.clicked.connect(lambda: self._set_accent_setting("#a666ff"))
         acc_row.addLayout(acc_text, 1)
         acc_row.addWidget(self.accent_btn)
@@ -3403,6 +3405,8 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
 
     def on_accent_pick(self):
+        if _UI_STYLE_AT_START == "new":
+            return                                   # Sunset has a fixed orange accent
         from PyQt6.QtWidgets import QColorDialog
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
         chosen = QColorDialog.getColor(current, self, "Pick an accent color")
@@ -3410,6 +3414,8 @@ class SettingsPage(QWidget):
             self._set_accent_setting(chosen.name())
 
     def _set_accent_setting(self, color):
+        if _UI_STYLE_AT_START == "new":
+            return                                   # keep the saved Classic colour untouched
         settings = load_launcher_settings()
         settings["accent_color"] = color
         save_launcher_settings(settings)
@@ -4601,7 +4607,66 @@ def rounded_cover_pixmap(path, width, height, radius, blur=False):
     return out
 
 # ---- NSFW covers: blurred until the user confirms once, then every cover is revealed for good
-NSFW_DESCRIPTOR_IDS = {3, 4}    # Steam content descriptors: 3 = Adult Only Sexual Content, 4 = Frequent Nudity or Sexual Content
+NSFW_DESCRIPTOR_IDS = {3, 4}    # Steam content descriptors: 3 = Adult Only Sexual Content, 4 = Frequent Nudity or Sexual Content (only the fallback)
+
+# Preferred check: look at the cover picture itself with NudeNet (pip install nudenet) and blur it only when it really shows
+# exposed nudity. Without NudeNet the launcher falls back to Steam's strictest content descriptors above.
+# class -> minimum confidence. Buttocks / anus are the ones anime and cartoon art trips most often, so they need more.
+NSFW_CLASS_SCORES = {"FEMALE_GENITALIA_EXPOSED": 0.45, "MALE_GENITALIA_EXPOSED": 0.45, "FEMALE_BREAST_EXPOSED": 0.55,
+                     "BUTTOCKS_EXPOSED": 0.65, "ANUS_EXPOSED": 0.65}
+NSFW_DEBUG = True       # writes what the detector saw for each new cover to store_cache/nsfw_log.txt, so thresholds can be tuned
+_nsfw_log_lock = threading.Lock()
+
+def _nsfw_log(text):
+    if not NSFW_DEBUG:
+        return
+    try:
+        path = os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "nsfw_log.txt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _nsfw_log_lock:
+            if os.path.exists(path) and os.path.getsize(path) > 300000:
+                os.remove(path)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+    except Exception:
+        pass
+_nsfw_det_lock = threading.RLock()
+_nsfw_det = {"obj": None, "tried": False}
+
+def _get_nsfw_detector():
+    with _nsfw_det_lock:
+        if not _nsfw_det["tried"]:
+            _nsfw_det["tried"] = True
+            try:
+                from nudenet import NudeDetector
+                _nsfw_det["obj"] = NudeDetector()
+            except Exception:
+                _nsfw_det["obj"] = None
+        return _nsfw_det["obj"]
+
+def cover_has_nudity(path, label=""):
+    """True / False from the picture itself, None when NudeNet isn't available or the image can't be read."""
+    det = _get_nsfw_detector()
+    if det is None:
+        return None
+    try:
+        with _nsfw_det_lock:
+            found = det.detect(path)
+    except Exception:
+        return None
+    hits = [(d.get("class"), round(float(d.get("score", 0)), 2)) for d in found or [] if d.get("class") in NSFW_CLASS_SCORES]
+    result = any(float(d.get("score", 0)) >= NSFW_CLASS_SCORES.get(d.get("class"), 2) for d in found or [])
+    _nsfw_log(f"image [{label}] {os.path.basename(path)}: nudity={result} detections={hits or 'none'}")
+    return result
+
+def _nsfw_descriptor_flag(appid, quick=False):
+    """Steam's strictest content descriptors (adult only / frequent nudity). True / False, None if Steam didn't answer."""
+    entry = (_nsfw_fetch(appid, tries=1 if quick else 4) or {}).get(str(appid)) or {}
+    if not entry.get("success"):
+        return None
+    ids = ((entry.get("data") or {}).get("content_descriptors") or {}).get("ids") or []
+    _nsfw_log(f"steam [{appid}]: content descriptors={sorted(ids)}")
+    return bool(set(ids) & NSFW_DESCRIPTOR_IDS)
 _nsfw_lock = threading.Lock()
 _nsfw_cache = None              # {appid(str): bool}
 _nsfw_revealed_flag = None
@@ -4611,7 +4676,8 @@ class _NsfwBus(QObject):
 nsfw_bus = _NsfwBus()
 
 def _nsfw_cache_path():
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "nsfw.json")
+    name = "cover_nsfw3.json" if _get_nsfw_detector() is not None else "nsfw.json"    # picture check vs descriptor fallback
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", name)
 
 def nsfw_cached(appid):
     """True / False if we already know whether this Steam game is NSFW, None if we don't."""
@@ -4626,19 +4692,61 @@ def nsfw_cached(appid):
                 _nsfw_cache = {}
         return _nsfw_cache.get(str(appid))
 
-def check_app_nsfw(appid):
-    """Asks Steam for the game's content descriptors (cached on disk). None when Steam gave no answer."""
+_nsfw_slot_lock = threading.Lock()
+_nsfw_next_slot = [0.0]
+
+def _nsfw_fetch(appid, tries=4):
+    """appdetails call with spacing between requests and retries: Steam answers 429 when covers ask all at once, which used
+    to be read as 'not NSFW' so nothing got blurred."""
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
+    headers = {"Cookie": "birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1"}
+    last = None
+    for attempt in range(tries):
+        with _nsfw_slot_lock:                       # reserve a start time, then call outside the lock
+            now = time.time()
+            start = max(now, _nsfw_next_slot[0])
+            _nsfw_next_slot[0] = start + 0.25
+        if start > now:
+            time.sleep(start - now)
+        delay = 1.0
+        try:
+            return json.loads(_http_get(url, headers=headers).decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 429:
+                delay = 5.0                         # rate limited: back off properly
+                with _nsfw_slot_lock:
+                    _nsfw_next_slot[0] = max(_nsfw_next_slot[0], time.time() + delay)
+        except Exception as e:
+            last = e
+        time.sleep(delay * (attempt + 1) if delay < 5 else delay)
+    raise last
+
+def check_app_nsfw(appid, path=None, title=""):
+    """Is this game's cover NSFW? Looks at the cover picture when NudeNet is installed (needs the image path),
+    otherwise asks Steam for the strictest content descriptors. Cached on disk. None when we can't tell yet."""
     known = nsfw_cached(appid)
     if known is not None:
         return known
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
-    data = json.loads(_http_get(url, headers={"Cookie": "birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1"}
-                                ).decode("utf-8", errors="replace"))
-    entry = data.get(str(appid)) or {}
-    if not entry.get("success"):
-        return None
-    ids = ((entry.get("data") or {}).get("content_descriptors") or {}).get("ids") or []
-    flag = bool(set(ids) & NSFW_DESCRIPTOR_IDS)
+    if _get_nsfw_detector() is not None:
+        if not path or not os.path.exists(path):
+            return None
+        flag = cover_has_nudity(path, title or str(appid))
+        if flag is None:
+            return None
+        if not flag:        # the picture detector is weak on anime / stylised art: Steam's strict ratings back it up
+            try:
+                meta = _nsfw_descriptor_flag(appid, quick=True)
+            except Exception as e:
+                _nsfw_log(f"steam [{title or appid}]: lookup failed ({e})")
+                meta = None
+            if meta is None:
+                return False            # Steam unreachable: show it for now, don't cache so it is asked again
+            flag = meta
+    else:
+        flag = _nsfw_descriptor_flag(appid)
+        if flag is None:
+            return None
     with _nsfw_lock:
         _nsfw_cache[str(appid)] = flag
         try:
@@ -4670,6 +4778,15 @@ def confirm_reveal_nsfw(parent):
     _nsfw_revealed_flag = True
     nsfw_bus.revealed.emit()
     return True
+
+def hide_nsfw_again():
+    """Undoes a past 'Reveal': NSFW covers are blurred again."""
+    global _nsfw_revealed_flag
+    settings = load_launcher_settings()
+    settings["nsfw_revealed"] = False
+    save_launcher_settings(settings)
+    _nsfw_revealed_flag = False
+    nsfw_bus.revealed.emit()                        # every cover re-checks whether it should be blurred
 
 def update_reveal_button(cover_label, owner, show):
     """Shows/hides the Reveal button centred on a cover label (created on first use)."""
@@ -4738,7 +4855,7 @@ class CoverLoader(QObject):
         nsfw = None
         if self.CHECK_NSFW and path:
             try:
-                nsfw = check_app_nsfw(appid)
+                nsfw = check_app_nsfw(appid, path, title)
             except Exception:
                 nsfw = None
         with self._lock:
@@ -5304,7 +5421,7 @@ class StoreDetailPage(QWidget):
 
         def work():
             try:
-                return (appid, check_app_nsfw(appid))
+                return (appid, check_app_nsfw(appid, self._cover_path))
             except Exception:
                 return (appid, None)
 
@@ -12952,7 +13069,7 @@ class FriendsPage(QWidget):
     def _rebuild_rows(self):
         self._clear_rows()
         if not self.friends:
-            empty = QLabel("No friends yet. Share your code or enter someone else's above.")
+            empty = QLabel("No friends yet. Share your code or enter someone else's to add them.")
             empty.setObjectName("RowDesc")
             self.rows_layout.insertWidget(0, empty)
             return
@@ -13881,6 +13998,7 @@ def _companion_names_on_disk():
 
 def companion_update_check():
     """Updates overlay.py / controller_input.py / overlay_hook.dll. True if anything changed."""
+    return False  # TEMP: companion/assets updater disabled - delete this line to re-enable
     if os.environ.get("NCZ_NO_UPDATE"):
         return False
     frozen = getattr(sys, "frozen", False)
@@ -15651,6 +15769,88 @@ class WorkshopCountWorker(QThread):
         except Exception:
             self.done.emit(self.appid, -1)
 
+class WorkshopBrowserWorker(QThread):
+    """Opens the game's Steam Workshop in a visible Playwright browser and reports every item the user subscribes to.
+    The window stays open until the user closes it; the login is kept in a persistent profile."""
+    subscribed = pyqtSignal(str)    # Workshop item id that was just subscribed to
+    status = pyqtSignal(str)        # non-fatal hint (e.g. Steam refused the subscribe)
+    failed = pyqtSignal(str)        # the browser couldn't be started
+
+    def __init__(self, url, profile_dir, parent=None):
+        super().__init__(parent)
+        self.url, self.profile_dir = url, profile_dir
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    @staticmethod
+    def _item_id(req):
+        try:
+            body = req.post_data or ""
+        except Exception:
+            body = ""
+        m = re.search(r"(?:^|&)id=(\d+)", body) or re.search(r'name="id"\s+(\d+)', body)
+        return m.group(1) if m else ""
+
+    def run(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.failed.emit("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
+            return
+        seen = set()
+        try:
+            with sync_playwright() as p:
+                os.makedirs(self.profile_dir, exist_ok=True)
+                ctx = p.chromium.launch_persistent_context(
+                    self.profile_dir, headless=False, no_viewport=True,
+                    args=["--disable-blink-features=AutomationControlled"])
+                state = {"closed": False}
+                ctx.on("close", lambda *_: state.__setitem__("closed", True))
+
+                def on_response(resp):
+                    try:
+                        req = resp.request
+                        if req.method != "POST" or "/sharedfiles/subscribe" not in resp.url:
+                            return
+                        fid = self._item_id(req)
+                        if not fid:
+                            return
+                        ok = True
+                        try:
+                            js = resp.json()
+                            if isinstance(js, dict) and "success" in js and int(js["success"]) != 1:
+                                ok = False
+                        except Exception:
+                            pass                      # not JSON: a 200 is good enough
+                        if ok:
+                            self.subscribed.emit(fid)
+                        else:
+                            self.status.emit("Steam didn't accept that subscribe. Log in to Steam in the browser window and try again.")
+                    except Exception:
+                        pass
+                ctx.on("response", on_response)
+
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                try:
+                    page.goto(self.url, timeout=60000)
+                except Exception:
+                    pass
+                while not self._stop and not state["closed"]:
+                    if not ctx.pages:
+                        break
+                    try:
+                        ctx.pages[0].wait_for_timeout(300)
+                    except Exception:
+                        time.sleep(0.3)
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.failed.emit(f"Couldn't start the browser: {e}")
+
 class WorkshopPage(QWidget):
     CARD_W = 200
     GAME_W = 170
@@ -15802,6 +16002,14 @@ class WorkshopPage(QWidget):
         self.list_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.list_btn.setToolTip("Select mods to export as a .nczlist file")
         self.list_btn.toggled.connect(self.set_list_mode)
+        self.browser_btn = QPushButton("Open in browser")
+        self.browser_btn.setFixedHeight(36)
+        self.browser_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.browser_btn.setToolTip("Open this game's Steam Workshop in a browser window. Every mod you subscribe to "
+                                    "is added to the queue automatically, and the window stays open.")
+        self.browser_btn.clicked.connect(self.open_in_browser)
+        self._browser = None
+        self._browser_added = 0
         self.mode_combo = QComboBox()
         self.mode_combo.setFixedHeight(36)
         self.mode_combo.addItem("Mods", "mods")
@@ -15813,6 +16021,7 @@ class WorkshopPage(QWidget):
         bar.addWidget(self.sort_combo)
         bar.addWidget(go)
         bar.addWidget(self.list_btn)
+        bar.addWidget(self.browser_btn)
         bl.addLayout(bar)
         self.list_bar = QWidget()
         lb = QHBoxLayout(self.list_bar)
@@ -15917,6 +16126,21 @@ class WorkshopPage(QWidget):
         dl = QVBoxLayout(dw)
         dl.setContentsMargins(0, 0, 0, 0)
         dl.setSpacing(12)
+        self.dl_bar = QWidget()
+        dbl = QHBoxLayout(self.dl_bar)
+        dbl.setContentsMargins(0, 0, 0, 0)
+        dbl.setSpacing(8)
+        self.dl_info = QLabel()
+        self.dl_info.setObjectName("RowDesc")
+        self.install_all_btn = QPushButton("Install all to Garry's Mod")
+        self.install_all_btn.setObjectName("Primary")
+        self.install_all_btn.setFixedHeight(34)
+        self.install_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_all_btn.setToolTip("Extract every downloaded addon below into garrysmod/addons")
+        self.install_all_btn.clicked.connect(self.install_all)
+        dbl.addWidget(self.dl_info, 1)
+        dbl.addWidget(self.install_all_btn)
+        dl.addWidget(self.dl_bar)
         sc4 = self._scroll()
         self.dl_container = QWidget()
         self.dl_container.setObjectName("GridContainer")
@@ -15934,6 +16158,11 @@ class WorkshopPage(QWidget):
 
         self.stack.addWidget(gv)
         self.back_btn.hide()
+        self._dl_sig = None
+        self._dl_timer = QTimer(self)               # keeps the Downloaded tab in step with what's really on disk
+        self._dl_timer.setInterval(2500)
+        self._dl_timer.timeout.connect(self._poll_downloaded)
+        self.tab_group.idClicked.connect(self._on_tab_clicked)
         self._apply_css()
         self._refresh_list_bar()
         self._rebuild_games()
@@ -15972,6 +16201,35 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                                else "SteamCMD will be downloaded on your first download")
         if self.stack.currentIndex() == 0:
             self._rebuild_games()
+        elif self.appid is not None:
+            self._rebuild_downloaded()
+            self._refresh_card_states()
+        self._dl_timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._dl_timer.stop()
+
+    def _on_tab_clicked(self, i):
+        if i == 2 and self.appid is not None:
+            self._rebuild_downloaded()
+
+    def _dl_signature(self):
+        sig = []
+        for d in self._downloads_for_game():
+            try:
+                m = int(os.path.getmtime(workshop_item_dir(d["appid"], d["id"])))
+            except OSError:
+                m = 0
+            sig.append((str(d["id"]), m))
+        return tuple(sorted(sig))
+
+    def _poll_downloaded(self):
+        if self.appid is None or self.stack.currentIndex() != 1:
+            return
+        if self._dl_signature() != self._dl_sig:
+            self._rebuild_downloaded()
+            self._refresh_card_states()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -16007,6 +16265,9 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 self.worker.wait(2000)
             for w in list(self._fetchers):
                 w.wait(1000)
+            if self._browser is not None and self._browser.isRunning():
+                self._browser.stop()                 # closes the Workshop browser window
+                self._browser.wait(4000)
         except Exception:
             pass
 
@@ -16873,6 +17134,9 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         for d in entries:
             self._make_downloaded_row(d)
         self.dl_empty.setVisible(not entries)
+        self.dl_info.setText(f"{len(entries)} downloaded" if entries else "")
+        self.install_all_btn.setVisible(self.appid == 4000 and bool(entries))
+        self._dl_sig = self._dl_signature()
         self._refresh_tab_titles()
 
     def _make_downloaded_row(self, d):
@@ -16936,6 +17200,92 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                            if not (x["id"] == d["id"] and x["appid"] == d["appid"])])
         self._rebuild_downloaded()
         self._refresh_card_states()
+
+    def install_all(self):
+        entries = self._downloads_for_game()
+        if self.appid != 4000 or not entries:
+            return
+        root = find_gmod_root()
+        if not root:
+            QMessageBox.information(self, "Garry's Mod", "Garry's Mod isn't installed in the launcher.")
+            return
+        if QMessageBox.question(self, "Install all", f"Install {len(entries)} downloaded addon(s) to Garry's Mod?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        addons = os.path.join(root, "garrysmod", "addons")
+        installed, problems, done_ids = 0, [], set()
+        self.install_all_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            os.makedirs(addons, exist_ok=True)
+            for n, d in enumerate(entries, 1):
+                self.install_all_btn.setText(f"Installing {n}/{len(entries)}...")
+                QApplication.processEvents()
+                src = workshop_item_dir(d["appid"], d["id"])
+                try:
+                    result = extract_workshop_folder(src, addons, lambda t, k: None, lambda a, b: None,
+                                                     delete_source=True)
+                except Exception as e:
+                    problems.append(f"{d['title']}: {e}")
+                    continue
+                if result and result[0] + result[1] > 0 and not result[2] and not os.path.isdir(src):
+                    installed += 1
+                    done_ids.add(str(d["id"]))
+                else:
+                    problems.append(f"{d['title']}: nothing was installed")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.install_all_btn.setEnabled(True)
+            self.install_all_btn.setText("Install all to Garry's Mod")
+        if done_ids:
+            ws_save_downloads([x for x in ws_load_downloads()
+                               if not (x["appid"] == 4000 and str(x["id"]) in done_ids)])
+        self._rebuild_downloaded()
+        self._refresh_card_states()
+        lines = [f"Installed {installed} of {len(entries)} addon(s)."]
+        if problems:
+            lines.append("")
+            lines.extend(problems[:8])
+            if len(problems) > 8:
+                lines.append(f"...and {len(problems) - 8} more.")
+        QMessageBox.information(self, "Install all", "\n".join(lines))
+
+    # ------------------------------------------------------------ browser (subscribe -> queue)
+    def open_in_browser(self):
+        if self.appid is None or (self._browser is not None and self._browser.isRunning()):
+            return
+        url = f"https://steamcommunity.com/app/{self.appid}/workshop/"
+        w = WorkshopBrowserWorker(url, os.path.join(_writable_dir(), "workshop_browser"), self)
+        w.subscribed.connect(self._on_browser_subscribed)
+        w.status.connect(lambda t: self.browser_btn.setToolTip(t))
+        w.failed.connect(lambda t: QMessageBox.warning(self, "Browser", t))
+        w.finished.connect(self._on_browser_closed)
+        self._browser, self._browser_added = w, 0
+        self.browser_btn.setEnabled(False)
+        self.browser_btn.setText("Browser open...")
+        w.start()
+
+    def _on_browser_closed(self):
+        self._browser = None
+        self.browser_btn.setEnabled(True)
+        self.browser_btn.setText("Open in browser")
+
+    def _on_browser_subscribed(self, fid):
+        known = {g["appid"]: g["title"] for g in _ws_installed_games()}
+        w = WorkshopLinkWorker([fid], known, self)
+        w.done.connect(self._on_browser_item)
+        self._fetchers.append(w)
+        w.finished.connect(lambda w=w: self._fetchers.remove(w) if w in self._fetchers else None)
+        w.start()
+
+    def _on_browser_item(self, results, errors):
+        for appid, game, it in results:
+            if self._ws_have(appid, it["id"]):
+                continue
+            if self.enqueue(it, appid, game):
+                self._browser_added += 1
+        if self._browser is not None and self._browser_added:
+            self.browser_btn.setText(f"Browser open · {self._browser_added} queued")
 
     def _install_to_gmod(self, d):
         root = find_gmod_root()
@@ -27050,6 +27400,598 @@ class CountryDialog(QDialog):
     def code(self):
         it = self.list.currentItem()
         return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
+
+
+# ================================================================ Sunset UI (new) + Classic UI switch
+# "new"     = sunset theme (dark indigo -> orange, always dark) + navigation rail on the left.
+# "classic" = the previous look (lavender accent, tabs in the top bar, follows Dark Mode / Accent Color).
+# The style is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
+def _ui_read_style():
+    try:
+        with open(get_launcher_settings_path(), encoding="utf-8") as f:
+            v = json.load(f).get("ui_style")
+        return v if v in ("new", "classic") else "new"
+    except Exception:
+        return "new"
+
+_UI_STYLE_AT_START = _ui_read_style()
+
+_ui_prev_load_settings = load_launcher_settings
+def load_launcher_settings():
+    s = _ui_prev_load_settings()          # the original drops unknown keys, so carry ui_style through it
+    s["ui_style"] = _ui_read_style()
+    return s
+
+SUNSET_THEME = dict(
+    bg="#140c2b", sidebar="#0c0719", panel="#201444", input="#120b27", border="#3a2866",
+    text="#fbf3ee", subtext="#a99bc4", accent="#ff7a2f", accent_hover="#ff9456", accent_press="#e0561a",
+    button="#2b1d52", button_hover="#3a2870", disabled_bg="#1a1236", disabled_text="#5f5280",
+    handle="#4a3585", hover="#261a4d",
+    red="#ff7a2f", red_hover="#ff9456", red_press="#e0561a", accent_fill="rgba(255,122,47,0.18)",
+    nav_text="#b9aad6", nav_active="#ffffff", brand="#ffffff", sidebar_border="#2d1f55",
+    nav_fill="rgba(255,255,255,0.06)", nav_fill_hover="rgba(255,255,255,0.12)",
+)
+
+_SUNSET_EXTRA = """
+QMainWindow, QWidget#Content, QWidget#GridContainer {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b0716, stop:0.55 #1b1042, stop:0.85 #2c1649, stop:1 #43194a);
+}
+QWidget#GridContainer { background: transparent; }
+QFrame#Sidebar {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0b0716, stop:1 #1e1040); border-bottom: 1px solid #2d1f55;
+}
+QFrame#SideRail {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b0716, stop:0.65 #1a0e36, stop:1 #3d1838);
+    border-right: 1px solid #2d1f55;
+}
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: #b9aad6; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.07); color: #ffffff; }
+QFrame#SideRail QPushButton#NavButton:checked {
+    color: #ffffff; border: none; border-left: 3px solid #ff7a2f;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(255,122,47,0.30), stop:1 rgba(255,122,47,0));
+}
+QPushButton#Primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8a3d, stop:1 #f0450f); border-radius: 8px;
+}
+QPushButton#Primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffa05a, stop:1 #ff5a24);
+}
+QPushButton#Primary:pressed { background: #e0561a; }
+QPushButton#Primary:disabled { background: #1a1236; color: #5f5280; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8a3d, stop:1 #c2358a); border-radius: 3px;
+}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; }
+QFrame#GameCard { background: rgba(32, 20, 68, 0.55); border: 1px solid #2f2058; border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(32, 20, 68, 0.75); border: 1px solid #ff7a2f; }
+QFrame#ToolBar { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; border-radius: 16px; }
+QFrame#ToolBar QLabel { background: transparent; border: none; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: #120b27; }
+QFrame#SidePanel { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; border-radius: 16px; }
+QFrame#SidePanel QLabel { background: transparent; border: none; }
+QLabel#PaneHeader { color: #a99bc4; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+"""
+
+def _ui_apply_sunset():
+    app = QApplication.instance()
+    if app is None:
+        return
+    theme = SUNSET_THEME
+    app.setStyle("Fusion")
+    app.setPalette(build_palette(theme))
+    family = load_app_font()
+    force_font = f'* {{ font-family: "{family}"; }}\n' if family else ""
+    app.setStyleSheet(force_font + STYLE_TEMPLATE.substitute(theme) + _SUNSET_EXTRA)
+    _theme_state["nav_text"] = theme["nav_text"]
+    _theme_state["nav_active"] = theme["nav_active"]
+    try:
+        import overlay as _overlay_mod
+        _overlay_mod.set_light(False)
+        _overlay_mod.set_sunset(True)
+        _overlay_mod.set_accent(theme["accent"])
+    except Exception:
+        pass
+    for listener in list(_theme_listeners):
+        try:
+            listener()
+        except Exception:
+            pass
+
+SUNSET_ACCENT = SUNSET_THEME["accent"]
+
+_ui_prev_set_accent = set_accent
+def set_accent(color):
+    """Sunset always uses its own orange (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
+    _ui_prev_set_accent(SUNSET_ACCENT if _UI_STYLE_AT_START == "new" else color)
+
+_ui_prev_apply_accent_to_icon = apply_accent_to_icon
+def apply_accent_to_icon(color):
+    if _UI_STYLE_AT_START == "new":
+        return False                                 # the Sunset icon is never recoloured
+    return _ui_prev_apply_accent_to_icon(color)
+
+_ui_prev_apply_dark_mode = apply_dark_mode
+def apply_dark_mode(mode):
+    _ui_prev_apply_dark_mode(mode)
+    if _UI_STYLE_AT_START == "new":
+        _ui_apply_sunset()                # sunset is always dark; Dark Mode / Accent Color only affect Classic
+
+# Icons: new UI always uses assets/icon.png (the new sunset icon). Classic uses the accent-recolored icon if there is
+# one, otherwise assets/icon_default.png (put the OLD icon there), otherwise icon.png.
+_ui_prev_asset_path = asset_path
+def asset_path(filename):
+    if filename == "icon.png":
+        if _UI_STYLE_AT_START == "new":
+            return os.path.join(ASSETS_DIR, "icon.png")
+        if not os.path.exists(accent_icon_path()):
+            old = os.path.join(ASSETS_DIR, "icon_default.png")
+            if os.path.exists(old):
+                return old
+    return _ui_prev_asset_path(filename)
+
+_ui_prev_reload_brand_logo = AdaptiveApp.reload_brand_logo
+def _ui_reload_brand_logo(self):
+    """The new icon is the 'N' in the middle of a big square, so crop to the centre instead of a circle of the whole image."""
+    pm = QPixmap(asset_path("icon.png"))
+    if pm.isNull():
+        return _ui_prev_reload_brand_logo(self)
+    side = int(min(pm.width(), pm.height()) * 0.58)
+    pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+    pm = pm.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(64, 64)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, 64, 64, 14, 14)
+    p.setClipPath(path)
+    p.drawPixmap(0, 0, pm)
+    p.end()
+    out.setDevicePixelRatio(2.0)
+    self.brand_logo.setVisible(True)
+    self.brand_logo.setPixmap(out)
+
+if _UI_STYLE_AT_START == "new":
+    AdaptiveApp.reload_brand_logo = _ui_reload_brand_logo
+
+class _UiRailLayout(QVBoxLayout):
+    """Vertical tab list that keeps a trailing stretch; tabs added later (profile tabs) land above it."""
+    def addWidget(self, w, *args, **kwargs):
+        w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.insertWidget(max(0, self.count() - 1), w)
+
+def _ui_move_nav_to_rail(self):
+    root_layout = self.centralWidget().layout()          # [top bar, pages]
+    old = self._nav_center_layout                        # the strip that holds the tab buttons
+    items = []
+    while old.count():
+        w = old.takeAt(0).widget()
+        if w is not None:
+            items.append(w)
+
+    root_layout.removeWidget(self.pages)
+    body = QWidget()
+    bl = QHBoxLayout(body)
+    bl.setContentsMargins(0, 0, 0, 0)
+    bl.setSpacing(0)
+    rail = QFrame()
+    rail.setObjectName("SideRail")
+    rail.setFixedWidth(208)
+    rv = _UiRailLayout(rail)
+    rv.setContentsMargins(0, 16, 0, 16)
+    rv.setSpacing(2)
+    rv.addStretch()
+    self._nav_center_layout = rv                         # profile tabs add themselves here later
+    self._ui_rail = rail
+
+    prev = None
+    for w in items:
+        if isinstance(w, QPushButton):
+            w.setFixedHeight(44)
+            w.setIconSize(QSize(18, 18))
+            rv.addWidget(w)
+            prev = w
+        elif prev is not None:                           # the red unread badge: sits on the right end of the Friends tab
+            hl = QHBoxLayout(prev)
+            hl.setContentsMargins(0, 0, 12, 0)
+            hl.addStretch()
+            hl.addWidget(w)
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    bl.addWidget(rail)
+    bl.addWidget(self.pages, 1)
+    root_layout.addWidget(body, 1)
+    try:
+        self._nav_center_filter.center.hide()            # the old centred strip is empty now
+    except Exception:
+        pass
+
+def _ui_add_setting(self):
+    sp = self.settings_page
+    panel = sp.dark_mode_combo.parentWidget()
+    lay = panel.layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("Interface Style")
+    title.setObjectName("RowTitle")
+    desc = QLabel("Sunset: the new look with a side navigation bar. Classic: the old look. Needs a restart.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    combo = QComboBox()
+    combo.setFixedWidth(160)
+    combo.addItem("Sunset (new)", "new")
+    combo.addItem("Classic", "classic")
+    combo.setCurrentIndex(max(0, combo.findData(_UI_STYLE_AT_START)))
+
+    def changed():
+        s = load_launcher_settings()
+        s["ui_style"] = combo.currentData()
+        save_launcher_settings(s)
+        if combo.currentData() != _UI_STYLE_AT_START:
+            QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new interface style.")
+    combo.currentIndexChanged.connect(changed)
+    row.addLayout(col, 1)
+    row.addWidget(combo)
+    lay.insertLayout(1, row)                             # right under Dark Mode
+    lay.insertSpacing(1, 12)
+    lay.insertSpacing(3, 12)
+    sp.ui_style_combo = combo
+    if _UI_STYLE_AT_START == "new":
+        sp.accent_btn.setEnabled(False)
+        sp.accent_reset_btn.setEnabled(False)
+        sp.accent_desc.setText("Locked to Sunset orange. Switch Interface Style to Classic to pick your own color.")
+
+def _ui_add_nsfw_setting(self):
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("NSFW Covers")
+    title.setObjectName("RowTitle")
+    desc = QLabel()
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    btn = QPushButton("Hide again")
+    btn.setFixedWidth(110)
+
+    def refresh():
+        rev = nsfw_revealed()
+        desc.setText("Revealed: NSFW covers are shown everywhere." if rev
+                     else "Hidden: NSFW covers are blurred until you press Reveal on one.")
+        btn.setEnabled(rev)
+        btn.setText("Hide again" if rev else "Hidden")
+    btn.clicked.connect(hide_nsfw_again)
+    nsfw_bus.revealed.connect(refresh)
+    refresh()
+    row.addLayout(col, 1)
+    row.addWidget(btn)
+    lay.addSpacing(10)
+    lay.addLayout(row)
+    sp.nsfw_hide_btn = btn
+
+_ui_prev_init = AdaptiveApp.__init__
+def _ui_init(self):
+    _ui_prev_init(self)
+    import traceback
+    try:
+        _ui_add_setting(self)
+    except Exception:
+        traceback.print_exc()
+    try:
+        _ui_add_nsfw_setting(self)
+    except Exception:
+        traceback.print_exc()
+    if _UI_STYLE_AT_START == "new":
+        try:
+            _ui_move_nav_to_rail(self)
+        except Exception:
+            traceback.print_exc()
+AdaptiveApp.__init__ = _ui_init
+
+# ---------------------------------------------------------------- Sunset UI: layout touches + fade animations
+from PyQt6.QtWidgets import QGraphicsOpacityEffect as _QGOE
+from PyQt6.QtCore import QPropertyAnimation as _QPA, QEasingCurve as _QEC
+
+def _ui_fade_in(w, ms=340, delay=0):
+    """Fades a widget from invisible to normal (optionally after `delay` ms). The effect is removed when done."""
+    if w is None:
+        return
+    try:
+        eff = _QGOE(w)
+        eff.setOpacity(0.0)
+        w.setGraphicsEffect(eff)
+        w._ui_fx = eff
+        anim = _QPA(eff, b"opacity", eff)
+        anim.setDuration(ms)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(_QEC.Type.OutCubic)
+
+        def clear():
+            try:
+                if getattr(w, "_ui_fx", None) is eff:
+                    w._ui_fx = None
+                    w.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        anim.finished.connect(lambda: QTimer.singleShot(0, clear))
+
+        def go():
+            try:
+                anim.start()
+            except RuntimeError:
+                pass
+        if delay > 0:
+            QTimer.singleShot(delay, go)
+        else:
+            go()
+    except RuntimeError:
+        pass
+
+def _ui_stagger_library(self, base=0):
+    cards = [c for c, _t in self.cards if not c.isHidden()]
+    for i, c in enumerate(cards):
+        _ui_fade_in(c, 460, base + min(i, 12) * 70)
+
+def _ui_restyle_store(self):
+    """Store: title, count, search and Tags move into one rounded toolbar instead of a bare header row."""
+    sp = self.store_page
+    lay = sp.layout()
+    header = lay.itemAt(0).layout()
+    title = sp.findChild(QLabel, "PageTitle")
+    if header is None or title is None:
+        return
+    while header.count():
+        header.takeAt(0)
+    lay.removeItem(header)
+    header.deleteLater()
+
+    bar = QFrame()
+    bar.setObjectName("ToolBar")
+    bar.setFixedHeight(68)
+    bl = QHBoxLayout(bar)
+    bl.setContentsMargins(22, 0, 16, 0)
+    bl.setSpacing(12)
+    bl.addWidget(title)
+    bl.addWidget(sp.count_label, 0, Qt.AlignmentFlag.AlignVCenter)
+    bl.addSpacing(10)
+    sp.search_edit.setMinimumSize(200, 40)
+    sp.search_edit.setMaximumSize(16777215, 40)
+    sp.search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    sp.tags_btn.setFixedHeight(40)
+    bl.addWidget(sp.search_edit, 1)
+    bl.addWidget(sp.tags_btn)
+    lay.insertWidget(0, bar)
+    lay.setContentsMargins(28, 22, 20, 0)
+    lay.insertSpacing(1, 6)
+
+def _ui_restyle_friends(self):
+    """Friends: add-friend + requests become a left side panel, the friends list gets its own pane on the right."""
+    fp = self.friends_page
+    page = fp.stack.widget(0)
+    old = page.layout()
+    title = page.findChild(QLabel, "PageTitle")
+    scroll = page.findChild(QScrollArea)
+    panel = fp.code_label.parentWidget()
+    if title is None or scroll is None or panel is None:
+        return
+    others = []                              # anything else another patch put in here (the Group chats box)
+    while old.count():
+        w = old.takeAt(0).widget()
+        if w is not None and w not in (title, panel, fp.req_box, scroll):
+            others.append(w)
+
+    old.addWidget(title)
+    old.addSpacing(16)
+    body = QHBoxLayout()
+    body.setSpacing(24)
+
+    left = QWidget()
+    left.setFixedWidth(340)
+    ll = QVBoxLayout(left)
+    ll.setContentsMargins(0, 0, 0, 0)
+    ll.setSpacing(14)
+    side_head = QLabel("ADD FRIENDS")
+    side_head.setObjectName("PaneHeader")
+    panel.setObjectName("SidePanel")
+    fp.req_box.setObjectName("SidePanel")
+    ll.addWidget(side_head)
+    ll.addWidget(panel)
+    ll.addWidget(fp.req_box)
+    for w in others:
+        if isinstance(w, QFrame):
+            w.setObjectName("SidePanel")
+        ll.addWidget(w)
+    ll.addStretch()
+
+    right = QVBoxLayout()
+    right.setSpacing(10)
+    head_row = QHBoxLayout()
+    fp._ui_friends_count = QLabel("YOUR FRIENDS")
+    fp._ui_friends_count.setObjectName("PaneHeader")
+    head_row.addWidget(fp._ui_friends_count)
+    head_row.addStretch()
+    right.addLayout(head_row)
+    right.addWidget(scroll, 1)
+
+    body.addWidget(left, 0, Qt.AlignmentFlag.AlignTop)
+    body.addLayout(right, 1)
+    old.addLayout(body, 1)
+
+_ui_prev_rebuild_rows = FriendsPage._rebuild_rows
+def _ui_rebuild_rows(self):
+    _ui_prev_rebuild_rows(self)
+    lbl = getattr(self, "_ui_friends_count", None)
+    if lbl is not None:
+        try:
+            n = len(self.friends)
+            lbl.setText(f"YOUR FRIENDS  -  {n}" if n else "YOUR FRIENDS")
+        except RuntimeError:
+            pass
+FriendsPage._rebuild_rows = _ui_rebuild_rows
+
+def _ui_drain(layout):
+    """Takes every item out of a layout (recursing into child layouts) and returns the plain widgets that were in it."""
+    out = []
+    while layout.count():
+        it = layout.takeAt(0)
+        if it.widget() is not None:
+            out.append(it.widget())
+        elif it.layout() is not None:
+            out.extend(_ui_drain(it.layout()))
+    return out
+
+def _ui_restyle_workshop(self):
+    """Steam Workshop: header actions go into one toolbar, Browse / Queue / Downloaded become a left rail."""
+    wp = getattr(self, "workshop_page", None)
+    if wp is None:
+        return
+    outer = wp.layout()
+    title = wp.findChild(QLabel, "PageTitle")
+    if title is None:
+        return
+    head = outer.itemAt(0).layout()
+    if head is None:
+        return
+    _ui_drain(head)
+    outer.removeItem(head)
+    head.deleteLater()
+
+    bar = QFrame()
+    bar.setObjectName("ToolBar")
+    bar.setFixedHeight(68)
+    bl = QHBoxLayout(bar)
+    bl.setContentsMargins(22, 0, 16, 0)
+    bl.setSpacing(10)
+    bl.addWidget(title)
+    bl.addWidget(wp.game_label, 0, Qt.AlignmentFlag.AlignVCenter)
+    bl.addStretch()
+    for b in (wp.import_btn, wp.link_btn, wp.sync_btn, wp.back_btn):
+        b.setFixedHeight(38)
+        bl.addWidget(b)
+    outer.insertWidget(0, bar)
+    outer.setContentsMargins(28, 22, 28, 20)
+
+    # game view: tabs on the left instead of a row above the content
+    gv = wp.stack.widget(1)
+    gl = gv.layout()
+    _ui_drain(gl)
+    rail = QFrame()
+    rail.setObjectName("SidePanel")
+    rail.setFixedWidth(190)
+    rl = QVBoxLayout(rail)
+    rl.setContentsMargins(12, 14, 12, 14)
+    rl.setSpacing(6)
+    head_lbl = QLabel("WORKSHOP")
+    head_lbl.setObjectName("PaneHeader")
+    rl.addWidget(head_lbl)
+    rl.addSpacing(4)
+    for b in wp.tab_btns:
+        b.setFixedHeight(40)
+        rl.addWidget(b)
+    rl.addStretch()
+    row = QHBoxLayout()
+    row.setSpacing(20)
+    row.addWidget(rail, 0, Qt.AlignmentFlag.AlignTop)
+    row.addWidget(wp.inner, 1)
+    gl.addLayout(row, 1)
+
+def _ui_restyle_gmod(self):
+    """Gmod addons: title, count and the two tabs share one toolbar; the addons folder sits under it."""
+    gp = getattr(self, "gmod_page", None)
+    if gp is None:
+        return
+    outer = gp.layout()
+    title = gp.findChild(QLabel, "PageTitle")
+    if title is None:
+        return
+    _ui_drain(outer)
+    bar = QFrame()
+    bar.setObjectName("ToolBar")
+    bar.setFixedHeight(68)
+    bl = QHBoxLayout(bar)
+    bl.setContentsMargins(22, 0, 16, 0)
+    bl.setSpacing(10)
+    bl.addWidget(title)
+    bl.addWidget(gp.count_label, 0, Qt.AlignmentFlag.AlignVCenter)
+    bl.addStretch()
+    for b in gp.tab_group.buttons():
+        b.setFixedHeight(38)
+        bl.addWidget(b)
+    outer.addWidget(bar)
+    outer.addSpacing(10)
+    outer.addWidget(gp.path_label)
+    outer.addSpacing(14)
+    outer.addWidget(gp.stack, 1)
+    outer.setContentsMargins(28, 22, 28, 20)
+
+def _ui_decorate(self):
+    # Store + Friends: new layouts
+    for fn in (_ui_restyle_store, _ui_restyle_friends, _ui_restyle_workshop, _ui_restyle_gmod):
+        try:
+            fn(self)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    # Settings: readable column, centred, instead of stretching across the whole window
+    sp = self.settings_page
+    sp._content.setMaximumWidth(920)
+    sp._scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+    # fade between pages (the Library staggers its cards instead)
+    def on_page(i):
+        w = self.pages.widget(i)
+        if w is None or not getattr(self, "_ui_intro_done", False):
+            return
+        if i == 0:
+            _ui_stagger_library(self, 80)
+        else:
+            _ui_fade_in(w, 360)
+    self.pages.currentChanged.connect(on_page)
+
+def _ui_intro(self):
+    """First time the window is shown: brand, rail tabs and cards fade in one after another."""
+    try:
+        brand = self.findChild(QLabel, "Brand")
+        if brand is not None:
+            _ui_fade_in(brand, 700)
+        rail = getattr(self, "_ui_rail", None)
+        if rail is not None:
+            tabs = [b for b in rail.findChildren(QPushButton) if not b.isHidden()]
+            for i, b in enumerate(tabs):
+                _ui_fade_in(b, 420, 120 + i * 80)
+        _ui_stagger_library(self, 300)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+_ui_anim_prev_show = AdaptiveApp.showEvent
+def _ui_anim_show_event(self, ev):
+    _ui_anim_prev_show(self, ev)
+    if _UI_STYLE_AT_START == "new" and not getattr(self, "_ui_intro_done", False) and hasattr(self, "_ui_rail"):
+        self._ui_intro_done = True
+        QTimer.singleShot(0, lambda: _ui_intro(self))
+AdaptiveApp.showEvent = _ui_anim_show_event
+
+_ui_anim_prev_init = AdaptiveApp.__init__
+def _ui_anim_init(self):
+    _ui_anim_prev_init(self)
+    if _UI_STYLE_AT_START == "new":
+        try:
+            _ui_decorate(self)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+AdaptiveApp.__init__ = _ui_anim_init
 
 
 if __name__ == "__main__":
