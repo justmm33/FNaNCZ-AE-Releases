@@ -42,6 +42,7 @@ _DARK_DEFAULTS = dict(BG=QColor("#1c1c1c"), STRIPE=QColor(255, 255, 255, 9), TEX
 TEXT_COLOR = QColor("white")   # the white "is playing" part
 _accent_base = None            # QColor chosen in the launcher (None = the built-in purple)
 _light = False                 # light mode: light gray toast with dark text
+_sunset = False                # Sunset launcher theme: dark indigo toast with faint orange stripes (always dark)
 
 
 def _readable(c):
@@ -64,18 +65,21 @@ def _apply_colors():
     """Recomputes every toast colour from the accent + light/dark mode."""
     global BG, STRIPE, TEXT_COLOR, ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR
     d = _DARK_DEFAULTS
-    if _light:
+    light = _light and not _sunset
+    if light:
         BG, STRIPE, TEXT_COLOR = QColor("#e4e4e4"), QColor(0, 0, 0, 12), QColor("#1c1c1c")   # gray -> light gray
+    elif _sunset:
+        BG, STRIPE, TEXT_COLOR = QColor("#1b1042"), QColor(255, 122, 47, 16), QColor("white")
     else:
         BG, STRIPE, TEXT_COLOR = QColor(d["BG"]), QColor(d["STRIPE"]), QColor(d["TEXT"])
     base = _accent_base
-    if base is None and not _light:
+    if base is None and not light:
         ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR = QColor(d["ACCENT"]), QColor(d["NAME"]), QColor(d["NAME"]), QColor(d["AVATAR"])
         return
     base = base or QColor(d["ACCENT"])
     ACCENT = QColor(base)
-    NAME_COLOR = GAME_COLOR = _readable_light(base) if _light else _readable(base)
-    AVATAR_COLOR = QColor(base) if _light else _readable(base).lighter(115)
+    NAME_COLOR = GAME_COLOR = _readable_light(base) if light else _readable(base)
+    AVATAR_COLOR = QColor(base) if light else _readable(base).lighter(115)
 
 
 def set_accent(color):
@@ -85,6 +89,13 @@ def set_accent(color):
     if not c.isValid():
         return
     _accent_base, _accent_hex = c, c.name()
+    _apply_colors()
+
+
+def set_sunset(flag):
+    """Sunset theme on/off: indigo toast with orange stripes (overrides light mode)."""
+    global _sunset
+    _sunset = bool(flag)
     _apply_colors()
 
 
@@ -801,7 +812,7 @@ class OverlayManager:
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
                                          "badge": badge or "", "plain": bool(plain),
-                                         "accent": _accent_hex, "light": _light,
+                                         "accent": _accent_hex, "light": _light, "sunset": _sunset,
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
@@ -1163,6 +1174,8 @@ class _ServerBridge(QObject):
             set_emoji_dir(d["emoji_dir"])
         if d.get("accent"):
             set_accent(str(d["accent"]))
+        if "sunset" in d:
+            set_sunset(bool(d["sunset"]))
         if "light" in d:
             set_light(bool(d["light"]))
         if d.get("link"):
