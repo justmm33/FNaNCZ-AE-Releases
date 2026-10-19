@@ -6146,9 +6146,21 @@ class AdaptiveApp(QMainWindow):
         return page
 
     def grid_columns(self):
-        # window width minus the library page / grid margins (36 + 24 + 12); the nav bar is on top now
-        available = self.width() - 36 - 24 - 12
         card_w, gap = COVER_W + 18, 24
+        available = None
+        try:
+            # measure the real scroll area: it is narrower than the window now (side rail + page margins),
+            # and reserve the vertical scrollbar so the column count doesn't flip when it appears
+            scroll = self.grid_container.parentWidget().parentWidget()
+            if scroll.width() > 200:
+                available = (scroll.width() - 2 * scroll.frameWidth()
+                             - scroll.verticalScrollBar().sizeHint().width() - 12)
+        except Exception:
+            pass
+        if available is None:
+            rail = getattr(self, "_ui_rail", None)
+            rail_w = rail.width() if rail is not None else 0
+            available = self.width() - rail_w - 36 - 24 - 12
         return max(1, (available + gap) // (card_w + gap))
 
     def resizeEvent(self, event):
@@ -8068,72 +8080,270 @@ def find_existing_archive(prefixes):
     return None
 
 # ---------------------------------------------------------------- finding archive tools (7-Zip / WinRAR aren't on PATH on Windows)
-def find_tool(*names):
-    """Full path of the first tool found: on PATH, next to the launcher, or in the usual Windows install folders."""
-    for n in names:
-        found = shutil.which(n)
-        if found:
-            return found
+_ARCHIVE_DIR_RE = re.compile(r"7-?zip|7z|winrar|rarlab|roshal|unrar|peazip|nanazip|bandizip|p7zip", re.I)
+_ARCHIVE_APP_RE = re.compile(r"7-?zip|winrar|unrar|peazip|nanazip|bandizip", re.I)
+_TOOL_CACHE = {}        # names -> (time found, [paths])
+_FOLDER_CACHE = {"t": 0.0, "folders": []}
+_TOOL_MISS_TTL = 60     # a "not found" is re-checked after this many seconds (the user may have just installed it)
+_FOLDER_TTL = 120
+
+def _exe_dir_from_command(cmd):
+    """'"C:\\Program Files\\7-Zip\\7zFM.exe" "%1"' / 'C:\\x\\WinRAR.exe,0' -> the folder of that exe."""
+    if not cmd:
+        return None
+    cmd = os.path.expandvars(str(cmd).strip())
+    m = re.match(r'\s*"([^"]+)"', cmd) or re.match(r'\s*(.+?\.(?:exe|dll|ico))', cmd, re.I) or re.match(r'\s*([^,\s]+)', cmd)
+    if not m:
+        return None
+    p = m.group(1).strip().strip('"')
+    if os.path.isdir(p):
+        return p
+    d = os.path.dirname(p)
+    return d if d and os.path.isdir(d) else None
+
+def _windows_tool_folders():
+    folders = []
+    env = os.environ.get
+    prog_roots = [env(k) for k in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "ProgramData")]
+    user_roots = [env("LOCALAPPDATA") and os.path.join(env("LOCALAPPDATA"), "Programs"), env("LOCALAPPDATA"), env("APPDATA"),
+                  env("USERPROFILE")]
+    # every fixed drive: people install to D:\Program Files, D:\Apps, ...
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZAB":
+        drive = letter + ":\\"
+        if os.path.isdir(drive):
+            prog_roots += [os.path.join(drive, s) for s in
+                           ("Program Files", "Program Files (x86)", "Programs", "Apps", "Software", "Tools", "Portable", "")]
+    subs = ("7-Zip", "7-Zip-Zstandard", "7-Zip (Zstandard)", "7zip", "7z", "7-Zip-ZS", "WinRAR", "RAR", "UnRAR", "RARLAB",
+            "NanaZip", "PeaZip", "Bandizip", "Portable7-Zip", "7-ZipPortable", "WinRARPortable",
+            os.path.join("PeaZip", "res", "bin", "7z"), os.path.join("PeaZip", "res", "7z"),
+            os.path.join("7-ZipPortable", "App", "7-Zip64"), os.path.join("7-ZipPortable", "App", "7-Zip"))
+    for root in filter(None, prog_roots + user_roots):
+        for sub in subs:
+            folders.append(os.path.join(root, sub))
+    # package managers
+    home = env("USERPROFILE") or os.path.expanduser("~")
+    local = env("LOCALAPPDATA") or ""
+    scoops = [env("SCOOP"), os.path.join(home, "scoop"), env("SCOOP_GLOBAL"), os.path.join(env("ProgramData") or "C:\\ProgramData", "scoop")]
+    for sc in filter(None, scoops):
+        folders.append(os.path.join(sc, "shims"))
+        for app in ("7zip", "7zip-zstd", "winrar", "unrar", "peazip", "nanazip", "bandizip"):
+            folders.append(os.path.join(sc, "apps", app, "current"))
+    choco = env("ChocolateyInstall") or os.path.join(env("ProgramData") or "C:\\ProgramData", "chocolatey")
+    folders.append(os.path.join(choco, "bin"))
+    import glob
+    for pattern in (os.path.join(choco, "lib", "*7zip*", "tools"), os.path.join(choco, "lib", "*winrar*", "tools"),
+                    os.path.join(choco, "lib", "*unrar*", "tools"), os.path.join(choco, "lib", "*peazip*", "tools"),
+                    os.path.join(local, "Microsoft", "WinGet", "Packages", "*7zip*"),
+                    os.path.join(local, "Microsoft", "WinGet", "Packages", "*NanaZip*"),
+                    os.path.join(local, "Microsoft", "WinGet", "Packages", "*WinRAR*"),
+                    os.path.join(local, "Microsoft", "WinGet", "Packages", "*RARLab*")):
+        try:
+            folders += glob.glob(pattern)
+        except Exception:
+            pass
+    folders += [os.path.join(local, "Microsoft", "WinGet", "Links"), os.path.join(local, "Microsoft", "WindowsApps")]
+    # the registry: install keys, App Paths, uninstall entries and file associations
+    try:
+        import winreg
+        views = (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0))
+        value_names = ("Path64", "Path", "exe64", "exe32", "InstallLocation", "InstallDir", "InstallPath")
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for key in (r"SOFTWARE\7-Zip", r"SOFTWARE\7-Zip-Zstandard", r"SOFTWARE\WinRAR", r"SOFTWARE\RARLAB",
+                        r"SOFTWARE\WOW6432Node\7-Zip", r"SOFTWARE\WOW6432Node\WinRAR", r"SOFTWARE\Giorgiotani\Peazip",
+                        r"SOFTWARE\Bandizip", r"SOFTWARE\NanaZip"):
+                for view in views:
+                    try:
+                        with winreg.OpenKey(hive, key, 0, winreg.KEY_READ | view) as k:
+                            for val in value_names:
+                                try:
+                                    d = _exe_dir_from_command(winreg.QueryValueEx(k, val)[0])
+                                except OSError:
+                                    continue
+                                if d:
+                                    folders.append(d)
+                    except OSError:
+                        pass
+            apps = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+            for exe in ("WinRAR.exe", "UnRAR.exe", "Rar.exe", "7zFM.exe", "7z.exe", "7zG.exe", "PeaZip.exe", "NanaZip.exe", "Bandizip.exe"):
+                for view in views:
+                    try:
+                        with winreg.OpenKey(hive, apps + "\\" + exe, 0, winreg.KEY_READ | view) as k:
+                            for val in ("", "Path"):
+                                try:
+                                    d = _exe_dir_from_command(winreg.QueryValueEx(k, val)[0])
+                                except OSError:
+                                    continue
+                                if d:
+                                    folders.append(d)
+                    except OSError:
+                        pass
+            # Add/Remove Programs entries that look like an archiver
+            unin = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+            for sub in (unin, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+                try:
+                    with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ) as parent:
+                        i = 0
+                        while True:
+                            try:
+                                name = winreg.EnumKey(parent, i)
+                            except OSError:
+                                break
+                            i += 1
+                            try:
+                                with winreg.OpenKey(parent, name) as k:
+                                    try:
+                                        shown = str(winreg.QueryValueEx(k, "DisplayName")[0])
+                                    except OSError:
+                                        shown = name
+                                    if not _ARCHIVE_APP_RE.search(shown) and not _ARCHIVE_APP_RE.search(name):
+                                        continue
+                                    for val in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                                        try:
+                                            d = _exe_dir_from_command(winreg.QueryValueEx(k, val)[0])
+                                        except OSError:
+                                            continue
+                                        if d:
+                                            folders.append(d)
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
+        for cls in (r"WinRAR\shell\open\command", r"7-Zip.7z\shell\open\command", r"7-Zip.zip\shell\open\command",
+                    r"WinRAR.RAR\shell\open\command", r"WinRAR.ZIP\shell\open\command",
+                    r"Applications\7zFM.exe\shell\open\command", r"Applications\WinRAR.exe\shell\open\command"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, cls) as k:
+                    d = _exe_dir_from_command(winreg.QueryValueEx(k, "")[0])
+                    if d:
+                        folders.append(d)
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    # last resort: look at what's actually inside the install roots (odd names like "7-Zip 24.09" or "RARLAB\\WinRAR"),
+    # two levels deep at most so this stays quick
+    scan_roots = [r for r in prog_roots + user_roots[:2] if r and os.path.isdir(r)]
+    for root in scan_roots:
+        try:
+            with os.scandir(root) as it:
+                for e in it:
+                    try:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if _ARCHIVE_DIR_RE.search(e.name):
+                        folders.append(e.path)
+                        continue
+                    if root.endswith("") and e.name.lower() in ("rarlab", "alexander roshal", "igor pavlov", "giorgiotani"):
+                        try:
+                            with os.scandir(e.path) as it2:
+                                for e2 in it2:
+                                    if e2.is_dir(follow_symlinks=False):
+                                        folders.append(e2.path)
+                        except OSError:
+                            pass
+        except OSError:
+            continue
+    return folders
+
+def _tool_folders(force=False):
+    """Every folder worth looking in for 7-Zip / WinRAR / unrar & co.; cached for a couple of minutes."""
+    if not force and _FOLDER_CACHE["folders"] and time.time() - _FOLDER_CACHE["t"] < _FOLDER_TTL:
+        return _FOLDER_CACHE["folders"]
     folders = []
     for getter in (_bundled_dir, _writable_dir):
         try:
             folders.append(getter())
         except Exception:
             pass
-    folders += [ASSETS_DIR, os.path.join(SCRIPT_DIR, "tools")]
+    for base in (ASSETS_DIR, os.path.join(SCRIPT_DIR, "tools"), SCRIPT_DIR):
+        folders.append(base)
+        for sub in ("7z", "7-Zip", "7zip", "WinRAR", "unrar", "tools", "bin"):
+            folders.append(os.path.join(base, sub))
     if sys.platform.startswith("win"):
-        roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")]
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            roots.append(os.path.join(local, "Programs"))
-        for root in filter(None, roots):
-            for sub in ("7-Zip", "7-Zip-Zstandard", "WinRAR", "NanaZip", "PeaZip", os.path.join("PeaZip", "res", "bin", "7z")):
-                folders.append(os.path.join(root, sub))
         try:
-            import winreg
-            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                for key in (r"SOFTWARE\7-Zip", r"SOFTWARE\WOW6432Node\7-Zip", r"SOFTWARE\WinRAR", r"SOFTWARE\WOW6432Node\WinRAR"):
-                    for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0)):
-                        try:
-                            with winreg.OpenKey(hive, key, 0, winreg.KEY_READ | view) as k:
-                                for val in ("Path64", "Path", "exe64", "exe32"):
-                                    try:
-                                        v = winreg.QueryValueEx(k, val)[0]
-                                    except OSError:
-                                        continue
-                                    folders.append(v if os.path.isdir(v) else os.path.dirname(v))
-                        except OSError:
-                            pass
-        except ImportError:
+            folders += _windows_tool_folders()
+        except Exception:
             pass
-    for folder in folders:
+    else:
+        home = os.path.expanduser("~")
+        folders += ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", "/snap/bin",
+                    "/var/lib/flatpak/exports/bin", "/run/current-system/sw/bin", "/usr/lib/p7zip", "/usr/libexec/p7zip",
+                    os.path.join(home, ".local", "bin"), os.path.join(home, "bin"), os.path.join(home, ".nix-profile", "bin"),
+                    "/Applications/Keka.app/Contents/Resources", "/Applications/The Unarchiver.app/Contents/Resources"]
+    seen, out = set(), []
+    for f in folders:
+        if not f:
+            continue
+        key = os.path.normcase(os.path.normpath(f))
+        if key in seen or not os.path.isdir(f):
+            continue
+        seen.add(key)
+        out.append(f)
+    _FOLDER_CACHE["t"], _FOLDER_CACHE["folders"] = time.time(), out
+    return out
+
+def find_all_tools(*names, refresh=False):
+    """Every distinct copy of the named tools we can find: PATH first, then next to the launcher, the usual install
+    folders on every drive, package managers (Scoop / Chocolatey / WinGet), and the Windows registry."""
+    key = tuple(n.lower() for n in names)
+    hit = _TOOL_CACHE.get(key)
+    if not refresh and hit and (hit[1] or time.time() - hit[0] < _TOOL_MISS_TTL):
+        return [p for p in hit[1] if os.path.isfile(p)] or ([] if hit[1] else [])
+    found, seen = [], set()
+
+    def add(path):
+        k = os.path.normcase(os.path.realpath(path))
+        if k not in seen and os.path.isfile(path):
+            seen.add(k)
+            found.append(path)
+
+    for n in names:
+        w = shutil.which(n)
+        if w:
+            add(w)
+    exts = ("", ".exe", ".cmd", ".bat") if sys.platform.startswith("win") else ("",)
+    for folder in _tool_folders(force=refresh):
         for n in names:
-            for cand in (n, n + ".exe"):
-                path = os.path.join(folder, cand)
-                if os.path.isfile(path):
-                    return path
-    return None
+            for ext in exts:
+                add(os.path.join(folder, n + ext))
+    _TOOL_CACHE[key] = (time.time(), list(found))
+    return found
+
+def find_tool(*names):
+    """Full path of the first tool found, or None."""
+    found = find_all_tools(*names)
+    return found[0] if found else None
+
+_SEVENZIP_NAMES = ("7z", "7za", "7zz", "7zr", "NanaZipC", "7z-zstd", "7zG-console")
+_UNRAR_NAMES = ("unrar", "UnRAR", "unrar-free", "unrar-nonfree")
+
+def _extraction_attempts(path, out_dir, rar=True):
+    attempts = []
+    for exe in find_all_tools(*_SEVENZIP_NAMES):        # every copy: if one can't do the format, the next might
+        attempts.append([exe, "x", "-y", f"-o{out_dir}", path])
+    if rar:
+        for unrar in find_all_tools(*_UNRAR_NAMES):
+            attempts.append([unrar, "x", "-y", path, out_dir + os.sep])
+        for winrar in find_all_tools("WinRAR", "Rar"):
+            attempts.append([winrar, "x", "-y", "-ibck", path, out_dir + os.sep])
+    for unar in find_all_tools("unar"):
+        attempts.append([unar, "-f", "-o", out_dir, path])
+    for tar in find_all_tools("bsdtar", "tar"):         # Windows 10+ ships a tar.exe that can read rar and 7z
+        attempts.append([tar, "-xf", path, "-C", out_dir])
+    return attempts
 
 def _extract_with_tools(path, out_dir, rar=True):
     """Tries every extractor we can find. Returns True on success."""
     os.makedirs(out_dir, exist_ok=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    attempts = []
-    for exe in filter(None, [find_tool("7z", "7za", "7zz", "7zr")]):
-        attempts.append([exe, "x", "-y", f"-o{out_dir}", path])
-    if rar:
-        unrar = find_tool("unrar", "UnRAR")
-        if unrar:
-            attempts.append([unrar, "x", "-y", path, out_dir + os.sep])
-        winrar = find_tool("WinRAR")
-        if winrar:
-            attempts.append([winrar, "x", "-y", "-ibck", path, out_dir + os.sep])
-    unar = find_tool("unar")
-    if unar:
-        attempts.append([unar, "-f", "-o", out_dir, path])
-    tar = find_tool("bsdtar", "tar")   # Windows 10+ ships a tar.exe that can read rar and 7z
-    if tar:
-        attempts.append([tar, "-xf", path, "-C", out_dir])
+    attempts = _extraction_attempts(path, out_dir, rar)
+    if not any(os.path.basename(c[0]).lower().startswith(("7z", "nanazip", "unrar", "winrar", "rar", "unar")) for c in attempts):
+        # nothing archive-specific found: rescan from scratch (they may have installed 7-Zip / WinRAR a minute ago)
+        _TOOL_CACHE.clear()
+        _FOLDER_CACHE["t"] = 0.0
+        attempts = _extraction_attempts(path, out_dir, rar)
     for cmd in attempts:
         try:
             res = subprocess.run(cmd, capture_output=True, timeout=3600, creationflags=flags)
@@ -13998,7 +14208,6 @@ def _companion_names_on_disk():
 
 def companion_update_check():
     """Updates overlay.py / controller_input.py / overlay_hook.dll. True if anything changed."""
-    return False  # TEMP: companion/assets updater disabled - delete this line to re-enable
     if os.environ.get("NCZ_NO_UPDATE"):
         return False
     frozen = getattr(sys, "frozen", False)
