@@ -40,8 +40,21 @@ if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the runn
         os.environ["SteamAppId"] = os.environ["SteamGameId"] = _appid
         os.chdir(os.path.dirname(_lib))
         _api = ctypes.CDLL(_lib)
-        _api.SteamAPI_Init.restype = ctypes.c_bool
-        if _api.SteamAPI_Init():
+        _initflat = getattr(_api, "SteamAPI_InitFlat", None)        # newer SDKs (1.59+) only export InitFlat
+        if _initflat is not None:
+            _initflat.restype = ctypes.c_int
+            _initflat.argtypes = [ctypes.c_char_p]
+            _msg = ctypes.create_string_buffer(1024)
+            _res = _initflat(_msg)
+            _ok = (_res == 0)
+            if not _ok:
+                sys.stderr.write("SteamAPI_InitFlat failed (%s): %s\n" % (_res, _msg.value.decode("utf-8", "replace")))
+        else:
+            _api.SteamAPI_Init.restype = ctypes.c_bool
+            _ok = bool(_api.SteamAPI_Init())
+            if not _ok:
+                sys.stderr.write("SteamAPI_Init failed (is Steam running and signed in?)\n")
+        if _ok:
             _fr = None
             for _v in range(20, 7, -1):     # the accessor's name carries the ISteamFriends version of that steam_api library
                 _fn = getattr(_api, "SteamAPI_SteamFriends_v%03d" % _v, None)
@@ -64,9 +77,13 @@ if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the runn
                         print(_val.decode("utf-8", "replace"))
                         break
                     time.sleep(0.1)
+                else:
+                    sys.stderr.write("Steam has no 'connect' rich presence for this game right now\n")
+            else:
+                sys.stderr.write("couldn't get the ISteamFriends interface from this libsteam_api.so\n")
             _api.SteamAPI_Shutdown()
-    except Exception:
-        pass
+    except Exception as _e:
+        sys.stderr.write("rp helper error: %r\n" % (_e,))
     sys.exit(0)
 
 def _bundled_dir():
@@ -595,6 +612,9 @@ def load_launcher_settings():
                 key = loaded.get("steamgriddb_api_key", "")
                 if isinstance(key, str):
                     settings["steamgriddb_api_key"] = key.strip()
+                wkey = loaded.get("steam_web_api_key", "")
+                if isinstance(wkey, str):
+                    settings["steam_web_api_key"] = wkey.strip()
                 opts = loaded.get("launch_options", {})
                 if isinstance(opts, dict):
                     settings["launch_options"] = {str(k): v for k, v in opts.items()
@@ -10819,6 +10839,7 @@ def cloud_ensure_friend_code():
 
 # --- what the player is currently playing
 _now_playing = {"name": None}
+_running_dirs = {}           # game name -> the folder the launcher started it from
 _playing_listeners = []
 
 def pretty_game_name(name):
@@ -11004,6 +11025,7 @@ def _watch_game(name, proc, folder, t0):
 def _track_playing(name, proc, folder=None):
     name = pretty_game_name(name)
     _running[name] = proc
+    _running_dirs[name] = folder
     _now_playing["name"] = name
     for cb in _playing_listeners:
         cb()
@@ -11480,6 +11502,34 @@ def steam_profile_join(sid):
     out.setdefault("link", "")
     return out if out.get("name") or out.get("appid") else {}
 
+_invite_debug = []
+def _invite_log(msg):
+    print("invite: " + msg)
+    _invite_debug.append(msg)
+
+def steam_webapi_join(sid):
+    """Steam Web API (needs the free key in settings + public 'Game details'): the lobby/server you're in right now
+    -> {'appid', 'name', 'link'} or {}. Works for every game, including Windows games run through Proton."""
+    key = load_launcher_settings().get("steam_web_api_key", "")
+    if not (key and sid):
+        return {}
+    try:
+        data = json.loads(_http_get("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key="
+                                    + urllib.parse.quote(key) + "&steamids=" + sid, timeout=8).decode("utf-8", "replace"))
+        pl = (data.get("response", {}).get("players") or [{}])[0]
+    except Exception:
+        return {}
+    gid = str(pl.get("gameid", "") or "")
+    if not gid.isdigit():
+        return {}
+    out = {"appid": int(gid), "name": str(pl.get("gameextrainfo", ""))[:60], "link": ""}
+    lobby = str(pl.get("lobbysteamid", "") or "")
+    if lobby.isdigit():
+        out["link"] = normalize_steam_join(f"steam://joinlobby/{gid}/{lobby}/{sid}")
+    elif pl.get("gameserverip"):
+        out["link"] = normalize_steam_join(str(pl["gameserverip"]))
+    return out
+
 def _steam_api_lib_for(appid):
     """The game's own steam_api library (it ships next to the game), or ''."""
     name = "steam_api64.dll" if sys.platform.startswith("win") else "libsteam_api.so"
@@ -11492,6 +11542,158 @@ def _steam_api_lib_for(appid):
                     dirs[:] = []
                 if name in files:
                     return os.path.join(root, name)
+    return _any_steam_api_lib()
+
+_any_lib_cache = [None]
+
+def _steam_lib_dirs():
+    """Every Steam library folder (the Steam root plus the ones in libraryfolders.vdf)."""
+    libs = []
+    for root in _steam_root_dirs():
+        libs.append(root)
+        try:
+            with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+                libs += [p.replace("\\\\", "\\") for p in re.findall(r'"path"\s*"([^"]+)"', f.read())]
+        except OSError:
+            pass
+    out = []
+    for d in libs:
+        if d and d not in out and os.path.isdir(d):
+            out.append(d)
+    return out
+
+def _any_steam_api_lib():
+    """Any copy of Valve's steam_api library (libsteam_api.so on Linux, steam_api64.dll on Windows): a copy next to the
+    launcher wins, else the first 64-bit one found in the Steam library. It is only a thin wrapper around the Steam
+    client, so it works for any appid, whether or not the launcher's library knows the game."""
+    name = "steam_api64.dll" if sys.platform.startswith("win") else "libsteam_api.so"
+    for d in (ASSETS_DIR, SCRIPT_DIR, os.path.dirname(get_launcher_settings_path())):
+        path = os.path.join(d, name)
+        if os.path.isfile(path):
+            return path
+    if _any_lib_cache[0]:
+        return _any_lib_cache[0]
+    found = ""
+    for lib in _steam_lib_dirs():
+        common = os.path.join(lib, "steamapps", "common")
+        try:
+            games = sorted(os.listdir(common))
+        except OSError:
+            continue
+        for game in games:
+            base = os.path.join(common, game)
+            for root, dirs, files in os.walk(base):
+                if root[len(base):].count(os.sep) >= 3:
+                    dirs[:] = []
+                if name in files:
+                    path = os.path.join(root, name)
+                    if not sys.platform.startswith("win"):
+                        try:
+                            with open(path, "rb") as f:
+                                head = f.read(5)
+                        except OSError:
+                            continue
+                        if not (head[:4] == b"\x7fELF" and head[4:5] == b"\x02"):      # 64-bit only
+                            continue
+                    found = path
+                    break
+            if found:
+                break
+        if found:
+            break
+    _any_lib_cache[0] = found or None
+    return found
+
+def running_steam_appids():
+    """AppIDs of the games the Steam client says are running right now (RunningAppID first). Keyless, and it doesn't
+    depend on the launcher's own library knowing the game."""
+    ids = []
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+                v = int(winreg.QueryValueEx(k, "RunningAppID")[0])
+                if v:
+                    ids.append(v)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\Apps") as ak:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(ak, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with winreg.OpenKey(ak, sub) as sk:
+                            if sub.isdigit() and int(winreg.QueryValueEx(sk, "Running")[0]) and int(sub) not in ids:
+                                ids.append(int(sub))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    else:
+        home = os.path.expanduser("~")
+        for path in (home + "/.steam/registry.vdf", home + "/.var/app/com.valvesoftware.Steam/.steam/registry.vdf"):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            m = re.search(r'"RunningAppID"\s*"(\d+)"', text)
+            if m and int(m.group(1)) and int(m.group(1)) not in ids:
+                ids.append(int(m.group(1)))
+            for aid in re.findall(r'"(\d+)"\s*\{[^{}]*?"Running"\s*"1"', text):
+                if int(aid) not in ids:
+                    ids.append(int(aid))
+    return ids
+
+def _appid_from_game_folder(folder):
+    """AppID of a game the launcher started itself (not Steam): steam_appid.txt next to the game, or the Steam library
+    folder it lives in (steamapps/common/<installdir> -> its appmanifest)."""
+    if not folder or not os.path.isdir(folder):
+        return 0
+    base = os.path.abspath(folder)
+    for root, dirs, files in os.walk(base):
+        if root[len(base):].count(os.sep) >= 2:
+            dirs[:] = []
+        if "steam_appid.txt" in files:
+            try:
+                with open(os.path.join(root, "steam_appid.txt"), encoding="utf-8", errors="replace") as f:
+                    t = f.read().strip()
+                if t.isdigit() and int(t):
+                    return int(t)
+            except OSError:
+                pass
+    parts = base.replace("\\", "/").split("/")
+    if "steamapps" in parts and "common" in parts:
+        i = parts.index("common")
+        if i + 1 < len(parts):
+            steamapps, inst = "/".join(parts[:i]), parts[i + 1]
+            try:
+                for fn in os.listdir(steamapps):
+                    m = re.fullmatch(r"appmanifest_(\d+)\.acf", fn)
+                    if not m:
+                        continue
+                    with open(os.path.join(steamapps, fn), encoding="utf-8", errors="replace") as f:
+                        im = re.search(r'"installdir"\s*"([^"]*)"', f.read())
+                    if im and im.group(1).casefold() == inst.casefold():
+                        return int(m.group(1))
+            except OSError:
+                pass
+    return 0
+
+def _steam_name_for_appid(appid):
+    for lib in _steam_lib_dirs():
+        try:
+            with open(os.path.join(lib, "steamapps", f"appmanifest_{appid}.acf"), encoding="utf-8", errors="replace") as f:
+                m = re.search(r'"name"\s*"([^"]+)"', f.read())
+        except OSError:
+            continue
+        if m:
+            return pretty_game_name(m.group(1))[:60]
+    for g in load_steam_library():
+        if g.get("appid") == appid and g.get("title"):
+            return pretty_game_name(g["title"])
     return ""
 
 def steam_join_via_steamworks(appid, sid, timeout=15):
@@ -11499,34 +11701,42 @@ def steam_join_via_steamworks(appid, sid, timeout=15):
     rich presence 'connect' text and turns it into a join link. Worker thread. -> link or ''."""
     lib = _steam_api_lib_for(appid)
     if not lib or not sid:
+        _invite_log(("no libsteam_api / steam_api64 file found (put libsteam_api.so in assets/)" if not lib else
+                     "no Steam account found (is Steam installed and signed in?)") + f" [appid {appid}]")
         return ""
     cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)])
     cmd += ["--ncz-rp-helper", str(appid), lib, sid]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
-    except Exception:
+        _r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = _r.stdout.strip()
+    except Exception as e:
+        _invite_log(f"steamworks helper didn't run: {e!r}")
         return ""
     if not out:
+        _invite_log(f"appid {appid} via {lib}: {_r.stderr.strip() or 'no output (no join link published right now?)'}")
         return ""
     return normalize_steam_join(f"steam://rungame/{appid}/{sid}/" + urllib.parse.quote(out.splitlines()[-1], safe=""))
 
 def detect_invite_info():
-    """Runs on a worker thread. -> {'game', 'appid', 'link'}; each is empty/0 when it couldn't be found."""
+    """Runs on a worker thread. -> {'game', 'appid', 'link'}; each is empty/0 when it couldn't be found.
+    The join link comes from Steam's Web API (needs the saved key and public Game details)."""
     cur = current_game_for_invite() or {}
-    game, appid, link = cur.get("game", ""), cur.get("appid", 0), ""
+    game, appid = cur.get("game", ""), cur.get("appid", 0)
     sid = local_steam_id()
-    if sid and game and appid:              # first choice: ask the Steam client itself
-        link = steam_join_via_steamworks(appid, sid)
-    prof = steam_profile_join(sid) if (sid and not link) else {}
-    if prof:                                # the launcher's game wins for name + cover; the link comes from Steam either way
+    prof = steam_webapi_join(sid) if sid else {}
+    if sid and not prof.get("link"):
+        prof = {**steam_profile_join(sid), **{k: v for k, v in prof.items() if v}}
+    link = ""
+    if prof:
         if not game:
             game = pretty_game_name(prof.get("name", ""))
         appid = appid or prof.get("appid", 0)
-        link = link or prof.get("link", "")
+        link = prof.get("link", "")
     if game and not appid:
         appid = _steam_appid_for_title(game)
     return {"game": game, "appid": appid, "link": link}
+
 
 # ---- accepting an invite: if the invite's game (matched by NAME) isn't running, start it from this launcher's own
 # library card, wait 3 s, then accept the invite
@@ -13896,6 +14106,52 @@ class FriendsPage(QWidget):
         self._run(lambda: cloud_set_reaction(uid, key, code, on), done)
 
 
+class SteamApiKeyDialog(QDialog):
+    """Where the Steam Web API key goes; with it the launcher finds the join link by itself."""
+    def __init__(self, parent, note=""):
+        super().__init__(parent)
+        self.setWindowTitle("Invite to game")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        if note:
+            info = QLabel(note)
+            info.setWordWrap(True)
+            lay.addWidget(info)
+        self.key_edit = QLineEdit(load_launcher_settings().get("steam_web_api_key", ""))
+        self.key_edit.setPlaceholderText("Steam Web API key")
+        lay.addWidget(self.key_edit)
+        get = QPushButton("Get a Steam Web API key")
+        get.setCursor(Qt.CursorShape.PointingHandCursor)
+        get.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://steamcommunity.com/dev/apikey")))
+        lay.addWidget(get)
+        self.err = QLabel("")
+        self.err.setStyleSheet("color:#e5484d;")
+        self.err.hide()
+        lay.addWidget(self.err)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Save")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self._ok)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def _ok(self):
+        k = self.key_edit.text().strip()
+        if not re.fullmatch(r"[0-9A-Fa-f]{32}", k):
+            self.err.setText("A Steam Web API key is 32 letters and numbers.")
+            self.err.show()
+            return
+        st = load_launcher_settings()
+        st["steam_web_api_key"] = k
+        save_launcher_settings(st)
+        self.accept()
+
+
 class SteamInviteDialog(QDialog):
     """Only shown when the invite couldn't be completed automatically; whatever was found is already filled in."""
     def __init__(self, parent, game="", link="", appid=0, note=""):
@@ -13907,6 +14163,7 @@ class SteamInviteDialog(QDialog):
         if note:
             info = QLabel(note)
             info.setWordWrap(True)
+            info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             lay.addWidget(info)
         form = QFormLayout()
         self.name_edit = QLineEdit(game)
@@ -13915,8 +14172,12 @@ class SteamInviteDialog(QDialog):
         self.link_edit.setPlaceholderText("steam://joinlobby/...  or  steam://connect/...  or  ip:port")
         form.addRow("Game", self.name_edit)
         form.addRow("Join link", self.link_edit)
+        self.key_edit = QLineEdit(load_launcher_settings().get("steam_web_api_key", ""))
+        self.key_edit.setPlaceholderText("optional: free key from steamcommunity.com/dev/apikey")
+        form.addRow("Steam API key", self.key_edit)
         lay.addLayout(form)
-        hint = QLabel("Paste the game's steam join link.")
+        hint = QLabel("Paste the game's steam join link. With a Steam API key saved (and your Steam profile's Game "
+                      "details set to public) the launcher finds the link by itself next time.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888888; font-size:11px;")
         lay.addWidget(hint)
@@ -13942,6 +14203,11 @@ class SteamInviteDialog(QDialog):
         elif not normalize_steam_join(self.link_edit.text()):
             self.err.setText("That isn't a steam://joinlobby/ or steam://connect/ link (or ip:port).")
         else:
+            k = self.key_edit.text().strip()
+            if k != load_launcher_settings().get("steam_web_api_key", ""):
+                st = load_launcher_settings()
+                st["steam_web_api_key"] = k
+                save_launcher_settings(st)
             self.accept()
             return
         self.err.show()
@@ -13977,17 +14243,12 @@ def _friends_invite_to_game(self):
             self._send_invite(uid, game, link, appid)
             return
         self._set_status("")
-        if not game:
-            note = "No game is running right now, so enter the game and its join link."
-        elif clip:
-            note = f"Found {game}. Used the link from your clipboard; check it, then send."
-        else:
-            note = f"Found {game}, but Steam has no join link for it right now (it only has one while you're in a joinable lobby or server)."
-        dlg = SteamInviteDialog(self, game, link or clip, appid, note)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        g, l, a = dlg.values()
-        self._send_invite(uid, g, l, a)
+        note = ("Steam has no join link right now. Be in a joinable lobby or server (and set your Steam profile's Game "
+                "details to public), or check the key below."
+                if load_launcher_settings().get("steam_web_api_key") else
+                "Enter a Steam Web API key and the launcher will find the join link for you.")
+        if SteamApiKeyDialog(self, note).exec() == QDialog.DialogCode.Accepted:
+            self.invite_to_game()
     self._run(detect_invite_info, done, key="invite-detect")
 
 FriendsPage.invite_to_game = _friends_invite_to_game
@@ -26431,17 +26692,12 @@ class GroupChatPage(QWidget):
                 self._send_invite(game, link, appid)
                 return
             self._set_status("")
-            if not game:
-                note = "No game is running right now, so enter the game and its join link."
-            elif clip:
-                note = f"Found {game}. Used the link from your clipboard; check it, then send."
-            else:
-                note = f"Found {game}, but Steam has no join link for it right now."
-            dlg = SteamInviteDialog(self, game, link or clip, appid, note)
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                return
-            g, l, a = dlg.values()
-            self._send_invite(g, l, a)
+            note = ("Steam has no join link right now. Be in a joinable lobby or server (and set your Steam profile's Game "
+                    "details to public), or check the key below."
+                    if load_launcher_settings().get("steam_web_api_key") else
+                    "Enter a Steam Web API key and the launcher will find the join link for you.")
+            if SteamApiKeyDialog(self, note).exec() == QDialog.DialogCode.Accepted:
+                self.invite_to_game()
         self._run(detect_invite_info, done, key="ginvite-detect")
 
 
@@ -27759,13 +28015,60 @@ class CountryDialog(QDialog):
 # "new"     = sunset theme (dark indigo -> orange, always dark) + navigation rail on the left.
 # "classic" = the previous look (lavender accent, tabs in the top bar, follows Dark Mode / Accent Color).
 # The style is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
-def _ui_read_style():
+# Account themes: a theme can belong to specific accounts, and a "locked" one can't use any other theme.
+# The admin accounts below can pick every account theme (the existing one and any added later) and are never locked.
+_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
+_ACCOUNT_THEMES = {
+    "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": True},
+}   # each entry's look (label, theme, extra) is attached next to its colours below
+
+def _saved_uid():
+    try:
+        return (load_account() or {}).get("uid", "")
+    except Exception:
+        return ""
+
+def _raw_setting(name):
     try:
         with open(get_launcher_settings_path(), encoding="utf-8") as f:
-            v = json.load(f).get("ui_style")
-        return v if v in ("new", "classic") else "new"
+            return json.load(f).get(name)
     except Exception:
-        return "new"
+        return None
+
+def _locked_theme_key():
+    """The theme this account is locked to ('' if none). Admin accounts are never locked."""
+    uid = _saved_uid()
+    if not uid or uid in _THEME_ADMIN_UIDS:
+        return ""
+    for key, t in _ACCOUNT_THEMES.items():
+        if t.get("locked") and uid in t["uids"]:
+            return key
+    return ""
+
+def _custom_theme_locked():
+    return bool(_locked_theme_key())
+
+def _allowed_theme_keys():
+    """Account themes the saved account may use: its own, or every one of them for the admin accounts."""
+    uid = _saved_uid()
+    if uid in _THEME_ADMIN_UIDS:
+        return list(_ACCOUNT_THEMES)
+    return [k for k, t in _ACCOUNT_THEMES.items() if uid and uid in t["uids"]]
+
+def _active_theme_key():
+    key = _locked_theme_key()
+    if key:
+        return key
+    chosen = _raw_setting("ui_theme")
+    if chosen in _allowed_theme_keys() and _raw_setting("ui_style") != "classic":
+        return chosen
+    return ""
+
+def _ui_read_style():
+    if _locked_theme_key():
+        return "new"                       # account themes ride on the new layout
+    v = _raw_setting("ui_style")
+    return v if v in ("new", "classic") else "new"
 
 _UI_STYLE_AT_START = _ui_read_style()
 
@@ -27773,6 +28076,7 @@ _ui_prev_load_settings = load_launcher_settings
 def load_launcher_settings():
     s = _ui_prev_load_settings()          # the original drops unknown keys, so carry ui_style through it
     s["ui_style"] = _ui_read_style()
+    s["ui_theme"] = _raw_setting("ui_theme") or ""
     return s
 
 SUNSET_THEME = dict(
@@ -27855,6 +28159,72 @@ def _ui_apply_sunset():
 
 SUNSET_ACCENT = SUNSET_THEME["accent"]
 
+# ---------------------------------------------------------------- custom theme, locked to one account
+# Charcoal and silver (from that account's profile: black banner, silver-grey) with navy-blue highlights.
+_CUSTOM_THEME = dict(
+    bg="#1e2023", sidebar="#101113", panel="#2a2c30", input="#1a1b1e", border="#43464a",
+    text="#f4f5f5", subtext="#b4b8b9", accent="#4a6fc0", accent_hover="#6285d4", accent_press="#3a5aa5",
+    button="#34373b", button_hover="#40444a", disabled_bg="#25272a", disabled_text="#6f7375",
+    handle="#50545a", hover="#2f3236",
+    red="#4a6fc0", red_hover="#6285d4", red_press="#3a5aa5", accent_fill="rgba(74,111,192,0.20)",
+    nav_text="#c3c7c8", nav_active="#ffffff", brand="#ffffff", sidebar_border="#2e3033",
+    nav_fill="rgba(255,255,255,0.08)", nav_fill_hover="rgba(255,255,255,0.14)",
+)
+
+_CUSTOM_EXTRA = """
+QMainWindow, QWidget#Content, QWidget#GridContainer {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a2c30, stop:0.6 #1e2023, stop:1 #17181a);
+}
+QWidget#GridContainer { background: transparent; }
+QFrame#Sidebar {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #101113, stop:1 #4a4d50); border-bottom: 1px solid #2e3033;
+}
+QFrame#SideRail {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #101113, stop:0.7 #1e2023, stop:1 #2a2c30);
+    border-right: 1px solid #2e3033;
+}
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: #c3c7c8; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.10); color: #ffffff; }
+QFrame#SideRail QPushButton#NavButton:checked {
+    color: #ffffff; border: none; border-left: 3px solid #4a6fc0;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(74,111,192,0.30), stop:1 rgba(74,111,192,0));
+}
+QPushButton#Primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2b4f93, stop:1 #1f3b73); border-radius: 8px; color: #ffffff;
+}
+QPushButton#Primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3560b3, stop:1 #274a8c);
+}
+QPushButton#Primary:pressed { background: #1a3263; }
+QPushButton#Primary:disabled { background: #25272a; color: #6f7375; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4a6fc0, stop:1 #2b4f93); border-radius: 3px;
+}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(42, 44, 48, 0.88); border: 1px solid #43464a; }
+QFrame#GameCard { background: rgba(42, 44, 48, 0.78); border: 1px solid #3a3d41; border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(52, 55, 60, 0.95); border: 1px solid #4a6fc0; }
+QFrame#ToolBar { background: rgba(42, 44, 48, 0.88); border: 1px solid #43464a; border-radius: 16px; }
+QFrame#ToolBar QLabel { background: transparent; border: none; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: #1a1b1e; }
+QFrame#SidePanel { background: rgba(42, 44, 48, 0.88); border: 1px solid #43464a; border-radius: 16px; }
+QFrame#SidePanel QLabel { background: transparent; border: none; }
+QLabel#PaneHeader { color: #c3c7c8; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+"""
+
+_ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
+                                   icon="icon_kablooey.png")      # recoloured launcher icon, put it in assets/
+
+_ACTIVE_THEME_AT_START = _active_theme_key()
+if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the one an admin account picked
+    _look = _ACCOUNT_THEMES[_ACTIVE_THEME_AT_START]
+    SUNSET_THEME, _SUNSET_EXTRA = _look["theme"], _look["extra"]
+    SUNSET_ACCENT = SUNSET_THEME["accent"]
+    THEMES["dark" if QColor(SUNSET_THEME["bg"]).lightness() < 128 else "light"].update(SUNSET_THEME)   # widgets that pick light/dark by the window colour follow it too
+
+
 _ui_prev_set_accent = set_accent
 def set_accent(color):
     """Sunset always uses its own orange (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
@@ -27878,6 +28248,9 @@ _ui_prev_asset_path = asset_path
 def asset_path(filename):
     if filename == "icon.png":
         if _UI_STYLE_AT_START == "new":
+            themed = (_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}).get("icon")     # the active theme's own icon
+            if themed and os.path.exists(os.path.join(ASSETS_DIR, themed)):
+                return os.path.join(ASSETS_DIR, themed)
             return os.path.join(ASSETS_DIR, "icon.png")
         if not os.path.exists(accent_icon_path()):
             old = os.path.join(ASSETS_DIR, "icon_default.png")
@@ -27979,13 +28352,28 @@ def _ui_add_setting(self):
     combo.setFixedWidth(160)
     combo.addItem("Sunset (new)", "new")
     combo.addItem("Classic", "classic")
-    combo.setCurrentIndex(max(0, combo.findData(_UI_STYLE_AT_START)))
+    for key in _allowed_theme_keys():      # account themes this account may use (admin accounts get all of them)
+        combo.addItem(_ACCOUNT_THEMES[key]["label"], key)
+    start_data = _active_theme_key() or _UI_STYLE_AT_START
+    combo.setCurrentIndex(max(0, combo.findData(start_data)))
+    if _custom_theme_locked():             # this account's theme is fixed
+        key = _locked_theme_key()
+        combo.clear()
+        combo.addItem(_ACCOUNT_THEMES[key]["label"], key)
+        combo.setEnabled(False)
+        desc.setText("Your custom theme. Other themes are locked for this account.")
+        try:
+            sp.dark_mode_combo.setEnabled(False)
+        except Exception:
+            pass
 
     def changed():
+        d = combo.currentData()
         s = load_launcher_settings()
-        s["ui_style"] = combo.currentData()
+        s["ui_style"] = "classic" if d == "classic" else "new"
+        s["ui_theme"] = d if d in _ACCOUNT_THEMES else ""
         save_launcher_settings(s)
-        if combo.currentData() != _UI_STYLE_AT_START:
+        if d != start_data:
             QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new interface style.")
     combo.currentIndexChanged.connect(changed)
     row.addLayout(col, 1)
@@ -27997,7 +28385,10 @@ def _ui_add_setting(self):
     if _UI_STYLE_AT_START == "new":
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
-        sp.accent_desc.setText("Locked to Sunset orange. Switch Interface Style to Classic to pick your own color.")
+        sp.accent_desc.setText("Locked to your custom theme." if _custom_theme_locked() else
+                               "Locked to this theme's color. Switch Interface Style to Classic to pick your own color."
+                               if _active_theme_key() else
+                               "Locked to Sunset orange. Switch Interface Style to Classic to pick your own color.")
 
 def _ui_add_nsfw_setting(self):
     sp = self.settings_page
