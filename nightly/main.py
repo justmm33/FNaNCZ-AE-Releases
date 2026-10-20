@@ -28215,7 +28215,9 @@ QLabel#PaneHeader { color: #c3c7c8; font-size: 11px; font-weight: bold; backgrou
 """
 
 _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
-                                   icon="icon_kablooey.png")      # recoloured launcher icon, put it in assets/
+                                   icon="icon_kablooey.png",      # recoloured launcher icon (assets/, downloaded if missing)
+                                   icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_kablooey.png",
+                                              "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_kablooey.png?raw=true"])
 
 _ACTIVE_THEME_AT_START = _active_theme_key()
 if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the one an admin account picked
@@ -28244,14 +28246,46 @@ def apply_dark_mode(mode):
 
 # Icons: new UI always uses assets/icon.png (the new sunset icon). Classic uses the accent-recolored icon if there is
 # one, otherwise assets/icon_default.png (put the OLD icon there), otherwise icon.png.
+_icon_download_tried = set()
+
+def _ensure_theme_icon(entry):
+    """Path of a theme's own icon. If it isn't in assets/ (or the config folder) it is downloaded once per run;
+    '' when it isn't there and can't be downloaded (the normal icon is used then)."""
+    name = entry.get("icon")
+    if not name:
+        return ""
+    dirs = [ASSETS_DIR, os.path.dirname(get_launcher_settings_path())]
+    for d in dirs:
+        if os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
+    if name in _icon_download_tried:
+        return ""
+    _icon_download_tried.add(name)
+    for url in entry.get("icon_urls", []):
+        try:
+            data = _http_get(url, timeout=6)
+        except Exception:
+            continue
+        if len(data) < 1000 or data[:8] != b"\x89PNG\r\n\x1a\n":
+            continue
+        for d in dirs:                       # assets/ first; the config folder if assets/ can't be written to
+            try:
+                os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, name)
+                with open(path + ".part", "wb") as f:
+                    f.write(data)
+                os.replace(path + ".part", path)
+                return path
+            except OSError:
+                continue
+    return ""
+
 _ui_prev_asset_path = asset_path
 def asset_path(filename):
     if filename == "icon.png":
         if _UI_STYLE_AT_START == "new":
-            themed = (_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}).get("icon")     # the active theme's own icon
-            if themed and os.path.exists(os.path.join(ASSETS_DIR, themed)):
-                return os.path.join(ASSETS_DIR, themed)
-            return os.path.join(ASSETS_DIR, "icon.png")
+            themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the active theme's own icon
+            return themed or os.path.join(ASSETS_DIR, "icon.png")
         if not os.path.exists(accent_icon_path()):
             old = os.path.join(ASSETS_DIR, "icon_default.png")
             if os.path.exists(old):
