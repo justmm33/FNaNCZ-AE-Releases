@@ -603,6 +603,10 @@ def load_launcher_settings():
                         settings[_k] = loaded[_k]
                 if isinstance(loaded.get("nsfw_revealed"), bool):
                     settings["nsfw_revealed"] = loaded["nsfw_revealed"]
+                if isinstance(loaded.get("controller_bridge"), bool):
+                    settings["controller_bridge"] = loaded["controller_bridge"]
+                if isinstance(loaded.get("bridge_pin"), str):
+                    settings["bridge_pin"] = loaded["bridge_pin"]
                 if isinstance(loaded.get("archive_tool"), str):
                     settings["archive_tool"] = loaded["archive_tool"].strip().strip('"')
                 if loaded.get("download_server") in ("1", "2", "3", "ask"):
@@ -28515,6 +28519,79 @@ def _ui_add_nsfw_setting(self):
     lay.addLayout(row)
     sp.nsfw_hide_btn = btn
 
+# ---------------------------------------------------------------- Controller Bridge (phone -> PC gamepad)
+_bridge_obj = None
+
+def _bridge_pin():
+    s = load_launcher_settings()
+    pin = str(s.get("bridge_pin", "") or "")
+    if not pin:
+        import random
+        pin = "%04d" % random.randint(0, 9999)
+        s["bridge_pin"] = pin
+        save_launcher_settings(s)
+    return pin
+
+def _bridge_set_running(on):
+    global _bridge_obj
+    try:
+        from controller_bridge import ControllerBridge
+    except Exception:
+        return False
+    if _bridge_obj is None:
+        _bridge_obj = ControllerBridge(_bridge_pin)
+    if on:
+        _bridge_obj.start()
+    else:
+        _bridge_obj.stop()
+        _bridge_obj = None
+    return True
+
+def _ui_add_bridge_setting(self):
+    from controller_bridge import local_ip, PORT
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("Input Bridge")
+    title.setObjectName("RowTitle")
+    desc = QLabel()
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    btn = QPushButton()
+    btn.setCheckable(True)
+    btn.setFixedWidth(110)
+
+    def refresh():
+        on = btn.isChecked()
+        btn.setText("On" if on else "Off")
+        if on:
+            desc.setText("Use your phone's Bluetooth controller on this PC over Wi-Fi. In the mobile app open "
+                         "Input Bridge and enter  %s  with PIN  %s  (same network, port %d)."
+                         % (local_ip(), _bridge_pin(), PORT))
+        else:
+            desc.setText("Off: phones can't send controller input to this PC.")
+
+    def toggled(on):
+        s = load_launcher_settings()
+        s["controller_bridge"] = bool(on)
+        save_launcher_settings(s)
+        _bridge_set_running(on)
+        refresh()
+    btn.setChecked(bool(load_launcher_settings().get("controller_bridge", False)))
+    btn.toggled.connect(toggled)
+    refresh()
+    row.addLayout(col, 1)
+    row.addWidget(btn)
+    lay.addSpacing(10)
+    lay.addLayout(row)
+    sp.bridge_btn = btn
+    if btn.isChecked():
+        _bridge_set_running(True)
+
 _ui_prev_init = AdaptiveApp.__init__
 def _ui_init(self):
     _ui_prev_init(self)
@@ -28525,6 +28602,10 @@ def _ui_init(self):
         traceback.print_exc()
     try:
         _ui_add_nsfw_setting(self)
+    except Exception:
+        traceback.print_exc()
+    try:
+        _ui_add_bridge_setting(self)
     except Exception:
         traceback.print_exc()
     if _UI_STYLE_AT_START == "new":
