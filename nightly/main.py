@@ -28020,6 +28020,7 @@ class CountryDialog(QDialog):
 _THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
 _ACCOUNT_THEMES = {
     "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": True},
+    "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
 }   # each entry's look (label, theme, extra) is attached next to its colours below
 
 def _saved_uid():
@@ -28213,6 +28214,65 @@ QFrame#SidePanel { background: rgba(42, 44, 48, 0.88); border: 1px solid #43464a
 QFrame#SidePanel QLabel { background: transparent; border: none; }
 QLabel#PaneHeader { color: #c3c7c8; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
 """
+
+# MM33's theme: dark teal fading to olive green (his profile card) with the gold of his banner sunset as the highlight.
+_MM33_THEME = dict(
+    bg="#102f31", sidebar="#08191b", panel="#1b3f41", input="#0c2224", border="#2e5254",
+    text="#eef6f4", subtext="#9db8b3", accent="#c98420", accent_hover="#dd9a35", accent_press="#a96c16",
+    button="#24494b", button_hover="#2e5a5c", disabled_bg="#15302f", disabled_text="#587572",
+    handle="#3d6567", hover="#1a393b",
+    red="#c98420", red_hover="#dd9a35", red_press="#a96c16", accent_fill="rgba(201,132,32,0.22)",
+    nav_text="#a9c4bf", nav_active="#ffffff", brand="#ffffff", sidebar_border="#143537",
+    nav_fill="rgba(255,255,255,0.07)", nav_fill_hover="rgba(255,255,255,0.13)",
+)
+
+_MM33_EXTRA = """
+QMainWindow, QWidget#Content, QWidget#GridContainer {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #174a4f, stop:0.55 #102f31, stop:1 #1e2f28);
+}
+QWidget#GridContainer { background: transparent; }
+QFrame#Sidebar {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #08191b, stop:1 #16403f); border-bottom: 1px solid #143537;
+}
+QFrame#SideRail {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #06171a, stop:0.7 #0c2527, stop:1 #1b2e27);
+    border-right: 1px solid #143537;
+}
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: #a9c4bf; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.08); color: #ffffff; }
+QFrame#SideRail QPushButton#NavButton:checked {
+    color: #ffffff; border: none; border-left: 3px solid #eead62;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(238,173,98,0.28), stop:1 rgba(238,173,98,0));
+}
+QPushButton#Primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f0b562, stop:1 #d98f35); border-radius: 8px; color: #ffffff;
+}
+QPushButton#Primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f6c47e, stop:1 #e29d45);
+}
+QPushButton#Primary:pressed { background: #c98a3a; }
+QPushButton#Primary:disabled { background: #15302f; color: #587572; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #eead62, stop:1 #d98f35); border-radius: 3px;
+}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(27, 63, 65, 0.80); border: 1px solid #2e5254; }
+QFrame#GameCard { background: rgba(27, 63, 65, 0.65); border: 1px solid #26494b; border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(36, 80, 82, 0.90); border: 1px solid #eead62; }
+QFrame#ToolBar { background: rgba(27, 63, 65, 0.80); border: 1px solid #2e5254; border-radius: 16px; }
+QFrame#ToolBar QLabel { background: transparent; border: none; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: #0c2224; }
+QFrame#SidePanel { background: rgba(27, 63, 65, 0.80); border: 1px solid #2e5254; border-radius: 16px; }
+QFrame#SidePanel QLabel { background: transparent; border: none; }
+QLabel#PaneHeader { color: #9db8b3; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+"""
+
+_ACCOUNT_THEMES["mm33"].update(label="MM33 (custom)", theme=_MM33_THEME, extra=_MM33_EXTRA,
+                               icon="icon_mm33.png",          # teal and gold launcher icon (assets/, downloaded if missing)
+                               icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_mm33.png",
+                                          "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_mm33.png?raw=true"])
 
 _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
                                    icon="icon_kablooey.png",      # recoloured launcher icon (assets/, downloaded if missing)
@@ -29852,6 +29912,955 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
     except Exception as e:
         _ss_log(f"couldn't add the Cloud Saves menu entry: {e!r}")
 
+
+# ---------------------------------------------------------------- start games from your phone
+# The Android app writes a request to remote/<uid>/cmd. If (and only if) you turned this on in Friends, this PC picks it up,
+# presses that game's Play button, and writes the outcome to remote/<uid>/res. Only a game that is in your own library and
+# ready to play can ever be started, and old requests are thrown away instead of being run late.
+REMOTE_POLL_MS = 4000
+REMOTE_STALE_MS = 5 * 60 * 1000
+_remote = {"seen_ids": [], "primed": False, "busy": False, "last_pc": 0.0, "last_sig": None}
+_remote_workers = set()
+_PLAY_BTN_RE = re.compile(r"^\W*(play|launch)\b", re.I)
+
+def _remote_flag_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "remote_start.json")
+
+def remote_start_enabled():
+    try:
+        with open(_remote_flag_path(), encoding="utf-8") as f:
+            return json.load(f).get("enabled") is True
+    except Exception:
+        return False
+
+def set_remote_start_enabled(on):
+    try:
+        path = _remote_flag_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(on)}, f)
+    except Exception as e:
+        print(f"remote start: couldn't save the setting ({e!r})")
+
+def _remote_cards(app):
+    out = []
+    for lst in (getattr(app, "cards", None), getattr(app, "fan_lib_list", None)):
+        if not isinstance(lst, list):
+            continue
+        for card, title in list(lst):
+            try:
+                card.objectName()          # raises if the card was deleted
+            except RuntimeError:
+                continue
+            t = pretty_game_name(title)
+            if t:
+                out.append((card, t))
+    return out
+
+def _remote_play_button(card):
+    try:
+        for b in card.findChildren(QPushButton):
+            if b.isEnabled() and _PLAY_BTN_RE.match(b.text() or ""):
+                return b
+    except RuntimeError:
+        pass
+    return None
+
+def _remote_games(app):
+    games, seen = [], set()
+    for card, title in _remote_cards(app):
+        if title not in seen and _remote_play_button(card):
+            seen.add(title)
+            games.append(title)
+    return sorted(games, key=str.lower)[:200]
+
+def _remote_bg(app, fn, done=None, failed=None):
+    w = TaskWorker(fn)
+    _remote_workers.add(w)
+    if done:
+        w.done.connect(done)
+    if failed:
+        w.failed.connect(failed)
+    w.finished.connect(lambda: _remote_workers.discard(w))
+    w.start()
+
+def _remote_reply(app, cid, game, ok, msg):
+    def work():
+        token, uid = get_id_token()
+        _http_json(_fdb(f"remote/{uid}/res", token), "PUT",
+                   {"id": cid, "game": game, "ok": bool(ok), "msg": str(msg)[:200], "ts": {".sv": "timestamp"}})
+    _remote_bg(app, work)
+
+def _remote_handle(app, cmd):
+    cid = str(cmd.get("id", ""))
+    game = str(cmd.get("game", ""))[:160]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,40}", cid) or cid in _remote["seen_ids"]:
+        return
+    _remote["seen_ids"] = (_remote["seen_ids"] + [cid])[-50:]
+    ts = cmd.get("ts")
+    if cmd.get("do") != "start" or not game:
+        return _remote_reply(app, cid, game, False, "Your PC didn't understand that request.")
+    if not isinstance(ts, (int, float)) or abs(time.time() * 1000 - ts) > REMOTE_STALE_MS:
+        return _remote_reply(app, cid, game, False, "That request was too old. Try again.")
+    btn = None
+    for card, title in _remote_cards(app):
+        if title == game:
+            btn = _remote_play_button(card)
+            if btn:
+                break
+    if btn is None:
+        return _remote_reply(app, cid, game, False, f"{game} can't be started right now (not installed, or still downloading).")
+    if game in _running:
+        return _remote_reply(app, cid, game, False, f"{game} is already running.")
+    try:
+        btn.click()
+    except Exception as e:
+        return _remote_reply(app, cid, game, False, f"The launcher couldn't start {game}: {e}")
+    _remote_reply(app, cid, game, True, f"Starting {game} on your PC...")
+
+def _remote_tick(app):
+    if _remote["busy"]:
+        return
+    try:
+        if not load_account():
+            return
+    except Exception:
+        return
+    enabled = remote_start_enabled()
+    if not enabled:
+        _remote["primed"] = False
+    games = _remote_games(app) if enabled else []
+    playing = _now_playing["name"] or ""
+    sig = (enabled, tuple(games), playing)
+    publish = sig != _remote["last_sig"] or time.time() - _remote["last_pc"] > (20 if enabled else 30)
+    if not enabled and not publish:
+        return
+    _remote["busy"] = True
+
+    def work():
+        token, uid = get_id_token()
+        if publish:
+            _http_json(_fdb(f"remote/{uid}/pc", token), "PUT",
+                       {"enabled": enabled, "games": games, "playing": playing, "seen": {".sv": "timestamp"}})
+        cmd = None
+        if enabled:
+            cmd = _http_json(_fdb(f"remote/{uid}/cmd", token))
+            if cmd is not None:
+                _http_json(_fdb(f"remote/{uid}/cmd", token), "DELETE")      # claimed: it can only ever run once
+        return cmd
+
+    def done(cmd):
+        _remote["busy"] = False
+        if publish:
+            _remote["last_sig"] = sig
+            _remote["last_pc"] = time.time()
+        if not (enabled and remote_start_enabled()):
+            return
+        if not _remote["primed"]:
+            _remote["primed"] = True          # whatever was waiting from before this moment is dropped, never run
+        elif isinstance(cmd, dict):
+            _remote_handle(app, cmd)
+
+    def failed(_msg):
+        _remote["busy"] = False
+
+    _remote_bg(app, work, done, failed)
+
+_rs_prev_app_init = AdaptiveApp.__init__
+
+def _rs_app_init(self):
+    _rs_prev_app_init(self)
+    try:
+        self._remote_timer = QTimer(self)
+        self._remote_timer.setInterval(REMOTE_POLL_MS)
+        self._remote_timer.timeout.connect(lambda: _remote_tick(self))
+        self._remote_timer.start()
+    except Exception as e:
+        print(f"remote start: couldn't start ({e!r})")
+
+AdaptiveApp.__init__ = _rs_app_init
+
+_rs_prev_build_list = FriendsPage._build_list
+
+def _rs_build_list(self):
+    page = _rs_prev_build_list(self)
+    try:
+        from PyQt6.QtWidgets import QCheckBox
+        lay = page.layout()
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 16, 22, 16)
+        pl.setSpacing(4)
+        cb = QCheckBox("Let my phone start games on this PC")
+        cb.setChecked(remote_start_enabled())
+        cb.toggled.connect(set_remote_start_enabled)
+        desc = QLabel("Turn this on to start games from the Friends app on your phone (My PC tab). Only games that are already "
+                      "installed in your library can be started, and only from your own account. The launcher has to be running.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        pl.addWidget(cb)
+        pl.addWidget(desc)
+        lay.insertSpacing(3, 12)
+        lay.insertWidget(4, panel)
+    except Exception as e:
+        print(f"remote start: couldn't add the setting ({e!r})")
+    return page
+
+FriendsPage._build_list = _rs_build_list
+
+# ---------------------------------------------------------------- phone: PC store, Workshop mods, cloud saves, download server
+# Builds on the "start games from your phone" channel above. The Android app puts requests in remote/<uid>/q/<id> and this PC
+# answers in remote/<uid>/r/<id>; the PC also publishes what the phone needs to show (library, running downloads, which
+# switches are on) in remote/<uid>/pcx. Two separate switches in Friends decide what the phone may do, both OFF by default:
+#   "Let my phone manage downloads on this PC"  -> browse the Steam store, add to library, download (and pick the server),
+#                                                  download Steam Workshop mods
+#   "Let my phone sync cloud saves for this PC" -> save to / get from the cloud for the games on this PC
+# Nothing runs unless the request comes from your own signed-in account, is less than 2 minutes old, and its switch is on.
+RX_POLL_MS = 3000
+RX_STALE_MS = 2 * 60 * 1000
+RX_DL_VERBS = {"store_search", "store_add", "store_remove", "store_servers", "store_download",
+               "ws_lookup", "ws_search", "ws_get", "jobs_cancel"}
+RX_SAVE_VERBS = {"save_status", "save_up", "save_down", "save_all"}
+_rx = {"seen": [], "primed": False, "busy": False, "last_pub": 0.0, "last_sig": None, "store": {},
+       "exe_fns": {}, "server": {}, "existing": {}, "out": [], "saving": False}
+
+def _rx_flag_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "remote_extra.json")
+
+def _rx_flags():
+    try:
+        with open(_rx_flag_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    d = d if isinstance(d, dict) else {}
+    return {"dl": d.get("dl") is True, "saves": d.get("saves") is True}
+
+def _rx_set_flag(name, on):
+    try:
+        d = _rx_flags()
+        d[name] = bool(on)
+        os.makedirs(os.path.dirname(_rx_flag_path()), exist_ok=True)
+        with open(_rx_flag_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"phone remote: couldn't save the setting ({e!r})")
+
+def _rx_int(v, lo=1, hi=2 ** 31 - 1):
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if lo <= n <= hi else None
+
+def _rx_reply(cid, ok, msg="", data=None):
+    def work():
+        token, uid = get_id_token()
+        body = {"id": cid, "ok": bool(ok), "msg": str(msg)[:300], "ts": {".sv": "timestamp"}}
+        if data is not None:
+            body["data"] = data
+        _http_json(_fdb(f"remote/{uid}/r/{cid}", token), "PUT", body)
+        _rx["out"].append((cid, time.time()))
+    _remote_bg(None, work)
+
+def _rx_cover_url(appid, base):
+    if isinstance(base, str) and re.match(r"^https://[A-Za-z0-9.-]+\.steamstatic\.com/", base):
+        return base + "/library_600x900.jpg"
+    return f"https://cdn.cloudflare.steamstatic.com/steam/apps/{int(appid)}/library_600x900.jpg"
+
+def _rx_win():
+    return _invite_main_window()
+
+def _rx_card_title(card, fallback=""):
+    try:
+        lab = card.findChild(QLabel, "CardTitle")
+        return (lab.text() if lab else "") or fallback
+    except RuntimeError:
+        return fallback
+
+def _rx_card_installed(card):
+    try:
+        b = card.findChild(QPushButton, "Primary")
+        return bool(b) and b.text().strip().lower() in ("launch", "play")
+    except RuntimeError:
+        return False
+
+def _rx_download_cards(win):
+    out = []
+    try:
+        lay = win.downloads_page.container_layout
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, DownloadCard):
+                out.append(w)
+    except Exception:
+        pass
+    return out
+
+def _rx_is_downloading(win, title):
+    key = _invite_norm(title)
+    for c in _rx_download_cards(win):
+        try:
+            if c.state == "active" and _invite_norm(c.title) == key:
+                return True
+        except RuntimeError:
+            continue
+    return False
+
+def _rx_jobs(win):
+    jobs = []
+    for c in _rx_download_cards(win):
+        try:
+            bar = c.progress_bar
+            pct = -1 if bar.maximum() == bar.minimum() else int(bar.value())
+            jobs.append({"k": "s", "t": str(c.title)[:80], "s": str(c.state), "p": pct,
+                         "x": c.status_label.text()[:60], "i": c.info_label.text()[:90]})
+        except RuntimeError:
+            continue
+    try:
+        for q in list(win.workshop_page.queue)[-40:]:
+            pct = q.get("pct")
+            jobs.append({"k": "w", "id": str(q["id"]), "t": str(q["title"])[:80], "g": str(q["game"])[:60],
+                         "s": {"queued": "queued", "downloading": "active", "done": "done"}.get(q["status"], "failed"),
+                         "p": -1 if pct is None else int(pct), "x": str(q.get("line") or q.get("msg") or "")[:90]})
+    except Exception:
+        pass
+    return jobs[-40:]
+
+def _rx_build_pcx(win, fl):
+    pcx = {"v": 2, "dl": fl["dl"], "saves": fl["saves"]}
+    if not fl["dl"] or win is None:
+        return pcx
+    st = load_launcher_settings().get("download_server")
+    pcx["server"] = st if st in ("1", "2", "3", "ask") else "1"
+    pcx["servers"] = [{"id": k, "n": v[0], "d": v[1]} for k, v in sorted(PW_SERVER_NAMES.items())]
+    lib = []
+    for appid, card in list(getattr(win, "steam_cards", {}).items())[:300]:
+        title = _rx_card_title(card)
+        if title:
+            lib.append({"a": int(appid), "t": title[:80], "i": 1 if _rx_card_installed(card) else 0})
+    lib.sort(key=lambda e: e["t"].lower())
+    pcx["lib"] = lib
+    pcx["jobs"] = _rx_jobs(win)
+    return pcx
+
+# ---------------------------------------------------------------- download server: the phone's pick beats the launcher's setting
+# for that one download (and never pops the "Choose download server" window on the PC).
+_rx_prev_pw_server = pw_server
+
+def pw_server():
+    v = getattr(_pw_tls, "rx_server", None)
+    return v if v in ("1", "2", "3") else _rx_prev_pw_server()
+
+_rx_prev_ask_server = _pw_ask_server
+
+def _pw_ask_server(worker):
+    v = getattr(_pw_tls, "rx_server", None)
+    if v in ("1", "2", "3"):
+        return v
+    return _rx_prev_ask_server(worker)
+
+_rx_prev_fb_run = FirebaseDownloadWorker.run
+
+def _rx_fb_run(self):
+    pick = None
+    try:
+        pick = _rx["server"].pop(_invite_norm(getattr(self, "title", "")), None)
+    except Exception:
+        pass
+    _pw_tls.rx_server = pick[0] if pick and time.time() - pick[1] < 180 else None
+    try:
+        return _rx_prev_fb_run(self)
+    finally:
+        _pw_tls.rx_server = None
+
+FirebaseDownloadWorker.run = _rx_fb_run
+
+# "an old download file is already here" normally opens a window on the PC; a request from the phone carries the answer
+_rx_prev_ask_existing = _ask_existing_archive
+
+def _ask_existing_archive(parent, title):
+    choice = _rx["existing"].pop(_invite_norm(title), None)
+    if choice is None:
+        return _rx_prev_ask_existing(parent, title)
+    existing = find_existing_archive_for_title(title)
+    if existing and choice == "use":
+        return False, existing
+    if existing:
+        try:
+            os.remove(existing)
+        except Exception:
+            pass
+    return False, None
+
+# ---------------------------------------------------------------- store
+def _rx_remember(appid, title, base):
+    _rx["store"][appid] = {"t": title, "b": base}
+    while len(_rx["store"]) > 400:
+        _rx["store"].pop(next(iter(_rx["store"])))
+
+def _rx_store_search(win, cid, a):
+    q = str(a.get("q", ""))[:80]
+    page = _rx_int(a.get("page", 0), 0, 40) or 0
+    top = a.get("sort") == "top"
+
+    def work():
+        return fetch_steam_games(q, page * 24, 24, sort_by="Reviews_DESC" if top else "_ASC")
+
+    def done(res):
+        games, total = res
+        out = []
+        for appid, title, base in games:
+            _rx_remember(appid, title, base)
+            out.append({"a": appid, "t": title[:90], "c": _rx_cover_url(appid, base),
+                        "l": 1 if appid in win.steam_cards else 0})
+        _rx_reply(cid, True, "", {"games": out, "total": total, "page": page})
+
+    _remote_bg(None, work, done, lambda m: _rx_reply(cid, False, m))
+
+def _rx_title_for(win, appid):
+    card = win.steam_cards.get(appid)
+    if card is not None:
+        t = _rx_card_title(card)
+        if t:
+            return t
+    return (_rx["store"].get(appid) or {}).get("t", "")
+
+def _rx_ensure_library(win, appid, then):
+    """Adds the game to the library (cover included) if it isn't there, then calls then(ok, title_or_error) on the GUI thread."""
+    if appid in win.steam_cards:
+        return then(True, _rx_title_for(win, appid))
+    cached = _rx["store"].get(appid) or {}
+
+    def work():
+        title, base = cached.get("t", ""), cached.get("b", "")
+        if not title:
+            js = json.loads(_http_get(f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic",
+                                      timeout=12).decode("utf-8", "replace"))
+            title = js[str(appid)]["data"]["name"]
+        title = re.sub(r"\s+", " ", str(title)).strip()[:120]
+        if not title:
+            raise CloudError("Steam doesn't know that game.")
+        cover = ""
+        try:
+            os.makedirs(get_store_cache_dir(), exist_ok=True)
+            path = os.path.join(get_store_cache_dir(), f"remote-{appid}.img")
+            with open(path, "wb") as f:
+                f.write(_http_get(_rx_cover_url(appid, base), timeout=15))
+            cover = path
+        except Exception:
+            cover = ""
+        return title, cover
+
+    def done(res):
+        title, cover = res
+        try:
+            page = win.store_detail_page
+            shown = getattr(page, "_appid", None)
+            win.add_steam_game(appid, title, cover)
+            if shown not in (None, appid):          # add_steam_game flips the open store page's button; put it back
+                page.set_in_library(shown in win.steam_cards)
+        except Exception as e:
+            return then(False, f"Couldn't add {title} to the library: {e}")
+        then(True, title)
+
+    _remote_bg(None, work, done, lambda m: then(False, m))
+
+def _rx_store_add(win, cid, a):
+    appid = _rx_int(a.get("a"))
+    if appid is None:
+        return _rx_reply(cid, False, "That game isn't valid.")
+    had = appid in win.steam_cards
+    _rx_ensure_library(win, appid, lambda ok, info: _rx_reply(
+        cid, ok, (f"{info} is already in your PC's library." if had else f"Added {info} to your PC's library.") if ok else info))
+
+def _rx_store_remove(win, cid, a):
+    appid = _rx_int(a.get("a"))
+    if appid is None or appid not in win.steam_cards:
+        return _rx_reply(cid, False, "That game isn't in your PC's library.")
+    title = _rx_title_for(win, appid)
+    if title and _rx_is_downloading(win, title):
+        return _rx_reply(cid, False, f"{title} is downloading right now. Cancel it first.")
+    win.remove_steam_game(appid)
+    _rx_reply(cid, True, f"Removed {title or 'the game'} from your PC's library.")
+
+def _rx_store_servers(win, cid, a):
+    appid = _rx_int(a.get("a"))
+    title = _rx_title_for(win, appid) if appid else ""
+    if not title:
+        return _rx_reply(cid, False, "Look the game up in the store first.")
+
+    def work():
+        sids = ("1", "2", "3")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            states = list(ex.map(lambda s: _pw_probe_server(title, s), sids))
+        return [{"id": s, "n": PW_SERVER_NAMES[s][0], "d": PW_SERVER_NAMES[s][1], "s": st} for s, st in zip(sids, states)]
+
+    _remote_bg(None, work, lambda r: _rx_reply(cid, True, "", {"servers": r, "t": title}), lambda m: _rx_reply(cid, False, m))
+
+def _rx_store_download(win, cid, a):
+    appid = _rx_int(a.get("a"))
+    server = str(a.get("server", ""))
+    existing = a.get("existing")
+    if appid is None:
+        return _rx_reply(cid, False, "That game isn't valid.")
+    if server not in PW_SERVER_NAMES:
+        return _rx_reply(cid, False, "Pick a download server first.")
+
+    def go(ok, info):
+        if not ok:
+            return _rx_reply(cid, False, info)
+        card = win.steam_cards.get(appid)
+        title = info
+        btn = card.findChild(QPushButton, "Primary") if card is not None else None
+        label = btn.text().strip().lower() if btn is not None else ""
+        if label in ("launch", "play"):
+            return _rx_reply(cid, False, f"{title} is already installed on your PC.")
+        if label != "install" or not btn.isEnabled():
+            return _rx_reply(cid, False, f"{title} can't be installed right now.")
+        if _rx_is_downloading(win, title):
+            return _rx_reply(cid, False, f"{title} is already downloading.")
+        old = find_existing_archive_for_title(title)
+        if old and existing not in ("use", "redownload"):
+            return _rx_reply(cid, False, f"A downloaded file for {title} is already on your PC.",
+                             {"needs": "existing", "file": os.path.basename(old), "t": title})
+        key = _invite_norm(title)
+        _rx["server"][key] = (server, time.time())
+        if old:
+            _rx["existing"][key] = "use" if existing == "use" else "fresh"
+        btn.click()
+        _rx["existing"].pop(key, None)            # the click has already asked; never let an answer wait for a later install
+        if not _rx_is_downloading(win, title):
+            _rx["server"].pop(key, None)
+            return _rx_reply(cid, False, f"The launcher didn't start downloading {title}. Try it from the launcher once.")
+        used = "the downloaded file" if (old and existing == "use") else PW_SERVER_NAMES[server][0]
+        _rx_reply(cid, True, f"Downloading {title} on your PC ({used}).")
+
+    _rx_ensure_library(win, appid, go)
+
+# ---------------------------------------------------------------- Steam Workshop
+def _rx_ws_details(ids):
+    known = {g["appid"]: g["title"] for g in load_steam_library()}
+    out = {}
+    w = WorkshopLinkWorker(ids, known)
+    w.done.connect(lambda r, e: out.update(r=r, e=e), Qt.ConnectionType.DirectConnection)
+    w.run()                      # a plain call: we're already on a worker thread
+    return out.get("r", []), out.get("e", [])
+
+def _rx_ws_lookup(win, cid, a):
+    ids = ws_parse_item_ids(str(a.get("text", ""))[:900])[:20]
+    if not ids:
+        return _rx_reply(cid, False, "Paste a Workshop link or an item number.")
+
+    def done(res):
+        results, errors = res
+        items = [{"id": it["id"], "t": it["title"][:90], "pv": it.get("preview", "") if str(it.get("preview", "")).startswith("https://") else "",
+                  "au": it.get("author", "")[:40], "a": appid, "g": game[:60]} for appid, game, it in results]
+        _rx_reply(cid, bool(items), "; ".join(errors)[:280] if not items else "", {"items": items, "err": errors[:5]})
+
+    _remote_bg(None, lambda: _rx_ws_details(ids), done, lambda m: _rx_reply(cid, False, m))
+
+def _rx_ws_search(win, cid, a):
+    appid = _rx_int(a.get("a"))
+    if appid is None:
+        return _rx_reply(cid, False, "Pick a game first.")
+    q = str(a.get("q", ""))[:80]
+    page = _rx_int(a.get("page", 1), 1, 50) or 1
+    sort = a.get("sort") if a.get("sort") in [s[1] for s in WS_SORTS] else "trend"
+
+    def work():
+        out = {}
+        w = WorkshopFetchWorker(0, appid, q, sort, page)
+        w.done.connect(lambda tok, items, err: out.update(i=items, e=err), Qt.ConnectionType.DirectConnection)
+        w.run()
+        if not out.get("i"):
+            raise CloudError(out.get("e") or "Steam's Workshop had nothing for that.")
+        return [{"id": it["id"], "t": it["title"][:90], "au": it.get("author", "")[:40],
+                 "pv": it["preview"] if str(it.get("preview", "")).startswith("https://") else ""} for it in out["i"][:30]]
+
+    _remote_bg(None, work, lambda r: _rx_reply(cid, True, "", {"items": r, "page": page, "a": appid}),
+               lambda m: _rx_reply(cid, False, m))
+
+def _rx_ws_get(win, cid, a):
+    raw = a.get("ids") if isinstance(a.get("ids"), list) else []
+    ids = []
+    for x in raw[:20]:
+        if str(x).isdigit() and 5 <= len(str(x)) <= 20 and str(x) not in ids:
+            ids.append(str(x))
+    if not ids:
+        return _rx_reply(cid, False, "No mods were picked.")
+    pg = getattr(win, "workshop_page", None)
+    if pg is None:
+        return _rx_reply(cid, False, "This launcher has no Workshop page.")
+
+    def done(res):
+        results, errors = res
+        queued, have = [], 0
+        for appid, game, it in results:
+            try:
+                if pg._ws_have(appid, it["id"]):
+                    have += 1
+                elif pg.enqueue(it, appid, game):
+                    queued.append(it["title"])
+                else:
+                    have += 1
+            except Exception as e:
+                errors.append(f"{it.get('title', it['id'])}: {e}")
+        bits = []
+        if queued:
+            bits.append(f"Downloading {len(queued)} mod{'s' if len(queued) != 1 else ''} on your PC" +
+                        (f": {queued[0]}" if len(queued) == 1 else "."))
+        if have:
+            bits.append(f"{have} already on your PC or in the queue.")
+        bits += errors[:2]
+        _rx_reply(cid, bool(queued) or bool(have), " ".join(bits) or "Nothing to download.", {"queued": len(queued)})
+
+    _remote_bg(None, lambda: _rx_ws_details(ids), done, lambda m: _rx_reply(cid, False, m))
+
+def _rx_jobs_cancel(win, cid, a):
+    if a.get("k") == "w":
+        pg = getattr(win, "workshop_page", None)
+        for e in list(getattr(pg, "queue", [])):
+            if str(e["id"]) == str(a.get("id")) and e["status"] in ("queued", "downloading"):
+                pg._queue_action(e)
+                return _rx_reply(cid, True, f"Cancelled {e['title']}.")
+        return _rx_reply(cid, False, "That mod isn't downloading any more.")
+    key = _invite_norm(str(a.get("t", "")))
+    for c in _rx_download_cards(win):
+        try:
+            if c.state == "active" and _invite_norm(c.title) == key:
+                title = c.title
+                c.cancel_download()
+                return _rx_reply(cid, True, f"Cancelled {title}.")
+        except RuntimeError:
+            continue
+    _rx_reply(cid, False, "That download isn't running any more.")
+
+# ---------------------------------------------------------------- cloud saves
+def _rx_save_entries():
+    out = []
+    try:
+        for gid, spec in GAME_SYNC.items():           # Five Nights at NCZ AE / 2: their own two-file format
+            out.append({"k": "ncz:" + gid, "t": spec[0], "kind": "ncz", "gid": gid})
+    except Exception:
+        pass
+    for key, g in _ss_cfg_load()["games"].items():    # every other game the launcher keeps cloud saves for
+        if isinstance(g, dict) and g.get("paths") and not g.get("never"):
+            title = str(g.get("title") or key)
+            if not _ss_is_own_sync_game(title):
+                out.append({"k": "ss:" + key, "t": title, "kind": "ss", "key": key, "off": g.get("sync") is False})
+    out.sort(key=lambda e: e["t"].lower())
+    return out
+
+def _rx_find_entry(k):
+    return next((e for e in _rx_save_entries() if e["k"] == k), None)
+
+def _rx_ss_ctx(entry):
+    """Same context the game card's Save Data / Sync Data menu builds, but keyed by the entry's own cloud key."""
+    key = entry["key"]
+    exe_fn = _rx["exe_fns"].get(key) or (lambda: "")
+    try:
+        exe = exe_fn() or ""
+    except Exception:
+        exe = ""
+    g0 = _ss_game(key)
+    ctx = {"name": pretty_game_name(entry["t"]), "key": key,
+           "folder": g0.get("folder") or (os.path.dirname(exe) if exe else None), "prefix": g0.get("prefix")}
+    if ctx["prefix"] is None and exe and sys.platform.startswith("linux") and exe.lower().endswith(".exe"):
+        pfx = os.path.join(os.path.dirname(exe) + "_compat_data", "pfx")
+        ctx["prefix"] = pfx if os.path.isdir(pfx) else _wine_prefix()
+    return ctx["name"], ctx
+
+def _rx_ncz_texts(gid):
+    _name, save_fn, settings_fn = GAME_SYNC[gid]
+    got = {}
+    for k, p in (("save", save_fn()), ("settings", settings_fn())):
+        if p and os.path.exists(p):
+            try:
+                got[k] = read_game_text(p)[0]
+            except Exception:
+                got[k] = None
+    return got
+
+def _rx_save_check(entry):
+    """Blocking. What 'Sync all' would do for this game: upload / download / in_sync / conflict / none / partial."""
+    info = {"k": entry["k"], "t": entry["t"], "act": "none"}
+    if entry["kind"] == "ncz":
+        cloud = cloud_get_game(entry["gid"])
+        has_cloud = bool(cloud and (cloud.get("save_text") or cloud.get("settings_text")))
+        local = _rx_ncz_texts(entry["gid"])
+        has_local = any(v for v in local.values())
+        if has_cloud:
+            info["cu"], info["cd"] = cloud.get("updated"), str(cloud.get("device", ""))[:30]
+        if not has_cloud:
+            info["act"] = "upload" if has_local else "none"
+        elif not has_local:
+            info["act"] = "download"
+        else:
+            same = all((local.get(k) or "") == (cloud.get(k + "_text") or "") for k in ("save", "settings"))
+            info["act"] = "in_sync" if same else "conflict"
+        return info
+    name, ctx = _rx_ss_ctx(entry)
+    g, _anchors, entries = _ss_state(entry["key"], ctx)
+    if any(r is None for r, _f in entries):
+        info["act"] = "partial"
+        return info
+    files = _ss_collect(entries)
+    digest = _ss_digest(files) if files else ""
+    meta = _ss_meta_get(entry["key"], 15)
+    if meta:
+        info["cu"], info["cd"] = meta.get("updated"), str(meta.get("device", ""))[:30]
+    info["act"] = _ss_decide(digest, bool(files), g.get("last_sha"), (meta or {}).get("sha256") or "")
+    info["n"] = len(files)
+    return info
+
+def _rx_save_upload(entry):
+    if entry["kind"] == "ncz":
+        name, save_fn, settings_fn = GAME_SYNC[entry["gid"]]
+        return cloud_upload_game(entry["gid"], save_fn(), settings_fn())
+    name, ctx = _rx_ss_ctx(entry)
+    _ss_backup_cloud(entry["key"])                    # keep the cloud copy that's about to be replaced
+    return _ss_upload(entry["key"], name, ctx)
+
+def _rx_save_download(entry):
+    if entry["kind"] == "ncz":
+        name, save_fn, settings_fn = GAME_SYNC[entry["gid"]]
+        cloud = cloud_get_game(entry["gid"])
+        if not cloud or not (cloud.get("save_text") or cloud.get("settings_text")):
+            raise CloudError("There's nothing in the cloud for this game yet.")
+        return len(apply_cloud_game(cloud, save_fn(), settings_fn()))
+    name, ctx = _rx_ss_ctx(entry)
+    return _ss_download(entry["key"], name, ctx)
+
+_RX_ACT_TEXT = {"upload": "uploaded to the cloud", "download": "restored from the cloud", "in_sync": "already in sync",
+                "none": "no saves yet", "conflict": "differs on both sides: choose Save or Get yourself",
+                "partial": "some save folders aren't on this PC"}
+
+def _rx_save_job(win, cid, fn, done_msg):
+    if _rx["saving"]:
+        return _rx_reply(cid, False, "Another save job is still running on your PC. Try again in a moment.")
+    _rx["saving"] = True
+
+    def finish(ok, msg, data=None):
+        _rx["saving"] = False
+        _rx_reply(cid, ok, msg, data)
+
+    _remote_bg(None, fn, lambda r: finish(True, done_msg(r), r if isinstance(r, dict) else None), lambda m: finish(False, m))
+
+def _rx_save_status(win, cid, a):
+    def work():
+        return {"games": [_rx_save_check(e) for e in _rx_save_entries()]}
+    _rx_save_job(win, cid, work, lambda r: f"{len(r['games'])} game(s) checked.")
+
+def _rx_save_one(win, cid, a, upload):
+    entry = _rx_find_entry(str(a.get("k", "")))
+    if entry is None:
+        return _rx_reply(cid, False, "Your PC doesn't keep cloud saves for that game.")
+    if not upload and _invite_game_is_open(entry["t"]):
+        return _rx_reply(cid, False, f"Close {entry['t']} on your PC first, then try again.")
+
+    def work():
+        n = _rx_save_upload(entry) if upload else _rx_save_download(entry)
+        return {"n": n}
+    _rx_save_job(win, cid, work, lambda r: (f"Saved {entry['t']} to the cloud." if upload
+                                           else f"Restored {entry['t']} on your PC ({r['n']} file(s))."))
+
+def _rx_save_all(win, cid, a):
+    def work():
+        results = []
+        for e in _rx_save_entries():
+            if e.get("off"):
+                results.append({"k": e["k"], "t": e["t"], "r": "skipped (sync turned off for this game)"})
+                continue
+            try:
+                if _invite_game_is_open(e["t"]):
+                    results.append({"k": e["k"], "t": e["t"], "r": "skipped (running right now)"})
+                    continue
+                c = _rx_save_check(e)
+                if c["act"] == "upload":
+                    _rx_save_upload(e)
+                elif c["act"] == "download":
+                    _rx_save_download(e)
+                results.append({"k": e["k"], "t": e["t"], "r": _RX_ACT_TEXT.get(c["act"], c["act"]), "act": c["act"]})
+            except Exception as ex:
+                results.append({"k": e["k"], "t": e["t"], "r": f"problem: {str(ex)[:120]}", "act": "error"})
+        return {"results": results}
+
+    def msg(r):
+        done = sum(1 for x in r["results"] if x.get("act") in ("upload", "download"))
+        bad = sum(1 for x in r["results"] if x.get("act") in ("error", "conflict"))
+        return f"{done} game(s) synced" + (f", {bad} need a look." if bad else ".")
+
+    _rx_save_job(win, cid, work, msg)
+
+# ---------------------------------------------------------------- request loop
+def _rx_handle(app, cmd, fl):
+    cid = str(cmd.get("id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,40}", cid) or cid in _rx["seen"]:
+        return
+    _rx["seen"] = (_rx["seen"] + [cid])[-80:]
+    verb, ts = cmd.get("do"), cmd.get("ts")
+    if not isinstance(ts, (int, float)) or abs(time.time() * 1000 - ts) > RX_STALE_MS:
+        return _rx_reply(cid, False, "That request was too old. Try again.")
+    try:
+        args = json.loads(cmd.get("arg") or "{}")
+        if not isinstance(args, dict):
+            raise ValueError
+    except Exception:
+        return _rx_reply(cid, False, "Your PC didn't understand that request.")
+    win = _rx_win()
+    if verb in RX_DL_VERBS:
+        if not fl["dl"]:
+            return _rx_reply(cid, False, "Downloads from your phone are turned off. On your PC, open Friends and turn on "
+                                         "\"Let my phone manage downloads on this PC\".")
+    elif verb in RX_SAVE_VERBS:
+        if not fl["saves"]:
+            return _rx_reply(cid, False, "Cloud saves from your phone are turned off. On your PC, open Friends and turn on "
+                                         "\"Let my phone sync cloud saves for this PC\".")
+        try:
+            if not (cloud_configured() and load_account() is not None):
+                return _rx_reply(cid, False, "Log in to your account in the launcher first.")
+        except Exception:
+            return _rx_reply(cid, False, "Log in to your account in the launcher first.")
+    else:
+        return _rx_reply(cid, False, "Your PC didn't understand that request.")
+    if win is None:
+        return _rx_reply(cid, False, "The launcher window isn't ready.")
+    table = {"store_search": _rx_store_search, "store_add": _rx_store_add, "store_remove": _rx_store_remove,
+             "store_servers": _rx_store_servers, "store_download": _rx_store_download, "ws_lookup": _rx_ws_lookup,
+             "ws_search": _rx_ws_search, "ws_get": _rx_ws_get, "jobs_cancel": _rx_jobs_cancel,
+             "save_status": _rx_save_status, "save_all": _rx_save_all,
+             "save_up": lambda w, c, a: _rx_save_one(w, c, a, True),
+             "save_down": lambda w, c, a: _rx_save_one(w, c, a, False)}
+    try:
+        table[verb](win, cid, args)
+    except Exception as e:
+        _rx_reply(cid, False, f"Your PC hit a problem: {str(e)[:150]}")
+
+def _rx_tick(app):
+    if _rx["busy"]:
+        return
+    try:
+        if not load_account():
+            return
+    except Exception:
+        return
+    fl = _rx_flags()
+    active = fl["dl"] or fl["saves"]
+    if not active:
+        _rx["primed"] = False
+    try:
+        pcx = _rx_build_pcx(_rx_win(), fl)
+    except Exception as e:
+        print(f"phone remote: couldn't read the library ({e!r})")
+        pcx = {"v": 2, "dl": fl["dl"], "saves": fl["saves"]}
+    sig = json.dumps(pcx, sort_keys=True)
+    publish = sig != _rx["last_sig"] or time.time() - _rx["last_pub"] > (20 if active else 30)
+    if not active and not publish:
+        return
+    _rx["busy"] = True
+    stale = [c for c, t in _rx["out"] if time.time() - t > 300]
+    _rx["out"] = [(c, t) for c, t in _rx["out"] if time.time() - t <= 300]
+
+    def work():
+        token, uid = get_id_token()
+        if publish:
+            body = dict(pcx)
+            body["seen"] = {".sv": "timestamp"}
+            _http_json(_fdb(f"remote/{uid}/pcx", token), "PUT", body)
+        cmds = []
+        if active:
+            q = _http_json(_fdb(f"remote/{uid}/q", token))
+            if isinstance(q, dict):
+                for qid, c in list(q.items())[:8]:
+                    _http_json(_fdb(f"remote/{uid}/q/{urllib.parse.quote(str(qid), safe='')}", token), "DELETE")   # claimed: runs once
+                    if isinstance(c, dict):
+                        cmds.append(c)
+            for c in stale:
+                try:
+                    _http_json(_fdb(f"remote/{uid}/r/{urllib.parse.quote(c, safe='')}", token), "DELETE")
+                except Exception:
+                    pass
+        return cmds
+
+    def done(cmds):
+        _rx["busy"] = False
+        if publish:
+            _rx["last_sig"], _rx["last_pub"] = sig, time.time()
+        now = _rx_flags()
+        if not (now["dl"] or now["saves"]):
+            return
+        if not _rx["primed"]:
+            _rx["primed"] = True              # whatever was waiting from before the switch was turned on is dropped, never run
+            return
+        for c in cmds:
+            _rx_handle(app, c, now)
+
+    def failed(_msg):
+        _rx["busy"] = False
+
+    _remote_bg(app, work, done, failed)
+
+_rx_prev_app_init = AdaptiveApp.__init__
+
+def _rx_app_init(self):
+    _rx_prev_app_init(self)
+    try:
+        self._rx_timer = QTimer(self)
+        self._rx_timer.setInterval(RX_POLL_MS)
+        self._rx_timer.timeout.connect(lambda: _rx_tick(self))
+        self._rx_timer.start()
+    except Exception as e:
+        print(f"phone remote: couldn't start ({e!r})")
+
+AdaptiveApp.__init__ = _rx_app_init
+
+# remember how to find each game's folder, so cloud saves can be located for a request that didn't come from a game card
+_rx_prev_add_shortcut = _add_shortcut_action
+
+def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
+    _rx_prev_add_shortcut(app, card, title, exe_fn, tool_fn, cover, key)
+    try:
+        _rx["exe_fns"][_pt_key(pretty_game_name(title))] = exe_fn      # == the cloud-saves key of that game
+    except Exception:
+        pass
+
+_rx_prev_build_list = FriendsPage._build_list
+
+def _rx_build_list(self):
+    page = _rx_prev_build_list(self)
+    try:
+        from PyQt6.QtWidgets import QCheckBox
+        lay = page.layout()
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 16, 22, 16)
+        pl.setSpacing(4)
+        for flag, text, hint in (
+                ("dl", "Let my phone manage downloads on this PC",
+                 "Lets the phone app browse the store, add games to your library, download them here (you pick the download "
+                 "server on the phone) and download Steam Workshop mods to this PC."),
+                ("saves", "Let my phone sync cloud saves for this PC",
+                 "Lets the phone app save this PC's game saves to your account, or restore them here. Restoring needs the game "
+                 "closed, and your current files are backed up first.")):
+            cb = QCheckBox(text)
+            cb.setChecked(_rx_flags()[flag])
+            cb.toggled.connect(lambda on, f=flag: _rx_set_flag(f, on))
+            desc = QLabel(hint + " Only your own account can do this, and the launcher has to be running.")
+            desc.setObjectName("RowDesc")
+            desc.setWordWrap(True)
+            pl.addWidget(cb)
+            pl.addWidget(desc)
+            pl.addSpacing(6)
+        lay.insertSpacing(5, 12)
+        lay.insertWidget(6, panel)
+    except Exception as e:
+        print(f"phone remote: couldn't add the settings ({e!r})")
+    return page
+
+FriendsPage._build_list = _rx_build_list
 
 if __name__ == "__main__":
     main()
