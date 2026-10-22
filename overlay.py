@@ -42,7 +42,7 @@ _DARK_DEFAULTS = dict(BG=QColor("#1c1c1c"), STRIPE=QColor(255, 255, 255, 9), TEX
 TEXT_COLOR = QColor("white")   # the white "is playing" part
 _accent_base = None            # QColor chosen in the launcher (None = the built-in purple)
 _light = False                 # light mode: light gray toast with dark text
-_sunset = False                # Sunset launcher theme: dark indigo toast with faint orange stripes (always dark)
+_sunset = False                # "New" launcher theme: black toast, faint white stripes, white accent (always dark)
 
 
 def _readable(c):
@@ -69,9 +69,19 @@ def _apply_colors():
     if light:
         BG, STRIPE, TEXT_COLOR = QColor("#e4e4e4"), QColor(0, 0, 0, 12), QColor("#1c1c1c")   # gray -> light gray
     elif _sunset:
-        BG, STRIPE, TEXT_COLOR = QColor("#1b1042"), QColor(255, 122, 47, 16), QColor("white")
+        BG, STRIPE, TEXT_COLOR = QColor("#0c0c0c"), QColor(255, 255, 255, 9), QColor("#aaaaaa")
     else:
         BG, STRIPE, TEXT_COLOR = QColor(d["BG"]), QColor(d["STRIPE"]), QColor(d["TEXT"])
+    if _sunset:
+        base = QColor(_accent_base) if _accent_base is not None else QColor("#fcfcfc")
+        ACCENT = QColor(base)
+        if base.lightnessF() > 0.85:                 # white accent: white names, grey avatar placeholder
+            NAME_COLOR = GAME_COLOR = QColor("#ffffff")
+            AVATAR_COLOR = QColor("#4d4d4d")
+        else:                                        # an account theme with its own coloured accent
+            NAME_COLOR = GAME_COLOR = _readable(base)
+            AVATAR_COLOR = _readable(base).lighter(115)
+        return
     base = _accent_base
     if base is None and not light:
         ACCENT, NAME_COLOR, GAME_COLOR, AVATAR_COLOR = QColor(d["ACCENT"]), QColor(d["NAME"]), QColor(d["NAME"]), QColor(d["AVATAR"])
@@ -93,7 +103,7 @@ def set_accent(color):
 
 
 def set_sunset(flag):
-    """Sunset theme on/off: indigo toast with orange stripes (overrides light mode)."""
+    """New theme on/off: black toast with a white accent (overrides light mode)."""
     global _sunset
     _sunset = bool(flag)
     _apply_colors()
@@ -306,6 +316,43 @@ def _draw_text(p, rect, text, flags=Qt.AlignmentFlag.AlignVCenter):
             x += w
 
 
+ICON_D = 46                       # size of the little icon on the right (unscaled toast units)
+ICON_PAD = 14                     # gap to the toast's right edge
+ICON_RESERVE = ICON_D + ICON_PAD + 6      # text stops this far from the right edge
+_icon_cache = {"pm": None, "tried": False}
+
+
+def _toast_icon():
+    """assets/icon.png as a square, cropped to the middle (None when the file isn't there)."""
+    if not _icon_cache["tried"]:
+        _icon_cache["tried"] = True
+        for d in _assets_dirs():
+            path = os.path.join(d, "icon.png")
+            if os.path.isfile(path):
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                    Qt.TransformationMode.SmoothTransformation)
+                    _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
+                                                 ICON_D * 2, ICON_D * 2)
+                    break
+    return _icon_cache["pm"]
+
+
+def _draw_icon(p, cy):
+    """Rounded-corner icon at the right edge of the toast, vertically centred on cy."""
+    pm = _toast_icon()
+    if pm is None:
+        return
+    r = QRectF(W - ICON_PAD - ICON_D, cy - ICON_D / 2, ICON_D, ICON_D)
+    clip = QPainterPath()
+    clip.addRoundedRect(r, 11, 11)
+    p.save()
+    p.setClipPath(clip)
+    p.drawPixmap(r, pm, QRectF(pm.rect()))
+    p.restore()
+
+
 def _fit_font(text, px, max_w, bold=True):
     """Largest font (up to px) that fits max_w."""
     while px > 9:
@@ -487,10 +534,11 @@ class PlayingToast(QWidget):
 
         # accent bar
         p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _draw_icon(p, H / 2)
 
         if self.plain:
             tx = BAR_W + 22
-            max_w = W - tx - 14
+            max_w = W - tx - 14 - ICON_RESERVE
             p.setPen(NAME_COLOR)
             p.setFont(_fit_font(self.user, 28, max_w))
             _draw_text(p, QRectF(tx, 0, max_w, H), self.user)
@@ -529,7 +577,7 @@ class PlayingToast(QWidget):
 
         # text: username (purple), "is playing" (white), game (purple)
         tx = int(r.right()) + 10
-        max_w = W - tx - 12
+        max_w = W - tx - 12 - ICON_RESERVE
         p.setPen(NAME_COLOR)
         p.setFont(_fit_font(self.user, 25, max_w))
         _draw_text(p, QRectF(tx, 18, max_w, 36), self.user)
@@ -641,6 +689,7 @@ class InviteToast(PlayingToast):
         for x in range(-h, W + h, 64):
             p.drawLine(x, h, x + h, 0)
         p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _draw_icon(p, 12 + ICON_D / 2)
 
         # cover
         cx, cy, cw, ch = INV_COVER
@@ -655,14 +704,15 @@ class InviteToast(PlayingToast):
             p.drawPixmap(r, pm, QRectF((pm.width() - cw * 2) / 2, (pm.height() - ch * 2) / 2, cw * 2, ch * 2))
         else:
             p.fillRect(r, AVATAR_COLOR)
-            p.setPen(QColor("white"))
+            p.setPen(QColor("white") if AVATAR_COLOR.lightnessF() < 0.6 else QColor("#111111"))
             p.setFont(_make_font(40, True))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.game[:1] or "?").upper())
         p.restore()
 
         # sender: small avatar + name, then "invited you to play", then the game
         tx = cx + cw + 12
-        max_w = W - tx - 12
+        max_w = W - tx - 12 - ICON_RESERVE          # rows next to the icon
+        full_w = W - tx - 12                         # the game line sits below it
         d = 26
         ar = QRectF(tx, 12, d, d)
         apath = QPainterPath()
@@ -678,14 +728,14 @@ class InviteToast(PlayingToast):
             p.fillPath(apath, AVATAR_COLOR)
         nx = tx + d + 8
         p.setPen(NAME_COLOR)
-        p.setFont(_fit_font(self.user, 20, W - nx - 12))
-        _draw_text(p, QRectF(nx, 10, W - nx - 12, 30), self.user)
+        p.setFont(_fit_font(self.user, 20, W - nx - 12 - ICON_RESERVE))
+        _draw_text(p, QRectF(nx, 10, W - nx - 12 - ICON_RESERVE, 30), self.user)
         p.setPen(TEXT_COLOR)
         p.setFont(_make_font(15, False))
         p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, "invited you to play")
         p.setPen(GAME_COLOR)
-        p.setFont(_fit_font(self.game, 21, max_w))
-        _draw_text(p, QRectF(tx, 64, max_w, 28), self.game)
+        p.setFont(_fit_font(self.game, 21, full_w))
+        _draw_text(p, QRectF(tx, 64, full_w, 28), self.game)
 
         # buttons
         for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
