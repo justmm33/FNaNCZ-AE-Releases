@@ -1352,6 +1352,9 @@ def _create_linux_shortcut(target, args, workdir, icon):
 def create_desktop_shortcut():
     """Creates (or refreshes) a desktop shortcut and returns its path. Raises RuntimeError with a readable message."""
     target, args, workdir = get_launch_command()
+    demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")     # the sign-in / installer script next to main.py
+    if not os.environ.get("APPIMAGE") and not getattr(sys, "frozen", False) and os.path.isfile(demo):
+        args, workdir = [demo], os.path.dirname(demo)      # the shortcut opens demo.py (it starts main.py once signed in)
     icon = prepare_shortcut_icon()
     if sys.platform.startswith("win"):
         return _create_windows_shortcut(target, args, workdir, icon)
@@ -1384,6 +1387,13 @@ THEMES = {
 # Colour the window-caption buttons (minimize / maximize / close) follow, so they stay readable on the bar.
 _theme_state = {"nav_text": "#a0a0a8", "nav_active": "#ffffff"}
 _theme_listeners = []
+
+def _on_accent():
+    """Text colour for things drawn on the accent colour (dark when the theme's accent is white)."""
+    try:
+        return SUNSET_THEME.get("on_accent", "#ffffff")
+    except NameError:
+        return "#ffffff"
 
 STYLE_TEMPLATE = Template("""
 QMainWindow, QWidget#Content, QWidget#GridContainer { background: $bg; }
@@ -1523,7 +1533,7 @@ def build_palette(t):
     palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 80, 80))
     palette.setColor(QPalette.ColorRole.Link, QColor(t["accent"]))
     palette.setColor(QPalette.ColorRole.Highlight, QColor(t["accent"]))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(_on_accent()))
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(t["subtext"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
@@ -1658,6 +1668,32 @@ def apply_accent_to_icon(color):
     except Exception:
         return False
 
+_crisp_filter = {"obj": None}
+
+def _install_crisp_text(app):
+    """Style-sheet font rules (bold buttons, sized labels...) make Qt drop the app font's 'no hinting + antialias'
+    settings, which is what makes small bold text look blocky. This puts them back on every widget once it is polished."""
+    if _crisp_filter["obj"] is not None:
+        return
+    from PyQt6.QtCore import QEvent
+
+    class _CrispText(QObject):
+        def eventFilter(self, obj, ev):
+            try:
+                if ev.type() in (QEvent.Type.Polish, QEvent.Type.Show) and obj.isWidgetType():
+                    f = obj.font()
+                    if (f.hintingPreference() != QFont.HintingPreference.PreferNoHinting
+                            or not (f.styleStrategy() & QFont.StyleStrategy.PreferAntialias)):
+                        f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+                        f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+                        obj.setFont(f)
+            except Exception:
+                pass
+            return False
+
+    _crisp_filter["obj"] = _CrispText(app)
+    app.installEventFilter(_crisp_filter["obj"])
+
 def apply_dark_mode(mode):
     app = QApplication.instance()
     if app is None:
@@ -1672,6 +1708,7 @@ def apply_dark_mode(mode):
         pass
     app.setPalette(build_palette(theme))
     app.setFont(build_app_font())
+    _install_crisp_text(app)
     family = load_app_font()
     force_font = f'* {{ font-family: "{family}"; }}\n' if family else ""
     app.setStyleSheet(force_font + STYLE_TEMPLATE.substitute(theme))
@@ -3505,7 +3542,7 @@ class SettingsPage(QWidget):
 
     def on_accent_pick(self):
         if _UI_STYLE_AT_START == "new":
-            return                                   # Sunset has a fixed orange accent
+            return                                   # the New theme has a fixed accent
         from PyQt6.QtWidgets import QColorDialog
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
         chosen = QColorDialog.getColor(current, self, "Pick an accent color")
@@ -3514,7 +3551,7 @@ class SettingsPage(QWidget):
 
     def _set_accent_setting(self, color):
         if _UI_STYLE_AT_START == "new":
-            return                                   # keep the saved Classic colour untouched
+            return                                   # the accent is fixed by the theme
         settings = load_launcher_settings()
         settings["accent_color"] = color
         save_launcher_settings(settings)
@@ -7035,6 +7072,38 @@ def set_windows_taskbar_identity(window):
         store.Commit()
     except Exception:
         pass
+
+UPDATE_URL_WIN = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/NCZ%20Games%20Launcher.exe"
+UPDATE_URL_DEB = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher_7.0_all.deb"
+UPDATE_URL_ARCH = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher-7.0-1-any.pkg.tar.zst"
+UPDATE_URL_FALLBACK = "https://github.com/justmm33/FNaNCZ-AE-Releases/tree/main/build"
+
+
+def _launcher_update_url():
+    """Download link for the current platform (Windows exe, Debian/Ubuntu .deb, Arch package)."""
+    if sys.platform.startswith("win"):
+        return UPDATE_URL_WIN
+    if sys.platform.startswith("linux"):
+        ids = set()
+        try:
+            with open("/etc/os-release", encoding="utf-8") as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k in ("ID", "ID_LIKE"):
+                        ids.update(v.strip().strip('"').lower().split())
+        except OSError:
+            pass
+        if ids & {"arch", "manjaro", "endeavouros", "cachyos", "garuda", "artix"}:
+            return UPDATE_URL_ARCH
+        if ids & {"debian", "ubuntu", "linuxmint", "pop", "zorin", "elementary", "kali", "raspbian"}:
+            return UPDATE_URL_DEB
+    return UPDATE_URL_FALLBACK
+
+
+def _demo_py_present():
+    """demo.py (sign-in + installer) is started by the bootstrap and lives next to main.py."""
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py"))
+
 
 def main():
     import traceback
@@ -12863,7 +12932,7 @@ class _MsgRow(QWidget):
             lab.setMaximumWidth(380)
             lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             lab.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            lab.setStyleSheet("QLabel{background:transparent;" + ("color:#ffffff;" if mine else "") + "}")
+            lab.setStyleSheet("QLabel{background:transparent;" + (f"color:{_on_accent()};" if mine else "") + "}")
             bl.addWidget(lab)
         for att in atts[:CHAT_MAX_ATTACH]:
             bl.addWidget(chat.attachment_widget(att, mine))
@@ -13226,7 +13295,7 @@ class ChatView(QScrollArea):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setToolTip("Open in your video player")
         btn.setStyleSheet("QPushButton{text-align:left; padding:10px 14px; border:none; border-radius:8px;"
-                          "background:rgba(0,0,0,0.25);" + ("color:#ffffff;" if mine else "") + "}"
+                          "background:rgba(0,0,0,0.25);" + (f"color:{_on_accent()};" if mine else "") + "}"
                           "QPushButton:hover{background:rgba(0,0,0,0.38);}")
         def open_it(path, err=""):
             try:
@@ -15152,14 +15221,14 @@ class GmodAddonManagerPage(QWidget):
 QPushButton#GmodTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
     border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
 QPushButton#GmodTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
-QPushButton#GmodTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
+QPushButton#GmodTab:checked {{ background: {t['accent']}; color: {_on_accent()}; border: 1px solid {t['accent']}; }}
 QFrame#GmodRow {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 10px; }}
 QFrame#GmodRow:hover {{ border: 1px solid {t['accent']}; }}
 QPushButton#GmodDelete {{ padding: 0 14px; font-size: 12px; min-width: 52px; }}
 QPushButton#GmodToggle {{ background: {t['button']}; color: {t['subtext']}; border-radius: 15px;
     padding: 0 14px; min-width: 70px; font-size: 12px; }}
 QPushButton#GmodToggle:hover {{ background: {t['button_hover']}; }}
-QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: #ffffff; }}
+QPushButton#GmodToggle:checked {{ background: {t['accent']}; color: {_on_accent()}; }}
 QPushButton#GmodToggle:checked:hover {{ background: {t['accent_hover']}; }}
 QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px solid {t['border']};
     border-radius: 10px; padding: 10px; font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 12px; }}
@@ -16801,7 +16870,7 @@ class WorkshopPage(QWidget):
 QPushButton#WsTab {{ background: transparent; color: {t['subtext']}; border: 1px solid {t['border']};
     border-radius: 17px; padding: 8px 20px; font-size: 13px; }}
 QPushButton#WsTab:hover {{ background: {t['hover']}; color: {t['text']}; }}
-QPushButton#WsTab:checked {{ background: {t['accent']}; color: #ffffff; border: 1px solid {t['accent']}; }}
+QPushButton#WsTab:checked {{ background: {t['accent']}; color: {_on_accent()}; border: 1px solid {t['accent']}; }}
 QFrame#WsCard {{ background: {t['panel']}; border: 1px solid {t['border']}; border-radius: 12px; }}
 QFrame#WsCard:hover {{ border: 1px solid {t['accent']}; }}
 QFrame#WsCard[sel="true"] {{ background: {t['hover']}; border: 1px solid {t['accent']}; }}
@@ -20436,7 +20505,7 @@ def _fan_init(self):
     self._lib_tab = "games"
     tabs = QWidget()
     tabs.setStyleSheet("QPushButton { padding: 6px 18px; border-radius: 8px; } "
-                       "QPushButton:checked { background: palette(highlight); color: #ffffff; font-weight: bold; }")
+                       "QPushButton:checked { background: palette(highlight); color: " + _on_accent() + "; font-weight: bold; }")
     tl = QHBoxLayout(tabs)
     tl.setContentsMargins(0, 0, 0, 14)
     tl.setSpacing(8)
@@ -25611,7 +25680,7 @@ def _grp_avatar(label, path, letter, size):
         return
     label.clear()
     label.setText(letter)
-    label.setStyleSheet(f"background:{THEMES['dark']['accent']}; color:#ffffff; border-radius:{size // 2}px; "
+    label.setStyleSheet(f"background:{THEMES['dark']['accent']}; color:{_on_accent()}; border-radius:{size // 2}px; "
                         f"font-weight:bold; font-size:{max(11, size // 2)}px;")
 
 
@@ -25739,7 +25808,7 @@ class _PickCard(QFrame):
         self.check = QLabel("\u2713", self)
         self.check.setFixedSize(20, 20)
         self.check.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.check.setStyleSheet(f"background:{self._accent}; color:#ffffff; border-radius:10px; font-weight:bold;")
+        self.check.setStyleSheet(f"background:{self._accent}; color:{_on_accent()}; border-radius:10px; font-weight:bold;")
         self.check.move(self.W - 26, 6)
         self.check.hide()
         for w in (av, n, s, self.check):
@@ -28015,15 +28084,14 @@ class CountryDialog(QDialog):
         return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
 
 
-# ================================================================ Sunset UI (new) + Classic UI switch
-# "new"     = sunset theme (dark indigo -> orange, always dark) + navigation rail on the left.
-# "classic" = the previous look (lavender accent, tabs in the top bar, follows Dark Mode / Accent Color).
-# The style is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
+# ================================================================ "New" UI theme
+# "New" theme = black -> grey like the sign-in window, white accent, always dark, navigation rail on the left.
+# The theme is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
 # Account themes: a theme can belong to specific accounts, and a "locked" one can't use any other theme.
 # The admin accounts below can pick every account theme (the existing one and any added later) and are never locked.
 _THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
 _ACCOUNT_THEMES = {
-    "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": True},
+    "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": False},     # free to switch between Sunset and this theme
     "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
 }   # each entry's look (label, theme, extra) is attached next to its colours below
 
@@ -28065,15 +28133,14 @@ def _active_theme_key():
     if key:
         return key
     chosen = _raw_setting("ui_theme")
-    if chosen in _allowed_theme_keys() and _raw_setting("ui_style") != "classic":
+    if chosen in _allowed_theme_keys():
         return chosen
     return ""
 
 def _ui_read_style():
     if _locked_theme_key():
         return "new"                       # account themes ride on the new layout
-    v = _raw_setting("ui_style")
-    return v if v in ("new", "classic") else "new"
+    return "new"                           # Classic was removed; an old saved "classic" is ignored
 
 _UI_STYLE_AT_START = _ui_read_style()
 
@@ -28084,57 +28151,63 @@ def load_launcher_settings():
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     return s
 
-SUNSET_THEME = dict(
-    bg="#140c2b", sidebar="#0c0719", panel="#201444", input="#120b27", border="#3a2866",
-    text="#fbf3ee", subtext="#a99bc4", accent="#ff7a2f", accent_hover="#ff9456", accent_press="#e0561a",
-    button="#2b1d52", button_hover="#3a2870", disabled_bg="#1a1236", disabled_text="#5f5280",
-    handle="#4a3585", hover="#261a4d",
-    red="#ff7a2f", red_hover="#ff9456", red_press="#e0561a", accent_fill="rgba(255,122,47,0.18)",
-    nav_text="#b9aad6", nav_active="#ffffff", brand="#ffffff", sidebar_border="#2d1f55",
+SUNSET_THEME = dict(      # the "New" theme: same colours as the sign-in window (black fading to grey, white accent)
+    bg="#080808", sidebar="#000000", panel="#1a1a1a", input="#0d0d0d", border="#2e2e2e",
+    on_accent="#1c1c1c", text="#ffffff", subtext="#aaaaaa", accent="#fcfcfc", accent_hover="#ffffff", accent_press="#c4c4c4",
+    button="#222222", button_hover="#303030", disabled_bg="#161616", disabled_text="#666666",
+    handle="#4d4d4d", hover="#1f1f1f",
+    red="#fcfcfc", red_hover="#ffffff", red_press="#c4c4c4", accent_fill="rgba(255,255,255,0.14)",
+    nav_text="#b0b0b0", nav_active="#ffffff", brand="#ffffff", sidebar_border="#1e1e1e",
     nav_fill="rgba(255,255,255,0.06)", nav_fill_hover="rgba(255,255,255,0.12)",
 )
 
 _SUNSET_EXTRA = """
 QMainWindow, QWidget#Content, QWidget#GridContainer {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b0716, stop:0.55 #1b1042, stop:0.85 #2c1649, stop:1 #43194a);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #000000, stop:0.45 #080808, stop:0.70 #282828, stop:0.88 #5f5f5f, stop:1 #8a8a8a);
 }
 QWidget#GridContainer { background: transparent; }
 QFrame#Sidebar {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0b0716, stop:1 #1e1040); border-bottom: 1px solid #2d1f55;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #1a1a1a); border-bottom: 1px solid #1e1e1e;
 }
 QFrame#SideRail {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b0716, stop:0.65 #1a0e36, stop:1 #3d1838);
-    border-right: 1px solid #2d1f55;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #000000, stop:0.65 #0a0a0a, stop:1 #303030);
+    border-right: 1px solid #1e1e1e;
 }
 QFrame#SideRail QPushButton#NavButton {
-    background: transparent; color: #b9aad6; border: none; border-left: 3px solid transparent; border-radius: 0;
+    background: transparent; color: #b0b0b0; border: none; border-left: 3px solid transparent; border-radius: 0;
     text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
 }
 QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.07); color: #ffffff; }
 QFrame#SideRail QPushButton#NavButton:checked {
-    color: #ffffff; border: none; border-left: 3px solid #ff7a2f;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(255,122,47,0.30), stop:1 rgba(255,122,47,0));
+    color: #ffffff; border: none; border-left: 3px solid #ffffff;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(255,255,255,0.18), stop:1 rgba(255,255,255,0));
 }
 QPushButton#Primary {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8a3d, stop:1 #f0450f); border-radius: 8px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fcfcfc, stop:1 #dedede); border-radius: 8px; color: #1c1c1c;
 }
 QPushButton#Primary:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffa05a, stop:1 #ff5a24);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #e8e8e8);
 }
-QPushButton#Primary:pressed { background: #e0561a; }
-QPushButton#Primary:disabled { background: #1a1236; color: #5f5280; }
+QPushButton#Primary:pressed { background: #c4c4c4; }
+QPushButton#Primary:disabled { background: #3a3a3a; color: #777777; }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8a3d, stop:1 #c2358a); border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #787878, stop:1 #ffffff); border-radius: 3px;
 }
-QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; }
-QFrame#GameCard { background: rgba(32, 20, 68, 0.55); border: 1px solid #2f2058; border-radius: 14px; }
-QFrame#GameCard:hover { background: rgba(32, 20, 68, 0.75); border: 1px solid #ff7a2f; }
-QFrame#ToolBar { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; border-radius: 16px; }
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); }
+QFrame#GameCard { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(255, 255, 255, 0.10); border: 1px solid #ffffff; }
+QFrame#ToolBar { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 16px; }
 QFrame#ToolBar QLabel { background: transparent; border: none; }
-QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: #120b27; }
-QFrame#SidePanel { background: rgba(32, 20, 68, 0.75); border: 1px solid #3a2866; border-radius: 16px; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: rgba(255, 255, 255, 0.08); }
+QFrame#SidePanel { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 16px; }
 QFrame#SidePanel QLabel { background: transparent; border: none; }
-QLabel#PaneHeader { color: #a99bc4; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+QLabel#PaneHeader { color: #aaaaaa; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+/* the accent is white now, so whatever sits on it needs dark text */
+QLabel#Avatar, QLabel#AvatarLarge, QLabel#SyncAvatar { color: #1c1c1c; }
+QMenu::item:selected { color: #1c1c1c; }
+QPushButton#Danger:hover, QPushButton#Uninstall:hover { background: #fcfcfc; color: #1c1c1c; }
+QLineEdit, QTextEdit { selection-background-color: #d8d8d8; selection-color: #141414; }
+QComboBox QAbstractItemView { selection-background-color: #d8d8d8; selection-color: #141414; }
 """
 
 def _ui_apply_sunset():
@@ -28293,23 +28366,22 @@ if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the
 
 _ui_prev_set_accent = set_accent
 def set_accent(color):
-    """Sunset always uses its own orange (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
+    """The theme always uses its own accent (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
     _ui_prev_set_accent(SUNSET_ACCENT if _UI_STYLE_AT_START == "new" else color)
 
 _ui_prev_apply_accent_to_icon = apply_accent_to_icon
 def apply_accent_to_icon(color):
     if _UI_STYLE_AT_START == "new":
-        return False                                 # the Sunset icon is never recoloured
+        return False                                 # the theme icon is never recoloured
     return _ui_prev_apply_accent_to_icon(color)
 
 _ui_prev_apply_dark_mode = apply_dark_mode
 def apply_dark_mode(mode):
     _ui_prev_apply_dark_mode(mode)
     if _UI_STYLE_AT_START == "new":
-        _ui_apply_sunset()                # sunset is always dark; Dark Mode / Accent Color only affect Classic
+        _ui_apply_sunset()                # the theme is always dark
 
-# Icons: new UI always uses assets/icon.png (the new sunset icon). Classic uses the accent-recolored icon if there is
-# one, otherwise assets/icon_default.png (put the OLD icon there), otherwise icon.png.
+# Icons: the UI always uses assets/icon.png (or the active account theme's own icon).
 _icon_download_tried = set()
 
 def _ensure_theme_icon(entry):
@@ -28441,15 +28513,14 @@ def _ui_add_setting(self):
     col.setSpacing(2)
     title = QLabel("Interface Style")
     title.setObjectName("RowTitle")
-    desc = QLabel("Sunset: the new look with a side navigation bar. Classic: the old look. Needs a restart.")
+    desc = QLabel("New: the default look with a side navigation bar. Needs a restart.")
     desc.setObjectName("RowDesc")
     desc.setWordWrap(True)
     col.addWidget(title)
     col.addWidget(desc)
     combo = QComboBox()
     combo.setFixedWidth(160)
-    combo.addItem("Sunset (new)", "new")
-    combo.addItem("Classic", "classic")
+    combo.addItem("New", "new")
     for key in _allowed_theme_keys():      # account themes this account may use (admin accounts get all of them)
         combo.addItem(_ACCOUNT_THEMES[key]["label"], key)
     start_data = _active_theme_key() or _UI_STYLE_AT_START
@@ -28468,7 +28539,7 @@ def _ui_add_setting(self):
     def changed():
         d = combo.currentData()
         s = load_launcher_settings()
-        s["ui_style"] = "classic" if d == "classic" else "new"
+        s["ui_style"] = "new"
         s["ui_theme"] = d if d in _ACCOUNT_THEMES else ""
         save_launcher_settings(s)
         if d != start_data:
@@ -28484,9 +28555,9 @@ def _ui_add_setting(self):
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
         sp.accent_desc.setText("Locked to your custom theme." if _custom_theme_locked() else
-                               "Locked to this theme's color. Switch Interface Style to Classic to pick your own color."
+                               "Locked to this theme's color."
                                if _active_theme_key() else
-                               "Locked to Sunset orange. Switch Interface Style to Classic to pick your own color.")
+                               "Locked to the New theme's color.")
 
 def _ui_add_nsfw_setting(self):
     sp = self.settings_page
@@ -30942,6 +31013,203 @@ def _rx_build_list(self):
     return page
 
 FriendsPage._build_list = _rx_build_list
+
+# ================================================================ "please update" lock (no demo.py next to main.py)
+class _UpdateRequiredOverlay(QFrame):
+    """Covers the whole launcher window (nav bar hidden) and can't be dismissed; has its own title strip."""
+    def __init__(self, window):
+        self._root = window.centralWidget()
+        super().__init__(self._root)
+        self._win = window
+        self.setObjectName("UpdateRequiredOverlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 24)
+        outer.setSpacing(0)
+
+        # minimal title strip (the nav bar is gone): drag to move, minimize / maximize / close
+        self.strip = QFrame()
+        self.strip.setObjectName("UpdateStrip")
+        self.strip.setFixedHeight(44)
+        sl = QHBoxLayout(self.strip)
+        sl.setContentsMargins(12, 0, 12, 0)
+        sl.setSpacing(2)
+        sl.addStretch(1)
+        for text, tip, fn in (("\u2013", "Minimize", window.showMinimized),
+                              ("\u25a1", "Maximize", self._toggle_max),
+                              ("\u2715", "Close", self._close_launcher)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFixedSize(40, 32)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setObjectName("UpdateCapClose" if tip == "Close" else "UpdateCap")
+            b.clicked.connect(fn)
+            sl.addWidget(b)
+        outer.addWidget(self.strip)
+        _TitleBarDrag(window, self.strip)
+        outer.addStretch(1)
+
+        self.card = QFrame()
+        self.card.setObjectName("UpdateCard")
+        self.card.setFixedWidth(480)
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(36, 36, 36, 36)
+        cl.setSpacing(14)
+        self.badge = QLabel("!")
+        self.badge.setObjectName("UpdateBadge")
+        self.badge.setFixedSize(72, 72)
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cl.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignHCenter)
+        cl.addSpacing(6)
+        self.title = QLabel("Please update your launcher to version 12.1.0")
+        self.title.setObjectName("UpdateTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title.setWordWrap(True)
+        cl.addWidget(self.title)
+        self.link = QLabel()
+        self.link.setObjectName("UpdateLink")
+        self.link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.link.setTextFormat(Qt.TextFormat.RichText)
+        self.link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.link.linkActivated.connect(lambda u: QDesktopServices.openUrl(QUrl(u)))
+        cl.addWidget(self.link)
+        outer.addWidget(self.card, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addStretch(1)
+        bar = window.findChild(QFrame, "Sidebar")
+        if bar is not None:
+            bar.hide()                                    # no nav bar / sidebar on the update page
+
+        self._url = _launcher_update_url()
+        self.restyle()
+        _theme_listeners.append(self.restyle)
+        self._root.installEventFilter(self)              # follow the window when it is resized
+        QApplication.instance().installEventFilter(self) # swallow shortcuts / keys aimed at the launcher window
+        self._keep = QTimer(self)
+        self._keep.timeout.connect(self.enforce)
+        self._keep.start(400)
+        self.enforce()
+
+    def restyle(self):
+        try:
+            dark = QApplication.instance().palette().color(QPalette.ColorRole.Window).lightness() < 128
+            t = dict(THEMES["dark" if dark else "light"])
+            accent = t.get("accent", "#a666ff")
+            self.link.setText(f'<a href="{self._url}" style="color:{accent}; text-decoration:underline;">'
+                              f'You can update it here</a>')
+            self.setStyleSheet(
+                f"QFrame#UpdateRequiredOverlay {{ background: {t.get('bg', '#0d0d0f')}; }}"
+                f"QFrame#UpdateCard {{ background: {t.get('panel', '#151518')}; border: 1px solid {t.get('border', '#26262b')};"
+                f" border-radius: 16px; }}"
+                f"QLabel#UpdateBadge {{ background: {accent}; color: #ffffff; border-radius: 36px;"
+                f" font-size: 44px; font-weight: 800; }}"
+                f"QLabel#UpdateTitle {{ color: {t.get('text', '#f2f2f4')}; font-size: 19px; font-weight: 700; }}"
+                f"QLabel#UpdateLink {{ font-size: 15px; font-weight: 600; background: transparent; }}"
+                f"QFrame#UpdateStrip {{ background: transparent; }}"
+                f"QPushButton#UpdateCap, QPushButton#UpdateCapClose {{ background: transparent; border: none;"
+                f" border-radius: 6px; color: {t.get('subtext', '#8d8d96')}; font-size: 15px; font-weight: bold; padding: 0; }}"
+                f"QPushButton#UpdateCap:hover {{ background: rgba(128,128,128,0.25); color: {t.get('text', '#f2f2f4')}; }}"
+                f"QPushButton#UpdateCapClose:hover {{ background: #e5484d; color: #ffffff; }}")
+        except Exception:
+            pass
+
+    def _toggle_max(self):
+        self._win.showNormal() if self._win.isMaximized() else self._win.showMaximized()
+
+    def _close_launcher(self):
+        btn = self._win.findChild(QPushButton, "ExitButton")     # the normal close logic (tray / quit)
+        if btn is not None:
+            btn.click()
+        else:
+            self._win.close()
+
+    def enforce(self):
+        """Keeps the lock in place: visible, on top, covering the whole window, with focus."""
+        try:
+            pages = self._win.pages
+            bar = self._win.findChild(QFrame, "Sidebar")
+            if bar is not None and bar.isVisible():
+                bar.hide()
+            self.setGeometry(self._root.rect())
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            if pages.isEnabled():
+                pages.setEnabled(False)
+            if self._win.isActiveWindow() and not self.hasFocus():
+                self.setFocus()
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if obj is self._root and t in (QEvent.Type.Resize, QEvent.Type.Show):
+            QTimer.singleShot(0, self.enforce)
+        elif t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease, QEvent.Type.ShortcutOverride):
+            w = obj if isinstance(obj, QWidget) else None
+            if w is not None and w.window() is self._win and event.key() != Qt.Key.Key_F4:
+                event.accept()
+                return True
+        return False
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        QTimer.singleShot(0, self.enforce)               # can't be hidden
+
+
+_updlock_prev_init = AdaptiveApp.__init__
+
+def _updlock_init(self):
+    _updlock_prev_init(self)
+    if _demo_py_present():
+        return
+    try:
+        self._update_lock = _UpdateRequiredOverlay(self)
+    except Exception as e:
+        print(f"update lock: couldn't show it ({e!r})")
+
+AdaptiveApp.__init__ = _updlock_init
+
+
+# ================================================================ log out -> back to demo.py (sign-in window)
+def _go_back_to_demo(widget):
+    """Starts demo.py (sign-in + installer, it starts main.py again after login) and closes this launcher."""
+    demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
+    if not os.path.exists(demo):
+        return False
+    args = [a for a in sys.argv[1:] if a not in ("--startup", "--friends")]
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = 0x00000008 | 0x00000200       # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, demo] + args, cwd=os.path.dirname(demo), env=dict(os.environ),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, **kwargs)
+    except Exception as e:
+        print(f"log out: couldn't start demo.py ({e!r})")
+        return False
+    win = widget.window() if widget is not None else None
+    if win is not None:
+        win._really_quit = True                          # skip "close to tray"
+        tray = getattr(win, "_tray", None)
+        if tray is not None:
+            tray.hide()
+    QApplication.instance().quit()
+    QTimer.singleShot(3000, lambda: os._exit(0))         # don't hang on a stuck background thread
+    return True
+
+_demo_prev_log_out = AccountPage.log_out
+
+def _demo_log_out(self):
+    _demo_prev_log_out(self)                             # clears the saved account as before
+    _go_back_to_demo(self)
+
+AccountPage.log_out = _demo_log_out
+
 
 if __name__ == "__main__":
     main()
