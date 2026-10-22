@@ -7032,6 +7032,38 @@ def set_windows_taskbar_identity(window):
     except Exception:
         pass
 
+UPDATE_URL_WIN = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/NCZ%20Games%20Launcher.exe"
+UPDATE_URL_DEB = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher_7.0_all.deb"
+UPDATE_URL_ARCH = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher-7.0-1-any.pkg.tar.zst"
+UPDATE_URL_FALLBACK = "https://github.com/justmm33/FNaNCZ-AE-Releases/tree/main/build"
+
+
+def _launcher_update_url():
+    """Download link for the current platform (Windows exe, Debian/Ubuntu .deb, Arch package)."""
+    if sys.platform.startswith("win"):
+        return UPDATE_URL_WIN
+    if sys.platform.startswith("linux"):
+        ids = set()
+        try:
+            with open("/etc/os-release", encoding="utf-8") as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k in ("ID", "ID_LIKE"):
+                        ids.update(v.strip().strip('"').lower().split())
+        except OSError:
+            pass
+        if ids & {"arch", "manjaro", "endeavouros", "cachyos", "garuda", "artix"}:
+            return UPDATE_URL_ARCH
+        if ids & {"debian", "ubuntu", "linuxmint", "pop", "zorin", "elementary", "kali", "raspbian"}:
+            return UPDATE_URL_DEB
+    return UPDATE_URL_FALLBACK
+
+
+def _demo_py_present():
+    """demo.py (sign-in + installer) is started by the bootstrap and lives next to main.py."""
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py"))
+
+
 def main():
     import traceback
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
@@ -30861,6 +30893,204 @@ def _rx_build_list(self):
     return page
 
 FriendsPage._build_list = _rx_build_list
+
+# ================================================================ "please update" lock (no demo.py next to main.py)
+class _UpdateRequiredOverlay(QFrame):
+    """Covers the launcher's content area (the title-bar buttons stay usable) and can't be dismissed."""
+    def __init__(self, window):
+        self._root = window.centralWidget()
+        super().__init__(self._root)
+        self._win = window
+        self.setObjectName("UpdateRequiredOverlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 24)
+        outer.setSpacing(0)
+
+        # minimal title strip (the nav bar is gone): drag to move, minimize / maximize / close
+        self.strip = QFrame()
+        self.strip.setObjectName("UpdateStrip")
+        self.strip.setFixedHeight(44)
+        sl = QHBoxLayout(self.strip)
+        sl.setContentsMargins(12, 0, 12, 0)
+        sl.setSpacing(2)
+        sl.addStretch(1)
+        self._cap_btns = []
+        for text, tip, fn in (("\u2013", "Minimize", window.showMinimized),
+                              ("\u25a1", "Maximize", self._toggle_max),
+                              ("\u2715", "Close", self._close_launcher)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFixedSize(40, 32)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setObjectName("UpdateCapClose" if tip == "Close" else "UpdateCap")
+            b.clicked.connect(fn)
+            sl.addWidget(b)
+            self._cap_btns.append(b)
+        outer.addWidget(self.strip)
+        _TitleBarDrag(window, self.strip)
+        outer.addStretch(1)
+        self.card = QFrame()
+        self.card.setObjectName("UpdateCard")
+        self.card.setFixedWidth(480)
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(36, 36, 36, 36)
+        cl.setSpacing(14)
+        self.badge = QLabel("!")
+        self.badge.setObjectName("UpdateBadge")
+        self.badge.setFixedSize(72, 72)
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cl.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignHCenter)
+        cl.addSpacing(6)
+        self.title = QLabel("Please update your launcher to version 12.1.0")
+        self.title.setObjectName("UpdateTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title.setWordWrap(True)
+        cl.addWidget(self.title)
+        self.link = QLabel()
+        self.link.setObjectName("UpdateLink")
+        self.link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.link.setTextFormat(Qt.TextFormat.RichText)
+        self.link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.link.linkActivated.connect(lambda u: QDesktopServices.openUrl(QUrl(u)))
+        cl.addWidget(self.link)
+        outer.addWidget(self.card, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addStretch(1)
+        bar = window.findChild(QFrame, "Sidebar")
+        if bar is not None:
+            bar.hide()                                    # no nav bar / sidebar on the update page
+
+        self._url = _launcher_update_url()
+        self.restyle()
+        _theme_listeners.append(self.restyle)
+        self._root.installEventFilter(self)              # follow the window when it is resized
+        QApplication.instance().installEventFilter(self) # swallow shortcuts / keys aimed at the launcher window
+        self._keep = QTimer(self)
+        self._keep.timeout.connect(self.enforce)
+        self._keep.start(400)
+        self.enforce()
+
+    def restyle(self):
+        try:
+            dark = QApplication.instance().palette().color(QPalette.ColorRole.Window).lightness() < 128
+            t = dict(THEMES["dark" if dark else "light"])
+            accent = t.get("accent", "#a666ff")
+            self.link.setText(f'<a href="{self._url}" style="color:{accent}; text-decoration:underline;">'
+                              f'You can update it here</a>')
+            self.setStyleSheet(
+                f"QFrame#UpdateRequiredOverlay {{ background: {t.get('bg', '#0d0d0f')}; }}"
+                f"QFrame#UpdateCard {{ background: {t.get('panel', '#151518')}; border: 1px solid {t.get('border', '#26262b')};"
+                f" border-radius: 16px; }}"
+                f"QLabel#UpdateBadge {{ background: {accent}; color: #ffffff; border-radius: 36px;"
+                f" font-size: 44px; font-weight: 800; }}"
+                f"QLabel#UpdateTitle {{ color: {t.get('text', '#f2f2f4')}; font-size: 19px; font-weight: 700; }}"
+                f"QLabel#UpdateLink {{ font-size: 15px; font-weight: 600; background: transparent; }}"
+                f"QFrame#UpdateStrip {{ background: transparent; }}"
+                f"QPushButton#UpdateCap, QPushButton#UpdateCapClose {{ background: transparent; border: none;"
+                f" border-radius: 6px; color: {t.get('subtext', '#8d8d96')}; font-size: 15px; font-weight: bold; padding: 0; }}"
+                f"QPushButton#UpdateCap:hover {{ background: rgba(128,128,128,0.25); color: {t.get('text', '#f2f2f4')}; }}"
+                f"QPushButton#UpdateCapClose:hover {{ background: #e5484d; color: #ffffff; }}")
+        except Exception:
+            pass
+
+    def _toggle_max(self):
+        self._win.showNormal() if self._win.isMaximized() else self._win.showMaximized()
+
+    def _close_launcher(self):
+        btn = self._win.findChild(QPushButton, "ExitButton")     # the normal close logic (tray / quit)
+        if btn is not None:
+            btn.click()
+        else:
+            self._win.close()
+
+    def enforce(self):
+        """Keeps the lock in place: visible, on top, covering the whole window, with focus."""
+        try:
+            pages = self._win.pages
+            bar = self._win.findChild(QFrame, "Sidebar")
+            if bar is not None and bar.isVisible():
+                bar.hide()
+            self.setGeometry(self._root.rect())
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            if pages.isEnabled():
+                pages.setEnabled(False)
+            if self._win.isActiveWindow() and not self.hasFocus():
+                self.setFocus()
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if obj is self._root and t in (QEvent.Type.Resize, QEvent.Type.Show):
+            QTimer.singleShot(0, self.enforce)
+        elif t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease, QEvent.Type.ShortcutOverride):
+            w = obj if isinstance(obj, QWidget) else None
+            if w is not None and w.window() is self._win and event.key() != Qt.Key.Key_F4:
+                event.accept()
+                return True
+        return False
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        QTimer.singleShot(0, self.enforce)               # can't be hidden
+
+
+_updlock_prev_init = AdaptiveApp.__init__
+
+def _updlock_init(self):
+    _updlock_prev_init(self)
+    if _demo_py_present():
+        return
+    try:
+        self._update_lock = _UpdateRequiredOverlay(self)
+    except Exception as e:
+        print(f"update lock: couldn't show it ({e!r})")
+
+AdaptiveApp.__init__ = _updlock_init
+
+
+# ================================================================ log out -> back to demo.py (sign-in window)
+def _go_back_to_demo(widget):
+    """Starts demo.py (sign-in + installer, it starts main.py again after login) and closes this launcher."""
+    demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
+    if not os.path.exists(demo):
+        return False
+    args = [a for a in sys.argv[1:] if a not in ("--startup", "--friends")]
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = 0x00000008 | 0x00000200       # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, demo] + args, cwd=os.path.dirname(demo), env=dict(os.environ),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, **kwargs)
+    except Exception as e:
+        print(f"log out: couldn't start demo.py ({e!r})")
+        return False
+    win = widget.window() if widget is not None else None
+    if win is not None:
+        win._really_quit = True                          # skip "close to tray"
+        tray = getattr(win, "_tray", None)
+        if tray is not None:
+            tray.hide()
+    QApplication.instance().quit()
+    QTimer.singleShot(3000, lambda: os._exit(0))         # don't hang on a stuck background thread
+    return True
+
+_demo_prev_log_out = AccountPage.log_out
+
+def _demo_log_out(self):
+    _demo_prev_log_out(self)                             # clears the saved account as before
+    _go_back_to_demo(self)
+
+AccountPage.log_out = _demo_log_out
+
 
 if __name__ == "__main__":
     main()
