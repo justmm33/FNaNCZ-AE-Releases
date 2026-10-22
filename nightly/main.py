@@ -12222,11 +12222,16 @@ def cloud_set_reaction(other, msg_key, code, on):
     else:
         _http_json(url, "DELETE")
 
-def _friend_status(d):
-    if d.get("playing"):
-        return f"Playing {pretty_game_name(d['playing'])}", GREEN
+def _friend_is_fresh(d):
+    """True if the friend's heartbeat is recent. A stale 'playing' (closed laptop, crash, lost connection) is ignored."""
     seen = d.get("seen")
-    if isinstance(seen, (int, float)) and time.time() * 1000 - seen < FRIEND_ONLINE_WINDOW_MS:
+    return isinstance(seen, (int, float)) and time.time() * 1000 - seen < FRIEND_ONLINE_WINDOW_MS
+
+def _friend_status(d):
+    fresh = _friend_is_fresh(d)
+    if fresh and d.get("playing"):
+        return f"Playing {pretty_game_name(d['playing'])}", GREEN
+    if fresh:
         if d.get("idle") is True:
             return "Idle", "#3b82f6"
         return "Online", GREEN
@@ -27420,7 +27425,8 @@ def profile_info_from_public(uid, d, raw_covers=None):
     if isinstance(lib, dict):
         lib = list(lib.values())
     titles = [pretty_game_name(t) for t in lib if isinstance(t, str)] if isinstance(lib, list) else []
-    playing = pretty_game_name(d["playing"]) if isinstance(d.get("playing"), str) and d.get("playing") else ""
+    playing = (pretty_game_name(d["playing"])
+               if _friend_is_fresh(d) and isinstance(d.get("playing"), str) and d.get("playing") else "")
     covers = {}
     for t in titles + ([playing] if playing and playing not in titles else []):
         key = _cover_key(t)
