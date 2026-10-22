@@ -21,6 +21,8 @@ import traceback
 
 PORT = 8765
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+IDLE_TIMEOUT = 30   # seconds with no frame at all (not even a pong) before a phone is treated as dead
+PING_EVERY = 5      # server -> phone ping interval; an idle (untouched) controller must not look "silent"
 
 # ------------------------------------------------------------------ logging
 # Every connection step is written to the console, to controller_bridge.log (next to this file) and to an
@@ -96,10 +98,16 @@ class _WinPad:
         self.pad.update()
 
     def close(self):
+        """Neutralize all inputs but keep the virtual pad plugged in (no connect/disconnect popup)."""
         try:
             self.update(0, [0, 0, 0, 0], 0, 0)
         except Exception:
             pass
+
+    def destroy(self):
+        """Really unplug the virtual pad (only when the bridge is stopped)."""
+        self.close()
+        self.pad = None          # vgamepad unplugs the device when the object is freed
 
 
 class _LinuxPad:
@@ -132,8 +140,15 @@ class _LinuxPad:
         ui.syn()
 
     def close(self):
+        """Neutralize all inputs but keep the virtual device alive."""
         try:
             self.update(0, [0, 0, 0, 0], 0, 0)
+        except Exception:
+            pass
+
+    def destroy(self):
+        self.close()
+        try:
             self.ui.close()
         except Exception:
             pass
@@ -237,6 +252,16 @@ class ControllerBridge:
         self.running = False
         self.client = None          # address string of the connected phone
         self.error = ""
+        self.pad = None             # ONE virtual pad for the whole session (created on first auth, never per connection)
+        self.pad_lock = threading.Lock()
+        self.active_sock = None     # the phone connection that currently owns the pad
+
+    def _get_pad(self):
+        with self.pad_lock:
+            if self.pad is None:
+                self.pad = _make_pad()
+                log("virtual gamepad created (once; it stays plugged in until the bridge is stopped)")
+            return self.pad
 
     def start(self):
         if self.running:
@@ -267,6 +292,16 @@ class ControllerBridge:
             self.srv.close()
         except Exception:
             pass
+        with self.pad_lock:
+            act, self.active_sock = self.active_sock, None
+            pad, self.pad = self.pad, None
+        if act is not None:
+            try:
+                act.close()
+            except Exception:
+                pass
+        if pad is not None:
+            pad.destroy()
         if was:
             log("stopped")
 
@@ -286,8 +321,26 @@ class ControllerBridge:
         who = "%s:%d" % (addr[0], addr[1])
         ignored = 0
         count, window = 0, time.time()
+        slock = threading.Lock()        # the heartbeat thread and this thread both write to the socket
+
+        def send(op, data=b""):
+            with slock:
+                _send_frame(sock, op, data)
+
+        def heartbeat():
+            # Ping the phone regularly. A browser answers with a pong automatically, so an idle controller
+            # (phone only sends a state message when something changes) never looks dead to the idle timeout.
+            while self.running and self.active_sock is sock:
+                time.sleep(PING_EVERY)
+                if self.active_sock is not sock:
+                    break
+                try:
+                    send(9, b"")
+                except Exception:
+                    break
+
         try:
-            sock.settimeout(20)
+            sock.settimeout(IDLE_TIMEOUT)
             if not _handshake(sock):
                 return
             authed = False
@@ -297,7 +350,9 @@ class ControllerBridge:
                     log("%s: phone sent a close frame", who)
                     break
                 if op == 9:
-                    _send_frame(sock, 10, data)
+                    send(10, data)
+                    continue
+                if op == 10:            # pong answering our heartbeat ping
                     continue
                 if op != 1:
                     ignored += 1
@@ -319,19 +374,33 @@ class ControllerBridge:
                     if ok:
                         authed = True
                         try:
-                            pad = _make_pad()
-                            log("%s: virtual gamepad created", who)
+                            pad = self._get_pad()
                         except Exception as ex:
                             log("%s: could not create the virtual gamepad: %r\n%s", who, ex, traceback.format_exc())
-                            _send_frame(sock, 1, json.dumps({"t": "err", "m": "No virtual gamepad driver: %s" % ex}).encode())
+                            send(1, json.dumps({"t": "err", "m": "No virtual gamepad driver: %s" % ex}).encode())
                             break
+                        with self.pad_lock:
+                            old, self.active_sock = self.active_sock, sock
+                        if old is not None:
+                            log("%s: replacing the previous phone connection (same pad is reused)", who)
+                            try:
+                                old.shutdown(socket.SHUT_RDWR)
+                            except Exception:
+                                pass
+                            try:
+                                old.close()
+                            except Exception:
+                                pass
                         self.client = addr[0]
-                        _send_frame(sock, 1, b'{"t":"ok"}')
+                        send(1, b'{"t":"ok"}')
                         log("%s: authenticated, sent ok. Streaming controller input", who)
+                        threading.Thread(target=heartbeat, daemon=True).start()
                         continue
-                    _send_frame(sock, 1, b'{"t":"err","m":"Wrong PIN"}')
+                    send(1, b'{"t":"err","m":"Wrong PIN"}')
                     break
                 if msg.get("t") == "s":
+                    if self.active_sock is not sock:
+                        break           # a newer connection took over the pad
                     a = (list(msg.get("a", [])) + [0, 0, 0, 0])[:4]
                     pad.update(int(msg.get("b", 0)), [float(x) for x in a],
                                float(msg.get("lt", 0)), float(msg.get("rt", 0)))
@@ -340,15 +409,19 @@ class ControllerBridge:
                         log("%s: streaming, %d state messages in the last 5s", who, count)
                         count, window = 0, time.time()
         except socket.timeout:
-            log("%s: TIMED OUT after 20s of silence", who)
+            log("%s: no data or pong for %ds, treating the phone as gone", who, IDLE_TIMEOUT)
         except ConnectionError as ex:
             log("%s: connection ended: %s", who, ex)
         except Exception as ex:
             log("%s: ERROR %r\n%s", who, ex, traceback.format_exc())
         finally:
-            if pad:
-                pad.close()
-                self.client = None
+            with self.pad_lock:
+                mine = self.active_sock is sock
+                if mine:
+                    self.active_sock = None
+                    self.client = None
+            if pad and mine:
+                pad.close()             # release all buttons/sticks, but the virtual pad stays plugged in
             try:
                 sock.close()
             except Exception:
