@@ -28091,7 +28091,7 @@ class CountryDialog(QDialog):
 # The admin accounts below can pick every account theme (the existing one and any added later) and are never locked.
 _THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
 _ACCOUNT_THEMES = {
-    "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": True},
+    "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": False},     # free to switch between Sunset and this theme
     "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
 }   # each entry's look (label, theme, extra) is attached next to its colours below
 
