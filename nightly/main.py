@@ -22,10 +22,17 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFrame, QMenu, QButtonGroup, QStackedWidget,
     QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
-    QAbstractItemView
+    QAbstractItemView, QTabWidget
 )
 from PyQt6.QtCore import QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
+try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
+                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
+    _HAS_WEBENGINE = True
+except Exception:
+    _HAS_WEBENGINE = False
 
 if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
     from overlay import run_server
@@ -107,7 +114,7 @@ DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
 LIBRARY_FOLDER_NAME = "NCZLibrary"       # looked for on every partition
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
-NCZFRONT_URL = "https://occultist-tattling-elevation.ngrok-free.dev/"
+NCZFRONT_URL = "https://acapesfront.duckdns.org:9000/"
 
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
 FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
@@ -570,7 +577,7 @@ def load_launcher_settings():
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
                 "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff",
-                "download_server": "1", "archive_tool": ""}
+                "download_server": "1", "archive_tool": "", "discord_pfp_sync": True, "discord_pfp_hash": ""}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -592,6 +599,10 @@ def load_launcher_settings():
                     settings["library_dirs"] = [d for d in loaded["library_dirs"] if isinstance(d, str) and d.strip()]
                 if isinstance(loaded.get("discord_rpc"), bool):
                     settings["discord_rpc"] = loaded["discord_rpc"]
+                if isinstance(loaded.get("discord_pfp_sync"), bool):
+                    settings["discord_pfp_sync"] = loaded["discord_pfp_sync"]
+                if isinstance(loaded.get("discord_pfp_hash"), str):
+                    settings["discord_pfp_hash"] = loaded["discord_pfp_hash"]
                 if isinstance(loaded.get("start_on_boot"), bool):
                     settings["start_on_boot"] = loaded["start_on_boot"]
                 if isinstance(loaded.get("auto_update"), bool):
@@ -1029,8 +1040,41 @@ COUNTRIES = dict(x.split(":", 1) for x in (
     "UZ:Uzbekistan|VU:Vanuatu|VA:Vatican City|VE:Venezuela|VN:Vietnam|YE:Yemen|ZM:Zambia|ZW:Zimbabwe"
 ).split("|"))
 
+QATAR_FLAG_URL = ("https://thumb.wikimedia.org/wikipedia/commons/thumb/3/3e/Flag_of_Qatar_%283-2%29.svg/"
+                  "3840px-Flag_of_Qatar_%283-2%29.svg.png?utm_source=commons.wikimedia.org"
+                  "&utm_campaign=index&utm_content=thumbnail")
+FLAG_URL_OVERRIDES = {"QA": QATAR_FLAG_URL, "QAR": QATAR_FLAG_URL}   # country / currency code -> exact image URL
+
+def _fetch_flag_override(code, path):
+    """Downloads the override flag, shrinks it (the source is 3840 px wide) and caches it. True on success."""
+    raw = _http_get(FLAG_URL_OVERRIDES[code], headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=20)
+    img = QImage.fromData(raw)
+    if img.isNull():
+        return False
+    if img.width() > 480:
+        img = img.scaledToWidth(480, Qt.TransformationMode.SmoothTransformation)
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    # recolor the maroon to #70113d: every pixel is a mix of white and the flag's own maroon (edges are
+    # antialiased), so work out how much maroon it holds and re-mix with the new colour
+    rc = img.pixel(int(img.width() * 0.8), img.height() // 2)
+    tgt = (0x70, 0x11, 0x3d)
+    span = [max(255 - ((rc >> 16) & 255), 1), max(255 - ((rc >> 8) & 255), 1), max(255 - (rc & 255), 1)]
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixel(x, y)
+            a = (c >> 24) & 255
+            r, g, b = (c >> 16) & 255, (c >> 8) & 255, c & 255
+            t = min(1.0, max(0.0, ((255 - r) / span[0] + (255 - g) / span[1] + (255 - b) / span[2]) / 3.0))
+            nr = int(round(255 + (tgt[0] - 255) * t))
+            ng = int(round(255 + (tgt[1] - 255) * t))
+            nb = int(round(255 + (tgt[2] - 255) * t))
+            img.setPixel(x, y, (a << 24) | (nr << 16) | (ng << 8) | nb)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return img.save(path, "PNG")
+
 def _country_flag_path(code):
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"country_{code}.png")
+    suffix = "_custom2" if code in FLAG_URL_OVERRIDES else ""
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"country_{code}{suffix}.png")
 
 def get_country_flag_file(code):
     """Flag image for a country code, downloaded once and cached. '' if unavailable (call off the GUI thread)."""
@@ -1040,6 +1084,13 @@ def get_country_flag_file(code):
     path = _country_flag_path(code)
     if os.path.exists(path) and os.path.getsize(path) > 100:
         return path
+    if code in FLAG_URL_OVERRIDES:
+        try:
+            if _fetch_flag_override(code, path):
+                return path
+        except Exception:
+            pass
+        return ""
     try:
         raw = _http_get(f"https://flagcdn.com/w160/{code.lower()}.png",
                         headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=8)
@@ -4442,7 +4493,8 @@ FLAG_WIKI_FILES = {   # currency -> Wikipedia / Wikimedia Commons flag file
 }
 
 def _flag_cache_path(code):
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"{code}.png")
+    suffix = "_custom2" if code in FLAG_URL_OVERRIDES else ""
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"{code}{suffix}.png")
 
 def get_flag_file(code):
     """Official flag from Wikimedia Commons (rendered as a PNG), downloaded once and cached. '' if unavailable."""
@@ -4452,6 +4504,13 @@ def get_flag_file(code):
     path = _flag_cache_path(code)
     if os.path.exists(path) and os.path.getsize(path) > 200:
         return path
+    if code in FLAG_URL_OVERRIDES:
+        try:
+            if _fetch_flag_override(code, path):
+                return path
+        except Exception:
+            pass
+        return ""
     try:
         raw = _http_get(f"https://commons.wikimedia.org/wiki/Special:FilePath/{name}?width=240",
                         headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=10)
@@ -4480,7 +4539,7 @@ def round_flag_pixmap(path, height=22):
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    radius = 5 * dpr
+    radius = 2 * dpr
     clip = QPainterPath()
     clip.addRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), radius, radius)
     p.setClipPath(clip)
@@ -6871,7 +6930,7 @@ class AdaptiveApp(QMainWindow):
 
         if game_id == "nczfront":
             btn_action.setText("Play")
-            btn_action.clicked.connect(lambda: webbrowser.open(NCZFRONT_URL))
+            btn_action.clicked.connect(lambda _c=False: self.open_nczfront())
             menu.addAction("Refresh status").triggered.connect(self.check_nczfront_status)
         else:
             btn_save = menu.addAction("Edit Current Save")
@@ -10863,7 +10922,7 @@ AdaptiveApp.build_library_page = _unified_build_library_page
 import secrets as _secrets
 
 FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-FRIEND_ONLINE_WINDOW_MS = 180000
+FRIEND_ONLINE_WINDOW_MS = 100000     # heartbeat is every 30 s
 
 def _friends_cache_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "friends.json")
@@ -11250,35 +11309,70 @@ def workshop_parse_mods(raw):
             found.append((str(r["id"]), str(r.get("title") or "")))
     return found
 
+_presence_lock = threading.Lock()
+_presence_state = {"offline": False, "full_sig": None, "full_at": 0.0}
+_clock_skew = {"ms": 0.0}          # server time minus this PC's time, so a wrong PC clock can't fake "online"
+PRESENCE_FULL_EVERY = 600          # seconds: re-send the whole profile at least this often
+
 def cloud_publish_presence():
-    try:
-        cloud_autoset_country()
-    except Exception:
-        pass
-    token, uid = get_id_token()
-    username, avatar = load_profile_cache()
-    payload = {
-        "username": username or (load_account() or {}).get("email", "").split("@")[0] or "Player",
-        "library": friends_library_titles(),
-        "playing": _now_playing["name"] or "",
-        "idle": is_idle(),
-        "seen": {".sv": "timestamp"},
-        "country": load_profile_country() or None,
-        "ptime": profile_ptime_payload(),
-        "photo": None,
-    }
-    if avatar and os.path.exists(avatar):
-        with open(avatar, "rb") as f:
-            payload["photo"] = base64.b64encode(f.read()).decode("ascii")
-    _http_json(_fdb(f"public/{uid}", token), "PATCH", payload)
-    try:
-        cloud_publish_covers(token, uid)
-    except CloudError:
-        pass  # covers are optional; never break presence over them
+    """Light heartbeat (seen/playing/idle) normally. The heavy profile (photo, library, covers, playtime)
+    is only sent when it changed, or every PRESENCE_FULL_EVERY seconds."""
+    if _presence_state["offline"]:
+        return                         # the launcher is quitting; a late heartbeat must not undo "offline"
+    with _presence_lock:
+        if _presence_state["offline"]:
+            return
+        try:
+            cloud_autoset_country()
+        except Exception:
+            pass
+        token, uid = get_id_token()
+        username, avatar = load_profile_cache()
+        username = username or (load_account() or {}).get("email", "").split("@")[0] or "Player"
+        library = friends_library_titles()
+        country = load_profile_country() or None
+        ptime = profile_ptime_payload()
+        try:
+            avatar_sig = (avatar, os.path.getmtime(avatar)) if avatar and os.path.exists(avatar) else None
+        except OSError:
+            avatar_sig = None
+        sig = (uid, username, json.dumps(library, sort_keys=True, default=str), country,
+               json.dumps(ptime, sort_keys=True, default=str), avatar_sig)
+        full = (sig != _presence_state["full_sig"]
+                or time.time() - _presence_state["full_at"] > PRESENCE_FULL_EVERY)
+        payload = {
+            "playing": _now_playing["name"] or "",
+            "idle": is_idle(),
+            "seen": {".sv": "timestamp"},
+        }
+        if full:
+            payload.update({"username": username, "library": library, "country": country, "ptime": ptime,
+                            "photo": None})
+            if avatar_sig:
+                with open(avatar, "rb") as f:
+                    payload["photo"] = base64.b64encode(f.read()).decode("ascii")
+        t0 = time.time() * 1000
+        resp = _http_json(_fdb(f"public/{uid}", token), "PATCH", payload)
+        if full:
+            _presence_state["full_sig"] = sig
+            _presence_state["full_at"] = time.time()
+        try:    # if Firebase echoes the resolved server timestamp, use it to measure this PC's clock error
+            srv = resp.get("seen") if isinstance(resp, dict) else None
+            if isinstance(srv, (int, float)) and srv > 0:
+                _clock_skew["ms"] = srv - (t0 + (time.time() * 1000 - t0) / 2)
+        except Exception:
+            pass
+        if full:
+            try:
+                cloud_publish_covers(token, uid)
+            except CloudError:
+                pass  # covers are optional; never break presence over them
 
 def cloud_publish_offline():
+    _presence_state["offline"] = True       # stops any heartbeat that is still in flight or starts later
     token, uid = get_id_token()
-    _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "idle": False, "playing": ""})
+    with _presence_lock:                    # waits for an in-flight heartbeat so "offline" is always the last write
+        _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "idle": False, "playing": ""})
 
 def cloud_accept_friend(other):
     token, uid = get_id_token()
@@ -11363,17 +11457,25 @@ def cloud_fetch_requests():
         out[rid] = d if isinstance(d, dict) else {}
     return out
 
+_friends_last_good = {}
+
 def cloud_fetch_friends():
     token, uid = get_id_token()
     ids = _http_json(_fdb(f"friends/{uid}", token))
     ids = list(ids.keys()) if isinstance(ids, dict) else []
     def one(fid):
-        try:
-            d = _http_json(_fdb(f"public/{fid}", token))
-            return fid, (d if isinstance(d, dict) else {})
-        except CloudError:
-            return fid, {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
+        for attempt in range(2):
+            try:
+                d = _http_json(_fdb(f"public/{fid}", token))
+                if isinstance(d, dict):
+                    _friends_last_good[fid] = d
+                    return fid, d
+                break
+            except CloudError:
+                continue
+        # fetch failed: keep showing what we knew instead of a blank "Unknown / Offline" profile
+        return fid, _friends_last_good.get(fid, {})
+    with ThreadPoolExecutor(max_workers=4) as ex:
         return dict(ex.map(one, ids))
 
 def _chat_id(a, b):
@@ -12225,7 +12327,10 @@ def cloud_set_reaction(other, msg_key, code, on):
 def _friend_is_fresh(d):
     """True if the friend's heartbeat is recent. A stale 'playing' (closed laptop, crash, lost connection) is ignored."""
     seen = d.get("seen")
-    return isinstance(seen, (int, float)) and time.time() * 1000 - seen < FRIEND_ONLINE_WINDOW_MS
+    if not isinstance(seen, (int, float)) or seen <= 0:
+        return False
+    now = time.time() * 1000 + _clock_skew["ms"]
+    return -30000 < now - seen < FRIEND_ONLINE_WINDOW_MS
 
 def _friend_status(d):
     fresh = _friend_is_fresh(d)
@@ -13411,7 +13516,7 @@ class FriendsPage(QWidget):
         self.chat_timer.setInterval(2000)
         self.chat_timer.timeout.connect(self.load_messages)
         self.beat_timer = QTimer(self)
-        self.beat_timer.setInterval(60000)
+        self.beat_timer.setInterval(30000)
         self.beat_timer.timeout.connect(self.heartbeat)
         self.beat_timer.start()
         self.list_timer.start()  # keeps polling in the background for notifications
@@ -13540,7 +13645,6 @@ class FriendsPage(QWidget):
             return
         def work():
             code = cloud_ensure_friend_code()
-            cloud_publish_presence()
             friends = cloud_fetch_friends()
             return code, friends, cloud_fetch_requests(), cloud_fetch_last_messages(list(friends))
         self._run(work, self._on_fetched, key="refresh")
@@ -21460,6 +21564,86 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
     except Exception as e:
         QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
 
+# ---------------------------------------------------------------- winetricks for any game (Linux)
+def _winetricks_env(app, exe, compat_tool):
+    """(env, prefix, kind) for running winetricks inside the Wine/Proton prefix this game launches in.
+    Proton games use the game's own Proton prefix and Proton's own wine (what protontricks does under the hood).
+    Raises RuntimeError with a message for the user if that isn't possible."""
+    kind = compat_tool_kind(compat_tool)
+    if kind == "proton":
+        wbin = _proton_wine_bin(compat_tool)
+        if not wbin:
+            raise RuntimeError("Couldn't find wine inside this Proton version:\n" + compat_tool)
+        compat = compat_data_dir_for(exe)
+        pfx = os.path.join(compat, "pfx")
+        if not os.path.isdir(pfx):
+            raise RuntimeError("This game's Proton prefix doesn't exist yet.\n"
+                               "Launch the game once so Proton creates it, then try again.")
+        files = os.path.dirname(os.path.dirname(wbin))          # .../files (or .../dist)
+        env = _proton_redist_env((compat_tool, compat))
+        env["WINEPREFIX"] = pfx
+        env["WINE"] = wbin
+        env["WINELOADER"] = wbin
+        ws = os.path.join(files, "bin", "wineserver")
+        if os.path.isfile(ws):
+            env["WINESERVER"] = ws
+        dll = [d for d in (os.path.join(files, "lib64", "wine"), os.path.join(files, "lib", "wine")) if os.path.isdir(d)]
+        if dll:
+            env["WINEDLLPATH"] = ":".join(dll)
+        libs = [d for d in (os.path.join(files, "lib64"), os.path.join(files, "lib")) if os.path.isdir(d)]
+        if libs:
+            env["LD_LIBRARY_PATH"] = ":".join(libs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
+        return env, pfx, "proton"
+    if kind != "wine" and not (exe or "").lower().endswith(".exe"):
+        raise RuntimeError("This looks like a native Linux game, so it doesn't use a Wine prefix.")
+    wine = compat_tool if kind == "wine" else default_wine_path(app)
+    if not wine:
+        raise RuntimeError("Wine isn't installed, so there's no prefix to open winetricks in.")
+    env = system_env()                  # no DLL overrides: winetricks should see the prefix as it is
+    env["WINE"] = wine
+    ws = os.path.join(os.path.dirname(wine), "wineserver")
+    if os.path.isfile(ws):
+        env["WINESERVER"] = ws
+    prefix = env.get("WINEPREFIX") or _wine_prefix()
+    env["WINEPREFIX"] = prefix
+    return env, prefix, "wine"
+
+def open_winetricks_for_game(app, title, exe, compat_tool=""):
+    """Menu action (Linux): opens the winetricks window for the Wine/Proton prefix this game runs in."""
+    if not sys.platform.startswith("linux"):
+        return
+    tricks = shutil.which("winetricks")
+    if not tricks:
+        QMessageBox.warning(app, "Winetricks", "winetricks isn't installed.\n\n"
+                            "Install it with your package manager (for example: sudo apt install winetricks, "
+                            "sudo pacman -S winetricks, or sudo dnf install winetricks), then try again.")
+        return
+    if not exe or not os.path.exists(exe):
+        QMessageBox.warning(app, "Winetricks", f"{title} isn't installed yet, so it has no Wine/Proton prefix.")
+        return
+    try:
+        env, prefix, kind = _winetricks_env(app, exe, compat_tool)
+    except Exception as e:
+        QMessageBox.warning(app, "Winetricks", str(e))
+        return
+    cmd = [tricks, "--gui"]
+    if not (shutil.which("zenity") or shutil.which("kdialog")):
+        QMessageBox.information(app, "Winetricks", "winetricks needs zenity or kdialog installed to show its window. "
+                                "Install one of them and try again.")
+        return
+    try:
+        subprocess.Popen(cmd, env=env, cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        QMessageBox.warning(app, "Winetricks", f"Couldn't start winetricks: {e}")
+
+def _winetricks_target(app, key, exe_fn, tool_fn):
+    """(exe, compat tool) for a library card, resolved when the menu item is clicked."""
+    if key in ("ae", "ncz2"):               # the built-in games run their Windows build from the wine folder
+        name = AE_GAME_NAME if key == "ae" else NCZ2_GAME_NAME
+        return _ae_launch_info(key, name)
+    return exe_fn(), tool_fn()
+
 def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
     more = card.findChild(QPushButton, "MoreButton") if card is not None else None
     if not more or not more.menu():
@@ -21472,6 +21656,10 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
     menu.addAction("Create Desktop Shortcut").triggered.connect(
         lambda _c=False: create_game_shortcut(app, title, exe_fn(), tool_fn(), cover,
                                               launch_args_for(key) if key is not None else None))
+    if sys.platform.startswith("linux"):
+        wt = menu.addAction("Open Winetricks")
+        wt.setToolTip("Install Windows components (DLLs, fonts, runtimes) into this game's Wine / Proton prefix")
+        wt.triggered.connect(lambda _c=False: open_winetricks_for_game(app, title, *_winetricks_target(app, key, exe_fn, tool_fn)))
 
 # --- hook every kind of library card ---
 _sc_prev_game_card = AdaptiveApp.create_game_card
@@ -31215,6 +31403,4403 @@ def _demo_log_out(self):
     _go_back_to_demo(self)
 
 AccountPage.log_out = _demo_log_out
+
+
+# ---------------------------------------------------------------- NCZ Link (stream this PC to your phone over LAN)
+# Like Steam Link, but small: turn it on in Settings, open NCZ Link in the phone app (same Wi-Fi), enter this PC's address and
+# the PIN once. The phone then sees your game list, can start a game, and gets a live view of this screen with touch /
+# mouse / keyboard control, plus the PC's sound. Everything stays on your local network: only private (LAN) addresses are accepted, every request
+# needs a token from PIN pairing, and it is OFF by default. Video is MJPEG; sound is raw PCM; input needs Windows, or xdotool on Linux.
+import http.server as _lk_http
+import socketserver as _lk_ss
+import hmac as _lk_hmac
+import ipaddress as _lk_ipa
+import secrets as _lk_secrets
+import socket as _lk_socket
+import queue as _lk_queue
+import struct as _lk_struct
+from PyQt6.QtGui import QGuiApplication as _LkGuiApp, QCursor as _LkCursor, QPolygonF as _LkPoly
+from PyQt6.QtCore import QPointF as _LkPointF
+
+NCZ_LINK_PORT = 47990
+_lk = {"server": None, "gen": 0, "agen": 0, "ainst": False, "fails": {}, "viewer": "", "seen": 0.0, "inv": None, "lock": threading.Lock()}
+
+def _lk_cfg_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "ncz_link.json")
+
+def _lk_load():
+    try:
+        with open(_lk_cfg_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+def _lk_save(d):
+    try:
+        os.makedirs(os.path.dirname(_lk_cfg_path()), exist_ok=True)
+        with open(_lk_cfg_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception as e:
+        print(f"NCZ Link: couldn't save its settings ({e!r})")
+
+def _lk_enabled():
+    return _lk_load().get("enabled") is True
+
+def _lk_pin():
+    d = _lk_load()
+    pin = str(d.get("pin", ""))
+    if not re.fullmatch(r"\d{6}", pin):
+        pin = "%06d" % _lk_secrets.randbelow(1000000)
+        d["pin"] = pin
+        _lk_save(d)
+    return pin
+
+def _lk_ip():
+    s = _lk_socket.socket(_lk_socket.AF_INET, _lk_socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))       # no packet is sent; it just picks the LAN interface
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+# ---- run something on the GUI thread (Qt widgets and screen grabs must not be touched from the server threads)
+class _LkInvoker(QObject):
+    call = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.call.connect(self._run)
+
+    def _run(self, job):
+        fn, box, ev = job
+        try:
+            box["r"] = fn()
+        except Exception as e:
+            box["e"] = e
+        finally:
+            ev.set()
+
+def _lk_gui(fn, timeout=4.0):
+    box, ev = {}, threading.Event()
+    _lk["inv"].call.emit((fn, box, ev))
+    if not ev.wait(timeout):
+        raise TimeoutError("the launcher is busy")
+    if "e" in box:
+        raise box["e"]
+    return box.get("r")
+
+def _lk_win():
+    return getattr(QApplication.instance(), "_ncz_main_window", None)
+
+def _lk_games_gui():
+    win = _lk_win()
+    return _remote_games(win) if win else []
+
+def _lk_launch_gui(game):
+    win = _lk_win()
+    if not win:
+        return False, "The launcher isn't ready yet."
+    btn = None
+    for card, title in _remote_cards(win):
+        if title == game:
+            btn = _remote_play_button(card)
+            if btn:
+                break
+    if btn is None:
+        return False, f"{game} can't be started right now (not installed, or still downloading)."
+    if game in _running:
+        return False, f"{game} is already running."
+    btn.click()
+    return True, f"Starting {game} on your PC..."
+
+def _lk_bits(img):
+    ptr = img.constBits()
+    ptr.setsize(img.sizeInBytes())
+    return ptr
+
+def _lk_grab_gui():
+    scr = _LkGuiApp.primaryScreen()
+    img = scr.grabWindow(0).toImage()
+    if img.hasAlphaChannel():       # GDI grabs can come back with alpha 0, which would turn the whole picture black
+        img = QImage(bytes(_lk_bits(img)), img.width(), img.height(), img.bytesPerLine(), QImage.Format.Format_RGB32).copy()
+    g, pos = scr.geometry(), _LkCursor.pos()
+    _lk["sz"] = (g.width(), g.height())
+    return img, (pos.x() - g.x()) / max(1, g.width()), (pos.y() - g.y()) / max(1, g.height()), g.width(), g.height()
+
+def _lk_encode(img, width, quality, cx, cy, hint=True):
+    if img.format() != QImage.Format.Format_RGB32:
+        img = img.convertToFormat(QImage.Format.Format_RGB32)
+    if img.width() > width:
+        img = img.scaledToWidth(width, Qt.TransformationMode.FastTransformation)
+    p = QPainter(img)                     # the screen grab has no mouse pointer, so draw one
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    k = max(1.0, img.width() / 1280.0)
+    w, h = img.width(), img.height()
+    try:
+        if hint and all((img.pixel(int(w * (i + .5) / 16), int(h * (j + .5) / 9)) & 0xFFFFFF) == 0 for i in range(16) for j in range(9)):
+            f = p.font()                      # a fully black screen: usually an exclusive-fullscreen game, which can't be captured
+            f.setPixelSize(int(20 * k))
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(QRect(int(30 * k), 0, w - int(60 * k), h), Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value,
+                       "The PC screen is black. If a game is running, set it to Borderless / Windowed (not exclusive "
+                       "fullscreen) so it can be streamed.")
+    except Exception:
+        pass
+    x0, y0 = cx * img.width(), cy * img.height()
+    if cx < 0:
+        x0 = y0 = -100.0
+    poly = _LkPoly([_LkPointF(x0 + k * a, y0 + k * b) for a, b in
+                    ((0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12))])
+    p.setPen(QPen(QColor(0, 0, 0), max(1.0, k)))
+    p.setBrush(QColor(255, 255, 255))
+    p.drawPolygon(poly)
+    p.end()
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "JPG", int(quality))
+    return bytes(buf.data())
+
+# ---- input injection (Windows: SendInput, Linux: xdotool)
+_LK_VK = {"Enter": 0x0D, "Escape": 0x1B, "Backspace": 0x08, "Tab": 0x09, " ": 0x20, "Space": 0x20, "Shift": 0x10,
+          "Control": 0x11, "Alt": 0x12, "ArrowLeft": 0x25, "ArrowUp": 0x26, "ArrowRight": 0x27, "ArrowDown": 0x28,
+          "Delete": 0x2E, "Insert": 0x2D, "Home": 0x24, "End": 0x23, "PageUp": 0x21, "PageDown": 0x22,
+          "CapsLock": 0x14, "Meta": 0x5B}
+_LK_VK.update({"F%d" % i: 0x6F + i for i in range(1, 13)})
+_LK_EXT = {0x25, 0x26, 0x27, 0x28, 0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x5B}
+_LK_XK = {"Enter": "Return", "Escape": "Escape", "Backspace": "BackSpace", "Tab": "Tab", " ": "space", "Space": "space",
+          "Shift": "shift", "Control": "ctrl", "Alt": "alt", "ArrowLeft": "Left", "ArrowUp": "Up", "ArrowRight": "Right",
+          "ArrowDown": "Down", "Delete": "Delete", "Insert": "Insert", "Home": "Home", "End": "End",
+          "PageUp": "Prior", "PageDown": "Next", "CapsLock": "Caps_Lock", "Meta": "super"}
+_LK_XK.update({"F%d" % i: "F%d" % i for i in range(1, 13)})
+_lk_win_api = {}
+
+def _lk_win_setup():
+    import ctypes
+    from ctypes import wintypes
+    ulp = ctypes.c_size_t
+
+    class MI(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ulp)]
+
+    class KI(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ulp)]
+
+    class HI(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+    class U(ctypes.Union):
+        _fields_ = [("mi", MI), ("ki", KI), ("hi", HI)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", U)]
+
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+
+    def send(inp):
+        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+    def mouse(flags, dx=0, dy=0, data=0):
+        i = INPUT(type=0)
+        i.mi = MI(int(dx), int(dy), data & 0xFFFFFFFF, flags, 0, 0)
+        send(i)
+
+    def key(vk, up, unicode_char=None):
+        i = INPUT(type=1)
+        if unicode_char is not None:
+            i.ki = KI(0, ord(unicode_char), 4 | (2 if up else 0), 0, 0)
+        else:
+            fl = 8 | (2 if up else 0) | (1 if vk in _LK_EXT else 0)     # 8 = send the scan code, which games read
+            i.ki = KI(vk, user32.MapVirtualKeyW(vk, 0), fl, 0, 0)
+        send(i)
+    _lk_win_api.update(mouse=mouse, key=key, vkscan=user32.VkKeyScanW)
+
+def _lk_vk_for(k):
+    if k in _LK_VK:
+        return _LK_VK[k]
+    if len(k) == 1:
+        r = _lk_win_api["vkscan"](ord(k)) & 0xFFFF
+        if r != 0xFFFF:
+            return r & 0xFF
+    return None
+
+
+# ---- Linux on Wayland: the launcher itself runs through XWayland, whose screen grab is black and whose xdotool only reaches
+# X11 windows. So on Wayland we use command-line tools instead: grim / spectacle / gnome-screenshot to capture, and ydotool
+# (needs its ydotoold daemon) to type and click.
+def _lk_wayland():
+    return sys.platform.startswith("linux") and (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+                                                 or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+def _lk_msg_image(text):
+    img = QImage(1280, 720, QImage.Format.Format_RGB32)
+    img.fill(QColor(0, 0, 0))
+    p = QPainter(img)
+    f = p.font()
+    f.setPixelSize(24)
+    p.setFont(f)
+    p.setPen(QColor(255, 255, 255))
+    p.drawText(QRect(60, 0, 1160, 720), Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value, text)
+    p.end()
+    return img
+
+def _lk_wl_frame():
+    """One screenshot of the whole Wayland desktop as a QImage, or RuntimeError with what to install."""
+    tmp = os.path.join(os.path.dirname(get_launcher_settings_path()), "ncz_link_frame.png")
+    cmds = []
+    if shutil.which("grim"):
+        cmds.append((["grim", "-t", "jpeg", "-q", "85", "-"], None))
+    if shutil.which("spectacle"):
+        cmds.append((["spectacle", "-b", "-n", "-f", "-o", tmp], tmp))
+    if shutil.which("gnome-screenshot"):
+        cmds.append((["gnome-screenshot", "-f", tmp], tmp))
+    if not cmds:
+        raise RuntimeError("Wayland: NCZ Link needs a screenshot tool on the PC. Install 'grim' (Sway / Hyprland / wlroots), "
+                           "'spectacle' (KDE) or 'gnome-screenshot' (GNOME), or log in with an X11 session.")
+    for cmd, path in cmds:
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=6)
+            img = QImage.fromData(r.stdout) if path is None else QImage(path)
+            if r.returncode == 0 and not img.isNull():
+                return img
+        except Exception:
+            continue
+    raise RuntimeError("Wayland: the screenshot tool ran but gave no picture. On GNOME / KDE it may need permission; "
+                       "otherwise try an X11 session.")
+
+def _lk_input_ok():
+    """'' when this PC can take remote input, else why not."""
+    if sys.platform.startswith("win"):
+        return ""
+    if _lk_backend():
+        return ""
+    if _lk_wayland() and shutil.which("ydotool"):
+        return ""
+    if shutil.which("xdotool") and not _lk_wayland():
+        return ""
+    if _lk_wayland():
+        return ("Wayland: remote input needs ydotool (install it and start its ydotoold daemon with access to /dev/uinput). "
+                "xdotool can't type into Wayland apps.")
+    return "Remote input needs xdotool on Linux."
+
+_LK_EV = {"Enter": 28, "Escape": 1, "Backspace": 14, "Tab": 15, " ": 57, "Space": 57, "Shift": 42, "Control": 29, "Alt": 56,
+          "ArrowLeft": 105, "ArrowUp": 103, "ArrowRight": 106, "ArrowDown": 108, "Delete": 111, "Insert": 110, "Home": 102,
+          "End": 107, "PageUp": 104, "PageDown": 109, "CapsLock": 58, "Meta": 125, "F11": 87, "F12": 88}
+_LK_EV.update({c: n for c, n in zip("qwertyuiop", range(16, 26))})
+_LK_EV.update({c: n for c, n in zip("asdfghjkl", range(30, 39))})
+_LK_EV.update({c: n for c, n in zip("zxcvbnm", range(44, 51))})
+_LK_EV.update({c: n for c, n in zip("1234567890", range(2, 12))})
+_LK_EV.update({"F%d" % i: 58 + i for i in range(1, 11)})
+
+def _lk_ydotool(ev, sw, sh):
+    def yd(*a):
+        subprocess.Popen(["ydotool"] + [str(v) for v in a], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t = ev.get("t")
+    num = lambda v, lo, hi: max(lo, min(hi, float(v))) if isinstance(v, (int, float)) else 0.0
+    b = ev.get("b", 0)
+    b = b if b in (0, 1, 2) else 0
+    code = {0: 0x00, 1: 0x02, 2: 0x01}[b]            # ours: 0 left, 1 middle, 2 right. ydotool: 0 left, 1 right, 2 middle
+    if t == "move":
+        yd("mousemove", "-x", int(num(ev.get("dx"), -400, 400)), "-y", int(num(ev.get("dy"), -400, 400)))
+    elif t == "abs":
+        yd("mousemove", "--absolute", "-x", int(num(ev.get("x"), 0, 1) * (sw - 1)), "-y", int(num(ev.get("y"), 0, 1) * (sh - 1)))
+    elif t in ("down", "up"):
+        yd("click", hex((0x40 if t == "down" else 0x80) | code))
+    elif t == "wheel":
+        d = int(num(ev.get("d"), -20, 20))
+        if d:
+            yd("mousemove", "--wheel", "-x", 0, "-y", -d)
+    elif t == "key":
+        k = ev.get("k")
+        if isinstance(k, str):
+            n = _LK_EV.get(k, _LK_EV.get(k.lower()) if len(k) == 1 else None)
+            if n:
+                yd("key", "%d:%d" % (n, 0 if ev.get("down") is False else 1))
+    elif t == "text":
+        s_ = str(ev.get("s", ""))[:200]
+        if s_:
+            yd("type", "--", s_)
+
+def _lk_inject(ev, sw, sh):
+    """One input event from the phone. Everything is validated; unknown things are ignored."""
+    t = ev.get("t")
+    win = sys.platform.startswith("win")
+    if not win and _lk_wayland():
+        if shutil.which("ydotool"):
+            c = _lk.setdefault("cur", [0.5, 0.5])         # Wayland won't tell us where the pointer is, so track it
+            if t == "move":
+                c[0] = max(0.0, min(1.0, c[0] + float(ev.get("dx") or 0) / max(1, sw)))
+                c[1] = max(0.0, min(1.0, c[1] + float(ev.get("dy") or 0) / max(1, sh)))
+            elif t == "abs":
+                c[0], c[1] = float(ev.get("x") or 0), float(ev.get("y") or 0)
+            _lk_ydotool(ev, sw, sh)
+            return
+    x11 = (not win) and bool(shutil.which("xdotool"))
+    if not (win or x11):
+        return
+    if win and not _lk_win_api:
+        _lk_win_setup()
+
+    def xd(*a):
+        subprocess.Popen(["xdotool"] + [str(v) for v in a], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    num = lambda v, lo, hi: max(lo, min(hi, float(v))) if isinstance(v, (int, float)) else 0.0
+    btn = ev.get("b", 0)
+    btn = btn if btn in (0, 1, 2) else 0
+    if t == "move":
+        dx, dy = int(num(ev.get("dx"), -400, 400)), int(num(ev.get("dy"), -400, 400))
+        if win:
+            _lk_win_api["mouse"](0x0001, dx, dy)
+        else:
+            xd("mousemove_relative", "--", dx, dy)
+    elif t == "abs":
+        x, y = num(ev.get("x"), 0, 1), num(ev.get("y"), 0, 1)
+        if win:
+            _lk_win_api["mouse"](0x8001, int(x * 65535), int(y * 65535))
+        else:
+            xd("mousemove", int(x * (sw - 1)), int(y * (sh - 1)))
+    elif t in ("down", "up"):
+        up = t == "up"
+        if win:
+            fl = {0: (0x0002, 0x0004), 1: (0x0020, 0x0040), 2: (0x0008, 0x0010)}[btn][1 if up else 0]
+            _lk_win_api["mouse"](fl)
+        else:
+            xd("mouseup" if up else "mousedown", {0: 1, 1: 2, 2: 3}[btn])
+    elif t == "wheel":
+        d = int(num(ev.get("d"), -20, 20))
+        if win:
+            _lk_win_api["mouse"](0x0800, 0, 0, d * -120)
+        elif d:
+            xd("click", "--repeat", abs(d), 5 if d > 0 else 4)
+    elif t == "key":
+        k = ev.get("k")
+        if not isinstance(k, str) or not (1 <= len(k) <= 12):
+            return
+        up = ev.get("down") is False
+        if win:
+            vk = _lk_vk_for(k)
+            if vk:
+                _lk_win_api["key"](vk, up)
+        else:
+            name = _LK_XK.get(k, k if len(k) == 1 else None)
+            if name:
+                xd("keyup" if up else "keydown", name)
+    elif t == "text":
+        s = str(ev.get("s", ""))[:200]
+        if win:
+            for ch in s:
+                _lk_win_api["key"](0, False, ch)
+                _lk_win_api["key"](0, True, ch)
+        elif s:
+            xd("type", "--", s)
+
+
+# ---- sound: PC audio (what the speakers play) is sent as raw 16-bit PCM; the phone plays it with Web Audio.
+# Windows uses WASAPI loopback through the PyAudioWPatch package (installed automatically the first time if it's missing);
+# Linux uses `parec` (PulseAudio / PipeWire) on the default output's monitor. macOS has no built-in way to capture it.
+def _lk_libs_dir():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "ncz_link_libs")
+
+def _lk_audio_install():
+    """Fetches the PyAudioWPatch wheel straight from PyPI into the launcher's data folder (no pip needed, so this also
+    works when the launcher is a frozen bridge that just runs main.py). It's checked against PyPI's SHA-256."""
+    if _lk["ainst"]:
+        return
+    _lk["ainst"] = True
+    def run():
+        try:
+            import hashlib, io
+            tag = "cp%d%d" % sys.version_info[:2]
+            plat = "win_amd64" if sys.maxsize > 2 ** 32 else "win32"
+            with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30) as r:
+                files = json.load(r)["urls"]
+            pick = next((f for f in files if f["packagetype"] == "bdist_wheel" and f"-{tag}-{tag}-{plat}" in f["filename"]), None)
+            if not pick:
+                _lk["aerr"] = f"no sound package exists for Python {sys.version_info[0]}.{sys.version_info[1]}"
+                return
+            with urllib.request.urlopen(pick["url"], timeout=120) as r:
+                blob = r.read()
+            if hashlib.sha256(blob).hexdigest() != pick["digests"]["sha256"]:
+                _lk["aerr"] = "the sound package download was corrupt"
+                return
+            d = _lk_libs_dir()
+            os.makedirs(d, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                z.extractall(d)
+            _lk["aerr"] = ""
+        except Exception as e:
+            _lk["aerr"] = f"couldn't download the sound package ({e})"
+            print(f"NCZ Link: {_lk['aerr']}")
+        finally:
+            _lk["ainst"] = "done"
+    threading.Thread(target=run, daemon=True).start()
+
+def _lk_audio_open():
+    """Returns (rate, channels, get_chunk(timeout)->bytes|None, close()) or raises RuntimeError with a short reason."""
+    if sys.platform.startswith("win"):
+        d = _lk_libs_dir()
+        if os.path.isdir(d) and d not in sys.path:
+            sys.path.insert(0, d)
+        try:
+            import pyaudiowpatch as pa
+        except Exception:
+            if _lk["ainst"] == "done" and _lk.get("aerr"):
+                raise RuntimeError(_lk["aerr"])
+            if not _lk["ainst"]:
+                _lk_audio_install()
+            raise RuntimeError("installing sound support on the PC, try again in a minute")
+        p = pa.PyAudio()
+        try:
+            wasapi = p.get_host_api_info_by_type(pa.paWASAPI)
+            dev = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+            if not dev.get("isLoopbackDevice"):
+                for lb in p.get_loopback_device_info_generator():
+                    if dev["name"] in lb["name"]:
+                        dev = lb
+                        break
+            rate, ch = int(dev["defaultSampleRate"]), max(1, min(2, int(dev["maxInputChannels"])))
+            q = _lk_queue.Queue(maxsize=64)
+
+            def cb(data, frames, ti, status):
+                try:
+                    q.put_nowait(data)
+                except _lk_queue.Full:
+                    pass
+                return (None, pa.paContinue)
+            st = p.open(format=pa.paInt16, channels=int(dev["maxInputChannels"]), rate=rate, input=True,
+                        input_device_index=dev["index"], frames_per_buffer=rate // 50, stream_callback=cb)
+            full = int(dev["maxInputChannels"])
+        except Exception as e:
+            p.terminate()
+            raise RuntimeError(f"no loopback device ({e})")
+
+        def get(timeout):
+            try:
+                d = q.get(timeout=timeout)
+            except _lk_queue.Empty:
+                return None
+            if full > 2:                                   # keep just front left / right
+                import array
+                a = array.array("h", d)
+                out = array.array("h")
+                for i in range(0, len(a) - full + 1, full):
+                    out.extend(a[i:i + 2])
+                return out.tobytes()
+            return d
+
+        def close():
+            try:
+                st.stop_stream()
+                st.close()
+            finally:
+                p.terminate()
+        return rate, ch, get, close
+    if shutil.which("parec"):
+        rate, ch = 48000, 2
+        proc = subprocess.Popen(["parec", "--format=s16le", f"--rate={rate}", f"--channels={ch}", "--latency-msec=30",
+                                 "-d", "@DEFAULT_MONITOR@"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        q = _lk_queue.Queue(maxsize=64)
+
+        def reader():
+            while True:
+                d = proc.stdout.read(rate // 50 * ch * 2)
+                if not d:
+                    break
+                try:
+                    q.put_nowait(d)
+                except _lk_queue.Full:
+                    pass
+        threading.Thread(target=reader, daemon=True).start()
+
+        def get(timeout):
+            try:
+                return q.get(timeout=timeout)
+            except _lk_queue.Empty:
+                return None
+        return rate, ch, get, proc.kill
+    raise RuntimeError("this PC can't capture sound (Windows, or Linux with pulseaudio-utils, is needed)")
+
+# ---- v2: WebSocket transport (acked frames, adaptive quality), fast capture, persistent input workers, Input Bridge hand-off.
+# Why the old version felt slow: every frame was grabbed on the launcher's GUI thread, every input batch was its own HTTP request
+# (two TCP writes + Nagle = 40-200 ms each, one at a time) and on Linux every key / mouse event spawned an xdotool / ydotool
+# process. MJPEG also has no back-pressure, so a slow Wi-Fi just filled buffers and the picture lagged further and further behind.
+import base64 as _lk_b64
+import hashlib as _lk_hl
+import zlib as _lk_zlib
+
+_LK_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_LK_HOLD = 0.035          # a click / key press lasts at least this long, so games that poll once per frame can't miss it
+
+
+def _lk_black(img):
+    try:
+        w, h = img.width(), img.height()
+        return all((img.pixel(int(w * (i + .5) / 16), int(h * (j + .5) / 9)) & 0xFFFFFF) == 0 for i in range(16) for j in range(9))
+    except Exception:
+        return False
+
+
+def _lk_jpeg(img, quality):
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "JPG", int(quality))
+    return bytes(buf.data())
+
+
+# ---- screen capture. Each returns (QImage | None, hash): None means "nothing changed since `prev`", so no encode, no send.
+class _LkCapWin:
+    """Windows: GDI StretchBlt straight into a small DIB, on the stream's own thread (the GUI thread is never touched)."""
+    name = "gdi"
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as wt
+        c = self.c = ctypes
+        self.wt = wt
+        u, g = self.u, self.g = c.windll.user32, c.windll.gdi32
+        vp = c.c_void_p
+        u.GetDC.restype = vp
+        u.GetDC.argtypes = [vp]
+        u.ReleaseDC.argtypes = [vp, vp]
+        u.GetCursorPos.argtypes = [c.POINTER(wt.POINT)]
+        g.CreateCompatibleDC.restype = vp
+        g.CreateCompatibleDC.argtypes = [vp]
+        g.CreateDIBSection.restype = vp
+        g.CreateDIBSection.argtypes = [vp, vp, c.c_uint, c.POINTER(vp), vp, c.c_uint]
+        g.SelectObject.restype = vp
+        g.SelectObject.argtypes = [vp, vp]
+        g.DeleteObject.argtypes = [vp]
+        g.DeleteDC.argtypes = [vp]
+        g.StretchBlt.argtypes = [vp, c.c_int, c.c_int, c.c_int, c.c_int, vp, c.c_int, c.c_int, c.c_int, c.c_int, c.c_uint]
+        g.SetStretchBltMode.argtypes = [vp, c.c_int]
+        g.GetDeviceCaps.argtypes = [vp, c.c_int]
+
+        class BIH(c.Structure):
+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
+                        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                        ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                        ("biClrImportant", wt.DWORD)]
+        self.BIH = BIH
+        self.sdc = u.GetDC(None)
+        self.mdc = self.hbm = self.old = self.bits = self.dims = None
+        self.sw, self.sh = self._size()
+        if not (self.sw and self.sh):
+            raise RuntimeError("no screen size")
+
+    def _size(self):
+        return self.g.GetDeviceCaps(self.sdc, 8), self.g.GetDeviceCaps(self.sdc, 10)      # HORZRES / VERTRES
+
+    def _free(self):
+        if self.mdc:
+            self.g.SelectObject(self.mdc, self.old)
+            self.g.DeleteObject(self.hbm)
+            self.g.DeleteDC(self.mdc)
+        self.mdc = self.hbm = self.dims = None
+
+    def _setup(self, tw, th):
+        self._free()
+        c, g = self.c, self.g
+        bih = self.BIH(c.sizeof(self.BIH), tw, -th, 1, 32, 0, 0, 0, 0, 0, 0)           # negative height = top-down
+        bits = c.c_void_p()
+        self.mdc = g.CreateCompatibleDC(self.sdc)
+        self.hbm = g.CreateDIBSection(self.sdc, c.byref(bih), 0, c.byref(bits), None, 0)
+        if not self.hbm or not bits.value:
+            self._free()
+            raise RuntimeError("couldn't make the capture bitmap")
+        self.old = g.SelectObject(self.mdc, self.hbm)
+        self.bits, self.dims = bits.value, (tw, th)
+        g.SetStretchBltMode(self.mdc, 3)                                                # COLORONCOLOR: fast
+
+    def grab(self, width, prev):
+        sw, sh = self._size()
+        if not (sw and sh):
+            raise RuntimeError("no screen size")
+        self.sw, self.sh = sw, sh
+        _lk["sz"] = (sw, sh)
+        tw = max(160, min(int(width), sw)) & ~1
+        th = max(90, int(round(sh * tw / sw))) & ~1
+        if self.dims != (tw, th):
+            self._setup(tw, th)
+        if not self.g.StretchBlt(self.mdc, 0, 0, tw, th, self.sdc, 0, 0, sw, sh, 0x40CC0020):   # SRCCOPY | CAPTUREBLT
+            raise RuntimeError("screen grab failed")
+        data = self._keep = self.c.string_at(self.bits, tw * th * 4)     # kept alive: the QImage below only points at it
+        h = _lk_zlib.adler32(data)
+        if h == prev:
+            return None, h
+        return QImage(data, tw, th, tw * 4, QImage.Format.Format_RGB32), h
+
+    def cursor(self):
+        p = self.wt.POINT()
+        if not self.u.GetCursorPos(self.c.byref(p)) or not self.sw:
+            return None
+        return p.x / self.sw, p.y / self.sh
+
+    def close(self):
+        try:
+            self._free()
+            self.u.ReleaseDC(None, self.sdc)
+        except Exception:
+            pass
+
+
+class _LkCapX11:
+    """Linux / X11: XGetImage on the stream's own X connection (no GUI-thread round trips)."""
+    name = "x11"
+
+    def __init__(self):
+        import ctypes, ctypes.util
+        c = self.c = ctypes
+        x = self.x = c.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+
+        class XImage(c.Structure):
+            _fields_ = [("width", c.c_int), ("height", c.c_int), ("xoffset", c.c_int), ("format", c.c_int), ("data", c.c_void_p),
+                        ("byte_order", c.c_int), ("bitmap_unit", c.c_int), ("bitmap_bit_order", c.c_int), ("bitmap_pad", c.c_int),
+                        ("depth", c.c_int), ("bytes_per_line", c.c_int), ("bits_per_pixel", c.c_int)]
+        vp, ul, ci = c.c_void_p, c.c_ulong, c.c_int
+        x.XOpenDisplay.restype, x.XOpenDisplay.argtypes = vp, [c.c_char_p]
+        x.XDefaultRootWindow.restype, x.XDefaultRootWindow.argtypes = ul, [vp]
+        x.XDefaultScreen.restype, x.XDefaultScreen.argtypes = ci, [vp]
+        x.XDisplayWidth.restype, x.XDisplayWidth.argtypes = ci, [vp, ci]
+        x.XDisplayHeight.restype, x.XDisplayHeight.argtypes = ci, [vp, ci]
+        x.XGetImage.restype = c.POINTER(XImage)
+        x.XGetImage.argtypes = [vp, ul, ci, ci, c.c_uint, c.c_uint, ul, ci]
+        x.XDestroyImage.argtypes = [c.POINTER(XImage)]
+        x.XQueryPointer.argtypes = [vp, ul, c.POINTER(ul), c.POINTER(ul), c.POINTER(ci), c.POINTER(ci), c.POINTER(ci),
+                                    c.POINTER(ci), c.POINTER(c.c_uint)]
+        x.XCloseDisplay.argtypes = [vp]
+        self.d = x.XOpenDisplay(None)
+        if not self.d:
+            raise RuntimeError("no X11 display")
+        self.root = x.XDefaultRootWindow(self.d)
+        self.scr = x.XDefaultScreen(self.d)
+        self.sw, self.sh = x.XDisplayWidth(self.d, self.scr), x.XDisplayHeight(self.d, self.scr)
+
+    def grab(self, width, prev):
+        x = self.x
+        sw, sh = x.XDisplayWidth(self.d, self.scr), x.XDisplayHeight(self.d, self.scr)
+        self.sw, self.sh = sw, sh
+        _lk["sz"] = (sw, sh)
+        im = x.XGetImage(self.d, self.root, 0, 0, sw, sh, 0xFFFFFFFFFFFFFFFF, 2)      # ZPixmap
+        if not im:
+            raise RuntimeError("XGetImage failed")
+        try:
+            i = im.contents
+            if i.bits_per_pixel != 32:
+                raise RuntimeError("unsupported pixel format")
+            w, h, bpl = i.width, i.height, i.bytes_per_line
+            data = self.c.string_at(i.data, bpl * h)
+        finally:
+            x.XDestroyImage(im)
+        hh = _lk_zlib.adler32(data)
+        if hh == prev:
+            return None, hh
+        img = QImage(data, w, h, bpl, QImage.Format.Format_RGB32)
+        tw = max(160, min(int(width), w)) & ~1
+        if tw < w:
+            img = img.scaledToWidth(tw, Qt.TransformationMode.FastTransformation)    # a copy, so `data` may go away
+        else:
+            img = img.copy()
+        return img, hh
+
+    def cursor(self):
+        c = self.c
+        rr, cr = c.c_ulong(), c.c_ulong()
+        rx, ry, wx, wy, m = c.c_int(), c.c_int(), c.c_int(), c.c_int(), c.c_uint()
+        if not self.x.XQueryPointer(self.d, self.root, c.byref(rr), c.byref(cr), c.byref(rx), c.byref(ry), c.byref(wx),
+                                    c.byref(wy), c.byref(m)):
+            return None
+        return rx.value / max(1, self.sw), ry.value / max(1, self.sh)
+
+    def close(self):
+        try:
+            self.x.XCloseDisplay(self.d)
+        except Exception:
+            pass
+
+
+class _LkCapQt:
+    """Fallback (and Wayland): Qt grab on the GUI thread, or the grim / spectacle / gnome-screenshot tools."""
+    name = "qt"
+
+    def __init__(self):
+        self.cur = (0.5, 0.5)
+
+    def grab(self, width, prev):
+        if _lk_wayland():
+            img = _lk_wl_frame()
+            _lk["sz"] = (img.width(), img.height())
+            self.cur = tuple(_lk.get("cur", [0.5, 0.5]))
+        else:
+            img, cx, cy, _w, _h = _lk_gui(_lk_grab_gui)
+            self.cur = (cx, cy)
+        if img.format() != QImage.Format.Format_RGB32:
+            img = img.convertToFormat(QImage.Format.Format_RGB32)
+        h = _lk_zlib.adler32(bytes(_lk_bits(img)))
+        if h == prev:
+            return None, h
+        if img.width() > width:
+            img = img.scaledToWidth(int(width), Qt.TransformationMode.FastTransformation)
+        return img, h
+
+    def cursor(self):
+        return self.cur
+
+    def close(self):
+        pass
+
+
+def _lk_make_cap():
+    if sys.platform.startswith("win"):
+        try:
+            return _LkCapWin()
+        except Exception as e:
+            print(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
+    elif sys.platform.startswith("linux") and not _lk_wayland():
+        try:
+            return _LkCapX11()
+        except Exception as e:
+            print(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
+    return _LkCapQt()
+
+
+# ---- input that doesn't spawn a process per event (Linux). Windows already uses SendInput in-process.
+_LK_XKS = {"Enter": "Return", "Escape": "Escape", "Backspace": "BackSpace", "Tab": "Tab", " ": "space", "Space": "space",
+           "Shift": "Shift_L", "Control": "Control_L", "Alt": "Alt_L", "ArrowLeft": "Left", "ArrowUp": "Up", "ArrowRight": "Right",
+           "ArrowDown": "Down", "Delete": "Delete", "Insert": "Insert", "Home": "Home", "End": "End", "PageUp": "Prior",
+           "PageDown": "Next", "CapsLock": "Caps_Lock", "Meta": "Super_L"}
+_LK_XKS.update({"F%d" % i: "F%d" % i for i in range(1, 13)})
+_LK_SHIFTED = "!@#$%^&*()_+{}|:\"<>?~"
+
+
+class _LkXTest:
+    """X11 input through XTest (libXtst), kept open for the life of the server."""
+    name = "xtest"
+
+    def __init__(self):
+        import ctypes, ctypes.util
+        c = ctypes
+        x = self.x = c.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        t = self.t = c.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        vp, ul, ci, cu = c.c_void_p, c.c_ulong, c.c_int, c.c_uint
+        x.XOpenDisplay.restype, x.XOpenDisplay.argtypes = vp, [c.c_char_p]
+        x.XStringToKeysym.restype, x.XStringToKeysym.argtypes = ul, [c.c_char_p]
+        x.XKeysymToKeycode.restype, x.XKeysymToKeycode.argtypes = c.c_ubyte, [vp, ul]
+        x.XFlush.argtypes = [vp]
+        t.XTestFakeKeyEvent.argtypes = [vp, cu, ci, ul]
+        t.XTestFakeButtonEvent.argtypes = [vp, cu, ci, ul]
+        t.XTestFakeMotionEvent.argtypes = [vp, ci, ci, ci, ul]
+        t.XTestFakeRelativeMotionEvent.argtypes = [vp, ci, ci, ul]
+        t.XTestQueryExtension.argtypes = [vp, c.POINTER(ci), c.POINTER(ci), c.POINTER(ci), c.POINTER(ci)]
+        self.d = x.XOpenDisplay(None)
+        if not self.d:
+            raise RuntimeError("no X11 display")
+        a, b, m, n = ci(), ci(), ci(), ci()
+        if not t.XTestQueryExtension(self.d, c.byref(a), c.byref(b), c.byref(m), c.byref(n)):
+            raise RuntimeError("the X server has no XTest extension")
+        self.lock = threading.Lock()
+
+    def _kc(self, k):
+        if k in _LK_XKS:
+            ks = self.x.XStringToKeysym(_LK_XKS[k].encode())
+        elif isinstance(k, str) and len(k) == 1:
+            ks = ord(k) if ord(k) < 0x100 else 0x01000000 + ord(k)
+        else:
+            return 0
+        return self.x.XKeysymToKeycode(self.d, ks) if ks else 0
+
+    def _key(self, k, down):
+        kc = self._kc(k)
+        if kc:
+            self.t.XTestFakeKeyEvent(self.d, kc, 1 if down else 0, 0)
+
+    def apply(self, ev, sw, sh):
+        t = ev.get("t")
+        num = lambda v, lo, hi: max(lo, min(hi, float(v))) if isinstance(v, (int, float)) else 0.0
+        b = ev.get("b", 0)
+        b = b if b in (0, 1, 2) else 0
+        with self.lock:
+            if t == "move":
+                self.t.XTestFakeRelativeMotionEvent(self.d, int(num(ev.get("dx"), -400, 400)), int(num(ev.get("dy"), -400, 400)), 0)
+            elif t == "abs":
+                self.t.XTestFakeMotionEvent(self.d, -1, int(num(ev.get("x"), 0, 1) * (sw - 1)), int(num(ev.get("y"), 0, 1) * (sh - 1)), 0)
+            elif t in ("down", "up"):
+                self.t.XTestFakeButtonEvent(self.d, {0: 1, 1: 2, 2: 3}[b], 1 if t == "down" else 0, 0)
+            elif t == "wheel":
+                d = int(num(ev.get("d"), -20, 20))
+                for _ in range(abs(d)):
+                    self.t.XTestFakeButtonEvent(self.d, 5 if d > 0 else 4, 1, 0)
+                    self.t.XTestFakeButtonEvent(self.d, 5 if d > 0 else 4, 0, 0)
+            elif t == "key":
+                k = ev.get("k")
+                if isinstance(k, str) and 1 <= len(k) <= 12:
+                    self._key(k, ev.get("down") is not False)
+            elif t == "text":
+                for ch in str(ev.get("s", ""))[:200]:
+                    sh_ = ch.isupper() or ch in _LK_SHIFTED
+                    k = "Enter" if ch == "\n" else ch
+                    if sh_:
+                        self._key("Shift", True)
+                    self._key(k.lower() if ch.isupper() else k, True)
+                    self._key(k.lower() if ch.isupper() else k, False)
+                    if sh_:
+                        self._key("Shift", False)
+            self.x.XFlush(self.d)
+
+
+_LK_UI_SHIFT = {c: n for c, n in zip("!@#$%^&*()", range(2, 12))}
+_LK_UI_SHIFT.update({"_": 12, "+": 13, ":": 39, "\"": 40, "<": 51, ">": 52, "?": 53, "{": 26, "}": 27, "|": 43, "~": 41})
+_LK_UI_PLAIN = {".": 52, ",": 51, "-": 12, "=": 13, "/": 53, ";": 39, "'": 40, "[": 26, "]": 27, "\\": 43, "`": 41, "\n": 28}
+
+
+class _LkUinput:
+    """Wayland (and anything else with /dev/uinput): one virtual mouse + keyboard made once, events written straight to it.
+    Needs write access to /dev/uinput (same requirement as ydotoold)."""
+    name = "uinput"
+
+    def __init__(self):
+        import fcntl
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            io = lambda code, v: fcntl.ioctl(self.fd, code, v)
+            for e in (1, 2, 3):                                    # EV_KEY, EV_REL, EV_ABS
+                io(0x40045564, e)
+            for k in list(range(1, 249)) + [0x110, 0x111, 0x112]:   # keys + left / right / middle button
+                io(0x40045565, k)
+            for r in (0, 1, 8):                                    # REL_X, REL_Y, REL_WHEEL
+                io(0x40045566, r)
+            for a in (0, 1):                                       # ABS_X, ABS_Y
+                io(0x40045567, a)
+            absmax = [0] * 64
+            absmax[0] = absmax[1] = 65535
+            zeros = _lk_struct.pack("<64i", *([0] * 64))
+            dev = (b"NCZ Link virtual input".ljust(80, b"\0") + _lk_struct.pack("<HHHH", 3, 0x1209, 0x4E5A, 1)
+                   + _lk_struct.pack("<I", 0) + _lk_struct.pack("<64i", *absmax) + zeros * 3)
+            os.write(self.fd, dev)
+            fcntl.ioctl(self.fd, 0x5501)                           # UI_DEV_CREATE
+        except Exception:
+            os.close(self.fd)
+            raise
+        self.lock = threading.Lock()
+        time.sleep(0.3)                                            # let the compositor notice the new device
+
+    def _w(self, typ, code, val):
+        os.write(self.fd, _lk_struct.pack("@llHHi", 0, 0, typ, code, val))
+
+    def _syn(self):
+        self._w(0, 0, 0)
+
+    def _key(self, code, down):
+        self._w(1, code, 1 if down else 0)
+        self._syn()
+
+    def apply(self, ev, sw, sh):
+        t = ev.get("t")
+        num = lambda v, lo, hi: max(lo, min(hi, float(v))) if isinstance(v, (int, float)) else 0.0
+        b = ev.get("b", 0)
+        b = b if b in (0, 1, 2) else 0
+        with self.lock:
+            if t == "move":
+                dx, dy = int(num(ev.get("dx"), -400, 400)), int(num(ev.get("dy"), -400, 400))
+                if dx:
+                    self._w(2, 0, dx)
+                if dy:
+                    self._w(2, 1, dy)
+                self._syn()
+            elif t == "abs":
+                self._w(3, 0, int(num(ev.get("x"), 0, 1) * 65535))
+                self._w(3, 1, int(num(ev.get("y"), 0, 1) * 65535))
+                self._syn()
+            elif t in ("down", "up"):
+                self._key({0: 0x110, 1: 0x112, 2: 0x111}[b], t == "down")
+            elif t == "wheel":
+                d = int(num(ev.get("d"), -20, 20))
+                if d:
+                    self._w(2, 8, -d)
+                    self._syn()
+            elif t == "key":
+                k = ev.get("k")
+                if isinstance(k, str):
+                    n = _LK_EV.get(k, _LK_EV.get(k.lower()) if len(k) == 1 else None)
+                    if n:
+                        self._key(n, ev.get("down") is not False)
+            elif t == "text":
+                for ch in str(ev.get("s", ""))[:200]:
+                    shift = ch.isupper() or ch in _LK_UI_SHIFT
+                    n = _LK_UI_SHIFT.get(ch) or _LK_UI_PLAIN.get(ch) or _LK_EV.get(ch.lower())
+                    if not n:
+                        continue
+                    if shift:
+                        self._key(42, True)
+                    self._key(n, True)
+                    self._key(n, False)
+                    if shift:
+                        self._key(42, False)
+
+
+def _lk_backend():
+    """The fast Linux input backend, or None (Windows, macOS, or nothing usable: the old command-line tools take over)."""
+    if "be" not in _lk:
+        be = None
+        if sys.platform.startswith("linux"):
+            try:
+                be = _LkUinput() if _lk_wayland() else _LkXTest()
+            except Exception as e:
+                print(f"NCZ Link: fast input unavailable ({e!r}), falling back to xdotool / ydotool")
+        _lk["be"] = be
+    return _lk["be"]
+
+
+_lk_inject_legacy = _lk_inject                                      # the original (SendInput on Windows, xdotool / ydotool on Linux)
+
+
+def _lk_inject(ev, sw, sh):
+    t = ev.get("t")
+    held = _lk.setdefault("held", {})
+    ident = None
+    if t in ("down", "up"):
+        ident = ("b", ev.get("b", 0))
+    elif t == "key" and isinstance(ev.get("k"), str):
+        ident = ("k", ev["k"])
+    if ident is not None:
+        now = time.time()
+        if t == "down" or (t == "key" and ev.get("down") is not False):
+            held[ident] = now
+        else:
+            t0 = held.pop(ident, None)
+            if t0 is not None and now - t0 < _LK_HOLD:
+                time.sleep(_LK_HOLD - (now - t0))
+    be = _lk_backend()
+    if be is None:
+        return _lk_inject_legacy(ev, sw, sh)
+    if be.name == "uinput":                                         # Wayland won't say where the pointer is, so track it
+        c = _lk.setdefault("cur", [0.5, 0.5])
+        if t == "move":
+            c[0] = max(0.0, min(1.0, c[0] + float(ev.get("dx") or 0) / max(1, sw)))
+            c[1] = max(0.0, min(1.0, c[1] + float(ev.get("dy") or 0) / max(1, sh)))
+        elif t == "abs":
+            c[0], c[1] = float(ev.get("x") or 0), float(ev.get("y") or 0)
+    be.apply(ev, sw, sh)
+
+
+# ---- one input worker for every connection: strict order, never blocks the network threads, merges piled-up mouse moves
+_lk_inq = _lk_queue.Queue(maxsize=4000)
+
+
+def _lk_input_loop():
+    pend = None
+    while True:
+        ev = pend if pend is not None else _lk_inq.get()
+        pend = None
+        try:
+            if ev.get("t") == "move":
+                dx, dy = float(ev.get("dx") or 0), float(ev.get("dy") or 0)
+                while True:
+                    try:
+                        nx = _lk_inq.get_nowait()
+                    except _lk_queue.Empty:
+                        break
+                    if nx.get("t") == "move":
+                        dx += float(nx.get("dx") or 0)
+                        dy += float(nx.get("dy") or 0)
+                    else:
+                        pend = nx
+                        break
+                ev = {"t": "move", "dx": dx, "dy": dy}
+            sz = _lk.get("sz") or (1920, 1080)
+            _lk_inject(ev, sz[0], sz[1])
+        except Exception as e:
+            if not _lk.get("ierr"):
+                _lk["ierr"] = True
+                print(f"NCZ Link: input error ({e!r})")
+
+
+def _lk_input_submit(evs):
+    """Queues events from the phone. Returns '' or the reason this PC can't take input."""
+    why = _lk_input_ok()
+    if why:
+        return why
+    if not _lk.get("iw"):
+        _lk["iw"] = True
+        threading.Thread(target=_lk_input_loop, daemon=True).start()
+    if isinstance(evs, list):
+        for ev in evs[:128]:
+            if isinstance(ev, dict):
+                try:
+                    _lk_inq.put_nowait(ev)
+                except _lk_queue.Full:
+                    break
+    return ""
+
+
+# ---- Input Bridge hand-off: a phone with a controller asks for the bridge's port + PIN (it's already paired, so that's fine)
+def _lk_bridge_state():
+    try:
+        from controller_bridge import PORT as bp
+    except Exception:
+        return {"ok": False, "msg": "This PC has no Input Bridge, so the controller can't be sent."}
+    return {"ok": True, "port": int(bp), "pin": _bridge_pin(), "running": _bridge_obj is not None}
+
+
+def _lk_bridge_set(on):
+    st = _lk_bridge_state()
+    if not st["ok"]:
+        return st
+    if on and _bridge_obj is None:
+        if not _lk_gui(lambda: _bridge_set_running(True)):
+            return {"ok": False, "msg": "The Input Bridge couldn't start on the PC."}
+        _lk["bridge_own"] = True                                    # we started it, so we stop it again
+    elif not on and _lk.get("bridge_own"):
+        _lk["bridge_own"] = False
+        _lk_gui(lambda: _bridge_set_running(False))
+    st["running"] = _bridge_obj is not None
+    return st
+
+
+# ---- WebSocket (RFC 6455, just what we need: text + binary frames, ping / pong, close)
+class _LkWS:
+    def __init__(self, h):
+        self.h, self.lock, self.alive = h, threading.Lock(), True
+
+    def send(self, op, data):
+        if not self.alive:
+            return False
+        n = len(data)
+        if n < 126:
+            hdr = bytes((0x80 | op, n))
+        elif n < 65536:
+            hdr = bytes((0x80 | op, 126)) + _lk_struct.pack(">H", n)
+        else:
+            hdr = bytes((0x80 | op, 127)) + _lk_struct.pack(">Q", n)
+        try:
+            with self.lock:
+                self.h.wfile.write(hdr + data)
+                self.h.wfile.flush()
+            return True
+        except Exception:
+            self.alive = False
+            return False
+
+    def text(self, obj):
+        return self.send(1, json.dumps(obj, separators=(",", ":")).encode())
+
+    def recv(self):
+        r = self.h.rfile
+
+        def rd(n):
+            b = r.read(n)
+            if b is None or len(b) < n:
+                raise EOFError
+            return b
+        b0, b1 = rd(2)
+        op, ln = b0 & 15, b1 & 127
+        if ln == 126:
+            ln = _lk_struct.unpack(">H", rd(2))[0]
+        elif ln == 127:
+            ln = _lk_struct.unpack(">Q", rd(8))[0]
+        if ln > 65536:
+            raise EOFError
+        mask = rd(4) if b1 & 128 else b""
+        p = rd(ln) if ln else b""
+        if mask and p:
+            m = (mask * (ln // 4 + 1))[:ln]
+            p = (int.from_bytes(p, "big") ^ int.from_bytes(m, "big")).to_bytes(ln, "big")
+        return op, p
+
+
+def _lk_ws_video(ws, st, cfg, gen):
+    """Capture -> (skip if unchanged) -> JPEG -> send, never more than 2 frames un-acked, quality follows the Wi-Fi."""
+    cap, fails, fid = None, 0, 0
+    cw, cq = min(cfg["w"], 1280), cfg["q"]
+    prev, lastsend, nextt, lastc, lastcs, lastsz = None, 0.0, 0.0, None, 0.0, None
+    ctl, good, lastblack, blackshown = time.time(), 0, 0.0, False
+    try:
+        while ws.alive and _lk["gen"] == gen and _lk["server"] is not None:
+            now = time.time()
+            if cap is None:
+                cap = _lk_make_cap()
+                ws.text({"cap": cap.name})
+            if now - lastcs >= 0.016:                               # the pointer travels on its own, so it's smooth even when the picture isn't
+                lastcs = now
+                try:
+                    c = cap.cursor()
+                except Exception:
+                    c = None
+                if c and (lastc is None or abs(c[0] - lastc[0]) > 1e-4 or abs(c[1] - lastc[1]) > 1e-4):
+                    lastc = c
+                    ws.text({"c": [round(c[0], 4), round(c[1], 4)]})
+            if now - ctl >= 0.5:                                    # rate control from how fast the phone acks frames
+                ctl = now
+                rtt = st["rtt"]
+                wmax, qmax = cfg["w"], cfg["q"]
+                cw, cq = min(cw, wmax), min(cq, qmax)
+                if rtt > 0.2:
+                    good = 0
+                    if cq > 38:
+                        cq -= 6
+                    elif cw > 560:
+                        cw = max(560, int(cw * 0.85) & ~1)
+                    prev = None
+                elif rtt < 0.09:
+                    good += 1
+                    if good >= 4:
+                        good = 0
+                        if cw < wmax:
+                            cw = min(wmax, int(cw * 1.12) & ~1)
+                            prev = None
+                        elif cq < qmax:
+                            cq = min(qmax, cq + 4)
+                            prev = None
+                else:
+                    good = 0
+            if now < nextt or st["inflight"] >= 2:
+                if st["inflight"] >= 2 and now - st["ack_t"] > 3.0:    # an ack got lost: don't deadlock
+                    with st["lock"]:
+                        st["inflight"] = 0
+                        st["sent"].clear()
+                time.sleep(0.003)
+                continue
+            nextt = now + 1.0 / max(5, cfg["fps"])
+            if now - lastsend > 1.5:
+                prev = None                                         # keep-alive frame even on a still screen
+            try:
+                img, h = cap.grab(cw, prev)
+                fails = 0
+            except Exception as e:
+                fails += 1
+                if isinstance(e, RuntimeError) and _lk_wayland():
+                    ws.text({"msg": str(e)[:240]})
+                    time.sleep(1.0)
+                elif fails >= 3:
+                    try:
+                        cap.close()
+                    except Exception:
+                        pass
+                    cap = _LkCapQt() if cap.name != "qt" else cap
+                    ws.text({"cap": cap.name})
+                    time.sleep(0.3)
+                else:
+                    time.sleep(0.1)
+                continue
+            sz = _lk.get("sz")
+            if sz and sz != lastsz:
+                lastsz = sz
+                ws.text({"sz": [sz[0], sz[1]]})
+            if img is None:
+                continue
+            if now - lastblack > 3.0:
+                lastblack = now
+                blk = _lk_black(img)
+                if blk:
+                    ws.text({"msg": "The PC screen is black. If a game is running, set it to Borderless / Windowed (not exclusive fullscreen) so it can be streamed."})
+                    blackshown = True
+                elif blackshown:
+                    blackshown = False
+                    ws.text({"msg": ""})
+            jpg = _lk_jpeg(img, cq)
+            fid = (fid + 1) & 0x7FFFFFFF
+            with st["lock"]:
+                st["sent"][fid] = time.time()
+                st["inflight"] += 1
+            if not ws.send(2, b"\x01" + _lk_struct.pack(">I", fid) + jpg):
+                break
+            prev, lastsend = h, time.time()
+    except Exception as e:
+        print(f"NCZ Link: stream stopped ({e!r})")
+    finally:
+        ws.alive = False
+        try:
+            if cap:
+                cap.close()
+        except Exception:
+            pass
+
+
+def _lk_ws_session(ws, q):
+    def qi(k, d, lo, hi):
+        try:
+            return max(lo, min(hi, int((q.get(k) or [d])[0])))
+        except Exception:
+            return d
+    cfg = {"w": qi("w", 1280, 320, 1920), "q": qi("q", 60, 25, 90), "fps": qi("fps", 30, 5, 60)}
+    with _lk["lock"]:
+        _lk["gen"] += 1                                            # a newer stream replaces this one
+        gen = _lk["gen"]
+    st = {"inflight": 0, "sent": {}, "rtt": 0.05, "ack_t": time.time(), "lock": threading.Lock()}
+    threading.Thread(target=_lk_ws_video, args=(ws, st, cfg, gen), daemon=True).start()
+    try:
+        while ws.alive and _lk["gen"] == gen and _lk["server"] is not None:
+            op, p = ws.recv()
+            _lk["seen"] = time.time()
+            if op == 8:
+                break
+            if op == 9:
+                ws.send(10, p)
+                continue
+            if op != 1:
+                continue
+            try:
+                m = json.loads(p)
+            except Exception:
+                continue
+            if not isinstance(m, dict):
+                continue
+            if "a" in m:
+                now = time.time()
+                with st["lock"]:
+                    t0 = st["sent"].pop(m["a"], None)
+                    if t0 is not None:
+                        st["rtt"] = 0.8 * st["rtt"] + 0.2 * (now - t0)
+                        st["inflight"] = max(0, st["inflight"] - 1)
+                    st["ack_t"] = now
+            if "e" in m:
+                why = _lk_input_submit(m["e"])
+                if why and not st.get("warned"):
+                    st["warned"] = True
+                    ws.text({"msg": why})
+            if "p" in m:
+                ws.text({"pong": m["p"]})
+            if "cfg" in m and isinstance(m["cfg"], dict):
+                for k, lo, hi in (("w", 320, 1920), ("q", 25, 90), ("fps", 5, 60)):
+                    try:
+                        cfg[k] = max(lo, min(hi, int(m["cfg"].get(k, cfg[k]))))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    finally:
+        ws.alive = False
+
+
+# ---- the HTTP side
+def _lk_ip_ok(ip):
+    try:
+        a = _lk_ipa.ip_address(ip.split("%")[0])
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        return a.is_private or a.is_loopback or a.is_link_local
+    except Exception:
+        return False
+
+def _lk_token_ok(tok):
+    if not tok:
+        return False
+    toks = _lk_load().get("tokens", {})
+    return any(_lk_hmac.compare_digest(tok, t) for t in toks)
+
+class _LkHandler(_lk_http.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "NCZLink/2"
+    disable_nagle_algorithm = True       # small replies must not wait for the 40-200 ms delayed-ACK timer
+    wbufsize = 65536                     # headers + body leave in one packet (every stream write flushes explicitly)
+
+    def log_message(self, *a):
+        pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Cache-Control", "no-store")
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), 16384)
+            d = json.loads(self.rfile.read(n) or b"{}")
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _route(self, method):
+        if not _lk_ip_ok(self.client_address[0]):
+            return self._json(403, {"ok": False, "msg": "LAN only"})
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        path = u.path
+        try:
+            if path == "/api/info":
+                return self._json(200, {"app": "ncz-link", "v": 2, "ws": True, "name": platform.node() or "PC",
+                                        "os": sys.platform, "input": not _lk_input_ok()})
+            if path == "/api/pair" and method == "POST":
+                return self._pair()
+            tok = (q.get("t") or [""])[0]
+            if not _lk_token_ok(tok):
+                return self._json(401, {"ok": False, "msg": "Not paired. Enter the PIN again."})
+            _lk["seen"] = time.time()
+            if path == "/api/state":
+                games = _lk_gui(_lk_games_gui)
+                if "sz" not in _lk:
+                    _lk["sz"] = _lk_gui(lambda: (_LkGuiApp.primaryScreen().geometry().width(),
+                                                 _LkGuiApp.primaryScreen().geometry().height()))
+                return self._json(200, {"ok": True, "games": games, "playing": _now_playing["name"] or "",
+                                        "sw": _lk["sz"][0], "sh": _lk["sz"][1]})
+            if path == "/api/launch" and method == "POST":
+                ok, msg = _lk_gui(lambda g=str(self._body().get("game", ""))[:160]: _lk_launch_gui(g))
+                return self._json(200, {"ok": ok, "msg": msg})
+            if path == "/api/input" and method == "POST":
+                if "sz" not in _lk:
+                    _lk["sz"] = _lk_gui(lambda: (_LkGuiApp.primaryScreen().geometry().width(),
+                                                 _LkGuiApp.primaryScreen().geometry().height()))
+                why = _lk_input_submit(self._body().get("e"))
+                if why:
+                    return self._json(200, {"ok": False, "msg": why})
+                return self._json(200, {"ok": True})
+            if path == "/api/bridge" and method == "POST":
+                return self._json(200, _lk_bridge_set(bool(self._body().get("on"))))
+            if path == "/ws":
+                return self._ws(q)
+            if path == "/api/unpair" and method == "POST":
+                d = _lk_load()
+                d.get("tokens", {}).pop(tok, None)
+                _lk_save(d)
+                return self._json(200, {"ok": True})
+            if path == "/stream":
+                return self._stream(q)
+            if path == "/audio":
+                return self._audio()
+            return self._json(404, {"ok": False, "msg": "unknown"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:
+            try:
+                self._json(500, {"ok": False, "msg": str(e)[:120]})
+            except Exception:
+                pass
+
+    def do_GET(self):
+        self._route("GET")
+
+    def do_POST(self):
+        self._route("POST")
+
+    def _pair(self):
+        ip = self.client_address[0]
+        n, until = _lk["fails"].get(ip, (0, 0.0))
+        if time.time() < until:
+            return self._json(429, {"ok": False, "msg": "Too many wrong PINs. Wait a minute."})
+        b = self._body()
+        if _lk_hmac.compare_digest(str(b.get("pin", "")), _lk_pin()):
+            _lk["fails"].pop(ip, None)
+            tok = _lk_secrets.token_urlsafe(24)
+            d = _lk_load()
+            toks = d.setdefault("tokens", {})
+            toks[tok] = {"name": str(b.get("name", "Phone"))[:40], "ts": int(time.time())}
+            while len(toks) > 8:                              # keep the 8 most recent devices
+                toks.pop(min(toks, key=lambda k: toks[k].get("ts", 0)))
+            _lk_save(d)
+            return self._json(200, {"ok": True, "token": tok, "name": platform.node() or "PC"})
+        n += 1
+        _lk["fails"][ip] = (0, time.time() + 60) if n >= 5 else (n, 0.0)
+        time.sleep(0.6)
+        return self._json(403, {"ok": False, "msg": "Wrong PIN."})
+
+    def _ws(self, q):
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key or "websocket" not in self.headers.get("Upgrade", "").lower():
+            return self._json(400, {"ok": False, "msg": "WebSocket only"})
+        acc = _lk_b64.b64encode(_lk_hl.sha1((key + _LK_WS_GUID).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", acc)
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        self.connection.settimeout(25)                    # the phone pings every 2 s; silence for 25 s means it's gone
+        _lk_ws_session(_LkWS(self), q)
+
+    def _audio(self):
+        try:
+            rate, ch, get, close = _lk_audio_open()
+        except RuntimeError as e:
+            return self._json(501, {"ok": False, "msg": str(e)[:160]})
+        with _lk["lock"]:
+            _lk["agen"] += 1
+            gen = _lk["agen"]                                 # a newer audio stream replaces this one
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(_lk_struct.pack("<II", rate, ch))
+            self.wfile.flush()
+            while _lk["agen"] == gen and _lk["server"] is not None:
+                d = get(0.5)
+                if d:
+                    self.wfile.write(d)
+                    self.wfile.flush()
+        finally:
+            close()
+
+    def _stream(self, q):
+        def qi(k, d, lo, hi):
+            try:
+                return max(lo, min(hi, int((q.get(k) or [d])[0])))
+            except Exception:
+                return d
+        width, quality, fps = qi("w", 1280, 320, 1920), qi("q", 55, 25, 90), qi("fps", 24, 5, 45)
+        with _lk["lock"]:
+            _lk["gen"] += 1
+            gen = _lk["gen"]                                  # a newer stream replaces this one
+        self.close_connection = True
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=nczframe")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        step = 1.0 / fps
+        while _lk["gen"] == gen and _lk["server"] is not None:
+            t0 = time.time()
+            hint = True
+            if _lk_wayland():
+                try:
+                    img = _lk_wl_frame()
+                    _lk["sz"] = (img.width(), img.height())
+                    cx, cy = _lk.get("cur", [0.5, 0.5])
+                except RuntimeError as e:
+                    img, cx, cy, hint = _lk_msg_image(str(e)), -1, -1, False
+                    time.sleep(1.0)
+            else:
+                try:
+                    img, cx, cy, _w, _h = _lk_gui(_lk_grab_gui)
+                except Exception:
+                    time.sleep(0.3)
+                    continue
+            jpg = _lk_encode(img, width, quality, cx, cy, hint)
+            self.wfile.write(b"--nczframe\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg))
+            self.wfile.write(jpg)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+            _lk["seen"] = time.time()
+            time.sleep(max(0.0, step - (time.time() - t0)))
+
+class _LkServer(_lk_ss.ThreadingMixIn, _lk_http.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    address_family = _lk_socket.AF_INET
+    request_queue_size = 32
+
+    def server_bind(self):
+        _lk_ss.TCPServer.server_bind(self)                # HTTPServer.server_bind does a getfqdn() lookup we don't need
+        self.server_name, self.server_port = "ncz-link", self.server_address[1]
+
+def ncz_link_set_running(on):
+    """Starts or stops the NCZ Link server. Returns an error string, or '' when it worked."""
+    if on and _lk["server"] is None:
+        if _lk["inv"] is None:
+            _lk["inv"] = _LkInvoker()                         # made on the GUI thread so its slot runs there
+        try:
+            srv = _LkServer(("0.0.0.0", NCZ_LINK_PORT), _LkHandler)
+        except OSError as e:
+            return f"couldn't open port {NCZ_LINK_PORT} ({e})"
+        _lk["server"] = srv
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    elif not on and _lk["server"] is not None:
+        srv, _lk["server"] = _lk["server"], None
+        _lk["gen"] += 1                                        # ends any running stream
+        _lk["agen"] += 1
+        if _lk.get("bridge_own"):
+            _lk["bridge_own"] = False
+            try:
+                _bridge_set_running(False)
+            except Exception:
+                pass
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+        srv.server_close()
+    return ""
+
+def _lk_add_setting(self):
+    from PyQt6.QtWidgets import QPushButton as _B
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("NCZ Link")
+    title.setObjectName("RowTitle")
+    desc = QLabel()
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    btn = _B()
+    btn.setCheckable(True)
+    btn.setFixedWidth(110)
+    forget = _B("Forget phones")
+    forget.setFixedWidth(110)
+
+    def refresh():
+        if btn.isChecked():
+            n = len(_lk_load().get("tokens", {}))
+            desc.setText("Play this PC's games from your phone over Wi-Fi. In the mobile app open NCZ Link and enter  %s  "
+                         "with PIN  %s  (same network, port %d). Paired phones: %d. Sound is streamed too; windowed or "
+                         "borderless games stream best. A controller connected to the phone is sent to this PC "
+                         "through the Input Bridge automatically." % (_lk_ip(), _lk_pin(), NCZ_LINK_PORT, n))
+        else:
+            desc.setText("Off: phones can't see or control this PC.")
+
+    def toggled(on):
+        d = _lk_load()
+        d["enabled"] = bool(on)
+        _lk_save(d)
+        err = ncz_link_set_running(on)
+        if err:
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+            d["enabled"] = False
+            _lk_save(d)
+            QMessageBox.warning(self, "NCZ Link", f"NCZ Link {err}.")
+        btn.setText("On" if btn.isChecked() else "Off")
+        refresh()
+
+    def forget_all():
+        d = _lk_load()
+        d["tokens"] = {}
+        d["pin"] = "%06d" % _lk_secrets.randbelow(1000000)     # new PIN too
+        _lk_save(d)
+        _lk["gen"] += 1
+        _lk["agen"] += 1
+        refresh()
+    forget.clicked.connect(forget_all)
+    btn.setChecked(_lk_enabled())
+    btn.setText("On" if btn.isChecked() else "Off")
+    btn.toggled.connect(toggled)
+    refresh()
+    side = QVBoxLayout()
+    side.addWidget(btn)
+    side.addWidget(forget)
+    row.addLayout(col, 1)
+    row.addLayout(side)
+    lay.addSpacing(10)
+    lay.addLayout(row)
+    sp.ncz_link_btn = btn
+    if btn.isChecked():
+        err = ncz_link_set_running(True)
+        if err:
+            print(f"NCZ Link: {err}")
+
+_lk_prev_init = AdaptiveApp.__init__
+
+def _lk_init(self):
+    _lk_prev_init(self)
+    try:
+        _lk["inv"] = _LkInvoker()
+        _lk_add_setting(self)
+    except Exception as e:
+        print(f"NCZ Link: couldn't start ({e!r})")
+
+AdaptiveApp.__init__ = _lk_init
+
+
+# ================================================================ NCZFront inside the launcher
+# "Play" on the NCZFront card opens the site in a browser tab inside the launcher (QtWebEngine) instead of the
+# default browser. The page stays alive when you switch to another launcher tab, so a running game keeps going.
+if _HAS_WEBENGINE:
+    class _NgrokSkipWarning(QWebEngineUrlRequestInterceptor):
+        """ngrok's free tunnels show a 'Visit Site' warning page; this header skips it for page loads."""
+        def interceptRequest(self, info):
+            try:
+                if info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame:
+                    host = (info.requestUrl().host() or "").lower()
+                    if host.endswith((".ngrok-free.dev", ".ngrok-free.app", ".ngrok.io", ".ngrok.app", ".ngrok.dev")):
+                        info.setHttpHeader(b"ngrok-skip-browser-warning", b"true")
+            except Exception:
+                pass
+
+    class _WebTabPage(QWebEnginePage):
+        def __init__(self, profile, owner, parent=None):
+            super().__init__(profile, parent)
+            self._owner = owner
+
+        def createWindow(self, _type):          # target=_blank / window.open -> a new tab in the launcher
+            return self._owner.new_tab(None, focus=True).page()
+
+    class NczWebPage(QWidget):
+        closed = pyqtSignal()                   # last tab was closed
+        back_requested = pyqtSignal()           # "Library" button
+
+        def __init__(self):
+            super().__init__()
+            self.setObjectName("Content")
+            self._fs_hidden = []
+
+            web_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "webview")
+            os.makedirs(web_dir, exist_ok=True)
+            self.profile = QWebEngineProfile("nczfront", self)          # persistent: cookies + localStorage (game saves) survive restarts
+            self.profile.setPersistentStoragePath(web_dir)
+            self.profile.setCachePath(os.path.join(web_dir, "cache"))
+            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+            self._interceptor = _NgrokSkipWarning(self)
+            self.profile.setUrlRequestInterceptor(self._interceptor)
+            self.profile.downloadRequested.connect(self._on_download)
+            st = self.profile.settings()
+            for attr, on in ((QWebEngineSettings.WebAttribute.LocalStorageEnabled, True),
+                             (QWebEngineSettings.WebAttribute.JavascriptEnabled, True),
+                             (QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True),
+                             (QWebEngineSettings.WebAttribute.WebGLEnabled, True),
+                             (QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True),
+                             (QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True),
+                             (QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)):
+                st.setAttribute(attr, on)
+
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(0)
+
+            self.bar = QFrame()
+            self.bar.setObjectName("WebBar")
+            self.bar.setStyleSheet(
+                "QFrame#WebBar { background: rgba(128,128,128,0.10); }"
+                "QPushButton#WebBtn { background: transparent; border: none; border-radius: 6px;"
+                " padding: 0 10px; font-size: 15px; min-height: 30px; }"
+                "QPushButton#WebBtn:hover { background: rgba(128,128,128,0.25); }"
+                "QPushButton#WebBtn:disabled { color: rgba(128,128,128,0.5); }"
+                "QLineEdit#WebUrl { background: rgba(128,128,128,0.15); border: 1px solid rgba(128,128,128,0.3);"
+                " border-radius: 15px; padding: 0 14px; min-height: 30px; }")
+            row = QHBoxLayout(self.bar)
+            row.setContentsMargins(12, 6, 12, 6)
+            row.setSpacing(4)
+
+            def mk(text, tip, slot):
+                b = QPushButton(text)
+                b.setObjectName("WebBtn")
+                b.setToolTip(tip)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _c=False: slot())
+                row.addWidget(b)
+                return b
+
+            mk("\u25C0 Library", "Back to the library (the page keeps running)", self.back_requested.emit)
+            row.addSpacing(8)
+            self.btn_back = mk("\u2190", "Back", lambda: self._cur() and self._cur().back())
+            self.btn_fwd = mk("\u2192", "Forward", lambda: self._cur() and self._cur().forward())
+            self.btn_reload = mk("\u21BB", "Reload", lambda: self._cur() and self._cur().reload())
+            self.url_edit = QLineEdit()
+            self.url_edit.setObjectName("WebUrl")
+            self.url_edit.returnPressed.connect(self._go)
+            row.addWidget(self.url_edit, 1)
+            mk("\u2197", "Open this page in your default browser", self._open_external)
+            outer.addWidget(self.bar)
+
+            self.tabs = QTabWidget()
+            self.tabs.setDocumentMode(True)
+            self.tabs.setTabsClosable(True)
+            self.tabs.tabCloseRequested.connect(self.close_tab)
+            self.tabs.currentChanged.connect(self._sync_toolbar)
+            outer.addWidget(self.tabs, 1)
+
+        # -------------------------------------------------- tabs
+        def _cur(self):
+            return self.tabs.currentWidget()
+
+        def new_tab(self, url=None, focus=True):
+            view = QWebEngineView()
+            page = _WebTabPage(self.profile, self, view)
+            view.setPage(page)
+            idx = self.tabs.addTab(view, "Loading...")
+            view.titleChanged.connect(lambda t, v=view: self._set_title(v, t))
+            view.iconChanged.connect(lambda ic, v=view: self._set_icon(v, ic))
+            view.urlChanged.connect(lambda u, v=view: self._url_changed(v, u))
+            view.loadStarted.connect(self._sync_toolbar)
+            view.loadFinished.connect(lambda _ok: self._sync_toolbar())
+            page.fullScreenRequested.connect(self._on_fullscreen)
+            if url:
+                view.setUrl(QUrl(url))
+            if focus:
+                self.tabs.setCurrentIndex(idx)
+            return view
+
+        def open_url(self, url):
+            """Show `url`, reusing a tab that already has that site open."""
+            want = QUrl(url).host()
+            for i in range(self.tabs.count()):
+                if self.tabs.widget(i).url().host() == want or self.tabs.widget(i).requestedUrl().host() == want:
+                    self.tabs.setCurrentIndex(i)
+                    return self.tabs.widget(i)
+            return self.new_tab(url)
+
+        def close_tab(self, i):
+            view = self.tabs.widget(i)
+            if view is None:
+                return
+            self.tabs.removeTab(i)
+            self._dispose(view)
+            if self.tabs.count() == 0:
+                self.closed.emit()
+
+        def _dispose(self, view):
+            try:
+                page = view.page()
+                view.setPage(None)
+                page.deleteLater()
+            except Exception:
+                pass
+            view.deleteLater()
+
+        def shutdown(self):
+            """Free the pages before the profile goes away (avoids Qt's 'profile released while page alive' warning)."""
+            while self.tabs.count():
+                view = self.tabs.widget(0)
+                self.tabs.removeTab(0)
+                self._dispose(view)
+
+        def has_tabs(self):
+            return self.tabs.count() > 0
+
+        # -------------------------------------------------- toolbar bits
+        def _set_title(self, view, title):
+            i = self.tabs.indexOf(view)
+            if i >= 0:
+                title = title or view.url().host() or "New tab"
+                self.tabs.setTabText(i, title if len(title) <= 26 else title[:25] + "\u2026")
+                self.tabs.setTabToolTip(i, title)
+
+        def _set_icon(self, view, icon):
+            i = self.tabs.indexOf(view)
+            if i >= 0:
+                self.tabs.setTabIcon(i, icon)
+
+        def _url_changed(self, view, url):
+            if view is self._cur():
+                self.url_edit.setText(url.toString())
+                self.url_edit.setCursorPosition(0)
+
+        def _sync_toolbar(self, *_a):
+            v = self._cur()
+            self.btn_back.setEnabled(bool(v) and v.history().canGoBack())
+            self.btn_fwd.setEnabled(bool(v) and v.history().canGoForward())
+            if v is not None and not self.url_edit.hasFocus():
+                self.url_edit.setText(v.url().toString())
+                self.url_edit.setCursorPosition(0)
+
+        def _go(self):
+            v = self._cur()
+            text = self.url_edit.text().strip()
+            if not text:
+                return
+            if "://" not in text:
+                text = "https://" + text
+            if v is None:
+                self.new_tab(text)
+            else:
+                v.setUrl(QUrl(text))
+            v = self._cur()
+            if v is not None:
+                v.setFocus()
+
+        def _open_external(self):
+            v = self._cur()
+            if v is not None:
+                _real_webbrowser_open(v.url().toString())
+
+        # -------------------------------------------------- downloads / fullscreen
+        def _on_download(self, item):
+            try:
+                folder = os.path.join(os.path.expanduser("~"), "Downloads")
+                os.makedirs(folder, exist_ok=True)
+                item.setDownloadDirectory(folder)
+                item.accept()
+            except Exception:
+                pass
+
+        def _on_fullscreen(self, req):
+            req.accept()
+            win = self.window()
+            if req.toggleOn():
+                self._fs_hidden = []
+                chrome = [self.bar, self.tabs.tabBar(), getattr(win, "_ui_rail", None), win.findChild(QFrame, "Sidebar")]
+                for w in chrome:
+                    if w is not None and w.isVisible():
+                        w.hide()
+                        self._fs_hidden.append(w)
+                self._fs_was_max = win.isMaximized()
+                win.showFullScreen()
+            else:
+                for w in self._fs_hidden:
+                    w.show()
+                self._fs_hidden = []
+                if getattr(self, "_fs_was_max", False):
+                    win.showMaximized()
+                else:
+                    win.showNormal()
+
+        def setGraphicsEffect(self, effect):   # the launcher's page fade-in breaks web view rendering; skip it here
+            if effect is None:
+                super().setGraphicsEffect(None)
+
+def _nczfront_mark_playing():
+    """Same 'playing NCZFront' status the default-browser path gives (shown to friends)."""
+    _web_until["t"] = time.time() + 1800
+    _now_playing["name"] = "NCZFront"
+    for cb in _playing_listeners:
+        cb()
+
+def _nczfront_unmark_playing():
+    _web_until["t"] = 0.0
+    if _now_playing["name"] == "NCZFront":
+        _now_playing["name"] = next(iter(_running), None)
+        for cb in _playing_listeners:
+            cb()
+
+def _open_nczfront(self):
+    if not _HAS_WEBENGINE:                      # PyQt6-WebEngine missing: old behaviour
+        webbrowser.open(NCZFRONT_URL)
+        return
+    page = self.__dict__.get("web_page")
+    if page is None:
+        page = NczWebPage()
+        self.web_page = page
+        self.pages.addWidget(page)
+        page.back_requested.connect(self._leave_web_page)
+        page.closed.connect(self._web_page_emptied)
+        QApplication.instance().aboutToQuit.connect(page.shutdown)
+    page.open_url(NCZFRONT_URL)
+    self.pages.setCurrentWidget(page)
+    _nczfront_mark_playing()
+
+def _leave_web_page(self):
+    self.pages.setCurrentIndex(0)
+    btn = self.nav_group.button(0) if hasattr(self, "nav_group") else None
+    if btn is not None:
+        btn.setChecked(True)
+
+def _web_page_emptied(self):
+    _nczfront_unmark_playing()
+    self._leave_web_page()
+
+AdaptiveApp.open_nczfront = _open_nczfront
+AdaptiveApp._leave_web_page = _leave_web_page
+AdaptiveApp._web_page_emptied = _web_page_emptied
+
+
+# ================================================================ Poll results: Discord picture sync + itch.io fan games
+# 1) Launcher profile picture follows your Discord picture (Settings -> "Sync profile picture with Discord", on by
+#    default). It reads your Discord user from the local Discord app (same pipe Rich Presence uses), so it needs the
+#    Discord desktop app open. It only copies when your Discord picture CHANGES, so a picture you pick by hand in the
+#    launcher stays until you change your Discord one.
+# 2) Fan Games gets an "itch.io Games" button that pulls free Windows fan games from itch.io into
+#    fan_games_itch.csv (next to launcher.json). They show up in the same list/details page/library as Game Jolt ones.
+import socket as _socket
+import struct as _dstruct
+import http.cookiejar as _cookiejar
+import tempfile as _tempfile
+
+# ---------------------------------------------------------------- Discord picture sync
+def _discord_ipc_candidates():
+    if sys.platform.startswith("win"):
+        return [r"\\?\pipe\discord-ipc-%d" % i for i in range(10)]
+    bases = []
+    for env in ("XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"):
+        v = os.environ.get(env)
+        if v and v not in bases:
+            bases.append(v)
+    try:
+        r = "/run/user/%d" % os.getuid()
+        if r not in bases:
+            bases.append(r)
+    except Exception:
+        pass
+    if "/tmp" not in bases:
+        bases.append("/tmp")
+    out = []
+    for b in bases:
+        for sub in ("", "snap.discord", os.path.join("app", "com.discordapp.Discord"),
+                    os.path.join("app", "com.discordapp.DiscordCanary")):
+            for i in range(10):
+                out.append(os.path.join(b, sub, "discord-ipc-%d" % i))
+    return out
+
+class _IPCConn:
+    def __init__(self, path):
+        self.sock, self.f = None, None
+        if sys.platform.startswith("win"):
+            self.f = open(path, "r+b", buffering=0)
+        else:
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.settimeout(4)
+            try:
+                s.connect(path)
+            except Exception:
+                s.close()
+                raise
+            self.sock = s
+
+    def write(self, data):
+        if self.sock:
+            self.sock.sendall(data)
+        else:
+            self.f.write(data)
+
+    def read(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf)) if self.sock else self.f.read(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Discord closed the connection")
+            buf += chunk
+        return buf
+
+    def send(self, op, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.write(_dstruct.pack("<II", op, len(data)) + data)
+
+    def recv(self):
+        op, length = _dstruct.unpack("<II", self.read(8))
+        raw = self.read(length) if length else b"{}"
+        try:
+            return op, json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return op, {}
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+            elif self.f:
+                self.f.close()
+        except Exception:
+            pass
+
+def _discord_local_user():
+    """The Discord account that's logged in on this PC ({id, username, avatar, ...}), or None when the Discord
+    desktop app isn't running. Discord hands this over when a program says hello on its local pipe."""
+    for path in _discord_ipc_candidates():
+        if not sys.platform.startswith("win") and not os.path.exists(path):
+            continue
+        try:
+            conn = _IPCConn(path)
+        except Exception:
+            continue
+        try:
+            conn.send(0, {"v": 1, "client_id": DISCORD_APP_ID})
+            for _ in range(4):
+                op, data = conn.recv()
+                if isinstance(data, dict) and data.get("evt") == "READY":
+                    user = (data.get("data") or {}).get("user")
+                    if isinstance(user, dict) and user.get("id"):
+                        return user
+                    break
+                if op == 2:
+                    break
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    return None
+
+def get_discord_pfp_sync_enabled():
+    return bool(load_launcher_settings().get("discord_pfp_sync", True))
+
+class _DiscordPfpSync(QObject):
+    updated = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.status = "Starting..."
+        self._wake = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def poke(self):
+        self._wake.set()
+
+    def _loop(self):
+        time.sleep(12)                  # let the launcher finish starting first
+        while True:
+            try:
+                self._sync()
+            except Exception as e:
+                self.status = f"Couldn't sync ({type(e).__name__}: {e})"
+            self._wake.wait(timeout=60)
+            self._wake.clear()
+
+    def _sync(self):
+        st = load_launcher_settings()
+        if not st.get("discord_pfp_sync", True):
+            self.status = "Off"
+            return
+        if not cloud_configured() or not load_account():
+            self.status = "Sign in to your launcher account to use this"
+            return
+        user = _discord_local_user()
+        if not user:
+            self.status = "Waiting for Discord (the desktop app has to be open)"
+            return
+        avatar = user.get("avatar")
+        if not avatar:
+            self.status = "Your Discord account has no profile picture"
+            return
+        key = f"{user['id']}:{avatar}"
+        if st.get("discord_pfp_hash") == key:
+            self.status = "In sync with Discord"
+            return
+        raw = _http_get(f"https://cdn.discordapp.com/avatars/{user['id']}/{avatar}.png?size=256", timeout=20)
+        fd, tmp = _tempfile.mkstemp(suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            png = prepare_avatar_png(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        cloud_save_profile(png=png)
+        st = load_launcher_settings()
+        st["discord_pfp_hash"] = key
+        save_launcher_settings(st)
+        self.status = "Picture copied from Discord"
+        self.updated.emit()
+
+_discord_pfp = _DiscordPfpSync()
+
+def set_discord_pfp_sync_enabled(on):
+    try:
+        st = load_launcher_settings()
+        st["discord_pfp_sync"] = bool(on)
+        if on:
+            st["discord_pfp_hash"] = ""         # turning it on copies your Discord picture right away
+        save_launcher_settings(st)
+    except Exception:
+        pass
+    _discord_pfp.poke()
+
+_pfp_prev_settings_init = SettingsPage.__init__
+
+def _pfp_settings_init(self, *a, **k):
+    _pfp_prev_settings_init(self, *a, **k)
+    layout = self.layout()
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    name = QLabel("Sync profile picture with Discord")
+    name.setObjectName("RowTitle")
+    desc = QLabel("Uses your Discord profile picture as your launcher picture. Needs the Discord desktop app open. "
+                  "It only copies when your Discord picture changes, so a picture you set by hand stays until then.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    status = QLabel()
+    status.setObjectName("RowDesc")
+    status.setWordWrap(True)
+    text.addWidget(name)
+    text.addWidget(desc)
+    text.addWidget(status)
+    timer = QTimer(self)
+    timer.timeout.connect(lambda: status.setText("Status: " + _discord_pfp.status))
+    timer.start(1500)
+    status.setText("Status: " + _discord_pfp.status)
+    combo = QComboBox()
+    combo.setFixedWidth(240)
+    combo.addItem("Off", False)
+    combo.addItem("On", True)
+    combo.setCurrentIndex(1 if get_discord_pfp_sync_enabled() else 0)
+    combo.currentIndexChanged.connect(lambda _i: set_discord_pfp_sync_enabled(combo.currentData()))
+    row.addLayout(text, 1)
+    row.addWidget(combo)
+    pl.addLayout(row)
+    idx = max(layout.count() - 1, 0)
+    layout.insertSpacing(idx, 12)
+    layout.insertWidget(idx + 1, panel)
+
+SettingsPage.__init__ = _pfp_settings_init
+
+def _pfp_refresh_ui(self):
+    try:
+        self.refresh_profile()
+        self.account_page.refresh_view()
+    except Exception:
+        pass
+
+AdaptiveApp._pfp_refresh_ui = _pfp_refresh_ui
+_pfp_prev_app_init = AdaptiveApp.__init__
+
+def _pfp_app_init(self, *a, **k):
+    _pfp_prev_app_init(self, *a, **k)
+    _discord_pfp.updated.connect(self._pfp_refresh_ui)
+
+AdaptiveApp.__init__ = _pfp_app_init
+
+
+# ---------------------------------------------------------------- itch.io fan games
+# itch.io games get the id  ITCH_ID_BASE + (itch game id)  so they never clash with Game Jolt ids and everything
+# that works on a fan game id (library, cloud sync, compat tool, uninstall) just works for them too.
+ITCH_ID_BASE = 1_000_000_000
+ITCH_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+# (launcher category tag, itch.io tags to browse). The empty category = generic fan game tags, shown under "All".
+ITCH_QUERIES = (("undertale", ("undertale",)),
+                ("fnf", ("friday-night-funkin", "fnf")),
+                ("fnaf", ("fnaf", "five-nights-at-freddys")),
+                ("bendy", ("bendy",)),
+                ("", ("fangame", "fan-game")))
+
+def _is_itch(gid):
+    try:
+        return int(gid) >= ITCH_ID_BASE
+    except (TypeError, ValueError):
+        return False
+
+def get_itch_csv_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_games_itch.csv")
+
+def load_itch_games():
+    """[(gid, name, link, tags(set), cover_url)] from fan_games_itch.csv."""
+    path = get_itch_csv_path()
+    games = []
+    if not os.path.exists(path):
+        return games
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    gid = ITCH_ID_BASE + int(row.get("id") or 0)
+                except ValueError:
+                    continue
+                name = (row.get("name") or "").strip()
+                link = (row.get("link") or "").strip()
+                if not (name and link and gid > ITCH_ID_BASE):
+                    continue
+                tags = {t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()}
+                games.append((gid, name, link, tags, (row.get("cover") or "").strip()))
+    except Exception:
+        pass
+    return games
+
+def _itch_game(gid):
+    return next((g for g in load_itch_games() if g[0] == gid), None)
+
+_itch_orig_load_fan_games = load_fan_games
+_ITCH_MERGED = {"for": None}
+
+def _load_fan_games_with_itch():
+    games = _itch_orig_load_fan_games()
+    if _ITCH_MERGED["for"] is not games:        # reload_fan_games() builds a new list, so this runs again then
+        have = {g[0] for g in games}
+        for gid, name, link, tags, _cover in load_itch_games():
+            if gid not in have:
+                games.append((gid, name, link, tags))
+                have.add(gid)
+        _ITCH_MERGED["for"] = games
+    return games
+
+load_fan_games = _load_fan_games_with_itch
+
+# ---- browsing itch.io (the browse pages can answer as json: {"content": "<html of the game cells>"})
+def _itch_parse_cells(html):
+    cells = []
+    marks = [m for m in re.finditer(r'<div[^>]*\bdata-game_id="(\d+)"[^>]*>', html)]
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(html)
+        seg = html[m.end():end]
+        link = re.search(r'href="(https://[^"/]+\.itch\.io/[^"?#]+)', seg)
+        title = re.search(r'<a[^>]+class="[^"]*\btitle\b[^"]*"[^>]*>(.*?)</a>', seg, re.S)
+        cover = re.search(r'data-lazy_src="([^"]+)"', seg) or re.search(r'<img[^>]+src="(https://img\.itch\.zone[^"]+)"', seg)
+        if not (link and title):
+            continue
+        name = html_lib.unescape(re.sub(r"<[^>]+>", "", title.group(1))).strip()
+        if name:
+            cells.append((int(m.group(1)), name, link.group(1), cover.group(1) if cover else ""))
+    return cells
+
+def _itch_fetch_cells(slug, page, errors):
+    """Tries a few url forms for one browse page. Returns the game cells, or [] (reasons go to errors)."""
+    q = f"page={page}"
+    urls = [(f"https://itch.io/games/tag-{slug}?{q}&format=json", True),
+            (f"https://itch.io/games/free/tag-{slug}?{q}&format=json", True),
+            (f"https://itch.io/games/free/platform-windows/tag-{slug}?{q}&format=json", True),
+            (f"https://itch.io/games/tag-{slug}?{q}", False)]
+    for url, is_json in urls:
+        try:
+            raw = _http_get(url, headers={"User-Agent": ITCH_UA, "Accept": "application/json, text/html, */*"},
+                            timeout=30).decode("utf-8", errors="replace")
+            html = raw
+            if is_json:
+                try:
+                    html = str(json.loads(raw).get("content") or "")
+                except Exception:
+                    pass        # not json after all: read it as a normal page
+            cells = _itch_parse_cells(html)
+            if cells:
+                return cells
+            errors.append(f"{url}: no games found in the reply ({len(raw)} bytes)")
+        except Exception as e:
+            errors.append(f"{url}: {type(e).__name__}: {e}")
+    return []
+
+def scrape_itch_games(pages=3):
+    """Browses itch.io for fan games and merges them into fan_games_itch.csv. Returns how many are new."""
+    found = {}      # itch id -> [name, link, set(tags), cover]
+    errors = []
+    for cat, slugs in ITCH_QUERIES:
+        for slug in slugs:
+            for page in range(1, pages + 1):
+                cells = _itch_fetch_cells(slug, page, errors)
+                if not cells:
+                    break
+                for iid, name, link, cover in cells:
+                    e = found.setdefault(iid, [name, link, set(), cover])
+                    if cat:
+                        e[2].add(cat)
+                time.sleep(0.4)
+    if not found:
+        try:
+            with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "itch_debug.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + "\n".join(errors[-12:]) + "\n\n")
+        except Exception:
+            pass
+        raise RuntimeError("Couldn't get any games from itch.io.\n\nLast problem: " + (errors[-1] if errors else "none") +
+                           "\n\n(Full details are in itch_debug.log next to launcher.json.)")
+    old = {g[0] - ITCH_ID_BASE: [g[1], g[2], set(g[3]), g[4]] for g in load_itch_games()}
+    new_count = len([i for i in found if i not in old])
+    for iid, e in found.items():
+        if iid in old:
+            old[iid][2] |= e[2]
+            old[iid][3] = old[iid][3] or e[3]
+        else:
+            old[iid] = e
+    path = get_itch_csv_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["id", "name", "link", "tags", "cover"])
+        for iid, (name, link, tags, cover) in sorted(old.items()):
+            w.writerow([iid, name, link, ",".join(sorted(tags)), cover])
+    return new_count
+
+# ---- covers + details page (the details page reads a Game Jolt shaped dict, so we hand it one)
+_itch_prev_cover_fetch = FanCoverLoader._fetch
+
+def _itch_cover_fetch(self, appid, img_base, key, title):
+    if not _is_itch(appid):
+        return _itch_prev_cover_fetch(self, appid, img_base, key, title)
+    folder = get_fan_cover_dir()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{appid}.img")
+    marker = os.path.join(folder, f"{appid}-itchnone")
+    if os.path.exists(path):
+        return path
+    if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 24 * 3600:
+        return ""
+    g = _itch_game(appid)
+    url = g[4] if g else ""
+    if not url:
+        try:
+            page = _http_get(img_base, headers={"User-Agent": ITCH_UA}, timeout=15).decode("utf-8", errors="replace")
+            for rx in _OG_RES:
+                m = rx.search(page)
+                if m:
+                    url = html_lib.unescape(m.group(1))
+                    break
+        except Exception:
+            pass
+    if url:
+        try:
+            data = _http_get(url, timeout=15)
+            if data:
+                with open(path, "wb") as f:
+                    f.write(data)
+                return path
+        except Exception:
+            pass
+    open(marker, "w").close()
+    return ""
+
+FanCoverLoader._fetch = _itch_cover_fetch
+
+def fetch_itch_overview(gid):
+    g = _itch_game(gid)
+    if not g:
+        raise RuntimeError("This itch.io game isn't in your list any more.")
+    link = g[2]
+    cache_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_overview")
+    cache_file = os.path.join(cache_dir, f"{gid}.json")
+    try:
+        if time.time() - os.path.getmtime(cache_file) < 6 * 3600:
+            with open(cache_file, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    page = _http_get(link, headers={"User-Agent": ITCH_UA}, timeout=30).decode("utf-8", errors="replace")
+    cover = g[4]
+    for rx in _OG_RES:
+        m = rx.search(page)
+        if m:
+            cover = html_lib.unescape(m.group(1))
+            break
+    desc_html = ""
+    m = re.search(r'<div[^>]+class="formatted_description[^"]*"[^>]*>', page)
+    if m:
+        rest = page[m.end():]
+        cuts = [rest.find(x) for x in ('class="more_information_toggle', '<div class="game_info_panel_widget',
+                                       '<div class="buy_row', '<div class="uploads_list') if rest.find(x) != -1]
+        desc_html = rest[:min(cuts + [8000])]
+    shots = []
+    for tag in re.findall(r'<a\b[^>]*data-image_lightbox[^>]*>', page):
+        h = re.search(r'href="([^"]+)"', tag)
+        if h and h.group(1) not in shots:
+            shots.append(html_lib.unescape(h.group(1)))
+    author = urllib.parse.urlparse(link).netloc.split(".")[0]
+    game = {"description_compiled": desc_html,
+            "thumbnail_media_item": {"img_url": cover} if cover else {},
+            "developer": {"display_name": author},
+            "mediaItems": [{"type": "image", "img_url": u} for u in shots[:8]],
+            "compatibility": {"os_windows": "icon-windows8" in page, "os_linux": "icon-tux" in page,
+                              "os_mac": "icon-apple" in page, "type_html": "html_embed" in page}}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(game, f)
+    except Exception:
+        pass
+    return game
+
+_itch_orig_overview = fetch_fan_overview
+
+def fetch_fan_overview(gid):
+    if _is_itch(gid):
+        return fetch_itch_overview(gid)
+    return _itch_orig_overview(gid)
+
+_itch_prev_show_game = FanDetailPage.show_game
+
+def _itch_show_game(self, appid, title, *a, **k):
+    _itch_prev_show_game(self, appid, title, *a, **k)
+    if _is_itch(appid):
+        self.meta_label.setText("Fan game  \u2022  itch.io")
+
+FanDetailPage.show_game = _itch_show_game
+_itch_prev_on_details = FanDetailPage._on_fan_details
+
+def _itch_on_details(self, result):
+    _itch_prev_on_details(self, result)
+    try:
+        if _is_itch(result[0]) and result[0] == self._appid:
+            dev = result[2]
+            self.meta_label.setText("  \u2022  ".join(([f"by {dev}"] if dev else []) + ["itch.io fan game"]))
+    except Exception:
+        pass
+
+FanDetailPage._on_fan_details = _itch_on_details
+
+# ---- downloading (itch.io's own download flow: page -> download_url -> file -> signed link)
+def _itch_csrf(page):
+    m = (re.search(r'<meta[^>]+name="csrf_token"[^>]+value="([^"]+)"', page)
+         or re.search(r'<meta[^>]+value="([^"]+)"[^>]+name="csrf_token"', page))
+    return html_lib.unescape(m.group(1)) if m else ""
+
+def _itch_size_bytes(text):
+    m = re.match(r"\s*([\d.,]+)\s*([KMG]?B)", text or "", re.I)
+    if not m:
+        return 0
+    try:
+        n = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+    return int(n * {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}[m.group(2).upper()])
+
+def _itch_parse_uploads(html):
+    out = []
+    starts = [m.start() for m in re.finditer(r'<div\s+class="upload(?:\s[^"]*)?"', html)]
+    for i, s in enumerate(starts):
+        seg = html[s:(starts[i + 1] if i + 1 < len(starts) else len(html))]
+        uid = re.search(r'data-upload_id="(\d+)"', seg)
+        if not uid:
+            continue
+        nm = re.search(r'<strong[^>]*class="name"[^>]*?(?:title="([^"]*)")?[^>]*>(.*?)</strong>', seg, re.S)
+        name = html_lib.unescape((nm.group(1) or re.sub(r"<[^>]+>", "", nm.group(2))) if nm else "").strip()
+        size = re.search(r'class="file_size"[^>]*>\s*<span>([^<]+)</span>', seg)
+        out.append({"id": uid.group(1), "pkg": name or f"Download {uid.group(1)}", "filename": name,
+                    "size": _itch_size_bytes(size.group(1)) if size else 0,
+                    "windows": "icon-windows8" in seg, "linux": "icon-tux" in seg,
+                    "mac": "icon-apple" in seg, "win64": False})
+    return out
+
+def _itch_post(opener, url, fields, referer):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), headers={
+        "Referer": referer, "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+    with opener.open(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+def _itch_find_link(worker, game_url):
+    """(url, headers) of the real download. Asks which build when a game has several Windows ones."""
+    base = game_url.split("?")[0].rstrip("/")
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookiejar.CookieJar()))
+    opener.addheaders = [("User-Agent", ITCH_UA)]
+    page = opener.open(base, timeout=30).read().decode("utf-8", errors="replace")
+    csrf = _itch_csrf(page)
+    resp = _itch_post(opener, base + "/download_url", {"csrf_token": csrf}, base)
+    dl_url = resp.get("url") if isinstance(resp, dict) else ""
+    if not dl_url:
+        raise ValueError("itch.io wouldn't give a download for this game. It may need to be bought or claimed on "
+                         "itch.io first. Open the game's page on itch.io to check.")
+    dpage = opener.open(dl_url, timeout=30).read().decode("utf-8", errors="replace")
+    uploads = _itch_parse_uploads(dpage)
+    wins = [u for u in uploads if u["windows"]] or []
+    if not wins:
+        raise ValueError("This game has no Windows download on itch.io.")
+    wins.sort(key=lambda u: (not u["filename"].lower().endswith((".zip", ".exe", ".7z", ".rar")), -u["size"]))
+    chosen = wins[0]
+    if len(wins) > 1:
+        for i, u in enumerate(wins):
+            u["primary"] = i == 0
+        picked = worker.ask_build(wins)
+        if picked is None:
+            raise ValueError("CANCELLED")
+        chosen = next((u for u in wins if u["id"] == picked), wins[0])
+    token = dl_url.rstrip("/").rsplit("/", 1)[-1] if "/download/" in dl_url else ""
+    furl = f"{base}/file/{chosen['id']}?source=game_download&as_props=1&after_download_lightbox=true"
+    if token:
+        furl += "&download_token=" + urllib.parse.quote(token, safe="")
+    resp2 = _itch_post(opener, furl, {"csrf_token": _itch_csrf(dpage) or csrf}, dl_url)
+    url = resp2.get("url") if isinstance(resp2, dict) else ""
+    if not url:
+        raise ValueError("itch.io didn't return a file link. Try again in a moment.")
+    return url, {"User-Agent": ITCH_UA, "Referer": base + "/"}
+
+class ItchDownloadWorker(GameJoltDownloadWorker):
+    def run(self):
+        dest_path, fresh = None, False
+        try:
+            if self.existing_zip_path and os.path.exists(self.existing_zip_path):
+                dest_path = self.existing_zip_path
+            else:
+                url, headers = _itch_find_link(self, self.game_url)
+                self.download_url = url
+                dest_path = _gj_stream(self, url, headers, lambda: _itch_find_link(self, self.game_url))
+                fresh = True
+            if self._is_cancelled:
+                if fresh and os.path.exists(dest_path):
+                    os.remove(dest_path)
+                self.failed.emit("CANCELLED")
+                return
+            self.status_update.emit("Installing...")
+            _gj_install_file(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+            self.finished.emit(dest_path)
+        except Exception as e:
+            if self._is_cancelled or str(e) == "CANCELLED":
+                self.failed.emit("CANCELLED")
+                return
+            self.failed.emit(str(e))
+
+_itch_prev_fan_install = AdaptiveApp._fan_install
+
+def _fan_install_itch(self, gid, title, cover_path, link):
+    if not _is_itch(gid) or _fan_installed_exe(title):      # installed already: the normal code launches it
+        return _itch_prev_fan_install(self, gid, title, cover_path, link)
+    if not link:
+        QMessageBox.warning(self, "Install", "This game has no itch.io link.")
+        return
+    cancelled, existing = _ask_existing_archive(self, title)
+    if cancelled:
+        return
+    worker = ItchDownloadWorker(title, link, gid, existing)
+    worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(self, w, builds))
+    worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
+    card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
+    self.downloads_page.add_download_card(card)
+    self.nav_group.button(6).setChecked(True)
+    self.pages.setCurrentWidget(self.downloads_page)
+
+AdaptiveApp._fan_install = _fan_install_itch
+
+# ---- the "itch.io Games" button on the Fan Games page
+def _itch_scrape_clicked(self):
+    pages, ok = QInputDialog.getInt(self, "itch.io Games",
+                                    "How many pages per category? (about 36 games per page, more pages take longer)",
+                                    3, 1, 10)
+    if not ok:
+        return
+    busy = BusyDialog("Getting fan games from itch.io...", lambda: scrape_itch_games(pages), self)
+    ok, added, error = busy.run()
+    if not ok:
+        QMessageBox.warning(self, "itch.io Games", error or "Couldn't get games from itch.io.")
+        return
+    games = reload_fan_games()
+    self._links = {gid: l for gid, _t, l, _tg in games}
+    self._build_tag_buttons()
+    self._set_tag(self._tag)
+    QMessageBox.information(self, "itch.io Games", f"Added {added} new fan game{'s' if added != 1 else ''} from itch.io.")
+
+FanGamesPage._itch_scrape_clicked = _itch_scrape_clicked
+_itch_prev_build_tags = FanGamesPage._build_tag_buttons
+
+def _itch_build_tags(self):
+    _itch_prev_build_tags(self)
+    b = QPushButton("itch.io Games")
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setFixedHeight(32)
+    b.setToolTip("Get free Windows fan games from itch.io and add them to this list")
+    b.clicked.connect(self._itch_scrape_clicked)
+    self._tag_row.addWidget(b)
+
+FanGamesPage._build_tag_buttons = _itch_build_tags
+
+
+
+# ================================================================ Store: Trending / Most Popular / Works on your PC
+# Trending = Steam's current top sellers, Most Popular = most reviewed. "Works on your PC" keeps only games whose
+# listed RAM and disk needs fit this PC (the same check as the game's page, so it's RAM + free space only).
+_steam_req_cache = {}
+
+_chart_cache = {}
+
+def _steam_api_json(url, timeout=20):
+    return json.loads(_http_get(url, timeout=timeout).decode("utf-8", errors="replace"))
+
+def _steam_chart_ranks():
+    """Steam's own Most Played chart: [{rank, last_week_rank, appid}], cached 10 min."""
+    hit = _chart_cache.get("ranks")
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    data = _steam_api_json("https://api.steampowered.com/ISteamChartsService/GetMostPlayedGames/v1/")
+    ranks = []
+    for r in (data.get("response") or {}).get("ranks", []):
+        if r.get("appid"):
+            ranks.append({"rank": int(r.get("rank") or 10 ** 6), "last": int(r.get("last_week_rank") or 0),
+                          "appid": int(r["appid"])})
+    ranks.sort(key=lambda r: r["rank"])
+    if not ranks:
+        raise RuntimeError("Steam's Most Played chart came back empty")
+    _chart_cache["ranks"] = (time.time(), ranks)
+    return ranks
+
+def _steam_most_played_ids():
+    return [r["appid"] for r in _steam_chart_ranks()]
+
+def _steam_trending_ids():
+    """Games climbing the chart fastest this week (new entries count as big climbs), biggest climb first."""
+    ranks = _steam_chart_ranks()
+    def climb(r):
+        before = r["last"] if r["last"] > 0 else len(ranks) + 50
+        return before - r["rank"]
+    return [r["appid"] for r in sorted(ranks, key=lambda r: (-climb(r), r["rank"]))]
+
+def _steam_names(appids):
+    """{appid: (name, type)} for these ids in ONE request. type 0 = a game (software/tools/DLC are other numbers)."""
+    cache = _chart_cache.setdefault("names", {})
+    need = [a for a in appids if a not in cache]
+    if need:
+        inp = json.dumps({"ids": [{"appid": a} for a in need],
+                          "context": {"language": "english", "country_code": "US"}, "data_request": {}})
+        data = _steam_api_json("https://api.steampowered.com/IStoreBrowseService/GetItems/v1?" +
+                               urllib.parse.urlencode({"input_json": inp}))
+        for it in (data.get("response") or {}).get("store_items", []):
+            if it.get("appid") and it.get("name"):
+                cache[int(it["appid"])] = (str(it["name"]), it.get("type", 0))
+    return cache
+
+_NOT_GAMES = ("wallpaper engine", "steam", "blender", "aseprite", "livesplash", "soundpad", "vtube studio")
+
+def _steam_chart_page(ids, start, count):
+    """One page of a ranked chart, in the order Steam ranks them: [(appid, title, image_base)], total."""
+    page = ids[start:start + count]
+    names = _steam_names(page)
+    games = []
+    for a in page:
+        if a not in names:
+            continue
+        name, kind = names[a]
+        if kind not in (0, None, "game") or name.lower() in _NOT_GAMES:
+            continue                                # games only: no software, tools or DLC
+        games.append((a, name, f"https://cdn.cloudflare.steamstatic.com/steam/apps/{a}"))
+    return games, len(ids)
+
+def fetch_steam_games_mode(term, start, tags=None, mode="", count=STORE_PAGE_SIZE):
+    """popular = Steam's Most Played chart (rank order); trending = Steam's top sellers. With a search word or
+    tags the chart can't be filtered, so those go through Steam's search instead."""
+    if mode in ("popular", "trending") and not term and not tags:
+        try:
+            ids = _steam_most_played_ids() if mode == "popular" else _steam_trending_ids()
+            return _steam_chart_page(ids, start, count)
+        except Exception:
+            pass                                    # chart unavailable: use the search below
+    base = {"query": "", "term": term, "start": start, "count": count, "dynamic_data": "",
+            "category1": 998, "l": "english", "infinite": 1}
+    if tags:
+        base["tags"] = ",".join(str(int(t)) for t in tags)
+    if mode == "popular":
+        tries = [{"filter": "topsellers"}]          # chart failed or filtered: best sellers is a fair stand-in
+    elif mode == "trending":
+        tries = [{"filter": "topsellers"}, {"filter": "popularnew"}]
+    else:
+        tries = [{"sort_by": "_ASC"}]
+    last = None
+    for extra in tries:
+        try:
+            url = STEAM_SEARCH_URL + "?" + urllib.parse.urlencode({**base, **extra})
+            data = json.loads(_http_get(url, timeout=20).decode("utf-8", errors="replace"))
+            games = parse_steam_results(data.get("results_html", ""))
+            if games:
+                return games, int(data.get("total_count") or 0)
+        except Exception as e:
+            last = e
+    if last:
+        raise last
+    return [], 0
+
+_steam_busy = {"until": 0.0}
+_fits_lock = threading.Lock()
+
+def _fits_cache_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fits_pc.json")
+
+def _fits_signature():
+    sp = get_system_specs()
+    return f"v2|{sp.get('cpu')}|{sp.get('gpu')}|{round(sp.get('ram_gb') or 0)}|{round(sp.get('free_gb') or 0)}"
+
+def _fits_load():
+    if _steam_req_cache.get("_loaded"):
+        return
+    _steam_req_cache["_loaded"] = True
+    try:
+        with open(_fits_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("sig") == _fits_signature():
+            for k, v in (data.get("games") or {}).items():
+                _steam_req_cache[int(k)] = bool(v)
+    except Exception:
+        pass
+
+def _fits_save():
+    try:
+        os.makedirs(os.path.dirname(_fits_cache_path()), exist_ok=True)
+        games = {str(k): v for k, v in _steam_req_cache.items() if isinstance(k, int)}
+        with open(_fits_cache_path(), "w", encoding="utf-8") as f:
+            json.dump({"sig": _fits_signature(), "games": games}, f)
+    except Exception:
+        pass
+
+def steam_game_fits_pc(appid):
+    """True when RAM, storage, processor and graphics look fine. None when Steam couldn't be asked (throttled)."""
+    with _fits_lock:
+        _fits_load()
+        if appid in _steam_req_cache:
+            return _steam_req_cache[appid]
+    if time.time() < _steam_busy["until"]:
+        return None
+    try:
+        time.sleep(0.15)        # be gentle: Steam throttles bursts of requests
+        # pc_requirements come with the "basic" part of the details; "platforms" is separate
+        url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us&filters=basic,platforms"
+        data = json.loads(_http_get(url, timeout=15).decode("utf-8", errors="replace"))
+        info = (data.get(str(appid)) or {}).get("data") or {}
+        platforms = info.get("platforms") or {}
+        src = info.get("pc_requirements")
+        if sys.platform.startswith("linux") and platforms.get("linux"):
+            lin = info.get("linux_requirements")
+            if isinstance(lin, dict) and (lin.get("minimum") or lin.get("recommended")):
+                src = lin
+        reqs = {}
+        if isinstance(src, dict):
+            reqs = {"minimum": parse_steam_requirements(src.get("minimum")),
+                    "recommended": parse_steam_requirements(src.get("recommended"))}
+        _v, color, _n = assess_requirements(reqs, platforms, get_system_specs())
+        ok = color in (GREEN, ORANGE)
+        with _fits_lock:
+            _steam_req_cache[appid] = ok
+        return ok
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 403):
+            _steam_busy["until"] = time.time() + 120
+        return None
+    except Exception:
+        return None
+
+_store_prev_init = StorePage.__init__
+
+def _store_modes_init(self, *a, **k):
+    _store_prev_init(self, *a, **k)
+    self._mode = ""             # "", "trending" or "popular"
+    self._works = False
+    if isinstance(self, FanGamesPage):
+        return
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    self._mode_buttons = {}
+    for key, label, tip in (("trending", "Trending", "What Steam is selling most right now"),
+                            ("popular", "Most Popular", "Most reviewed games on Steam"),
+                            ("works", "Works on your PC", "Only games whose RAM, storage, processor and graphics needs fit this PC")):
+        b = QPushButton(label)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFixedHeight(32)
+        b.setToolTip(tip)
+        b.clicked.connect(lambda _c=False, kk=key: self._toggle_mode(kk))
+        row.addWidget(b)
+        self._mode_buttons[key] = b
+    row.addStretch()
+    lay = self.layout()
+    lay.insertLayout(2, row)
+    lay.insertSpacing(3, 10)
+
+def _store_toggle_mode(self, key):
+    if key == "works":
+        self._works = not self._works
+    else:
+        self._mode = "" if self._mode == key else key
+    for k, b in self._mode_buttons.items():
+        on = self._works if k == "works" else self._mode == k
+        b.setObjectName("Primary" if on else "")
+        b.style().unpolish(b)
+        b.style().polish(b)
+    self._loaded_once = True
+    self._start_search()
+
+_store_prev_load_page = StorePage._load_page
+
+def _store_load_page(self):
+    if not getattr(self, "_mode", "") and not getattr(self, "_works", False):
+        return _store_prev_load_page(self)      # no button on: exactly the original Store loading
+    if self._loading or self._exhausted:
+        return
+    self._loading = True
+    request_id, term, start = self._request_id, self._term, self._next_start
+    tag_ids = [t for t, _ in self._tag_filter]
+    mode, works = getattr(self, "_mode", ""), getattr(self, "_works", False)
+
+    def work():
+        try:
+            s = start
+            for _ in range(2 if works else 1):      # a filtered page can come up empty: look at up to 2 pages
+                games, total = fetch_steam_games_mode(term, s, tag_ids, mode)
+                if works and games:
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        fits = list(pool.map(lambda g: steam_game_fits_pc(g[0]), games))
+                    _fits_save()
+                    games = [g for g, f in zip(games, fits) if f]
+                if games or s + STORE_PAGE_SIZE >= total:
+                    break
+                s += STORE_PAGE_SIZE
+            return (request_id, s, games, total, "")
+        except Exception as e:
+            return (request_id, start, [], 0, str(e) or e.__class__.__name__)
+
+    worker = TaskWorker(work)
+    worker.done.connect(self._on_page)
+    self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+    worker.start()
+
+_store_prev_on_page = StorePage._on_page
+
+def _store_modes_on_page(self, result):
+    _store_prev_on_page(self, result)
+    try:
+        if result[4] and result[0] == self._request_id and not isinstance(self, FanGamesPage):
+            self._set_status("Couldn't load games from Steam: " + str(result[4])[:160] +
+                             "\nIf this says 429 or 403, Steam is limiting requests: wait a few minutes.")
+            with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "store_debug.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(result[4]) + "\n")
+    except Exception:
+        pass
+    if getattr(self, "_works", False) and result[0] == self._request_id and not result[4]:
+        self.count_label.setText(f"{len(self._cards)} games that fit your PC")
+        if not self._cards:
+            if time.time() < _steam_busy["until"]:
+                self._set_status("Steam is limiting requests right now. Wait a couple of minutes and try again.")
+            else:
+                self._set_status("No games that fit your PC were found here. Try another tag or search.")
+
+StorePage.__init__ = _store_modes_init
+StorePage._toggle_mode = _store_toggle_mode
+StorePage._load_page = _store_load_page
+StorePage._on_page = _store_modes_on_page
+
+
+# ================================================================ "Can I run it": processor + graphics card
+# Compares this PC's CPU/GPU with the game's listed ones using an approximate built-in ranking (no internet needed).
+# Close calls are a guess, and anything it can't read (e.g. "DirectX 11 compatible") is simply not judged.
+_CPU_TIER = {"3": 0, "5": 6, "7": 12, "9": 18}
+_RYZEN_GEN = {1: 7, 2: 8, 3: 10, 4: 11, 5: 12, 6: 13, 7: 13, 8: 14, 9: 15}
+
+def _hw_cpu_score(text):
+    t = (text or "").lower()
+    m = re.search(r"core\W*(?:tm\W*)?i([3579])\W*(\d{3,5})", t)
+    if m:
+        d = m.group(2)
+        gen = int(d[:2]) if len(d) == 5 else int(d[0]) if len(d) == 4 else 1
+        return gen * 10 + _CPU_TIER[m.group(1)]
+    m = re.search(r"ryzen\W*(?:threadripper\W*)?([3579])\W*(\d{4})", t)
+    if m:
+        return _RYZEN_GEN.get(int(m.group(2)[0]), 12) * 10 + _CPU_TIER[m.group(1)]
+    m = re.search(r"\bfx\W*(\d{4})", t)
+    if m:
+        return 33 if int(m.group(1)) >= 8000 else 29
+    if re.search(r"core\W*2\W*quad", t) or re.search(r"phenom\W*(?:ii)?\W*x[46]", t):
+        return 18
+    if re.search(r"core\W*2\W*duo|athlon\W*(?:ii\W*)?x2|athlon\W*64", t):
+        return 14
+    if re.search(r"pentium|celeron|atom", t):
+        return 10
+    return None
+
+# rough relative speed, GTX 1060 = 100
+_GPU_TABLE = {
+    "gt 710": 6, "gt 730": 8, "gt 1030": 30, "gts 450": 14,
+    "gtx 260": 14, "gtx 460": 20, "gtx 550": 15, "gtx 560": 25, "gtx 650": 17, "gtx 660": 30, "gtx 670": 38,
+    "gtx 680": 45, "gtx 750": 28, "gtx 760": 38, "gtx 770": 50, "gtx 780": 60, "gtx 950": 45, "gtx 960": 55,
+    "gtx 970": 80, "gtx 980": 95, "gtx 1050": 55, "gtx 1060": 100, "gtx 1070": 140, "gtx 1080": 185,
+    "gtx 1650": 85, "gtx 1660": 125, "rtx 2060": 150, "rtx 2070": 190, "rtx 2080": 230, "rtx 3050": 120,
+    "rtx 3060": 190, "rtx 3070": 280, "rtx 3080": 380, "rtx 3090": 430, "rtx 4060": 240, "rtx 4070": 340,
+    "rtx 4080": 480, "rtx 4090": 700, "rtx 5070": 400, "rtx 5080": 560, "rtx 5090": 800,
+    "hd 5770": 15, "hd 6850": 22, "hd 7770": 25, "hd 7850": 38, "hd 7870": 48, "hd 7950": 55, "hd 7970": 65,
+    "r7 260": 35, "r9 270": 50, "r9 280": 70, "r9 290": 110, "r9 380": 70, "r9 390": 120,
+    "rx 460": 45, "rx 470": 85, "rx 480": 100, "rx 560": 55, "rx 570": 95, "rx 580": 110, "rx 590": 125,
+    "rx 5500": 100, "rx 5600": 150, "rx 5700": 190, "rx 6500": 110, "rx 6600": 220, "rx 6700": 300,
+    "rx 6800": 380, "rx 6900": 450, "rx 7600": 250, "rx 7700": 330, "rx 7800": 400, "rx 7900": 520,
+    "uhd 620": 14, "uhd 630": 16, "uhd 770": 25, "hd 4000": 6, "hd 4600": 9, "hd 520": 10, "hd 620": 12,
+    "hd 630": 14, "iris xe": 40, "arc a380": 70, "arc a580": 150, "arc a750": 190, "arc a770": 210,
+    "vega 8": 25, "vega 11": 32,
+}
+
+def _hw_gpu_scores(text):
+    """Every graphics card named in the text, as a list of scores."""
+    t = (text or "").lower().replace("geforce", " ").replace("nvidia", " ").replace("radeon", " ").replace("amd", " ")
+    t = re.sub(r"\s+", " ", t)
+    out = []
+
+    def lookup(fam, num):
+        key = f"{fam} {num}"
+        if key in _GPU_TABLE:
+            return _GPU_TABLE[key]
+        cands = [(abs(int(k.split()[1]) - int(num)), v) for k, v in _GPU_TABLE.items()
+                 if k.split()[0] == fam and k.split()[1].isdigit()]
+        return min(cands)[1] if cands else None
+    for m in re.finditer(r"\b(rtx|gtx|gts|gt)\s*(\d{3,4})\s*(ti super|ti|super)?", t):
+        s = lookup(m.group(1), m.group(2)[:-1] + "0" if len(m.group(2)) == 4 and m.group(1) != "gt" else m.group(2))
+        if s:
+            mult = {"ti": 1.15, "super": 1.12, "ti super": 1.2}.get(m.group(3) or "", 1)
+            out.append(s * mult)
+    for m in re.finditer(r"\brx\s*(\d{3,4})\s*(xt)?", t):
+        key = m.group(1)[:-2] + "00" if len(m.group(1)) == 4 else m.group(1)[:-1] + "0"
+        s = lookup("rx", key)
+        if s:
+            out.append(s * (1.15 if m.group(2) else 1))
+    for m in re.finditer(r"\b(hd|r[579])\s*(\d{3,4})(x)?\b", t):
+        if m.group(1) == "hd" and len(m.group(2)) == 3:
+            continue
+        s = lookup(m.group(1), m.group(2)[:-1] + "0" if m.group(1) != "hd" else m.group(2))
+        if s:
+            out.append(s * (1.15 if m.group(3) else 1))
+    for m in re.finditer(r"\b(uhd|hd) graphics\s*(\d{3,4})\b", t):
+        s = lookup(m.group(1), m.group(2))
+        if s:
+            out.append(s)
+    for m in re.finditer(r"\barc\s*a(\d{3})", t):
+        s = lookup("arc", "a" + m.group(1))
+        if s:
+            out.append(s)
+    if "iris xe" in t:
+        out.append(40)
+    m = re.search(r"vega\s*(\d+)", t)
+    if m:
+        out.append(25 if int(m.group(1)) <= 8 else 32)
+    if re.search(r"intel\W+(?:r\W+)?hd graphics(?!\s*\d)", t):
+        out.append(8)
+    return out
+
+def _hw_short(text, n=34):
+    text = re.sub(r"\((?:r|tm)\)|\bcpu\b|@.*|\s+", " ", text or "", flags=re.I).strip()
+    return text if len(text) <= n else text[:n - 1].rstrip() + "\u2026"
+
+def _hw_split(value):
+    return [p.strip() for p in re.split(r"\s*(?:/|;|,|\bor\b)\s*", value or "", flags=re.I) if p.strip()]
+
+def _hw_req_options(items, kind):
+    """Scores of the CPU/GPU options listed in these requirement lines, as [(score, text)]."""
+    label_rx = r"processor|cpu" if kind == "cpu" else r"graphics|video card|gpu"
+    found = []
+    for label, value in items or []:
+        if label:
+            if not re.search(label_rx, label, re.I) or re.search(r"memory|vram", label, re.I):
+                continue
+            texts = _hw_split(value)
+        else:
+            m = re.search(r"(?:" + label_rx + r")\s*:\s*(.+)", value or "", re.I)
+            if not m:
+                continue
+            texts = _hw_split(m.group(1))
+        for t in texts:
+            if kind == "cpu":
+                s = _hw_cpu_score(t)
+                if s is not None:
+                    found.append((s, t))
+            else:
+                for s in _hw_gpu_scores(t):
+                    found.append((s, t))
+    return found
+
+_hw_prev_assess = assess_requirements
+
+def assess_requirements(reqs, platforms, system):
+    verdict, color, notes = _hw_prev_assess(reqs, platforms, system)
+    mn, rc = (reqs or {}).get("minimum") or [], (reqs or {}).get("recommended") or []
+    my_cpu = _hw_cpu_score(system.get("cpu") or "")
+    my_gpus = _hw_gpu_scores(system.get("gpu") or "")
+    my_gpu = max(my_gpus) if my_gpus else None
+    problems, below_rec, checked = [], [], []
+    for kind, mine, label, shown in (("cpu", my_cpu, "processor", _hw_short(system.get("cpu") or "")),
+                                     ("gpu", my_gpu, "graphics card", "")):
+        if mine is None:
+            continue
+        low = 0.85
+        min_opts = _hw_req_options(mn, kind) or _hw_req_options(rc, kind)
+        rec_opts = _hw_req_options(rc, kind)
+        if not min_opts:
+            continue
+        need, need_txt = min(min_opts)         # any one of the listed options is enough
+        checked.append(label)
+        if mine < need * low:
+            problems.append(f"your {label} is below the minimum ({_hw_short(need_txt)})")
+        elif rec_opts and mine < min(rec_opts)[0] * low:
+            below_rec.append(label)
+    if problems:
+        base = verdict[len("May struggle: "):] if color == RED and verdict.startswith("May struggle: ") else ""
+        verdict, color = "May struggle: " + "; ".join(([base] if base else []) + problems), RED
+    elif color != RED:
+        if below_rec and color in (GREEN, None, ORANGE):
+            extra = "your " + " and ".join(below_rec) + " is below the recommended"
+            verdict = (verdict + "; " + extra) if color == ORANGE else "Should run: meets the minimum, " + extra
+            color = ORANGE
+        elif checked and color is None:
+            verdict, color = "Looks OK for " + " and ".join(checked), GREEN
+        elif checked and color == GREEN:
+            verdict = "Looks OK for RAM, storage, " + " and ".join(checked)
+    notes = [n for n in notes if not n.startswith("Only RAM and free disk")]
+    notes.insert(0, "Processor and graphics card are compared with an approximate ranking, so close calls are a guess.")
+    return verdict, color, notes
+
+
+# ================================================================ NCZ Big Picture mode
+# Full-screen Library + Store for a couch / controller. Everything is painted by ONE widget (no widget per game), it only
+# animates while something is moving, and it SLEEPS while a game runs (window hidden, controller closed, timers
+# stopped) and wakes up again when the game closes.
+# Tabs: Library (cover carousel) and Store (Steam browser: categories, search, details, add to library). LB/RB switch tabs.
+# Open it: "Big Picture" button in the Library header, Ctrl+Shift+B, or start the launcher with --bigpicture.
+from PyQt6.QtCore import QVariantAnimation, QPropertyAnimation, QEasingCurve, QSocketNotifier
+from PyQt6.QtGui import QShortcut, QLinearGradient, QFontMetrics
+
+
+class _BPInput(QObject):
+    """Controller -> 'left' 'right' 'up' 'down' 'accept' 'back' 'prev' 'next'.
+    Linux: reads /dev/input/js* with a socket notifier (zero CPU while idle). Windows: XInput, slow poll until a pad shows up."""
+    action = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fd = None
+        self._sn = None
+        self._axes = {}
+        self._dir = (0, 0)
+        self._xi = None
+        self._xi_prev = 0
+        self._rep = QTimer(self)
+        self._rep.timeout.connect(self._repeat)
+        self._scan = QTimer(self)
+        self._scan.timeout.connect(self._open_js)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._poll_xinput)
+
+    def start(self):
+        if sys.platform.startswith("win"):
+            self._poll.start(1000)
+        elif sys.platform.startswith("linux"):
+            self._open_js()
+            if self._fd is None:
+                self._scan.start(2000)
+
+    def stop(self):
+        for t in (self._rep, self._scan, self._poll):
+            t.stop()
+        self._close_js()
+        self._axes.clear()
+        self._dir = (0, 0)
+        self._xi_prev = 0
+
+    # held direction: fires once, then repeats
+    def _set_dir(self, d):
+        if d == self._dir:
+            return
+        self._dir = d
+        if d == (0, 0):
+            self._rep.stop()
+            return
+        self._emit_dir()
+        self._rep.start(380)
+
+    def _emit_dir(self):
+        dx, dy = self._dir
+        if dx:
+            self.action.emit("right" if dx > 0 else "left")
+        if dy:
+            self.action.emit("down" if dy > 0 else "up")
+
+    def _repeat(self):
+        self._rep.setInterval(110)
+        self._emit_dir()
+
+    # ---- Linux joystick API
+    def _open_js(self):
+        import glob
+        for p in sorted(glob.glob("/dev/input/js*")):
+            try:
+                fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            self._fd = fd
+            self._sn = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
+            self._sn.activated.connect(self._read_js)
+            self._scan.stop()
+            return
+
+    def _close_js(self):
+        if self._sn is not None:
+            self._sn.setEnabled(False)
+            self._sn.deleteLater()
+            self._sn = None
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def _read_js(self, *_):
+        import struct
+        while self._fd is not None:
+            try:
+                data = os.read(self._fd, 128)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+            if not data:                                   # pad unplugged: look for it again
+                self._close_js()
+                self._set_dir((0, 0))
+                self._scan.start(2000)
+                return
+            for off in range(0, len(data) - 7, 8):
+                _t, val, typ, num = struct.unpack_from("<IhBB", data, off)
+                if typ & 0x80:                             # initial-state events
+                    continue
+                if typ == 1 and val == 1:                  # button down (Xbox layout: A B X Y LB RB back start)
+                    name = {0: "accept", 1: "back", 3: "alt", 4: "prev", 5: "next", 7: "accept"}.get(num)
+                    if name:
+                        self.action.emit(name)
+                elif typ == 2:                             # axis: 0/1 left stick, 6/7 d-pad
+                    s = (val > 16000) - (val < -16000)
+                    if num in (0, 6):
+                        self._axes["x%d" % num] = s
+                    elif num in (1, 7):
+                        self._axes["y%d" % num] = s
+                    self._set_dir((self._axes.get("x6", 0) or self._axes.get("x0", 0),
+                                   self._axes.get("y7", 0) or self._axes.get("y1", 0)))
+
+    # ---- Windows XInput
+    def _poll_xinput(self):
+        import ctypes
+        if self._xi is None:
+            try:
+                try:
+                    dll = ctypes.windll.xinput1_4
+                except Exception:
+                    dll = ctypes.windll.xinput1_3
+
+                class _G(ctypes.Structure):
+                    _fields_ = [("wButtons", ctypes.c_uint16), ("lt", ctypes.c_uint8), ("rt", ctypes.c_uint8),
+                                ("lx", ctypes.c_int16), ("ly", ctypes.c_int16), ("rx", ctypes.c_int16), ("ry", ctypes.c_int16)]
+
+                class _S(ctypes.Structure):
+                    _fields_ = [("packet", ctypes.c_uint32), ("pad", _G)]
+                self._xi = (dll, _S)
+            except Exception:
+                self._poll.stop()
+                return
+        dll, S = self._xi
+        st = S()
+        if dll.XInputGetState(0, ctypes.byref(st)) != 0:   # no pad: check once a second
+            if self._poll.interval() != 1000:
+                self._poll.setInterval(1000)
+            self._xi_prev = 0
+            self._set_dir((0, 0))
+            return
+        if self._poll.interval() != 16:
+            self._poll.setInterval(16)
+        b, g = st.pad.wButtons, st.pad
+        new, self._xi_prev = b & ~self._xi_prev, b
+        for mask, name in ((0x1000, "accept"), (0x2000, "back"), (0x0100, "prev"), (0x0200, "next"), (0x0010, "accept"), (0x8000, "alt")):
+            if new & mask:
+                self.action.emit(name)
+        dx = (1 if b & 8 else -1 if b & 4 else 0) or (1 if g.lx > 16000 else -1 if g.lx < -16000 else 0)
+        dy = (1 if b & 2 else -1 if b & 1 else 0) or (-1 if g.ly > 16000 else 1 if g.ly < -16000 else 0)
+        self._set_dir((dx, dy))
+
+
+class _BPBridge(QObject):
+    changed = pyqtSignal()      # _playing_listeners are called from a worker thread; this hops to the GUI thread
+
+
+from PyQt6.QtGui import QRadialGradient
+from PyQt6.QtCore import QPointF
+
+# Store categories shown as chips in Big Picture: (label, Steam sort order, tag ids)
+_BP_CATS = (
+    ("Popular", "Reviews_DESC", ()), ("New", "Released_DESC", ()),
+    ("Action", "Reviews_DESC", (19,)), ("Adventure", "Reviews_DESC", (21,)), ("RPG", "Reviews_DESC", (122,)),
+    ("Horror", "Reviews_DESC", (1667,)), ("Co-op", "Reviews_DESC", (1685,)), ("Shooter", "Reviews_DESC", (1774,)),
+    ("Racing", "Reviews_DESC", (699,)), ("Survival", "Reviews_DESC", (1662,)), ("Puzzle", "Reviews_DESC", (1664,)),
+    ("Platformer", "Reviews_DESC", (1625,)), ("Simulation", "Reviews_DESC", (599,)),
+    ("Strategy", "Reviews_DESC", (9,)), ("Indie", "Reviews_DESC", (492,)), ("Story Rich", "Reviews_DESC", (1742,)),
+    ("Open World", "Reviews_DESC", (1695,)),
+)
+
+
+def _bp_app_details(appid):
+    """Short description / genres / release date for the store detail panel (Steam's public appdetails API)."""
+    raw = json.loads(_http_get("https://store.steampowered.com/api/appdetails?appids=%d&l=english" % appid,
+                               timeout=12).decode("utf-8", errors="replace"))
+    d = (raw.get(str(appid)) or {}).get("data") or {}
+    desc = html_lib.unescape(re.sub(r"<[^>]+>", "", d.get("short_description") or "")).strip()
+    return {"desc": desc,
+            "genres": [g.get("description", "") for g in (d.get("genres") or []) if g.get("description")],
+            "date": (d.get("release_date") or {}).get("date", ""),
+            "dev": ", ".join(d.get("developers") or [])}
+
+
+class _BigPicture(QWidget):
+    LIB_TH = 0.36           # library tile height as a fraction of the window height
+
+    def __init__(self, app):
+        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._app = app
+        self.setWindowTitle("NCZ Big Picture")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self._items, self._sel, self._pos = [], 0, 0.0
+        self._cache = {}
+        self._active = self._asleep = self._was_max = False
+        self._toast = ""
+        self._exit_rect = QRectF()
+        self._aspect = COVER_W / float(COVER_H)
+
+        # shared UI state
+        self._tab = 0                       # 0 = Library, 1 = Store
+        self._tabdir = 1
+        self._tabt = 1.0                    # tab switch animation 0..1
+        self._zone = "content"              # "tabs" | "chips" | "content"
+        self._tab_rects = []
+        self._lib_dirty = False
+
+        # store state
+        self._chip = 1                      # 0 = search box, 1.. = _BP_CATS[chip - 1]
+        self._chip_rects = []
+        self._chip_scroll = 0.0
+        self._search = ""
+        self._sitems, self._sbyid, self._spix = [], {}, {}
+        self._ssel, self._sscroll = 0, 0.0
+        self._stotal = self._snext = self._sreq = 0
+        self._sloading = self._sexhausted = self._sstarted = False
+        self._serror = ""
+        self._workers = []
+        self._details = {}                  # appid -> info dict (or {} while loading / failed)
+        self._detail = None                 # open detail panel: {"item": store item}
+        self._detail_btn = 0
+        self._detail_rects = []
+
+        # backdrop (blurred art of whatever is selected)
+        self._bg_key, self._bg_cur, self._bg_prev, self._bg_t = None, None, None, 1.0
+
+        self._loader = CoverLoader()
+        self._loader.loaded.connect(self._on_cover)
+        self._loader.nsfw_known.connect(self._on_nsfw)
+        QApplication.instance().aboutToQuit.connect(self._loader.shutdown)
+
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(240)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+        self._sanim = QVariantAnimation(self)
+        self._sanim.setDuration(220)
+        self._sanim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._sanim.valueChanged.connect(self._on_sanim)
+        self._tanim = QVariantAnimation(self)
+        self._tanim.setDuration(260)
+        self._tanim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._tanim.valueChanged.connect(self._on_tanim)
+        self._banim = QVariantAnimation(self)
+        self._banim.setDuration(350)
+        self._banim.valueChanged.connect(self._on_banim)
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(180)
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(self.update)
+        self._toast_t = QTimer(self)
+        self._toast_t.setSingleShot(True)
+        self._toast_t.timeout.connect(lambda: self._say(""))
+        self._stimer = QTimer(self)             # search-as-you-type debounce
+        self._stimer.setSingleShot(True)
+        self._stimer.setInterval(600)
+        self._stimer.timeout.connect(self._store_reset)
+        self._wheel = 0
+
+        self._input = _BPInput(self)
+        self._input.action.connect(self._act)
+        self._bridge = _BPBridge(self)
+        self._bridge.changed.connect(self._on_playing)
+        _playing_listeners.append(self._bridge.changed.emit)
+
+    # ---------------------------------------------------------------- open / close / sleep
+    def enter(self):
+        if not self._active:
+            self._was_max = self._app.isMaximized()
+        self._active, self._asleep = True, False
+        self._loader.set_key(get_steamgriddb_key())
+        self._refresh()
+        self._app.hide()
+        self._show_awake()
+        if self._tab == 1 and not self._sstarted:
+            self._store_reset()
+
+    def leave(self, show_main=True):
+        self._active = self._asleep = False
+        self._stop_awake()
+        self._loader.cancel_pending()
+        self._spix.clear()
+        self._cache.clear()
+        self._detail = None
+        self.hide()
+        if show_main:
+            self._app.showMaximized() if self._was_max else self._app.showNormal()
+            self._app.raise_()
+            self._app.activateWindow()
+
+    def _show_awake(self):
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self.setWindowOpacity(0.0)
+        self.showFullScreen()
+        self._fade.stop()
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        self._input.start()
+        self._clock.start(60000)
+        self._sync_bg(animate=False)
+
+    def _stop_awake(self):
+        self._input.stop()
+        self._clock.stop()
+        for a in (self._anim, self._sanim, self._tanim, self._banim, self._fade):
+            a.stop()
+        self._stimer.stop()
+        self._toast_t.stop()
+        self._toast = ""
+        self._tabt = self._bg_t = 1.0
+
+    def _on_playing(self):
+        playing = bool(_now_playing.get("name"))
+        if not self._active:
+            return
+        if playing and not self._asleep:        # a game started: sleep (nothing runs while you play)
+            self._asleep = True
+            self._stop_awake()
+            self._loader.cancel_pending()
+            self.hide()
+        elif not playing and self._asleep:      # the game closed: wake up
+            self._asleep = False
+            self._refresh()
+            self._show_awake()
+
+    # ---------------------------------------------------------------- library data (read straight from the library cards)
+    def _refresh(self):
+        keep = self._items[self._sel]["card"] if self._items and self._sel < len(self._items) else None
+        cards, seen, items = list(getattr(self._app, "cards", [])), set(), []
+        fan = getattr(self._app, "fan_lib_cards", None)
+        if isinstance(fan, dict):
+            cards += [(c, None) for c in fan.values()]
+        for card, title in cards:
+            if id(card) in seen:
+                continue
+            seen.add(id(card))
+            try:
+                lab = card.findChild(QLabel, "CardTitle")
+                title = title or (lab.text() if lab else "") or "Game"
+                btn = card.findChild(QPushButton, "Primary")
+                if btn is None:
+                    btn = next((b for b in card.findChildren(QPushButton) if b.objectName() != "MoreButton"), None)
+                st = card.findChild(QLabel, "CardStatus")
+                pix = None
+                for l in card.findChildren(QLabel):
+                    pm = l.pixmap()
+                    if pm is not None and not pm.isNull() and l.width() >= 100:
+                        pix = pm
+                        break
+                items.append({"card": card, "title": title, "btn": btn, "pix": pix,
+                              "status": st.text() if st else "", "action": btn.text().strip() if btn else ""})
+            except RuntimeError:                # card was deleted
+                continue
+        items.sort(key=lambda i: 0 if i["action"].lower() in ("play", "launch", "open") else 1)   # playable first
+        self._items = items
+        self._cache.clear()
+        self._sel = next((n for n, i in enumerate(items) if i["card"] is keep), 0)
+        self._pos = float(self._sel)
+        self._lib_dirty = False
+
+    def _say(self, text, ms=0):
+        self._toast = text
+        self._toast_t.stop()
+        if text and ms:
+            self._toast_t.start(ms)
+        self.update()
+
+    # ---------------------------------------------------------------- store data
+    def _store_params(self):
+        label, sort, tags = _BP_CATS[max(0, self._chip - 1)]
+        if self._search:
+            return self._search, "_ASC", ()
+        return "", sort, tags
+
+    def _store_reset(self):
+        self._stimer.stop()
+        self._sstarted = True
+        self._sreq += 1
+        self._loader.cancel_pending()
+        self._sitems, self._sbyid = [], {}
+        self._spix.clear()
+        self._ssel, self._sscroll = 0, 0.0
+        self._sanim.stop()
+        self._stotal = self._snext = 0
+        self._sloading = self._sexhausted = False
+        self._serror = ""
+        self._store_load_page()
+        self._sync_bg()
+        self.update()
+
+    def _store_load_page(self):
+        if self._sloading or self._sexhausted:
+            return
+        self._sloading, self._serror = True, ""
+        rid, start = self._sreq, self._snext
+        term, sort, tags = self._store_params()
+
+        def work():
+            try:
+                games, total = fetch_steam_games(term, start, tags=list(tags) or None, sort_by=sort)
+                return (rid, start, games, total, "")
+            except Exception as e:
+                return (rid, start, [], 0, str(e) or e.__class__.__name__)
+        worker = TaskWorker(work)
+        worker.done.connect(self._on_spage)
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+        self.update()
+
+    def _on_spage(self, result):
+        rid, start, games, total, error = result
+        if rid != self._sreq or not self._active:
+            return
+        self._sloading = False
+        if error:
+            self._serror = "Couldn't reach Steam. Press A to retry." if not self._sitems else "Couldn't load more games."
+            self.update()
+            return
+        self._stotal = total
+        for appid, title, img_base in games:
+            if appid in self._sbyid:
+                continue
+            it = {"appid": appid, "title": title, "path": "", "nsfw": False, "done": False}
+            self._sbyid[appid] = it
+            self._sitems.append(it)
+            self._loader.request(appid, img_base, title)
+        self._snext = start + STORE_PAGE_SIZE
+        if not games or self._snext >= total:
+            self._sexhausted = True
+        self._sync_bg()
+        self.update()
+
+    def _on_cover(self, appid, path):
+        it = self._sbyid.get(appid)
+        if it is None:
+            return
+        it["path"], it["done"] = path or "", True
+        self._spix.pop(appid, None)
+        if self._tab == 1:
+            if self._sitems and self._sitems[min(self._ssel, len(self._sitems) - 1)] is it:
+                self._sync_bg()
+            self.update()
+
+    def _on_nsfw(self, appid, flag):
+        it = self._sbyid.get(appid)
+        if it is not None:
+            it["nsfw"] = bool(flag)
+
+    def _load_details(self, appid):
+        if appid in self._details:
+            return
+        self._details[appid] = {}
+
+        def work():
+            try:
+                return (appid, _bp_app_details(appid))
+            except Exception:
+                return (appid, None)
+        worker = TaskWorker(work)
+        worker.done.connect(self._on_details)
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+
+    def _on_details(self, res):
+        appid, info = res
+        if info is None:
+            self._details.pop(appid, None)      # try again next time it is opened
+        else:
+            self._details[appid] = info
+        self.update()
+
+    # ---------------------------------------------------------------- animation callbacks
+    def _on_anim(self, v):
+        self._pos = float(v)
+        self.update()
+
+    def _on_sanim(self, v):
+        self._sscroll = float(v)
+        self.update()
+
+    def _on_tanim(self, v):
+        self._tabt = float(v)
+        self.update()
+
+    def _on_banim(self, v):
+        self._bg_t = float(v)
+        self.update()
+
+    # ---------------------------------------------------------------- backdrop
+    def _current_art(self):
+        if self._tab == 0:
+            if self._items and 0 <= self._sel < len(self._items):
+                it = self._items[self._sel]
+                return ("lib", it["title"]), it["pix"]
+        elif self._sitems and 0 <= self._ssel < len(self._sitems):
+            it = self._sitems[self._ssel]
+            if it["path"] and not (it["nsfw"] and not nsfw_revealed()):
+                pm = QPixmap(it["path"])
+                if not pm.isNull():
+                    return ("store", it["appid"]), pm
+            return ("store", it["appid"]), None
+        return None, None
+
+    def _sync_bg(self, animate=True):
+        key, pix = self._current_art()
+        if key == self._bg_key and (pix is None) == (self._bg_cur is None):
+            return
+        small = None
+        if pix is not None and not pix.isNull():     # shrink twice = soft blur, tiny in memory
+            small = pix.scaled(48, 72, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            small = small.scaled(16, 24, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._bg_prev, self._bg_cur, self._bg_key = self._bg_cur, small, key
+        self._banim.stop()
+        if animate and self.isVisible():
+            self._bg_t = 0.0
+            self._banim.setStartValue(0.0)
+            self._banim.setEndValue(1.0)
+            self._banim.start()
+        else:
+            self._bg_t = 1.0
+        self.update()
+
+    # ---------------------------------------------------------------- navigation
+    def _switch_tab(self, t):
+        t %= 2
+        if t == self._tab:
+            return
+        self._tabdir = 1 if t > self._tab else -1
+        self._tab = t
+        self._zone = "content"
+        if t == 0 and self._lib_dirty:
+            self._refresh()
+        if t == 1 and not self._sstarted:
+            self._store_reset()
+        self._tabt = 0.0
+        self._tanim.stop()
+        self._tanim.setStartValue(0.0)
+        self._tanim.setEndValue(1.0)
+        self._tanim.start()
+        self._sync_bg()
+        self.update()
+
+    def _move_to(self, i):
+        if not self._items:
+            return
+        i = max(0, min(len(self._items) - 1, i))
+        if i == self._sel:
+            return
+        self._sel = i
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(float(i))
+        self._anim.start()
+        for k in [k for k in self._cache if abs(k - i) > 8]:      # keep memory small
+            del self._cache[k]
+        self._sync_bg()
+        self.update()
+
+    def _store_move(self, i):
+        n = len(self._sitems)
+        if not n:
+            return
+        i = max(0, min(n - 1, i))
+        self._ssel = i
+        self._scroll_to_sel()
+        if i >= n - self._grid_geom()[4] * 2:       # near the end: fetch the next page
+            self._store_load_page()
+        for k in [k for k in self._spix if k not in {x["appid"] for x in self._sitems[max(0, i - 80):i + 80]}]:
+            del self._spix[k]
+        self._sync_bg()
+        self.update()
+
+    def _scroll_to_sel(self):
+        _m, gap, _tw, th, cols, _x0, top, bottom, pad = self._grid_geom()
+        row = self._ssel // cols
+        row_top = row * (th + gap)
+        view_h = bottom - top - 2 * pad
+        target = self._sscroll
+        if row_top < self._sscroll:
+            target = row_top
+        elif row_top + th > self._sscroll + view_h:
+            target = row_top + th - view_h
+        total_rows = (len(self._sitems) + cols - 1) // cols
+        target = max(0.0, min(target, max(0.0, total_rows * (th + gap) - gap - view_h)))
+        if abs(target - self._sscroll) > 0.5:
+            self._sanim.stop()
+            self._sanim.setStartValue(self._sscroll)
+            self._sanim.setEndValue(float(target))
+            self._sanim.start()
+
+    def _launch(self):
+        if not self._items:
+            return
+        it = self._items[self._sel]
+        btn = it["btn"]
+        if btn is None or not btn.isEnabled():
+            self._say("Not available right now", 2500)
+            return
+        if btn.text().strip().lower() in ("play", "launch", "open"):
+            self._say("Launching %s..." % it["title"], 20000)    # sleeps by itself once the game is running
+            btn.click()
+        else:                                                     # Install / Update / etc. need the normal launcher
+            self.leave(True)
+            btn.click()
+
+    # ---------------------------------------------------------------- store detail panel
+    def _in_library(self, appid):
+        return appid in getattr(self._app, "steam_cards", {})
+
+    def _open_detail(self, i):
+        if not (0 <= i < len(self._sitems)):
+            return
+        self._detail = {"item": self._sitems[i]}
+        self._detail_btn = 0
+        self._load_details(self._sitems[i]["appid"])
+        self.update()
+
+    def _detail_primary(self):
+        it = self._detail["item"]
+        if self._in_library(it["appid"]):
+            card = self._app.steam_cards.get(it["appid"])
+            self._detail = None
+            self._switch_tab(0)
+            if self._lib_dirty:
+                self._refresh()
+            for n, li in enumerate(self._items):
+                if li["card"] is card:
+                    self._sel = n
+                    self._pos = float(n)
+                    self._cache.clear()
+                    self._sync_bg(animate=False)
+                    break
+            self.update()
+            return
+        try:
+            self._app.add_steam_game(it["appid"], it["title"], it["path"])
+            self._lib_dirty = True
+            self._say("Added %s to your library" % it["title"], 3000)
+        except Exception as ex:
+            self._say("Couldn't add game: %s" % ex, 4000)
+        self.update()
+
+    def _detail_act(self, name):
+        if name == "back":
+            self._detail = None
+        elif name in ("left", "right", "up", "down"):
+            self._detail_btn = 1 - self._detail_btn
+        elif name == "accept":
+            if self._detail_btn == 0:
+                self._detail_primary()
+                return
+            self._detail = None
+        self.update()
+
+    # ---------------------------------------------------------------- input
+    def _chip_count(self):
+        return 1 + len(_BP_CATS)
+
+    def _act(self, name):
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        if self._detail is not None:
+            self._detail_act(name)
+            return
+        if name == "prev":
+            self._switch_tab(self._tab - 1)
+            return
+        if name == "next":
+            self._switch_tab(self._tab + 1)
+            return
+        if name == "back":
+            if self._tab == 1:                              # Store -> clear the search first, then go back to Library
+                if self._search:
+                    self._search = ""
+                    self._store_reset()
+                else:
+                    self._switch_tab(0)
+            else:
+                self.leave(True)
+            return
+        if name == "alt":
+            if self._tab == 1:
+                self._zone, self._chip = "chips", 0
+                self._say("Type to search, Enter to go", 3000)
+            return
+        z = self._zone
+        if z == "tabs":
+            if name in ("left", "right"):
+                self._switch_tab(self._tab + (1 if name == "right" else -1))
+                self._zone = "tabs"
+            elif name == "down":
+                self._zone = "chips" if self._tab == 1 else "content"
+            self.update()
+        elif z == "chips":
+            if name == "left":
+                self._chip = max(0, self._chip - 1)
+            elif name == "right":
+                self._chip = min(self._chip_count() - 1, self._chip + 1)
+            elif name == "up":
+                self._zone = "tabs"
+            elif name == "down":
+                if self._sitems:
+                    self._zone = "content"
+            elif name == "accept":
+                self._chip_accept()
+            self.update()
+        elif self._tab == 0:
+            if name == "left":
+                self._move_to(self._sel - 1)
+            elif name == "right":
+                self._move_to(self._sel + 1)
+            elif name == "up":
+                self._zone = "tabs"
+                self.update()
+            elif name == "accept":
+                self._launch()
+        else:
+            cols = self._grid_geom()[4]
+            if name == "left":
+                self._store_move(self._ssel - 1)
+            elif name == "right":
+                self._store_move(self._ssel + 1)
+            elif name == "down":
+                self._store_move(self._ssel + cols)
+            elif name == "up":
+                if self._ssel < cols:
+                    self._zone = "chips"
+                    self.update()
+                else:
+                    self._store_move(self._ssel - cols)
+            elif name == "accept":
+                if self._sitems:
+                    self._open_detail(self._ssel)
+                elif self._serror:
+                    self._store_reset()
+
+    def _chip_accept(self):
+        if self._chip == 0:
+            if self._search:
+                self._store_reset()
+            elif sys.platform.startswith("win"):
+                try:
+                    subprocess.Popen(["osk.exe"])
+                except Exception:
+                    pass
+            self._say("Type on your keyboard to search", 2500)
+            return
+        self._search = ""
+        self._store_reset()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        K = Qt.Key
+        if self._detail is not None:
+            if k in (K.Key_Left, K.Key_Right, K.Key_Up, K.Key_Down, K.Key_Tab):
+                self._detail_act("left")
+            elif k in (K.Key_Return, K.Key_Enter, K.Key_Space):
+                self._detail_act("accept")
+            elif k in (K.Key_Escape, K.Key_Backspace):
+                self._detail_act("back")
+            return
+        if k == K.Key_Tab:
+            self._switch_tab(self._tab + 1)
+            return
+        typing = (self._tab == 1 and self._zone == "chips" and self._chip == 0)
+        if self._tab == 1 and (k == K.Key_Backspace) and self._search:
+            self._search = self._search[:-1]
+            self._stimer.start()
+            self._chip = 0
+            self.update()
+            return
+        if self._tab == 1 and k == K.Key_Slash:
+            self._zone, self._chip = "chips", 0
+            self.update()
+            return
+        if k == K.Key_Left or (k == K.Key_A and self._tab == 0):
+            self._act("left")
+        elif k == K.Key_Right or (k == K.Key_D and self._tab == 0):
+            self._act("right")
+        elif k == K.Key_Up:
+            self._act("up")
+        elif k == K.Key_Down:
+            self._act("down")
+        elif k == K.Key_PageUp:
+            self._page(-1)
+        elif k == K.Key_PageDown:
+            self._page(1)
+        elif k == K.Key_Home:
+            self._move_to(0) if self._tab == 0 else self._store_move(0)
+        elif k == K.Key_End:
+            self._move_to(len(self._items) - 1) if self._tab == 0 else self._store_move(len(self._sitems) - 1)
+        elif k in (K.Key_Return, K.Key_Enter) or (k == K.Key_Space and not typing):
+            if self._tab == 1 and self._search and self._zone == "chips":
+                self._store_reset()
+            else:
+                self._act("accept")
+        elif k in (K.Key_Escape, K.Key_F11) or (k == K.Key_Backspace and not self._search):
+            self._act("back")
+        elif self._tab == 0 and e.text().isalnum() and self._items:      # type a letter: jump to the next game starting with it
+            ch, n = e.text().lower(), len(self._items)
+            for step in range(1, n + 1):
+                j = (self._sel + step) % n
+                if self._items[j]["title"].lower().startswith(ch):
+                    self._move_to(j)
+                    break
+        elif self._tab == 1 and e.text() and e.text().isprintable():     # Store: any typing is a search
+            self._search += e.text()
+            self._zone, self._chip = "chips", 0
+            self._stimer.start()
+            self.update()
+
+    def _page(self, d):
+        if self._tab == 0:
+            self._move_to(self._sel + 5 * d)
+        else:
+            cols = self._grid_geom()[4]
+            self._store_move(self._ssel + cols * 3 * d)
+
+    def closeEvent(self, e):
+        e.ignore()
+        self.leave(True)
+
+    # ---------------------------------------------------------------- geometry
+    def _tile_rect(self, i):
+        h, w = self.height(), self.width()
+        th = h * self.LIB_TH
+        tw = th * self._aspect
+        d = i - self._pos
+        s = 1 + 0.22 * max(0.0, 1 - abs(d))
+        cx, cy = w / 2 + d * tw * 1.25, h * 0.43
+        return QRectF(cx - tw * s / 2, cy - th * s / 2, tw * s, th * s)
+
+    def _grid_geom(self):
+        w, h = self.width(), self.height()
+        m = w * 0.05
+        gap = h * 0.022
+        th = h * 0.27
+        tw = th * self._aspect
+        cols = max(2, int((w - 2 * m + gap) // (tw + gap)))
+        gw = cols * tw + (cols - 1) * gap
+        x0 = (w - gw) / 2
+        top, bottom = h * 0.245, h * 0.86
+        pad = th * 0.06
+        return m, gap, tw, th, cols, x0, top, bottom, pad
+
+    def _srect(self, i):
+        _m, gap, tw, th, cols, x0, top, _b, pad = self._grid_geom()
+        row, col = divmod(i, cols)
+        return QRectF(x0 + col * (tw + gap), top + pad + row * (th + gap) - self._sscroll, tw, th)
+
+    # ---------------------------------------------------------------- mouse
+    def mouseMoveEvent(self, e):
+        if self.cursor().shape() != Qt.CursorShape.ArrowCursor:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, e):
+        pt = e.position()
+        if self._detail is not None:
+            for n, r in enumerate(self._detail_rects):
+                if r.contains(pt):
+                    self._detail_btn = n
+                    self._detail_act("accept")
+                    return
+            self._detail = None
+            self.update()
+            return
+        if self._exit_rect.contains(pt):
+            self.leave(True)
+            return
+        for n, r in enumerate(self._tab_rects):
+            if r.contains(pt):
+                self._zone = "content"
+                self._switch_tab(n)
+                return
+        if self._tab == 0:
+            best = None
+            for i in range(len(self._items)):
+                if self._tile_rect(i).contains(pt) and (best is None or abs(i - self._pos) < abs(best - self._pos)):
+                    best = i
+            if best is None:
+                return
+            if best == self._sel:
+                self._launch()
+            else:
+                self._move_to(best)
+            return
+        for n, r in enumerate(self._chip_rects):
+            if r.contains(pt):
+                self._zone, self._chip = "chips", n
+                self._chip_accept()
+                self.update()
+                return
+        _m, _g, _tw, _th, _c, _x, top, bottom, _p = self._grid_geom()
+        if top <= pt.y() <= bottom:
+            for i in range(len(self._sitems)):
+                if self._srect(i).contains(pt):
+                    self._zone = "content"
+                    if i == self._ssel:
+                        self._open_detail(i)
+                    else:
+                        self._store_move(i)
+                    return
+
+    def wheelEvent(self, e):
+        if self._detail is not None:
+            return
+        self._wheel += e.angleDelta().y() + e.angleDelta().x()
+        while abs(self._wheel) >= 120:
+            d = -1 if self._wheel > 0 else 1
+            if self._tab == 0:
+                self._move_to(self._sel + d)
+            else:
+                self._store_move(self._ssel + d * self._grid_geom()[4])
+            self._wheel -= 120 if self._wheel > 0 else -120
+
+    # ---------------------------------------------------------------- painting helpers
+    def resizeEvent(self, e):
+        self._cache.clear()
+        self._spix.clear()
+
+    def _font(self, px, bold=False):
+        f = QFont(self.font())
+        f.setPixelSize(max(9, int(px)))
+        f.setBold(bold)
+        return f
+
+    def _make_tile(self, src, title, W, H, dpr):
+        out = QPixmap(max(int(W * dpr), 8), max(int(H * dpr), 8))
+        out.fill(Qt.GlobalColor.transparent)
+        q = QPainter(out)
+        q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.TextAntialiasing)
+        pw, ph = out.width(), out.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, pw, ph), pw * 0.05, pw * 0.05)
+        q.setClipPath(path)
+        if src is not None and not src.isNull():
+            sc = src.scaled(pw, ph, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            q.drawPixmap((pw - sc.width()) // 2, (ph - sc.height()) // 2, sc)
+        else:
+            g = QLinearGradient(0, 0, pw, ph)
+            g.setColorAt(0, QColor(60, 50, 90))
+            g.setColorAt(1, QColor(25, 20, 45))
+            q.fillRect(0, 0, pw, ph, g)
+            f = QFont(self.font())
+            f.setPixelSize(max(10, int(pw * 0.11)))
+            f.setBold(True)
+            q.setFont(f)
+            q.setPen(QColor(230, 230, 245))
+            q.drawText(QRectF(pw * 0.08, 0, pw * 0.84, ph), int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap), title)
+        q.end()
+        out.setDevicePixelRatio(dpr)
+        return out
+
+    def _tile_pix(self, i):
+        pm = self._cache.get(i)
+        if pm is not None:
+            return pm
+        th = self.height() * self.LIB_TH * 1.15
+        pm = self._make_tile(self._items[i]["pix"], self._items[i]["title"], th * self._aspect, th, self.devicePixelRatioF())
+        self._cache[i] = pm
+        return pm
+
+    def _store_src(self, it, w, h):
+        if not it["path"]:
+            return None
+        if it["nsfw"] and not nsfw_revealed():
+            return rounded_cover_pixmap(it["path"], int(w), int(h), 0, blur=True)
+        pm = QPixmap(it["path"])
+        return pm if not pm.isNull() else None
+
+    def _store_pix(self, it, tw, th):
+        pm = self._spix.get(it["appid"])
+        if pm is None:
+            pm = self._make_tile(self._store_src(it, tw, th), it["title"], tw * 1.08, th * 1.08, self.devicePixelRatioF())
+            self._spix[it["appid"]] = pm
+        return pm
+
+    # ---------------------------------------------------------------- painting
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.TextAntialiasing)
+        w, h = self.width(), self.height()
+        acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        bg = QLinearGradient(0, 0, 0, h)
+        bg.setColorAt(0, QColor(9, 9, 16))
+        bg.setColorAt(1, QColor(12 + acc.red() // 7, 10 + acc.green() // 9, 20 + acc.blue() // 6))
+        p.fillRect(self.rect(), bg)
+
+        # blurred art of the selected game, crossfaded, with a dark fade so text stays readable
+        for pm, op in ((self._bg_prev, (1 - self._bg_t) * 0.55), (self._bg_cur, self._bg_t * 0.55)):
+            if pm is not None and op > 0.01:
+                p.setOpacity(op)
+                p.drawPixmap(QRectF(-w * 0.05, -h * 0.05, w * 1.1, h * 1.1), pm, QRectF(pm.rect()))
+        p.setOpacity(1.0)
+        fade = QLinearGradient(0, 0, 0, h)
+        fade.setColorAt(0.0, QColor(6, 6, 12, 150))
+        fade.setColorAt(0.45, QColor(6, 6, 12, 120))
+        fade.setColorAt(1.0, QColor(6, 6, 12, 235))
+        p.fillRect(self.rect(), fade)
+
+        m = w * 0.05
+        self._paint_header(p, w, h, m, acc)
+
+        k = max(0.0, min(1.0, self._tabt))
+        p.save()
+        p.translate((1 - k) * self._tabdir * w * 0.04, 0)
+        if self._tab == 0:
+            self._paint_library(p, w, h, m, acc, k)
+        else:
+            self._paint_store(p, w, h, m, acc, k)
+        p.restore()
+        p.setOpacity(1.0)
+
+        self._paint_footer(p, w, h, m)
+        if self._detail is not None:
+            self._paint_detail(p, w, h, acc)
+        if self._toast:
+            p.setFont(self._font(h * 0.026, True))
+            tw_ = QFontMetrics(p.font()).horizontalAdvance(self._toast) + h * 0.08
+            box = QRectF(w / 2 - tw_ / 2, h * 0.88 if self._detail is None else h * 0.9, tw_, h * 0.06)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 200))
+            p.drawRoundedRect(box, h * 0.03, h * 0.03)
+            p.setPen(QColor(245, 245, 252))
+            p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), self._toast)
+        p.end()
+
+    def _paint_header(self, p, w, h, m, acc):
+        al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        al_c = int(Qt.AlignmentFlag.AlignCenter)
+        p.setFont(self._font(h * 0.03, True))
+        p.setPen(QColor(240, 240, 250))
+        p.drawText(QRectF(m, h * 0.035, w * 0.2, h * 0.07), al_l, "NCZ")
+
+        # tab bar (centered pill)
+        labels = ("Library", "Store")
+        tf = self._font(h * 0.026, True)
+        fm = QFontMetrics(tf)
+        bw = max(fm.horizontalAdvance(t) for t in labels) + h * 0.07
+        bh = h * 0.058
+        total = bw * len(labels) + h * 0.012
+        x0, y0 = (w - total) / 2, h * 0.041
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 22))
+        p.drawRoundedRect(QRectF(x0, y0, total, bh + h * 0.012), (bh + h * 0.012) / 2, (bh + h * 0.012) / 2)
+        self._tab_rects = []
+        for n, t in enumerate(labels):
+            r = QRectF(x0 + h * 0.006 + n * bw, y0 + h * 0.006, bw, bh)
+            self._tab_rects.append(r)
+            if n == self._tab:
+                p.setBrush(acc)
+                p.drawRoundedRect(r, bh / 2, bh / 2)
+                if self._zone == "tabs":
+                    p.setPen(QPen(QColor(255, 255, 255, 230), max(2.0, h * 0.004)))
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    g = h * 0.005
+                    p.drawRoundedRect(r.adjusted(-g, -g, g, g), (bh + 2 * g) / 2, (bh + 2 * g) / 2)
+                    p.setPen(Qt.PenStyle.NoPen)
+                p.setPen(QColor(_on_accent()))
+            else:
+                p.setPen(QColor(200, 200, 220))
+            p.setFont(tf)
+            p.drawText(r, al_c, t)
+            p.setPen(Qt.PenStyle.NoPen)
+
+        # clock + exit
+        p.setFont(self._font(h * 0.026))
+        p.setPen(QColor(200, 200, 220))
+        p.drawText(QRectF(w - m - w * 0.07, h * 0.04, w * 0.07, h * 0.06), al_r, time.strftime("%H:%M"))
+        self._exit_rect = QRectF(w - m - w * 0.07 - h * 0.17, h * 0.047, h * 0.15, h * 0.046)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 28))
+        p.drawRoundedRect(self._exit_rect, h * 0.023, h * 0.023)
+        p.setFont(self._font(h * 0.02))
+        p.setPen(QColor(220, 220, 235))
+        p.drawText(self._exit_rect, al_c, "Exit")
+
+    def _paint_footer(self, p, w, h, m):
+        al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if self._detail is not None:
+            hint = "Left / Right  Choose      A / Enter  Select      B / Esc  Close"
+        elif self._tab == 0:
+            hint = "Left / Right  Browse      A / Enter  Launch      LB / RB  Store      B / Esc  Exit      Type a letter to jump"
+        else:
+            hint = "Arrows  Browse      A / Enter  Details      Y or type  Search      LB / RB  Library      B / Esc  Back"
+        p.setFont(self._font(h * 0.0185))
+        p.setPen(QColor(150, 150, 175))
+        p.drawText(QRectF(m, h * 0.93, w * 0.78, h * 0.04), al_l, hint)
+        if self._detail is None:
+            n, sel = (len(self._items), self._sel) if self._tab == 0 else (len(self._sitems), self._ssel)
+            if n:
+                txt = "%d / %d" % (sel + 1, n)
+                if self._tab == 1 and self._stotal:
+                    txt += "  (%s on Steam)" % format(self._stotal, ",")
+                p.drawText(QRectF(w - m - w * 0.22, h * 0.93, w * 0.22, h * 0.04), al_r, txt)
+
+    def _paint_library(self, p, w, h, m, acc, k):
+        al_c = int(Qt.AlignmentFlag.AlignCenter)
+        n = len(self._items)
+        if n == 0:
+            p.setOpacity(k)
+            p.setFont(self._font(h * 0.035))
+            p.setPen(QColor(200, 200, 220))
+            p.drawText(self.rect(), al_c, "No games in your library yet\nOpen the Store tab to add some")
+            return
+        content_on = self._zone != "tabs"
+        span = int(w / (h * self.LIB_TH * self._aspect * 1.25)) // 2 + 2
+        lo, hi = max(0, int(self._pos) - span), min(n - 1, int(self._pos) + span)
+        for i in sorted(range(lo, hi + 1), key=lambda q: -abs(q - self._pos)):
+            r = self._tile_rect(i)
+            if r.right() < 0 or r.left() > w:
+                continue
+            near = max(0.0, 1 - abs(i - self._pos))
+            if near > 0.05:                              # soft accent glow under the selected tile
+                glow = QRadialGradient(r.center().x(), r.bottom(), r.width() * 0.9)
+                gc = QColor(acc)
+                gc.setAlphaF(0.35 * near * k)
+                glow.setColorAt(0, gc)
+                gc.setAlpha(0)
+                glow.setColorAt(1, gc)
+                p.setOpacity(1.0)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(glow)
+                p.drawEllipse(QPointF(r.center().x(), r.bottom()), r.width() * 0.9, r.width() * 0.3)
+            p.setOpacity(k * (0.5 + 0.5 * near))
+            if near > 0 and content_on:
+                ring = QColor(acc)
+                ring.setAlphaF(near)
+                p.setPen(QPen(ring, max(2.0, h * 0.005)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                gap = h * 0.008
+                p.drawRoundedRect(r.adjusted(-gap, -gap, gap, gap), r.width() * 0.06, r.width() * 0.06)
+            pm = self._tile_pix(i)
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            # mirror reflection, fading out
+            if near > 0.5:
+                refl = QRectF(r.left(), r.bottom() + h * 0.008, r.width(), r.height() * 0.16)
+                p.save()
+                p.setClipRect(refl)
+                p.translate(0, r.bottom() * 2 + h * 0.008)
+                p.scale(1, -1)
+                p.setOpacity(k * 0.16 * near)
+                p.drawPixmap(r, pm, QRectF(pm.rect()))
+                p.restore()
+        p.setOpacity(k)
+
+        it = self._items[self._sel]
+        f = self._font(h * 0.05, True)
+        p.setFont(f)
+        p.setPen(QColor(245, 245, 252))
+        title = QFontMetrics(f).elidedText(it["title"], Qt.TextElideMode.ElideRight, int(w * 0.7))
+        p.drawText(QRectF(0, h * 0.70, w, h * 0.07), al_c, title)
+        p.setFont(self._font(h * 0.022))
+        p.setPen(QColor(170, 170, 195))
+        p.drawText(QRectF(0, h * 0.77, w, h * 0.035), al_c, it["status"])
+        if it["action"]:
+            pill = QRectF(w / 2 - h * 0.14, h * 0.82, h * 0.28, h * 0.065)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(acc)
+            p.drawRoundedRect(pill, h * 0.032, h * 0.032)
+            p.setFont(self._font(h * 0.028, True))
+            p.setPen(QColor(_on_accent()))
+            p.drawText(pill, al_c, it["action"])
+
+    def _paint_chips(self, p, w, h, m, acc, k):
+        al_c = int(Qt.AlignmentFlag.AlignCenter)
+        al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        ch = h * 0.05
+        y = h * 0.165
+        gap = h * 0.014
+        cf = self._font(h * 0.021, True)
+        fm = QFontMetrics(cf)
+        widths = [w * 0.2] + [fm.horizontalAdvance(c[0]) + h * 0.05 for c in _BP_CATS]
+        xs, x = [], 0.0
+        for cw in widths:
+            xs.append(x)
+            x += cw + gap
+        view_w = w - 2 * m
+        sel_l, sel_r = xs[self._chip], xs[self._chip] + widths[self._chip]
+        target = self._chip_scroll
+        if sel_l < target:
+            target = sel_l
+        elif sel_r > target + view_w:
+            target = sel_r - view_w
+        self._chip_scroll += (target - self._chip_scroll) * 0.35
+        if abs(target - self._chip_scroll) > 0.5:
+            QTimer.singleShot(16, self.update)
+        else:
+            self._chip_scroll = target
+        p.save()
+        p.setClipRect(QRectF(m - h * 0.01, y - h * 0.01, view_w + h * 0.02, ch + h * 0.02))
+        self._chip_rects = []
+        focus = self._zone == "chips"
+        for n, cw in enumerate(widths):
+            r = QRectF(m + xs[n] - self._chip_scroll, y, cw, ch)
+            self._chip_rects.append(r)
+            if r.right() < 0 or r.left() > w:
+                continue
+            active = (n == 0 and bool(self._search)) or (n == self._chip and n != 0 and not self._search)
+            p.setOpacity(k)
+            p.setPen(Qt.PenStyle.NoPen)
+            if active:
+                p.setBrush(acc)
+            else:
+                p.setBrush(QColor(255, 255, 255, 26))
+            p.drawRoundedRect(r, ch / 2, ch / 2)
+            if focus and n == self._chip:
+                p.setPen(QPen(QColor(255, 255, 255, 230), max(2.0, h * 0.004)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                g = h * 0.004
+                p.drawRoundedRect(r.adjusted(-g, -g, g, g), (ch + 2 * g) / 2, (ch + 2 * g) / 2)
+            p.setFont(cf)
+            p.setPen(QColor(_on_accent()) if active else QColor(215, 215, 232))
+            if n == 0:
+                txt = (self._search + ("|" if focus and self._chip == 0 else "")) if (self._search or (focus and self._chip == 0)) else "Search"
+                txt = QFontMetrics(cf).elidedText(txt, Qt.TextElideMode.ElideLeft, int(cw - h * 0.05))
+                p.drawText(r.adjusted(h * 0.025, 0, -h * 0.02, 0), al_l, txt)
+            else:
+                p.drawText(r, al_c, _BP_CATS[n - 1][0])
+        p.restore()
+
+    def _paint_store(self, p, w, h, m, acc, k):
+        al_c = int(Qt.AlignmentFlag.AlignCenter)
+        p.setOpacity(k)
+        self._paint_chips(p, w, h, m, acc, k)
+        _m, gap, tw, th, cols, x0, top, bottom, pad = self._grid_geom()
+        n = len(self._sitems)
+        if n == 0:
+            p.setOpacity(k)
+            p.setFont(self._font(h * 0.032))
+            p.setPen(QColor(200, 200, 220))
+            msg = self._serror or ("Loading games..." if (self._sloading or not self._sstarted) else "No games found")
+            p.drawText(QRectF(0, top, w, bottom - top), al_c, msg)
+            return
+        p.save()
+        p.setClipRect(QRectF(0, top, w, bottom - top))
+        row_h = th + gap
+        first = max(0, int(self._sscroll // row_h) - 1) * cols
+        last = min(n, (int((self._sscroll + bottom - top) // row_h) + 2) * cols)
+        focus = self._zone == "content"
+        for i in range(first, last):
+            it = self._sitems[i]
+            r = self._srect(i)
+            if r.bottom() < top or r.top() > bottom:
+                continue
+            sel = (i == self._ssel and focus)
+            if sel:
+                grow = tw * 0.04
+                r = r.adjusted(-grow, -grow, grow, grow)
+            p.setOpacity(k * (1.0 if sel or not focus else 0.78))
+            if sel:
+                ring = QColor(acc)
+                p.setPen(QPen(ring, max(2.0, h * 0.005)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                g = h * 0.007
+                p.drawRoundedRect(r.adjusted(-g, -g, g, g), r.width() * 0.06, r.width() * 0.06)
+            pm = self._store_pix(it, tw, th)
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            if self._in_library(it["appid"]):
+                bf = self._font(h * 0.0155, True)
+                p.setFont(bf)
+                bw = QFontMetrics(bf).horizontalAdvance("IN LIBRARY") + h * 0.026
+                b = QRectF(r.left() + h * 0.008, r.top() + h * 0.008, bw, h * 0.028)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(acc)
+                p.drawRoundedRect(b, h * 0.014, h * 0.014)
+                p.setPen(QColor(_on_accent()))
+                p.drawText(b, al_c, "IN LIBRARY")
+        p.restore()
+        p.setOpacity(k)
+        if self._sloading and n:                         # a quiet "more coming" hint at the end of the list
+            p.setFont(self._font(h * 0.018))
+            p.setPen(QColor(170, 170, 195))
+            p.drawText(QRectF(0, bottom - h * 0.035, w, h * 0.03), al_c, "Loading more...")
+        if self._serror and n:
+            p.setFont(self._font(h * 0.018))
+            p.setPen(QColor(230, 170, 170))
+            p.drawText(QRectF(0, bottom - h * 0.035, w, h * 0.03), al_c, self._serror)
+
+        # info bar for the selected game
+        it = self._sitems[min(self._ssel, n - 1)]
+        f = self._font(h * 0.03, True)
+        p.setFont(f)
+        p.setPen(QColor(245, 245, 252))
+        title = QFontMetrics(f).elidedText(it["title"], Qt.TextElideMode.ElideRight, int(w * 0.8))
+        p.drawText(QRectF(m, h * 0.865, w - 2 * m, h * 0.055), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title)
+
+    def _paint_detail(self, p, w, h, acc):
+        al_c = int(Qt.AlignmentFlag.AlignCenter)
+        it = self._detail["item"]
+        p.setOpacity(1.0)
+        p.fillRect(self.rect(), QColor(4, 4, 10, 215))
+        panel = QRectF(w * 0.14, h * 0.14, w * 0.72, h * 0.70)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1.5))
+        p.setBrush(QColor(20, 20, 32, 245))
+        p.drawRoundedRect(panel, h * 0.025, h * 0.025)
+        pad = h * 0.04
+        ch = panel.height() - 2 * pad
+        cw = ch * 0.72
+        cover = QRectF(panel.left() + pad, panel.top() + pad, cw, ch)
+        pm = self._store_pix(it, cover.width() / 1.08, cover.height() / 1.08)
+        p.drawPixmap(cover, pm, QRectF(pm.rect()))
+
+        tx = cover.right() + pad
+        tw = panel.right() - pad - tx
+        info = self._details.get(it["appid"]) or {}
+        p.setPen(QColor(245, 245, 252))
+        f = self._font(h * 0.042, True)
+        p.setFont(f)
+        p.drawText(QRectF(tx, cover.top(), tw, h * 0.1), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap),
+                   QFontMetrics(f).elidedText(it["title"], Qt.TextElideMode.ElideRight, int(tw * 2)))
+        y = cover.top() + h * 0.115
+        meta = "  ·  ".join(x for x in (", ".join(info.get("genres", [])[:4]), info.get("date", ""), info.get("dev", "")) if x)
+        p.setFont(self._font(h * 0.02))
+        p.setPen(QColor(acc.lighter(140)))
+        p.drawText(QRectF(tx, y, tw, h * 0.05), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap),
+                   meta or ("Loading details..." if it["appid"] in self._details else ""))
+        desc = info.get("desc", "")
+        if len(desc) > 520:
+            desc = desc[:517].rstrip() + "..."
+        p.setFont(self._font(h * 0.0235))
+        p.setPen(QColor(200, 200, 218))
+        p.drawText(QRectF(tx, y + h * 0.065, tw, ch - h * 0.065 - h * 0.115 - h * 0.1),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap), desc)
+
+        # buttons
+        in_lib = self._in_library(it["appid"])
+        labels = ("Show in Library" if in_lib else "Add to Library", "Close")
+        bh = h * 0.065
+        bw = min(h * 0.3, tw / 2 - h * 0.01)
+        by = cover.bottom() - bh
+        self._detail_rects = []
+        for n, text in enumerate(labels):
+            r = QRectF(tx + n * (bw + h * 0.014), by, bw, bh)
+            self._detail_rects.append(r)
+            p.setPen(Qt.PenStyle.NoPen)
+            if n == 0:
+                p.setBrush(acc)
+            else:
+                p.setBrush(QColor(255, 255, 255, 30))
+            p.drawRoundedRect(r, bh / 2, bh / 2)
+            if n == self._detail_btn:
+                p.setPen(QPen(QColor(255, 255, 255, 235), max(2.0, h * 0.004)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                g = h * 0.005
+                p.drawRoundedRect(r.adjusted(-g, -g, g, g), (bh + 2 * g) / 2, (bh + 2 * g) / 2)
+            p.setFont(self._font(h * 0.0245, True))
+            p.setPen(QColor(_on_accent()) if n == 0 else QColor(225, 225, 240))
+            p.drawText(r, al_c, text)
+
+
+def _bp_open(self):
+    bp = getattr(self, "_big_picture", None)
+    if bp is None:
+        bp = self._big_picture = _BigPicture(self)
+    bp.enter()
+
+
+AdaptiveApp.open_big_picture = _bp_open
+_bp_prev_init = AdaptiveApp.__init__
+
+
+def _bp_init(self, *a, **k):
+    _bp_prev_init(self, *a, **k)
+    try:                                                           # "Big Picture" button next to the library search box
+        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+        btn = QPushButton("Big Picture")
+        btn.setFixedHeight(36)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("Full-screen mode for controller / keyboard (Ctrl+Shift+B)")
+        btn.clicked.connect(lambda _c=False: self.open_big_picture())
+        idx = header.indexOf(self.search_edit)
+        header.insertWidget(idx, btn)
+        header.insertSpacing(idx + 1, 10)
+    except Exception:
+        pass
+    sc = QShortcut(QKeySequence("Ctrl+Shift+B"), self)
+    sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+    sc.activated.connect(self.open_big_picture)
+    if "--bigpicture" in sys.argv:
+        QTimer.singleShot(300, self.open_big_picture)
+
+
+AdaptiveApp.__init__ = _bp_init
 
 
 if __name__ == "__main__":
