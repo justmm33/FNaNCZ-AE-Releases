@@ -35804,3 +35804,4 @@ AdaptiveApp.__init__ = _bp_init
 
 if __name__ == "__main__":
     main()
+ 
