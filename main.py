@@ -114,7 +114,7 @@ DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
 LIBRARY_FOLDER_NAME = "NCZLibrary"       # looked for on every partition
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
-NCZFRONT_URL = "https://occultist-tattling-elevation.ngrok-free.dev/"
+NCZFRONT_URL = "https://acapesfront.duckdns.org:9000/"
 
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
 FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
