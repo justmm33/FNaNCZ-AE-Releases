@@ -31,6 +31,9 @@ import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
+import secrets
+import webbrowser
+import http.server
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
@@ -72,6 +75,17 @@ KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it
 TREE_URL = "https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 INSTALLED_MARKER = ".ncz_launcher_installed"
+
+# Social sign-in (Google / Microsoft / GitHub). Each one opens the system browser, comes back to a temporary
+# http://localhost:<port> address, and the result is exchanged for a Firebase account (accounts:signInWithIdp).
+# A provider whose client id is empty shows "isn't set up yet" when its button is clicked.
+OAUTH_GOOGLE_CLIENT_ID = "1079377453347-1d2p5acjk73nc0ju45eo14sv2pr4shkr.apps.googleusercontent.com"
+OAUTH_GOOGLE_CLIENT_SECRET = "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"     # Google "Desktop app" clients still send one; for installed apps it isn't confidential
+OAUTH_MICROSOFT_CLIENT_ID = "3d6c4cae-0a1b-4f2f-9886-78ccdb6c2492"      # Entra app registration, platform "Mobile and desktop", redirect http://localhost
+OAUTH_MICROSOFT_TENANT = "consumers"
+OAUTH_GITHUB_CLIENT_ID = "Ov23li5aW7haTC7gA6Y5"
+OAUTH_GITHUB_CLIENT_SECRET = "5107fd92abb41b040f1dc894e446252dc414ac3f"     # GitHub's code exchange needs it
+OAUTH_TIMEOUT_S = 180               # how long to wait for the browser to finish
 
 user_email = ""      # set to the typed email when Sign in / Create Account is clicked
 
@@ -176,7 +190,9 @@ CLOUD_ERRORS = {
     "WEAK_PASSWORD": "Password must be at least 6 characters.",
     "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts. Please wait a bit and try again.",
     "USER_DISABLED": "This account has been disabled.",
-    "OPERATION_NOT_ALLOWED": "Email/password sign-in isn't enabled for this cloud project.",
+    "OPERATION_NOT_ALLOWED": "That sign-in method isn't enabled for this cloud project.",
+    "INVALID_IDP_RESPONSE": "The sign-in provider's answer was rejected. Check the provider settings in Firebase.",
+    "FEDERATED_USER_ID_ALREADY_LINKED": "That account is already linked to a different user.",
     "Permission denied": "The cloud refused the request (check the database rules).",
 }
 
@@ -247,6 +263,189 @@ def db_profile_exists(uid, token):
 
 def db_create_profile(uid, token):
     _http_json(_profile_url(uid, token), "PATCH", {"updated": {".sv": "timestamp"}})
+
+
+# ------------------------------------------------------------------------------------------------ social sign-in
+_oauth_cancel = threading.Event()      # set when the window closes so a waiting browser sign-in stops
+
+_DONE_PAGE = (b"<!doctype html><meta charset=utf-8><title>NCZ Games Launcher</title>"
+              b"<body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#0b0d14;color:#fff;"
+              b"font-family:system-ui,Segoe UI,sans-serif\"><div style=\"text-align:center\">"
+              b"<h2>You're signed in</h2><p style=\"color:#aaa\">You can close this tab and go back to the launcher.</p>"
+              b"</div></body>")
+
+
+def _provider_cfg(name):
+    tenant = OAUTH_MICROSOFT_TENANT or "common"
+    return {
+        "google": {"label": "Google", "firebase_id": "google.com", "client_id": OAUTH_GOOGLE_CLIENT_ID,
+                   "client_secret": OAUTH_GOOGLE_CLIENT_SECRET, "pkce": True,
+                   "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+                   "token_url": "https://oauth2.googleapis.com/token",
+                   "scope": "openid email profile", "extra": {"prompt": "select_account"}},
+        "microsoft": {"label": "Microsoft", "firebase_id": "microsoft.com", "client_id": OAUTH_MICROSOFT_CLIENT_ID,
+                      "client_secret": "", "pkce": True,
+                      "auth_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+                      "token_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+                      "scope": "openid email profile User.Read", "extra": {"prompt": "select_account"}},
+        "github": {"label": "GitHub", "firebase_id": "github.com", "client_id": OAUTH_GITHUB_CLIENT_ID,
+                   "client_secret": OAUTH_GITHUB_CLIENT_SECRET, "pkce": False,
+                   "auth_url": "https://github.com/login/oauth/authorize",
+                   "token_url": "https://github.com/login/oauth/access_token",
+                   "scope": "read:user user:email", "extra": {}},
+    }[name]
+
+
+class _CallbackServer:
+    """One-shot local web server that catches the browser's redirect (?code=...&state=...)."""
+
+    def __init__(self, state):
+        self.state = state
+        self.result = None
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+                if ("code" not in q and "error" not in q) or q.get("state") != outer.state:
+                    self.send_response(404)                       # favicon requests, stray hits, wrong state
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                outer.result = q
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(_DONE_PAGE)))
+                self.end_headers()
+                self.wfile.write(_DONE_PAGE)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.timeout = 0.5
+        self.port = self.httpd.server_address[1]
+
+    def wait(self, timeout, cancel):
+        end = time.monotonic() + timeout
+        while self.result is None:
+            if cancel.is_set():
+                raise CloudError("Sign-in cancelled.")
+            if time.monotonic() > end:
+                raise CloudError("Sign-in timed out. Please try again.")
+            self.httpd.handle_request()
+        return self.result
+
+    def close(self):
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+
+
+def _http_form(url, fields, timeout=20):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode("utf-8"), method="POST",
+                                 headers={"User-Agent": "NCZ-Games-Launcher", "Accept": "application/json",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:                  # providers put the reason in the body of a 4xx
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+    except (urllib.error.URLError, OSError):
+        raise CloudError("Couldn't reach the sign-in provider. Check your internet connection.")
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise CloudError("The sign-in provider sent an unexpected reply.")
+
+
+def oauth_tokens(name, cancel):
+    """Browser sign-in with the provider -> {"id_token"?, "access_token"?}."""
+    cfg = _provider_cfg(name)
+    label = cfg["label"]
+    if not cfg["client_id"]:
+        raise CloudError(f"{label} sign-in isn't set up yet.")
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    server = _CallbackServer(state)
+    try:
+        redirect = f"http://localhost:{server.port}"
+        params = {"client_id": cfg["client_id"], "redirect_uri": redirect, "response_type": "code",
+                  "scope": cfg["scope"], "state": state, **cfg["extra"]}
+        if cfg["pkce"]:
+            params["code_challenge"] = base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+            params["code_challenge_method"] = "S256"
+        if not webbrowser.open(cfg["auth_url"] + "?" + urllib.parse.urlencode(params)):
+            raise CloudError("Couldn't open your web browser.")
+        result = server.wait(OAUTH_TIMEOUT_S, cancel)
+    finally:
+        server.close()
+    if "error" in result:
+        if result["error"] == "access_denied":
+            raise CloudError("Sign-in was cancelled.")
+        raise CloudError(f"{label} sign-in failed: {result.get('error_description') or result['error']}")
+    fields = {"client_id": cfg["client_id"], "code": result["code"], "redirect_uri": redirect}
+    if name != "github":
+        fields["grant_type"] = "authorization_code"
+    if cfg["client_secret"]:
+        fields["client_secret"] = cfg["client_secret"]
+    if cfg["pkce"]:
+        fields["code_verifier"] = verifier
+    tok = _http_form(cfg["token_url"], fields)
+    if tok.get("error") or not (tok.get("id_token") or tok.get("access_token")):
+        raise CloudError(f"{label} sign-in failed: {tok.get('error_description') or tok.get('error') or 'no token returned'}")
+    return tok
+
+
+def _idp_request(provider_id, pairs):
+    res = _http_json(
+        FIREBASE_AUTH_URL.format(action="signInWithIdp", key=urllib.parse.quote(FIREBASE_API_KEY, safe="")),
+        "POST", {"postBody": urllib.parse.urlencode({"providerId": provider_id, **pairs}),
+                 "requestUri": "http://localhost", "returnSecureToken": True, "returnIdpCredential": True})
+    if not res or not res.get("idToken"):
+        raise CloudError("An account with this email already exists with a different sign-in method. "
+                         "Sign in the way you did before.")
+    return res
+
+
+def fb_sign_in_idp(provider_id, tokens):
+    """Provider token -> Firebase account. Same return shape as fb_auth."""
+    if provider_id == "microsoft.com":          # Firebase accepts either; try the access token first, then the id token
+        combos = (("access_token",), ("id_token",))
+    else:
+        combos = (("id_token", "access_token"),)
+    res, last = None, None
+    for keys in combos:
+        pairs = {k: tokens[k] for k in keys if tokens.get(k)}
+        if not pairs:
+            continue
+        try:
+            res = _idp_request(provider_id, pairs)
+            break
+        except CloudError as e:
+            last = e
+            if "INVALID_CREDENTIAL_OR_PROVIDER_ID" not in str(e):
+                raise
+    if res is None:
+        raise last or CloudError("The sign-in provider didn't return a token.")
+    email = res.get("email") or res.get("displayName") or ""
+    return {"uid": res["localId"], "token": res["idToken"],
+            "account": {"email": email, "uid": res["localId"], "refresh_token": res["refreshToken"]}}
+
+
+def social_sign_in(name, cancel):
+    cfg = _provider_cfg(name)
+    tokens = oauth_tokens(name, cancel)
+    try:
+        return fb_sign_in_idp(cfg["firebase_id"], tokens)
+    except CloudError as e:
+        raise CloudError(f"{cfg['label']}: {e}")
+
 
 
 # ------------------------------------------------------------------------------------------------ Discord
@@ -623,6 +822,92 @@ class PrimaryButton(QPushButton):
         p.end()
 
 
+# Logos as plain move/line/cubic commands (no QtSvg needed): (viewbox size, [(color, path), ...])
+_ICON_DATA = {
+    "google": (48, [("#EA4335", 'M24,9.5 C27.54,9.5,30.71,10.72,33.21,13.1 L40.06,6.25 C35.9,2.38,30.47,0,24,0 C14.62,0,6.51,5.38,2.56,13.22 L10.54,19.41 C12.43,13.72,17.74,9.5,24,9.5 Z'), ("#4285F4", 'M46.98,24.55 C46.98,22.98,46.83,21.46,46.6,20 L24,20 L24,29.02 L36.94,29.02 C36.36,31.98,34.68,34.5,32.16,36.2 L39.89,42.2 C44.4,38.02,46.98,31.84,46.98,24.55 Z'), ("#FBBC05", 'M10.53,28.59 C10.05,27.14,9.77,25.6,9.77,24 C9.77,22.4,10.04,20.86,10.53,19.41 L2.55,13.22 C0.92,16.46,0,20.12,0,24 C0,27.88,0.92,31.54,2.56,34.78 L10.53,28.59 Z'), ("#34A853", 'M24,48 C30.48,48,35.93,45.87,39.89,42.19 L32.16,36.19 C30.01,37.64,27.24,38.49,24,38.49 C17.74,38.49,12.43,34.27,10.53,28.58 L2.55,34.77 C6.51,42.62,14.62,48,24,48 Z')]),
+    "github": (16, [("#FFFFFF", 'M8,0 C3.58,0,0,3.58,0,8 C0,11.54,2.29,14.53,5.47,15.59 C5.87,15.66,6.02,15.42,6.02,15.21 C6.02,15.02,6.01,14.39,6.01,13.72 C4,14.09,3.48,13.23,3.32,12.78 C3.23,12.55,2.84,11.84,2.5,11.65 C2.22,11.5,1.82,11.13,2.49,11.12 C3.12,11.11,3.57,11.7,3.72,11.94 C4.44,13.15,5.59,12.81,6.05,12.6 C6.12,12.08,6.33,11.73,6.56,11.53 C4.78,11.33,2.92,10.64,2.92,7.58 C2.92,6.71,3.23,5.99,3.74,5.43 C3.66,5.23,3.38,4.41,3.82,3.31 C3.82,3.31,4.49,3.1,6.02,4.13 C6.66,3.95,7.34,3.86,8.02,3.86 C8.7,3.86,9.38,3.95,10.02,4.13 C11.55,3.09,12.22,3.31,12.22,3.31 C12.66,4.41,12.38,5.23,12.3,5.43 C12.81,5.99,13.12,6.7,13.12,7.58 C13.12,10.65,11.25,11.33,9.47,11.53 C9.76,11.78,10.01,12.26,10.01,13.01 C10.01,14.08,10,14.94,10,15.21 C10,15.42,10.15,15.67,10.55,15.59 C13.81,14.49,16,11.44,16,8 C16,3.58,12.42,0,8,0 Z')]),
+}
+_icon_cache = {}
+
+
+def _icon_paths(kind):
+    if kind not in _icon_cache:
+        size, parts = _ICON_DATA[kind]
+        out = []
+        for color, cmds in parts:
+            path = QPainterPath()
+            path.setFillRule(Qt.FillRule.WindingFill)
+            for c in cmds.split():
+                v = [float(x) for x in c[1:].split(',')] if len(c) > 1 else []
+                if c[0] == 'M':
+                    path.moveTo(v[0], v[1])
+                elif c[0] == 'L':
+                    path.lineTo(v[0], v[1])
+                elif c[0] == 'C':
+                    path.cubicTo(v[0], v[1], v[2], v[3], v[4], v[5])
+                elif c[0] == 'Z':
+                    path.closeSubpath()
+            out.append((QColor(color), path))
+        _icon_cache[kind] = (size, out)
+    return _icon_cache[kind]
+
+
+class SocialButton(QPushButton):
+    """Glass pill (same look as the input fields) with the provider's logo and name."""
+
+    def __init__(self, kind, text, parent=None):
+        super().__init__(text, parent)
+        self.kind = kind
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+    def _paint_icon(self, p, box):
+        if self.kind == "microsoft":
+            gap = box.width() * 0.08
+            sq = (box.width() - gap) / 2
+            for i, col in enumerate(("#f25022", "#7fba00", "#00a4ef", "#ffb900")):
+                p.fillRect(QRectF(box.x() + (i % 2) * (sq + gap), box.y() + (i // 2) * (sq + gap), sq, sq), QColor(col))
+            return
+        size, parts = _icon_paths(self.kind)
+        p.save()
+        p.translate(box.x(), box.y())
+        p.scale(box.width() / size, box.height() / size)
+        for color, path in parts:
+            p.fillPath(path, color)
+        p.restore()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        on = self.isEnabled()
+        hov = on and self.underMouse()
+        p.setOpacity(1.0 if on else 0.45)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.fillPath(path, QColor(255, 255, 255, 46 if hov else 19))
+        p.setPen(QPen(QColor(255, 255, 255, 150 if hov else 46), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.setFont(self.font())
+        tw = QFontMetricsF(self.font()).horizontalAdvance(self.text())
+        isz, gap = h * 0.42, h * 0.26
+        x0 = (w - (isz + gap + tw)) / 2
+        self._paint_icon(p, QRectF(x0, (h - isz) / 2, isz, isz))
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(QRectF(x0 + isz + gap, 0, tw + 4, h),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+        p.end()
+
+
 class CtrlButton(QPushButton):
     """Minimise / close, drawn by hand because the window has no title bar."""
 
@@ -863,6 +1148,15 @@ class LoginWindow(QWidget):
         self.btn_back.clicked.connect(self.on_back)
         self._track(self.btn_back, 835, 896, 290, 48, self._fit("Back to sign in", W.Normal, 200, 31), W.Normal, 0)
 
+        # social sign-in row, same width as the primary button (x 713..1250), just below the Create / Forgot links
+        self._social_buttons = []
+        for i, (kind, text) in enumerate((("google", "Google"), ("microsoft", "Microsoft"), ("github", "GitHub"))):
+            b = SocialButton(kind, text, self)
+            b.clicked.connect(lambda _=False, k=kind: self.on_social(k))
+            self._track(b, 713 + i * 183, 958, 171, 50, 22, W.Normal, 0)
+            self._social_buttons.append(b)
+        self._social_buttons = tuple(self._social_buttons)
+
         self.progress = ProgressBar(self)
         self._track(self.progress, 560, 628, 800, 70, 21, W.Normal, 0)
 
@@ -874,7 +1168,7 @@ class LoginWindow(QWidget):
         self._track(self.btn_close, DW - 72, 16, 54, 40, 0, W.Normal, 0)
 
         self._dynamic = (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_create, self.btn_forgot,
-                         self.btn_back, self.btn_primary, self.lbl_status, self.progress)
+                         self.btn_back, self.btn_primary, self.lbl_status, self.progress, *self._social_buttons)
         self._shake_set = (self.lbl_email, self.lbl_pw, self.email, self.pw)
         self._shake_dx = 0.0
         self._shake_t0 = -10.0
@@ -976,6 +1270,7 @@ class LoginWindow(QWidget):
 
     def closeEvent(self, e):
         self._timer.stop()
+        _oauth_cancel.set()
         if self._dl is not None:
             self._dl.cancel = True
             self._dl.wait(3000)
@@ -1216,7 +1511,8 @@ class LoginWindow(QWidget):
             self._shake()
 
     def _set_inputs_enabled(self, on):
-        for wd in (self.email, self.pw, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back):
+        for wd in (self.email, self.pw, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back,
+                   *self._social_buttons):
             wd.setEnabled(on)
 
     def _busy(self, text):
@@ -1232,11 +1528,11 @@ class LoginWindow(QWidget):
     def _apply_state(self):
         visible = {
             "form": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_create, self.btn_forgot,
-                     self.btn_primary, self.lbl_status),
+                     self.btn_primary, self.lbl_status, *self._social_buttons),
             "downloading": (self.progress,),
             "launching": (self.progress,),
             "create": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_back, self.btn_primary,
-                       self.lbl_status),
+                       self.lbl_status, *self._social_buttons),
             "forgot": (self.lbl_email, self.email, self.btn_back, self.btn_primary, self.lbl_status),
             "dl_error": (self.btn_primary, self.lbl_status),
             "banned": (),
@@ -1321,6 +1617,33 @@ class LoginWindow(QWidget):
             return r["account"]
 
         self._run(job, self._let_pass)
+
+    def on_social(self, name):
+        global user_email
+        cfg = _provider_cfg(name)
+        if not cfg["client_id"]:
+            self.set_status(f"{cfg['label']} sign-in isn't set up yet.")
+            return
+        user_email = f"{cfg['label']} sign-in"          # shown in the ban alert until the real email is known
+        _oauth_cancel.clear()
+
+        def proceed():
+            self._busy(f"Finish signing in with {cfg['label']} in your browser...")
+
+            def job():
+                r = social_sign_in(name, _oauth_cancel)
+                r["exists"] = db_profile_exists(r["uid"], r["token"])
+                return r
+
+            self._run(job, self._social_signed_in)
+
+        self._new_account_gate(proceed, strict=False, action="sign in to")      # banned Discord id -> ban
+
+    def _social_signed_in(self, r):
+        global user_email
+        if r["account"].get("email"):
+            user_email = r["account"]["email"]
+        self._signed_in(r)                               # same path as email/password: profile check, Discord gate for new accounts
 
     def _email_enter(self):
         if self.state == "forgot":
@@ -1490,40 +1813,7 @@ def _new_init(self):
     self.setWindowTitle("NCZ Games Launcher Registration")
     self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "icon.png")))
 LoginWindow.__init__ = _new_init
-def check_for_updates_needed():
-    try:
-        entries = list_launcher_files()
-        for path, size, sha in entries:
-            dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
-            if not os.path.exists(dest):
-                return True
-            if path in KEEP_LOCAL_ASSETS:
-                continue
-            if sha and git_blob_sha(dest) != sha:
-                return True
-        return False
-    except Exception:
-        return False
 
-
-def main():
-    if not is_flagged_banned() and load_account() and install_complete():
-        if not check_for_updates_needed():
-            try:
-                launch_launcher()
-                return
-            except Exception:
-                pass
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = LoginWindow()
-    win.show()
-    win.play_intro()
-    if is_flagged_banned():
-        QTimer.singleShot(0, lambda: win.ban(None, notify=False))
-    elif load_account():
-        QTimer.singleShot(0, win.start_download)
-    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
