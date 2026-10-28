@@ -1490,7 +1490,40 @@ def _new_init(self):
     self.setWindowTitle("NCZ Games Launcher Registration")
     self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "icon.png")))
 LoginWindow.__init__ = _new_init
+def check_for_updates_needed():
+    try:
+        entries = list_launcher_files()
+        for path, size, sha in entries:
+            dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
+            if not os.path.exists(dest):
+                return True
+            if path in KEEP_LOCAL_ASSETS:
+                continue
+            if sha and git_blob_sha(dest) != sha:
+                return True
+        return False
+    except Exception:
+        return False
 
+
+def main():
+    if not is_flagged_banned() and load_account() and install_complete():
+        if not check_for_updates_needed():
+            try:
+                launch_launcher()
+                return
+            except Exception:
+                pass
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = LoginWindow()
+    win.show()
+    win.play_intro()
+    if is_flagged_banned():
+        QTimer.singleShot(0, lambda: win.ban(None, notify=False))
+    elif load_account():
+        QTimer.singleShot(0, win.start_download)
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
