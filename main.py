@@ -846,6 +846,32 @@ def _http_json(url, method="GET", payload=None, form=None, timeout=None):
     except ValueError:
         raise CloudError("The cloud sent back something unexpected.", "BAD_REPLY")
 
+def _http_json_etag(url, etag=None, timeout=None):
+    """GET that uses Firebase's ETag support. Returns (data, etag, changed). When nothing changed since `etag`
+    Firebase answers 304 with no body, so a poll costs almost no bandwidth."""
+    headers = {"User-Agent": "NCZ-Games-Launcher", "X-Firebase-ETag": "true"}
+    if etag:
+        headers["If-None-Match"] = etag
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            new_etag = resp.headers.get("ETag") or None
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return None, etag, False
+        return _http_json(url, timeout=timeout), None, True      # re-raises the proper CloudError
+    except ValueError:
+        raise CloudError("The cloud address in this launcher isn't valid.", "BAD_URL")
+    except (urllib.error.URLError, OSError):
+        raise CloudError("Couldn't reach the cloud. Check your internet connection.", "NETWORK")
+    if not body.strip():
+        return None, new_etag, True
+    try:
+        return json.loads(body), new_etag, True
+    except ValueError:
+        raise CloudError("The cloud sent back something unexpected.", "BAD_REPLY")
+
 def get_account_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "account.json")
 
@@ -6334,6 +6360,7 @@ class AdaptiveApp(QMainWindow):
 
         self.create_game_card("Five Nights at NCZ AE", asset_path("fnanczaecover.png"), "ae")
         self.create_game_card("Five Nights at NCZ 2", asset_path("fnancz2cover.png"), "ncz2")
+        self.create_game_card("NCZ Chess", asset_path("nczchess.png"), "chess")
         self.create_game_card("NCZFront", asset_path("nczfront-cover.png"), "nczfront")
         self.steam_cards = {}
         for game in load_steam_library():
@@ -6932,6 +6959,11 @@ class AdaptiveApp(QMainWindow):
             btn_action.setText("Play")
             btn_action.clicked.connect(lambda _c=False: self.open_nczfront())
             menu.addAction("Refresh status").triggered.connect(self.check_nczfront_status)
+        elif game_id == "chess":
+            btn_action.setText("Play")
+            btn_action.clicked.connect(lambda _c=False: self.open_chess())
+            more_btn.hide()
+            self.set_card_status("chess", "\u25CF Local & online", GREEN)
         else:
             btn_save = menu.addAction("Edit Current Save")
             btn_settings = menu.addAction("Edit Current Settings")
@@ -22145,10 +22177,10 @@ _reorder_prev_init = AdaptiveApp.__init__
 
 def _reorder_init(self):
     _reorder_prev_init(self)
-    # the three NCZ games are always the first three cards
-    self._fixed_cards = {id(c) for c, _t in self.cards[:3]}
+    # the four NCZ games (AE, 2, Chess, NCZFront) are always the first four cards
+    self._fixed_cards = {id(c) for c, _t in self.cards[:4]}
     saved = _load_library_order()
-    _apply_saved_order(self.cards, saved.get("main", []), keep_first=3)
+    _apply_saved_order(self.cards, saved.get("main", []), keep_first=4)
     _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
     self._card_reorder = _CardReorder(self)
     self.apply_filter()
@@ -24656,7 +24688,7 @@ def _sort_apply_filter(self, text=""):
     orig_main = list(self.cards)
     orig_fan = list(fan) if fan is not None else None
     try:
-        self.cards[3:] = sorted(self.cards[3:], key=lambda it: it[1].casefold())
+        self.cards[4:] = sorted(self.cards[4:], key=lambda it: it[1].casefold())
         if fan is not None:
             fan.sort(key=lambda it: it[1].casefold())
         return _sort_prev_apply_filter(self, text)
@@ -24723,9 +24755,11 @@ def set_discord_rpc_enabled(on):
     _discord_rpc.poke()
 
 # Cover art for Discord. Steam games use their public Steam cover (Discord accepts web links for images).
-# The two NCZ games have no public link, so they use art assets you upload in the Discord Developer Portal
+# The NCZ games have no public link, so they use art assets you upload in the Discord Developer Portal
 # (Rich Presence -> Art Assets) under exactly these names; until you do, they just show without a picture.
-_RPC_ASSET_KEYS = {AE_GAME_NAME.casefold(): "fnancz_ae", NCZ2_GAME_NAME.casefold(): "fnancz_2"}
+# NCZ Chess and NCZFront use the art assets named "nczchess" and "nczfront" in the Discord application.
+_RPC_ASSET_KEYS = {AE_GAME_NAME.casefold(): "fnancz_ae", NCZ2_GAME_NAME.casefold(): "fnancz_2",
+                   "ncz chess": "nczchess", "nczfront": "nczfront"}
 _rpc_image_cache = {}
 
 def _rpc_url_exists(url):
@@ -24818,8 +24852,6 @@ class _DiscordRPC:
 
     def _sync(self):
         name = _now_playing["name"] if get_discord_rpc_enabled() else None
-        if name == "NCZFront":          # NCZFront is a website: never shown on Discord
-            name = next((n for n in _running if n != "NCZFront"), None)
         for g in list(self._since):
             if g != name:
                 self._since.pop(g, None)
@@ -33297,6 +33329,3835 @@ def _web_page_emptied(self):
 AdaptiveApp.open_nczfront = _open_nczfront
 AdaptiveApp._leave_web_page = _leave_web_page
 AdaptiveApp._web_page_emptied = _web_page_emptied
+# ================================================================ NCZ Chess: rules engine (pure python)
+_CH_FILES = "abcdefgh"
+_CH_START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+_CH_KN = ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1))
+_CH_KG = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+_CH_ROOK = ((-1, 0), (1, 0), (0, -1), (0, 1))
+_CH_BISH = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+_CH_VALUE = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 0}
+_CH_RIGHTS_LOST = {60: "KQ", 4: "kq", 63: "K", 56: "Q", 7: "k", 0: "q"}
+
+def _ch_name(sq):
+    return _CH_FILES[sq % 8] + str(8 - sq // 8)
+
+def _ch_sq(name):
+    return (8 - int(name[1])) * 8 + _CH_FILES.index(name[0])
+
+def _ch_enc(m):
+    return _ch_name(m[0]) + _ch_name(m[1]) + (m[2] or "")
+
+def _ch_dec(s):
+    s = str(s)
+    if len(s) not in (4, 5):
+        raise ValueError("bad move")
+    return (_ch_sq(s[0:2]), _ch_sq(s[2:4]), s[4:5].lower())
+
+
+class _ChessPos:
+    """One position: 64 squares (index 0 = a8 ... 63 = h1), side to move, castling rights, en-passant square."""
+    __slots__ = ("b", "turn", "castle", "ep", "half", "full")
+
+    @classmethod
+    def from_fen(cls, fen=_CH_START_FEN):
+        parts = fen.split()
+        p = cls.__new__(cls)
+        p.b = []
+        for ch in parts[0]:
+            if ch == "/":
+                continue
+            if ch.isdigit():
+                p.b.extend([None] * int(ch))
+            else:
+                p.b.append(("w" if ch.isupper() else "b") + ch.upper())
+        p.turn = parts[1] if len(parts) > 1 else "w"
+        p.castle = parts[2].replace("-", "") if len(parts) > 2 else ""
+        p.ep = _ch_sq(parts[3]) if len(parts) > 3 and parts[3] != "-" else -1
+        p.half = int(parts[4]) if len(parts) > 4 else 0
+        p.full = int(parts[5]) if len(parts) > 5 else 1
+        return p
+
+    def key(self):
+        return (tuple(self.b), self.turn, self.castle, self.ep)
+
+    def attacked(self, sq, by):
+        b = self.b
+        r, c = divmod(sq, 8)
+        pr = r + 1 if by == "w" else r - 1
+        if 0 <= pr < 8:
+            for dc in (-1, 1):
+                cc = c + dc
+                if 0 <= cc < 8 and b[pr * 8 + cc] == by + "P":
+                    return True
+        for dr, dc in _CH_KN:
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < 8 and 0 <= cc < 8 and b[rr * 8 + cc] == by + "N":
+                return True
+        for dr, dc in _CH_KG:
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < 8 and 0 <= cc < 8 and b[rr * 8 + cc] == by + "K":
+                return True
+        for dirs, kinds in ((_CH_ROOK, "RQ"), (_CH_BISH, "BQ")):
+            for dr, dc in dirs:
+                rr, cc = r + dr, c + dc
+                while 0 <= rr < 8 and 0 <= cc < 8:
+                    p = b[rr * 8 + cc]
+                    if p:
+                        if p[0] == by and p[1] in kinds:
+                            return True
+                        break
+                    rr += dr
+                    cc += dc
+        return False
+
+    def king_sq(self, color):
+        try:
+            return self.b.index(color + "K")
+        except ValueError:
+            return -1
+
+    def in_check(self, color=None):
+        color = color or self.turn
+        k = self.king_sq(color)
+        return k >= 0 and self.attacked(k, "b" if color == "w" else "w")
+
+    @staticmethod
+    def _promos(out, f, t, promo):
+        if promo:
+            for k in "qrbn":
+                out.append((f, t, k))
+        else:
+            out.append((f, t, ""))
+
+    def pseudo(self):
+        b, t = self.b, self.turn
+        o = "b" if t == "w" else "w"
+        out = []
+        for s in range(64):
+            p = b[s]
+            if not p or p[0] != t:
+                continue
+            k = p[1]
+            r, c = divmod(s, 8)
+            if k == "P":
+                d = -1 if t == "w" else 1
+                start = 6 if t == "w" else 1
+                last = 0 if t == "w" else 7
+                rr = r + d
+                if 0 <= rr < 8:
+                    if not b[rr * 8 + c]:
+                        self._promos(out, s, rr * 8 + c, rr == last)
+                        if r == start and not b[(r + 2 * d) * 8 + c]:
+                            out.append((s, (r + 2 * d) * 8 + c, ""))
+                    for dc in (-1, 1):
+                        cc = c + dc
+                        if 0 <= cc < 8:
+                            ts = rr * 8 + cc
+                            q = b[ts]
+                            if (q and q[0] == o) or (not q and ts == self.ep):
+                                self._promos(out, s, ts, rr == last)
+            elif k in "NK":
+                for dr, dc in (_CH_KN if k == "N" else _CH_KG):
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < 8 and 0 <= cc < 8:
+                        q = b[rr * 8 + cc]
+                        if not q or q[0] == o:
+                            out.append((s, rr * 8 + cc, ""))
+                if k == "K":
+                    home = 60 if t == "w" else 4
+                    if s == home and not self.attacked(s, o):
+                        ks, qs = ("K", "Q") if t == "w" else ("k", "q")
+                        if (ks in self.castle and b[s + 3] == t + "R" and not b[s + 1] and not b[s + 2]
+                                and not self.attacked(s + 1, o) and not self.attacked(s + 2, o)):
+                            out.append((s, s + 2, ""))
+                        if (qs in self.castle and b[s - 4] == t + "R" and not b[s - 1] and not b[s - 2] and not b[s - 3]
+                                and not self.attacked(s - 1, o) and not self.attacked(s - 2, o)):
+                            out.append((s, s - 2, ""))
+            else:
+                for dr, dc in (_CH_ROOK if k == "R" else _CH_BISH if k == "B" else _CH_ROOK + _CH_BISH):
+                    rr, cc = r + dr, c + dc
+                    while 0 <= rr < 8 and 0 <= cc < 8:
+                        q = b[rr * 8 + cc]
+                        if not q:
+                            out.append((s, rr * 8 + cc, ""))
+                        else:
+                            if q[0] == o:
+                                out.append((s, rr * 8 + cc, ""))
+                            break
+                        rr += dr
+                        cc += dc
+        return out
+
+    def make(self, m):
+        f, t, pr = m
+        n = _ChessPos.__new__(_ChessPos)
+        n.b = self.b[:]
+        p = n.b[f]
+        col, kind = p[0], p[1]
+        cap = n.b[t]
+        n.b[f] = None
+        n.b[t] = p
+        n.ep = -1
+        took = bool(cap)
+        if kind == "P":
+            if t == self.ep and not cap and f % 8 != t % 8:
+                n.b[(f // 8) * 8 + t % 8] = None
+                took = True
+            if abs(t - f) == 16:
+                o = "b" if col == "w" else "w"
+                r, c = divmod(t, 8)
+                for dc in (-1, 1):
+                    cc = c + dc
+                    if 0 <= cc < 8 and n.b[r * 8 + cc] == o + "P":
+                        n.ep = (f + t) // 2
+            if pr:
+                n.b[t] = col + pr.upper()
+        elif kind == "K" and abs(t - f) == 2:
+            if t > f:
+                n.b[f + 1], n.b[f + 3] = n.b[f + 3], None
+            else:
+                n.b[f - 1], n.b[f - 4] = n.b[f - 4], None
+        lost = _CH_RIGHTS_LOST.get(f, "") + _CH_RIGHTS_LOST.get(t, "")
+        n.castle = "".join(ch for ch in self.castle if ch not in lost)
+        n.half = 0 if (kind == "P" or took) else self.half + 1
+        n.turn = "b" if col == "w" else "w"
+        n.full = self.full + (1 if col == "b" else 0)
+        return n
+
+    def legal(self):
+        me = self.turn
+        out = []
+        for m in self.pseudo():
+            n = self.make(m)
+            k = n.king_sq(me)
+            if k >= 0 and not n.attacked(k, n.turn):
+                out.append(m)
+        return out
+
+    def captured_by(self, m):
+        """The piece a move captures (or None)."""
+        f, t, _pr = m
+        q = self.b[t]
+        if q:
+            return q
+        p = self.b[f]
+        if p and p[1] == "P" and t == self.ep and f % 8 != t % 8:
+            return ("b" if p[0] == "w" else "w") + "P"
+        return None
+
+    def san(self, m, legal=None):
+        f, t, pr = m
+        p = self.b[f]
+        kind = p[1]
+        if legal is None:
+            legal = self.legal()
+        if kind == "K" and abs(t - f) == 2:
+            s = "O-O" if t > f else "O-O-O"
+        else:
+            cap = self.captured_by(m) is not None
+            if kind == "P":
+                s = (_CH_FILES[f % 8] + "x" if cap else "") + _ch_name(t)
+                if pr:
+                    s += "=" + pr.upper()
+            else:
+                s = kind
+                others = [x for x in legal if x[1] == t and x[0] != f and self.b[x[0]] == p]
+                if others:
+                    if all(x[0] % 8 != f % 8 for x in others):
+                        s += _CH_FILES[f % 8]
+                    elif all(x[0] // 8 != f // 8 for x in others):
+                        s += str(8 - f // 8)
+                    else:
+                        s += _ch_name(f)
+                s += ("x" if cap else "") + _ch_name(t)
+        n = self.make(m)
+        if n.in_check():
+            s += "#" if not n.legal() else "+"
+        return s
+
+    def insufficient(self):
+        minors = []
+        for s, p in enumerate(self.b):
+            if p and p[1] != "K":
+                if p[1] in "NB":
+                    minors.append((p[1], (s // 8 + s % 8) % 2))
+                else:
+                    return False
+        if len(minors) <= 1:
+            return True
+        return all(k == "B" for k, _ in minors) and len({sh for _, sh in minors}) == 1
+
+
+class _ChessGame:
+    """A game in progress: every position so far, the moves (with SAN), captures and the result."""
+    def __init__(self):
+        self.hist = [_ChessPos.from_fen()]
+        self.moves, self.sans, self.caps = [], [], []
+        self.result = None            # None, or {"winner": "w"/"b"/None, "reason": text}
+        self._legal = None
+        self.reps = {self.hist[0].key(): 1}
+
+    @property
+    def pos(self):
+        return self.hist[-1]
+
+    @property
+    def turn(self):
+        return self.pos.turn
+
+    def legal(self):
+        if self._legal is None:
+            self._legal = self.pos.legal()
+        return self._legal
+
+    def moves_from(self, sq):
+        return [m for m in self.legal() if m[0] == sq]
+
+    def play(self, m):
+        if self.result or m not in self.legal():
+            return None
+        pos = self.pos
+        san = pos.san(m, self.legal())
+        cap = pos.captured_by(m)
+        mover = pos.turn
+        n = pos.make(m)
+        self.hist.append(n)
+        self.moves.append(m)
+        self.sans.append(san)
+        self.caps.append(cap)
+        k = n.key()
+        self.reps[k] = self.reps.get(k, 0) + 1
+        self._legal = None
+        self._check_end(mover)
+        return san
+
+    def _check_end(self, mover):
+        pos = self.pos
+        if not self.legal():
+            if pos.in_check():
+                self.result = {"winner": mover, "reason": "checkmate"}
+            else:
+                self.result = {"winner": None, "reason": "stalemate"}
+        elif pos.insufficient():
+            self.result = {"winner": None, "reason": "insufficient material"}
+        elif pos.half >= 100:
+            self.result = {"winner": None, "reason": "the 50-move rule"}
+        elif self.reps.get(pos.key(), 0) >= 3:
+            self.result = {"winner": None, "reason": "threefold repetition"}
+
+    def end(self, winner, reason):
+        if not self.result:
+            self.result = {"winner": winner, "reason": reason}
+
+    def undo(self):
+        if not self.moves:
+            return False
+        self.moves.pop(); self.sans.pop(); self.caps.pop(); self.hist.pop()
+        self.result = None
+        self._legal = None
+        self.reps = {}
+        for p in self.hist:
+            self.reps[p.key()] = self.reps.get(p.key(), 0) + 1
+        return True
+
+    def captured(self):
+        """({'w': pieces White has lost, 'b': pieces Black has lost})"""
+        lost = {"w": [], "b": []}
+        for c in self.caps:
+            if c:
+                lost[c[0]].append(c)
+        return lost
+
+    def material_diff(self):
+        """Positive = White is ahead."""
+        tot = {"w": 0, "b": 0}
+        for p in self.pos.b:
+            if p:
+                tot[p[0]] += _CH_VALUE[p[1]]
+        return tot["w"] - tot["b"]
+
+# ================================================================ NCZ Chess: piece icons + move sounds
+# Piece pictures: drop them in assets/chess/. Colour-specific files are used first, named wK.png ... bP.png
+# (also white_king.png, king_white.png, white-king.png ...). A single un-coloured set (king.png, queen.png, rook.png,
+# bishop.png, knight.png, pawn.png) also works: it's used as-is for Black and outlined + whitened for White.
+# Without any pictures the board falls back to the built-in piece symbols.
+_CH_NAMES = {"K": ("king",), "Q": ("queen",), "R": ("rook",), "B": ("bishop",), "N": ("knight", "horse"), "P": ("pawn",)}
+_ch_icons = {"dir": None, "files": {}, "cache": {}}
+
+def _ch_scan_icons():
+    d = asset_path("chess")
+    if _ch_icons["dir"] == d:
+        return
+    _ch_icons["dir"] = d
+    _ch_icons["cache"] = {}
+    files = {}
+    try:
+        for f in os.listdir(d):
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in (".png", ".svg", ".webp", ".jpg", ".jpeg"):
+                files.setdefault(stem.lower(), os.path.join(d, f))
+    except OSError:
+        pass
+    _ch_icons["files"] = files
+
+def _ch_icon_file(piece):
+    """(path, single_colour_set) for a piece like 'wK', or None."""
+    _ch_scan_icons()
+    files = _ch_icons["files"]
+    col, k = piece[0], piece[1]
+    cname = "white" if col == "w" else "black"
+    for nm in _CH_NAMES[k] + (k.lower(),):
+        for stem in (f"{col}{k}", f"{cname}_{nm}", f"{cname}-{nm}", f"{cname}{nm}", f"{cname} {nm}",
+                     f"{nm}_{cname}", f"{nm}-{cname}", f"{nm}{cname}", f"{nm} {cname}"):
+            if stem.lower() in files:
+                return files[stem.lower()], False
+    for nm in _CH_NAMES[k]:
+        if nm in files:
+            return files[nm], True
+    return None
+
+def _ch_load_pixmap(path, px):
+    if path.lower().endswith(".svg"):
+        try:
+            from PyQt6.QtSvg import QSvgRenderer
+            r = QSvgRenderer(path)
+            if not r.isValid():
+                return None
+            sz = r.defaultSize()
+            if sz.width() <= 0 or sz.height() <= 0:
+                return None
+            sc = px / max(sz.width(), sz.height())
+            img = QImage(max(1, int(sz.width() * sc)), max(1, int(sz.height() * sc)), QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(0)
+            pp = QPainter(img)
+            r.render(pp)
+            pp.end()
+            return QPixmap.fromImage(img)
+        except Exception:
+            return None
+    pm = QPixmap(path)
+    if pm.isNull():
+        return None
+    return pm.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+def _ch_tint(pm, color):
+    out = QPixmap(pm.size())
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.drawPixmap(0, 0, pm)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(out.rect(), QColor(color))
+    p.end()
+    return out
+
+def _ch_icon_pixmap(piece, px):
+    """A pixmap of `piece` about px pixels tall/wide, or None when there's no picture for it (use the symbols)."""
+    _ch_scan_icons()
+    key = (piece, px)
+    cache = _ch_icons["cache"]
+    if key in cache:
+        return cache[key]
+    res = None
+    found = _ch_icon_file(piece)
+    if found:
+        path, single = found
+        base = _ch_load_pixmap(path, px)
+        if base is not None:
+            if single and piece[0] == "w":
+                pad = max(2, px // 40)
+                out = QPixmap(base.width() + 2 * pad, base.height() + 2 * pad)
+                out.fill(Qt.GlobalColor.transparent)
+                p = QPainter(out)
+                dark = _ch_tint(base, "#1b1b1b")
+                for dx in (-pad, 0, pad):
+                    for dy in (-pad, 0, pad):
+                        if dx or dy:
+                            p.drawPixmap(pad + dx, pad + dy, dark)
+                p.drawPixmap(pad, pad, _ch_tint(base, "#fbfbfb"))
+                p.end()
+                res = out
+            else:
+                res = base
+    cache[key] = res
+    return res
+
+# ---- sounds: tiny synthesized "wood" clicks, so nothing has to be downloaded. Put your own move.wav, capture.wav,
+# check.wav, castle.wav, promote.wav, end.wav or start.wav in assets/chess/sounds/ and those are used instead.
+import math as _math
+import wave as _wave
+import struct as _struct
+
+_ch_snd = {"on": True, "fx": {}, "dir": None, "broken": False}
+_CH_SOUNDS = ("move", "capture", "check", "castle", "promote", "end", "start")
+
+def _ch_synth(kind):
+    rate = 44100
+    rnd = _random.Random(7)
+    def thump(freq, dur, vol, decay, noise, nd):
+        n = int(rate * dur)
+        out = []
+        for i in range(n):
+            t = i / rate
+            f = freq * (1.0 + 0.5 * _math.exp(-t * 90))          # a quick pitch drop reads as a "knock"
+            s = _math.sin(2 * _math.pi * f * t) + 0.45 * _math.sin(2 * _math.pi * f * 2.02 * t)
+            out.append(vol * (s * _math.exp(-t * decay) * 0.7 + noise * (rnd.random() * 2 - 1) * _math.exp(-t * nd)))
+        return out
+    def bell(freq, dur, vol, decay):
+        n = int(rate * dur)
+        return [vol * _math.sin(2 * _math.pi * freq * (i / rate)) * _math.exp(-(i / rate) * decay) for i in range(n)]
+    def mix(parts):
+        total = max(int(off * rate) + len(sm) for off, sm in parts)
+        buf = [0.0] * total
+        for off, sm in parts:
+            o = int(off * rate)
+            for i, v in enumerate(sm):
+                buf[o + i] += v
+        return buf
+    if kind == "move":
+        buf = thump(190, 0.12, 0.9, 42, 0.5, 130)
+    elif kind == "capture":
+        buf = mix([(0.0, thump(150, 0.18, 1.0, 30, 0.8, 80)), (0.045, thump(230, 0.12, 0.7, 45, 0.5, 110))])
+    elif kind == "check":
+        buf = mix([(0.0, thump(190, 0.12, 0.8, 42, 0.5, 130)), (0.07, bell(1180, 0.22, 0.45, 16)), (0.13, bell(1480, 0.22, 0.35, 16))])
+    elif kind == "castle":
+        buf = mix([(0.0, thump(170, 0.12, 0.85, 42, 0.5, 130)), (0.11, thump(210, 0.12, 0.85, 42, 0.5, 130))])
+    elif kind == "promote":
+        buf = mix([(0.0, thump(190, 0.1, 0.7, 42, 0.5, 130)), (0.07, bell(660, 0.3, 0.4, 9)), (0.14, bell(880, 0.3, 0.4, 9)), (0.21, bell(1320, 0.4, 0.4, 7))])
+    elif kind == "end":
+        buf = mix([(0.0, bell(523, 0.5, 0.5, 6)), (0.16, bell(392, 0.5, 0.5, 6)), (0.32, bell(262, 0.8, 0.55, 4))])
+    else:   # start
+        buf = mix([(0.0, bell(740, 0.18, 0.4, 20)), (0.09, bell(990, 0.25, 0.4, 16))])
+    peak = max(1e-6, max(abs(v) for v in buf))
+    return b"".join(_struct.pack("<h", int(max(-1.0, min(1.0, v / peak * 0.85)) * 32767)) for v in buf), rate
+
+def _ch_sound_path(kind):
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_sounds")
+    os.makedirs(d, exist_ok=True)
+    custom = os.path.join(asset_path("chess"), "sounds", kind + ".wav")
+    if os.path.exists(custom):
+        return custom
+    path = os.path.join(d, kind + ".wav")
+    if not os.path.exists(path):
+        data, rate = _ch_synth(kind)
+        with _wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(data)
+    return path
+
+def _ch_play(kind):
+    if not _ch_snd["on"] or _ch_snd["broken"] or kind not in _CH_SOUNDS:
+        return
+    try:
+        fx = _ch_snd["fx"].get(kind)
+        if fx is None:
+            from PyQt6.QtMultimedia import QSoundEffect
+            fx = QSoundEffect()
+            fx.setSource(QUrl.fromLocalFile(_ch_sound_path(kind)))
+            fx.setVolume(0.7)
+            _ch_snd["fx"][kind] = fx
+        fx.play()
+    except Exception:
+        _ch_snd["broken"] = True          # no QtMultimedia / no audio device: stay silent instead of erroring
+
+def _ch_sound_for(san, result):
+    if result:
+        return "end"
+    if "#" in san:
+        return "end"
+    if "+" in san:
+        return "check"
+    if "=" in san:
+        return "promote"
+    if san.startswith("O-O"):
+        return "castle"
+    if "x" in san:
+        return "capture"
+    return "move"
+
+# ================================================================ NCZ Chess: board widget
+from PyQt6.QtGui import QBrush, QRadialGradient, QCursor, QFontMetricsF
+from PyQt6.QtWidgets import QTextBrowser, QCheckBox
+
+_CH_GLYPH = {"K": "\u265A", "Q": "\u265B", "R": "\u265C", "B": "\u265D", "N": "\u265E", "P": "\u265F"}
+_CH_FONTS = ["Segoe UI Symbol", "DejaVu Sans", "Noto Sans Symbols2", "Noto Sans Symbols", "FreeSerif",
+             "Apple Symbols", "Arial Unicode MS", "Symbola"]
+_CH_PIECE_NAMES = {"Q": "Queen", "R": "Rook", "B": "Bishop", "N": "Knight"}
+
+class _ChessBoard(QWidget):
+    moveRequested = pyqtSignal(int, int, str)       # from, to, promotion letter ('' if none): always a legal move
+    keyNav = pyqtSignal(int)
+
+    LIGHT, DARK, HL = QColor("#cccccc"), QColor("#616161"), QColor("#fcfcfc")   # replaced by set_theme() to match the launcher
+
+    def set_theme(self, light, dark, hl):
+        self.LIGHT, self.DARK, self.HL = QColor(light), QColor(dark), QColor(hl)
+        self.update()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 320)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.pos = _ChessPos.from_fen()
+        self.last = None                  # (from, to) of the move being shown
+        self.legal = []                   # legal moves in the position being shown
+        self.who = None                   # None = nobody can move, "w" / "b" / "both"
+        self.flipped = False
+        self.sel = -1
+        self._drag = -1
+        self._drag_xy = QPoint(0, 0)
+        self._paths = {}
+
+    # ---- geometry
+    def _geo(self):
+        side = min(self.width(), self.height())
+        return (self.width() - side) / 2.0, (self.height() - side) / 2.0, side / 8.0
+
+    def _cell(self, sq, geo=None):
+        ox, oy, s = geo or self._geo()
+        r, c = divmod(sq, 8)
+        if self.flipped:
+            r, c = 7 - r, 7 - c
+        return ox + c * s, oy + r * s, s
+
+    def _square_at(self, p):
+        ox, oy, s = self._geo()
+        c, r = int((p.x() - ox) // s), int((p.y() - oy) // s)
+        if not (0 <= c < 8 and 0 <= r < 8) or p.x() < ox or p.y() < oy:
+            return -1
+        if self.flipped:
+            r, c = 7 - r, 7 - c
+        return r * 8 + c
+
+    def set_state(self, pos, last, legal, who):
+        self.pos, self.last, self.legal, self.who = pos, last, legal, who
+        if self.sel >= 0 and not any(m[0] == self.sel for m in legal):
+            self.sel = -1
+        self._drag = -1
+        self.update()
+
+    def clear_selection(self):
+        self.sel = -1
+        self._drag = -1
+        self.update()
+
+    # ---- pieces
+    def _piece_path(self, kind, fs):
+        key = (kind, fs)
+        pth = self._paths.get(key)
+        if pth is None:
+            f = QFont()
+            f.setFamilies(_CH_FONTS)
+            f.setPixelSize(fs)
+            pth = QPainterPath()
+            pth.addText(0, 0, f, _CH_GLYPH[kind] + "\ufe0e")
+            self._paths[key] = pth
+        return pth
+
+    def _draw_piece(self, p, piece, cx, cy, size):
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = _ch_icon_pixmap(piece, max(8, int(size * 0.9 * dpr)))
+        if pm is not None:
+            w, h = pm.width() / dpr, pm.height() / dpr
+            p.drawPixmap(QRectF(cx - w / 2.0, cy - h / 2.0, w, h), pm, QRectF(pm.rect()))
+            return
+        fs = max(10, int(size * 0.86))
+        pth = self._piece_path(piece[1], fs)
+        ref = self._piece_path("K", fs).boundingRect()
+        rect = pth.boundingRect()
+        dy = cy - (ref.top() + ref.bottom()) / 2.0
+        dx = cx - (rect.left() + rect.right()) / 2.0
+        p.save()
+        p.translate(dx, dy)
+        if piece[0] == "w":
+            p.setPen(QPen(QColor("#1b1b1b"), max(1.2, size / 38.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(QColor("#fbfbfb"))
+        else:
+            p.setPen(QPen(QColor("#050505"), max(1.0, size / 48.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(QColor("#2c2a29"))
+        p.drawPath(pth)
+        p.restore()
+
+    # ---- painting
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        geo = self._geo()
+        ox, oy, s = geo
+        cf = QFont()
+        cf.setPixelSize(max(9, int(s * 0.17)))
+        cf.setBold(True)
+        p.setFont(cf)
+        king_chk = self.pos.king_sq(self.pos.turn) if self.pos.in_check() else -1
+        targets = {}
+        if self.sel >= 0:
+            for m in self.legal:
+                if m[0] == self.sel:
+                    targets[m[1]] = True
+        for sq in range(64):
+            x, y, _ = self._cell(sq, geo)
+            r, c = divmod(sq, 8)
+            light = (r + c) % 2 == 0
+            rect = QRectF(x, y, s, s)
+            p.fillRect(rect, self.LIGHT if light else self.DARK)
+            if self.last and sq in self.last:
+                _hc = QColor(self.HL)
+                _hc.setAlpha(115)
+                p.fillRect(rect, _hc)
+            if sq == self.sel:
+                _hc = QColor(self.HL)
+                _hc.setAlpha(175)
+                p.fillRect(rect, _hc)
+            if sq == king_chk:
+                g = QRadialGradient(x + s / 2, y + s / 2, s * 0.62)
+                g.setColorAt(0.0, QColor(255, 0, 0, 230))
+                g.setColorAt(0.65, QColor(231, 76, 60, 120))
+                g.setColorAt(1.0, QColor(231, 76, 60, 0))
+                p.fillRect(rect, QBrush(g))
+            # coordinates inside the edge squares
+            col = self.DARK if light else self.LIGHT
+            p.setPen(col)
+            dr, dc = (7 - r, 7 - c) if self.flipped else (r, c)
+            if dc == 0:
+                p.drawText(QRectF(x + s * 0.05, y + s * 0.03, s * 0.4, s * 0.3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, str(8 - r))
+            if dr == 7:
+                p.drawText(QRectF(x + s * 0.55, y + s * 0.68, s * 0.4, s * 0.3), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, _CH_FILES[c])
+        for sq in range(64):
+            pc = self.pos.b[sq]
+            if not pc or (sq == self._drag):
+                continue
+            x, y, _ = self._cell(sq, geo)
+            self._draw_piece(p, pc, x + s / 2, y + s / 2, s)
+        # legal move hints
+        p.setPen(Qt.PenStyle.NoPen)
+        for sq in targets:
+            x, y, _ = self._cell(sq, geo)
+            if self.pos.captured_by((self.sel, sq, "")) is not None:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(0, 0, 0, 70), s * 0.09))
+                p.drawEllipse(QRectF(x + s * 0.06, y + s * 0.06, s * 0.88, s * 0.88))
+                p.setPen(Qt.PenStyle.NoPen)
+            else:
+                p.setBrush(QColor(0, 0, 0, 62))
+                p.drawEllipse(QRectF(x + s * 0.34, y + s * 0.34, s * 0.32, s * 0.32))
+        if self._drag >= 0 and self.pos.b[self._drag]:
+            self._draw_piece(p, self.pos.b[self._drag], self._drag_xy.x(), self._drag_xy.y(), s * 1.12)
+        p.end()
+
+    # ---- mouse / keyboard
+    def _can_pick(self, sq):
+        pc = self.pos.b[sq] if sq >= 0 else None
+        if not pc or self.who is None:
+            return False
+        return (self.who == "both" or self.who == pc[0]) and pc[0] == self.pos.turn
+
+    def mousePressEvent(self, e):
+        self.setFocus()
+        if e.button() == Qt.MouseButton.RightButton:
+            self.clear_selection()
+            return
+        if e.button() != Qt.MouseButton.LeftButton or self.who is None:
+            return
+        sq = self._square_at(e.position().toPoint())
+        if sq < 0:
+            self.clear_selection()
+            return
+        if self.sel >= 0 and sq != self.sel and any(m[0] == self.sel and m[1] == sq for m in self.legal):
+            self._attempt(self.sel, sq)
+            return
+        if self._can_pick(sq):
+            self.sel = sq
+            self._drag = sq
+            self._drag_xy = e.position().toPoint()
+        else:
+            self.sel = -1
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        if self._drag >= 0:
+            self._drag_xy = e.position().toPoint()
+            self.update()
+        elif self.who is not None:
+            sq = self._square_at(e.position().toPoint())
+            self.setCursor(Qt.CursorShape.PointingHandCursor if self._can_pick(sq) else Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton or self._drag < 0:
+            return
+        src = self._drag
+        self._drag = -1
+        sq = self._square_at(e.position().toPoint())
+        if sq >= 0 and sq != src and any(m[0] == src and m[1] == sq for m in self.legal):
+            self._attempt(src, sq)
+        else:
+            if sq != src:
+                self.sel = -1 if sq >= 0 else self.sel
+        self.update()
+
+    def _attempt(self, f, t):
+        opts = [m for m in self.legal if m[0] == f and m[1] == t]
+        if not opts:
+            return
+        promo = ""
+        if len(opts) > 1:
+            menu = QMenu(self)
+            acts = {}
+            for k in "QRBN":
+                acts[menu.addAction(f"{_CH_GLYPH[k]}\ufe0e  {_CH_PIECE_NAMES[k]}")] = k.lower()
+            chosen = menu.exec(QCursor.pos())
+            if chosen is None:
+                self.sel = -1
+                self.update()
+                return
+            promo = acts[chosen]
+        self.sel = -1
+        self.moveRequested.emit(f, t, promo)
+        self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home, Qt.Key.Key_End):
+            self.keyNav.emit(int(e.key()))
+        else:
+            super().keyPressEvent(e)
+
+# ================================================================ NCZ Chess: the page
+import uuid as _uuid
+import random as _random
+
+# ================================================================ NCZ Chess: bots (their own fast search engine)
+# The rules engine above is written for clarity, not speed, so the bots search with this separate engine: int-coded
+# moves, make/unmake on one board, alpha-beta with iterative deepening, a transposition table, null-move pruning,
+# late-move reductions and a quiescence search. A bot's level = search depth + thinking time + evaluation noise +
+# a chance of a plain blunder. The Elo numbers are targets, not measured values.
+_BP_INF = 1000000
+_BP_MATE = 100000
+_BP_VAL = (0, 100, 320, 330, 500, 900, 0)           # centipawns by piece type (1 P, 2 N, 3 B, 4 R, 5 Q, 6 K)
+
+def _bp_make_tables():
+    kn, kg, br, rr = [], [], [], []
+    pf = {1: [], -1: []}
+    for sq in range(64):
+        r, c = divmod(sq, 8)
+        kn.append([(r + dr) * 8 + c + dc for dr, dc in _CH_KN if 0 <= r + dr < 8 and 0 <= c + dc < 8])
+        kg.append([(r + dr) * 8 + c + dc for dr, dc in _CH_KG if 0 <= r + dr < 8 and 0 <= c + dc < 8])
+        for dirs, out in ((_CH_BISH, br), (_CH_ROOK, rr)):
+            rays = []
+            for dr, dc in dirs:
+                ray, y, x = [], r + dr, c + dc
+                while 0 <= y < 8 and 0 <= x < 8:
+                    ray.append(y * 8 + x)
+                    y += dr
+                    x += dc
+                if ray:
+                    rays.append(ray)
+            out.append(rays)
+        # squares a pawn of that colour would stand on to attack sq
+        pf[1].append([(r + 1) * 8 + c + dc for dc in (-1, 1) if r + 1 < 8 and 0 <= c + dc < 8])
+        pf[-1].append([(r - 1) * 8 + c + dc for dc in (-1, 1) if r - 1 >= 0 and 0 <= c + dc < 8])
+    return kn, kg, br, rr, pf
+
+_BP_KN, _BP_KG, _BP_BR, _BP_RR, _BP_PF = _bp_make_tables()
+
+# piece-square tables (White's view, index 0 = a8)
+_BP_PAWN = (0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5, 10, 25, 25, 10, 5, 5,
+            0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20, -20, 10, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0)
+_BP_KNIGHT = (-50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10, 0, -30,
+              -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10, 5, -30,
+              -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50)
+_BP_BISHOP = (-20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0, -10,
+              -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10, 10, 10, 10, 10, -10,
+              -10, 5, 0, 0, 0, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10, -20)
+_BP_ROOK = (0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5,
+            -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 0, 0, 0, 5, 5, 0, 0, 0)
+_BP_QUEEN = (-20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10,
+             -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10,
+             -10, 0, 5, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20)
+_BP_KING_MG = (-30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30,
+               -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30,
+               -20, -30, -30, -40, -40, -30, -30, -20, -10, -20, -20, -20, -20, -20, -20, -10,
+               20, 20, 0, 0, 0, 0, 20, 20, 20, 30, 10, 0, 0, 10, 30, 20)
+_BP_KING_EG = (-50, -40, -30, -20, -20, -30, -40, -50, -30, -20, -10, 0, 0, -10, -20, -30, -30, -10, 20, 30, 30, 20, -10, -30,
+               -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 20, 30, 30, 20, -10, -30,
+               -30, -30, 0, 0, 0, 0, -30, -30, -50, -30, -30, -30, -30, -30, -30, -50)
+
+def _bp_make_pst():
+    base = {1: _BP_PAWN, 2: _BP_KNIGHT, 3: _BP_BISHOP, 4: _BP_ROOK, 5: _BP_QUEEN}
+    tbl = [None] * 13                       # tbl[p] works for p > 0 and (negative index) for p < 0
+    for k, t in base.items():
+        tbl[k] = [_BP_VAL[k] + t[s] for s in range(64)]
+        tbl[13 - k] = [-(_BP_VAL[k] + t[s ^ 56]) for s in range(64)]
+    return tbl
+
+_BP_PST = _bp_make_pst()
+
+def _bp_make_zobrist():
+    rng = _random.Random(0x4E435A43)
+    zp = [None] * 13
+    for k in range(1, 7):
+        zp[k] = [rng.getrandbits(64) for _i in range(64)]
+        zp[13 - k] = [rng.getrandbits(64) for _i in range(64)]
+    return zp, [rng.getrandbits(64) for _i in range(16)], [rng.getrandbits(64) for _i in range(65)], rng.getrandbits(64)
+
+_BP_ZP, _BP_ZC, _BP_ZE, _BP_ZS = _bp_make_zobrist()
+_BP_CR = [15] * 64                           # castling rights kept when a piece moves from / to this square (K=1 Q=2 k=4 q=8)
+for _sq, _mask in ((60, 12), (63, 14), (56, 13), (4, 3), (7, 11), (0, 7)):
+    _BP_CR[_sq] = _mask
+_BP_PROMO = {0: "", 2: "n", 3: "b", 4: "r", 5: "q"}
+
+
+class _BotTimeout(Exception):
+    pass
+
+
+class _ChessBot:
+    def __init__(self, noise=0, use_q=True):
+        self.noise, self.use_q = noise, use_q
+        self.b = [0] * 64
+        self.side, self.castle, self.ep, self.half = 1, 0, -1, 0
+        self.ksq = [60, 4]
+        self.hash = 0
+        self.stack, self.nstack = [], []
+        self.repc = {}
+        self.tt = {}
+        self.killers = [[0, 0] for _i in range(72)]
+        self.hh = [0] * 4096
+        self.nodes = 0
+        self.deadline = 0.0
+        self.can_stop = False
+        self.rbest = 0
+        self.rnd = _random.random
+
+    # ---- position in / out
+    def load(self, pos):
+        self.b = [0] * 64
+        for s, p in enumerate(pos.b):
+            if p:
+                k = "PNBRQK".index(p[1]) + 1
+                self.b[s] = k if p[0] == "w" else -k
+                if k == 6:
+                    self.ksq[0 if p[0] == "w" else 1] = s
+        self.side = 1 if pos.turn == "w" else -1
+        c = 0
+        for ch, bit in (("K", 1), ("Q", 2), ("k", 4), ("q", 8)):
+            if ch in pos.castle:
+                c |= bit
+        self.castle, self.ep, self.half = c, pos.ep, pos.half
+        self.stack, self.nstack = [], []
+        self.hash = self.full_hash()
+
+    def full_hash(self):
+        h = 0
+        for s, p in enumerate(self.b):
+            if p:
+                h ^= _BP_ZP[p][s]
+        h ^= _BP_ZC[self.castle] ^ _BP_ZE[self.ep + 1]
+        if self.side == -1:
+            h ^= _BP_ZS
+        return h
+
+    # ---- attacks / move generation
+    def attacked(self, sq, by):
+        b = self.b
+        for s in _BP_PF[by][sq]:
+            if b[s] == by:
+                return True
+        n, k = 2 * by, 6 * by
+        for s in _BP_KN[sq]:
+            if b[s] == n:
+                return True
+        for s in _BP_KG[sq]:
+            if b[s] == k:
+                return True
+        bq, rq, q = 3 * by, 4 * by, 5 * by
+        for ray in _BP_BR[sq]:
+            for s in ray:
+                p = b[s]
+                if p:
+                    if p == bq or p == q:
+                        return True
+                    break
+        for ray in _BP_RR[sq]:
+            for s in ray:
+                p = b[s]
+                if p:
+                    if p == rq or p == q:
+                        return True
+                    break
+        return False
+
+    def gen(self, qs=False):
+        """Pseudo-legal moves (captures and queen promotions only when qs)."""
+        b, side, out = self.b, self.side, []
+        ap = out.append
+        up = -8 if side == 1 else 8
+        prow = 0 if side == 1 else 7
+        srow = 6 if side == 1 else 1
+        ep = self.ep
+        for f in range(64):
+            p = b[f] * side
+            if p <= 0:
+                continue
+            if p == 1:
+                t = f + up
+                promo = (t >> 3) == prow
+                if not b[t]:
+                    if promo:
+                        ap(f | t << 6 | 5 << 12)
+                        if not qs:
+                            ap(f | t << 6 | 4 << 12)
+                            ap(f | t << 6 | 3 << 12)
+                            ap(f | t << 6 | 2 << 12)
+                    elif not qs:
+                        ap(f | t << 6)
+                        if (f >> 3) == srow and not b[t + up]:
+                            ap(f | (t + up) << 6)
+                c = f & 7
+                for ok, t2 in ((c > 0, t - 1), (c < 7, t + 1)):
+                    if ok:
+                        q = b[t2]
+                        if q * side < 0:
+                            if promo:
+                                ap(f | t2 << 6 | 5 << 12)
+                                if not qs:
+                                    ap(f | t2 << 6 | 4 << 12)
+                                    ap(f | t2 << 6 | 3 << 12)
+                                    ap(f | t2 << 6 | 2 << 12)
+                            else:
+                                ap(f | t2 << 6)
+                        elif q == 0 and t2 == ep:
+                            ap(f | t2 << 6)
+            elif p == 2 or p == 6:
+                for t in (_BP_KN[f] if p == 2 else _BP_KG[f]):
+                    q = b[t]
+                    if q * side > 0 or (qs and not q):
+                        continue
+                    ap(f | t << 6)
+                if p == 6 and not qs:
+                    cs = self.castle
+                    if side == 1 and f == 60 and cs & 3:
+                        if (cs & 1 and not b[61] and not b[62] and b[63] == 4 and not self.attacked(60, -1)
+                                and not self.attacked(61, -1) and not self.attacked(62, -1)):
+                            ap(60 | 62 << 6)
+                        if (cs & 2 and not b[59] and not b[58] and not b[57] and b[56] == 4 and not self.attacked(60, -1)
+                                and not self.attacked(59, -1) and not self.attacked(58, -1)):
+                            ap(60 | 58 << 6)
+                    elif side == -1 and f == 4 and cs & 12:
+                        if (cs & 4 and not b[5] and not b[6] and b[7] == -4 and not self.attacked(4, 1)
+                                and not self.attacked(5, 1) and not self.attacked(6, 1)):
+                            ap(4 | 6 << 6)
+                        if (cs & 8 and not b[3] and not b[2] and not b[1] and b[0] == -4 and not self.attacked(4, 1)
+                                and not self.attacked(3, 1) and not self.attacked(2, 1)):
+                            ap(4 | 2 << 6)
+            else:
+                if p != 4:
+                    for ray in _BP_BR[f]:
+                        for t in ray:
+                            q = b[t]
+                            if q == 0:
+                                if not qs:
+                                    ap(f | t << 6)
+                                continue
+                            if q * side < 0:
+                                ap(f | t << 6)
+                            break
+                if p != 3:
+                    for ray in _BP_RR[f]:
+                        for t in ray:
+                            q = b[t]
+                            if q == 0:
+                                if not qs:
+                                    ap(f | t << 6)
+                                continue
+                            if q * side < 0:
+                                ap(f | t << 6)
+                            break
+        return out
+
+    # ---- make / unmake
+    def make(self, m):
+        b = self.b
+        f, t, pr = m & 63, (m >> 6) & 63, m >> 12
+        p, cap, side = b[f], b[t], self.side
+        h = self.hash
+        self.stack.append((m, cap, self.castle, self.ep, self.half, h))
+        zp = _BP_ZP
+        h ^= zp[p][f]
+        if cap:
+            h ^= zp[cap][t]
+        b[f] = 0
+        kind = p if p > 0 else -p
+        half = self.half + 1
+        newp = p
+        newep = -1
+        if cap:
+            half = 0
+        if kind == 1:
+            half = 0
+            if t == self.ep and not cap and (f & 7) != (t & 7):
+                cs = t + (8 if side == 1 else -8)
+                h ^= zp[b[cs]][cs]
+                b[cs] = 0
+            if pr:
+                newp = pr * side
+            if t - f == 16 or f - t == 16:
+                e = (f + t) >> 1
+                en = -side
+                if ((t & 7) > 0 and b[t - 1] == en) or ((t & 7) < 7 and b[t + 1] == en):
+                    newep = e
+        elif kind == 6:
+            self.ksq[0 if side == 1 else 1] = t
+            if t - f == 2:
+                b[f + 1], b[f + 3] = b[f + 3], 0
+                h ^= zp[4 * side][f + 3] ^ zp[4 * side][f + 1]
+            elif f - t == 2:
+                b[f - 1], b[f - 4] = b[f - 4], 0
+                h ^= zp[4 * side][f - 4] ^ zp[4 * side][f - 1]
+        b[t] = newp
+        h ^= zp[newp][t]
+        oc = self.castle
+        nc = oc & _BP_CR[f] & _BP_CR[t]
+        h ^= _BP_ZC[oc] ^ _BP_ZC[nc] ^ _BP_ZE[self.ep + 1] ^ _BP_ZE[newep + 1] ^ _BP_ZS
+        self.castle, self.ep, self.half, self.side, self.hash = nc, newep, half, -side, h
+        self.repc[h] = self.repc.get(h, 0) + 1
+
+    def unmake(self):
+        self.repc[self.hash] -= 1
+        m, cap, castle, ep, half, h = self.stack.pop()
+        b = self.b
+        f, t, pr = m & 63, (m >> 6) & 63, m >> 12
+        side = -self.side
+        self.side = side
+        p = side if pr else b[t]
+        b[f] = p
+        b[t] = cap
+        kind = p if p > 0 else -p
+        if kind == 1:
+            if t == ep and not cap and (f & 7) != (t & 7):
+                b[t + (8 if side == 1 else -8)] = -side
+        elif kind == 6:
+            self.ksq[0 if side == 1 else 1] = f
+            if t - f == 2:
+                b[f + 3], b[f + 1] = b[f + 1], 0
+            elif f - t == 2:
+                b[f - 4], b[f - 1] = b[f - 1], 0
+        self.castle, self.ep, self.half, self.hash = castle, ep, half, h
+
+    def make_null(self):
+        self.nstack.append((self.ep, self.hash, self.half))
+        self.hash ^= _BP_ZE[self.ep + 1] ^ _BP_ZE[0] ^ _BP_ZS
+        self.ep = -1
+        self.side = -self.side
+        self.half += 1
+
+    def unmake_null(self):
+        self.ep, self.hash, self.half = self.nstack.pop()
+        self.side = -self.side
+
+    # ---- evaluation (centipawns, from the side to move)
+    def evaluate(self):
+        b, tbl = self.b, _BP_PST
+        s = 0
+        mat = 0
+        wk = bk = 0
+        wb = bb = 0
+        for sq in range(64):
+            p = b[sq]
+            if p:
+                if p == 6:
+                    wk = sq
+                elif p == -6:
+                    bk = sq
+                else:
+                    s += tbl[p][sq]
+                    if p == 3:
+                        wb += 1
+                    elif p == -3:
+                        bb += 1
+                    if p > 1:
+                        mat += _BP_VAL[p]
+                    elif p < -1:
+                        mat += _BP_VAL[-p]
+        kt = _BP_KING_EG if mat <= 2600 else _BP_KING_MG
+        s += kt[wk] - kt[bk ^ 56]
+        if wb > 1:
+            s += 30
+        if bb > 1:
+            s -= 30
+        if self.side == -1:
+            s = -s
+        s += 8
+        if self.noise:
+            s += int((self.rnd() * 2 - 1) * self.noise)
+        return s
+
+    # ---- search
+    def _poll_time(self):
+        time.sleep(0.001)                      # lets the UI thread breathe while a bot thinks
+        if self.can_stop and time.time() > self.deadline:
+            raise _BotTimeout()
+
+    def _sort(self, moves, ttm, ply):
+        b = self.b
+        k1, k2 = self.killers[ply]
+        hh = self.hh
+        scored = []
+        for m in moves:
+            f, t = m & 63, (m >> 6) & 63
+            if m == ttm:
+                s = 2000000
+            else:
+                v = b[t]
+                if v:
+                    s = 1000000 + (v if v > 0 else -v) * 16 - (b[f] if b[f] > 0 else -b[f])
+                elif m >> 12:
+                    s = 900000 + (m >> 12)
+                elif m == k1:
+                    s = 800000
+                elif m == k2:
+                    s = 799999
+                else:
+                    a = b[f]
+                    if (a == 1 or a == -1) and (f & 7) != (t & 7):
+                        s = 1000015
+                    else:
+                        s = hh[m & 4095]
+            scored.append((s, m))
+        scored.sort(reverse=True)
+        return [m for _s, m in scored]
+
+    def qsearch(self, alpha, beta, ply):
+        self.nodes += 1
+        if not (self.nodes & 511):
+            self._poll_time()
+        stand = self.evaluate()
+        if ply >= 64 or stand >= beta:
+            return stand
+        if stand > alpha:
+            alpha = stand
+        side = self.side
+        ki = 0 if side == 1 else 1
+        b = self.b
+        for m in self._sort(self.gen(True), 0, 70 if ply >= 70 else ply):
+            v = b[(m >> 6) & 63]
+            if not (m >> 12) and stand + _BP_VAL[v if v > 0 else -v] + 200 < alpha:
+                continue                                           # can't raise alpha even by winning the piece
+            self.make(m)
+            if self.attacked(self.ksq[ki], -side):
+                self.unmake()
+                continue
+            sc = -self.qsearch(-beta, -alpha, ply + 1)
+            self.unmake()
+            if sc >= beta:
+                return sc
+            if sc > alpha:
+                alpha = sc
+        return alpha
+
+    def _has_pieces(self, side):
+        for x in self.b:
+            x *= side
+            if 1 < x < 6:
+                return True
+        return False
+
+    def search(self, depth, alpha, beta, ply, nullok=True):
+        self.nodes += 1
+        if not (self.nodes & 511):
+            self._poll_time()
+        h = self.hash
+        if ply > 0 and (self.repc.get(h, 0) >= 2 or self.half >= 100):
+            return 0
+        side = self.side
+        ki = 0 if side == 1 else 1
+        incheck = self.attacked(self.ksq[ki], -side)
+        if incheck:
+            depth += 1
+        if depth <= 0 or ply >= 62:
+            return self.qsearch(alpha, beta, ply) if self.use_q else self.evaluate()
+        ttm = 0
+        e = self.tt.get(h)
+        if e:
+            ttm = e[3]
+            if ply > 0 and e[0] >= depth:
+                sc, fl = e[2], e[1]
+                if sc > _BP_MATE - 200:
+                    sc -= ply
+                elif sc < -_BP_MATE + 200:
+                    sc += ply
+                if fl == 0 or (fl == 1 and sc >= beta) or (fl == 2 and sc <= alpha):
+                    return sc
+        if (nullok and depth >= 3 and not incheck and beta < _BP_MATE - 200 and ply > 0
+                and self._has_pieces(side) and self.evaluate() >= beta):
+            self.make_null()
+            sc = -self.search(depth - 3, -beta, -beta + 1, ply + 1, False)
+            self.unmake_null()
+            if sc >= beta:
+                return beta
+        b = self.b
+        alpha0 = alpha
+        best, bm, legal = -_BP_INF, 0, 0
+        for m in self._sort(self.gen(), ttm, ply):
+            t = (m >> 6) & 63
+            quiet = not b[t] and not (m >> 12)
+            self.make(m)
+            if self.attacked(self.ksq[ki], -side):
+                self.unmake()
+                continue
+            legal += 1
+            if legal == 1:
+                sc = -self.search(depth - 1, -beta, -alpha, ply + 1)
+            else:
+                red = 1 if (depth >= 3 and legal > 4 and quiet and not incheck) else 0
+                sc = -self.search(depth - 1 - red, -alpha - 1, -alpha, ply + 1)
+                if sc > alpha and (red or sc < beta):
+                    sc = -self.search(depth - 1, -beta, -alpha, ply + 1)
+            self.unmake()
+            if sc > best:
+                best, bm = sc, m
+                if sc > alpha:
+                    alpha = sc
+                    if alpha >= beta:
+                        if quiet:
+                            k = self.killers[ply]
+                            if k[0] != m:
+                                k[1], k[0] = k[0], m
+                            v = self.hh[m & 4095] + depth * depth
+                            self.hh[m & 4095] = v if v < 700000 else 700000
+                        break
+        if not legal:
+            return -_BP_MATE + ply if incheck else 0
+        if ply == 0:
+            self.rbest = bm
+        sc = best
+        fl = 0 if alpha0 < best < beta else (1 if best >= beta else 2)
+        if sc > _BP_MATE - 200:
+            sc += ply
+        elif sc < -_BP_MATE + 200:
+            sc -= ply
+        if len(self.tt) > 300000:
+            self.tt.clear()
+        self.tt[h] = (depth, fl, sc, bm)
+        return best
+
+    def choose(self, pos, hist, depth_max, secs, blunder):
+        """Pick a move for `pos` (hist = every position of the game so far, last one is pos). Returns an int move or 0."""
+        self.repc = {}
+        for hp in hist[:-1]:
+            self.load(hp)
+            self.repc[self.hash] = self.repc.get(self.hash, 0) + 1
+        self.load(pos)
+        self.repc[self.hash] = self.repc.get(self.hash, 0) + 1
+        legal = []
+        for m in self.gen():
+            self.make(m)
+            if not self.attacked(self.ksq[0 if self.side == -1 else 1], self.side):
+                legal.append(m)
+            self.unmake()
+        if not legal:
+            return 0
+        if len(legal) == 1:
+            return legal[0]
+        if blunder and _random.random() < blunder:
+            return _random.choice(legal)
+        start = time.time()
+        self.deadline = start + secs
+        best = legal[0]
+        for d in range(1, depth_max + 1):
+            self.can_stop = d > 1
+            self.rbest = 0
+            try:
+                sc = self.search(d, -_BP_INF, _BP_INF, 0)
+            except _BotTimeout:
+                break
+            if self.rbest:
+                best = self.rbest
+            if abs(sc) > _BP_MATE - 200 or time.time() - start > secs * 0.45:
+                break
+        return best
+
+
+# ---- the bots
+_CH_BOT_LIST = [
+    dict(elo=250, name="Pebble", blurb="Barely knows how the pieces move.", depth=1, secs=0.3, noise=450, blunder=0.50, quiesce=False),
+    dict(elo=350, name="Toast", blurb="Grabs whatever it can and forgets to defend.", depth=1, secs=0.3, noise=330, blunder=0.35, quiesce=False),
+    dict(elo=450, name="Sprout", blurb="Plays fast and loose.", depth=1, secs=0.3, noise=230, blunder=0.25, quiesce=False),
+    dict(elo=600, name="Clyde", blurb="Sees one move ahead, and the trades that follow.", depth=1, secs=0.4, noise=140, blunder=0.12, quiesce=True),
+    dict(elo=800, name="Maya", blurb="Careful, but still makes mistakes.", depth=2, secs=0.8, noise=90, blunder=0.08, quiesce=False),
+    dict(elo=1000, name="Atlas", blurb="A solid beginner who sees most simple threats.", depth=2, secs=1.0, noise=50, blunder=0.04, quiesce=True),
+    dict(elo=1250, name="Nova", blurb="Spots most simple tactics.", depth=3, secs=1.5, noise=30, blunder=0.0, quiesce=True),
+    dict(elo=1500, name="Vega", blurb="Looks several moves ahead.", depth=4, secs=3.0, noise=14, blunder=0.0, quiesce=True),
+    dict(elo=2000, name="Orion", blurb="The strongest bot. Searches as deep as its time allows.", depth=12, secs=6.0, noise=4, blunder=0.0, quiesce=True),
+]
+
+def _bot_choose(pos, hist, cfg, secs):
+    """Run on a worker thread: the bot's move as (from, to, promotion letter), or None."""
+    bot = _ChessBot(cfg["noise"], cfg["quiesce"])
+    m = bot.choose(pos, hist, cfg["depth"], secs, cfg["blunder"])
+    if not m:
+        return None
+    return (m & 63, (m >> 6) & 63, _BP_PROMO[m >> 12])
+
+def _bot_eval_for(pos, bot_color):
+    """Quick 2-ply score of `pos` in centipawns from the bot's side (used to decide whether it accepts a draw)."""
+    bot = _ChessBot(0, True)
+    bot.load(pos)
+    sc = bot.search(2, -_BP_INF, _BP_INF, 0)
+    return sc if bot.side == (1 if bot_color == "w" else -1) else -sc
+
+
+_CH_TIMES = [("No clock", 0, 0), ("1 min", 1, 0), ("1 | 1", 1, 1), ("3 min", 3, 0), ("3 | 2", 3, 2),
+             ("5 min", 5, 0), ("10 min", 10, 0), ("15 | 10", 15, 10), ("30 min", 30, 0)]
+_CH_INVITE_TTL_MS = 15 * 60 * 1000
+
+def _ch_fmt_clock(ms):
+    if ms is None:
+        return "\u221E"
+    ms = max(0, int(ms))
+    if ms < 10000:
+        return f"0:{ms / 1000:04.1f}"
+    s = ms // 1000
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+def _ch_server_now():
+    return time.time() * 1000 + _clock_skew["ms"]
+
+def _ch_can_mate(pos, color):
+    """False when `color` has only a king, or a king and one minor piece (a flagged opponent then only draws)."""
+    minors = 0
+    for p in pos.b:
+        if p and p[0] == color and p[1] != "K":
+            if p[1] in "NB":
+                minors += 1
+            else:
+                return True
+    return minors >= 2
+
+class _ChessBg(QObject):
+    """Runs a function on a worker thread and hands (result, error) back on the GUI thread."""
+    done = pyqtSignal(int, object, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cbs, self._n = {}, 0
+        self.done.connect(self._finish)
+
+    def run(self, fn, cb):
+        self._n += 1
+        i = self._n
+        self._cbs[i] = cb
+        def work():
+            try:
+                res, err = fn(), None
+            except Exception as ex:
+                res, err = None, ex
+            self.done.emit(i, res, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish(self, i, res, err):
+        cb = self._cbs.pop(i, None)
+        if cb:
+            cb(res, err)
+
+class _ChessStrip(QFrame):
+    AV = 30
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChStrip")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 2, 8, 2)
+        row.setSpacing(8)
+        self.dot = QLabel()
+        self.dot.setFixedSize(14, 14)
+        self.avatar = QLabel()
+        self.avatar.setFixedSize(self.AV, self.AV)
+        self.avatar.hide()
+        self._av_key = None
+        self.name = QLabel("")
+        self.name.setObjectName("ChName")
+        self.elo = QLabel("")
+        self.elo.setObjectName("ChEloBadge")
+        self.elo.setTextFormat(Qt.TextFormat.RichText)
+        self.elo.hide()
+        self._elo_html = ""
+        self.caps = QLabel("")
+        self.caps.setObjectName("ChCaps")
+        self.caps.setTextFormat(Qt.TextFormat.RichText)
+        self.clock = QLabel("")
+        self.clock.setObjectName("ChClock")
+        self.clock.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clock.setMinimumWidth(92)
+        row.addWidget(self.dot)
+        row.addWidget(self.avatar)
+        row.addWidget(self.name)
+        row.addWidget(self.elo)
+        row.addWidget(self.caps, 1)
+        row.addWidget(self.clock)
+
+    def set(self, color, name, caps_html, clock_text, active, low, avatar=None, letter="", show_avatar=False, elo_html=""):
+        self.dot.setStyleSheet(f"border-radius:7px;border:1px solid #111;background:{'#f4f4f4' if color == 'w' else '#2b2b2b'};")
+        self.name.setText(name)
+        self.caps.setText(caps_html)
+        self.clock.setText(clock_text)
+        self.clock.setProperty("active", bool(active))
+        self.clock.setProperty("low", bool(low))
+        self.clock.style().unpolish(self.clock)
+        self.clock.style().polish(self.clock)
+        # the strip repaints ten times a second, so the picture / badge are only rebuilt when they change
+        if show_avatar:
+            key = (avatar, letter)
+            if key != self._av_key:
+                self.avatar.setPixmap(_fo_avatar(avatar, letter or "?", self.AV))
+                self._av_key = key
+            self.avatar.show()
+        else:
+            self._av_key = None
+            self.avatar.hide()
+        if elo_html != self._elo_html:
+            self._elo_html = elo_html
+            self.elo.setText(elo_html)
+            self.elo.setVisible(bool(elo_html))
+
+class _SquareHost(QWidget):
+    """Top player strip + square board + bottom strip, kept the same width."""
+    def __init__(self, top, board, bottom, parent=None):
+        super().__init__(parent)
+        self.top, self.board, self.bottom = top, board, bottom
+        for w in (top, board, bottom):
+            w.setParent(self)
+        self.setMinimumSize(340, 420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def resizeEvent(self, _e):
+        sh = 40
+        side = max(200, min(self.width(), self.height() - 2 * sh - 8))
+        x = (self.width() - side) // 2
+        total = side + 2 * sh + 8
+        y = max(0, (self.height() - total) // 2)
+        self.top.setGeometry(x, y, side, sh)
+        self.board.setGeometry(x, y + sh + 4, side, side)
+        self.bottom.setGeometry(x, y + sh + 4 + side + 4, side, sh)
+
+# ---------------------------------------------------------------- Elo ratings (online games between friends)
+# Every player keeps one record at chess/ratings/<uid> = {r: rating, g: games, w, l, d, last: {gid, before, delta, opp}}.
+# Each client only ever writes ITS OWN record when a game ends. `last` remembers which game was counted last and the rating
+# before it, so (a) a game is never counted twice and (b) the other player can still compute the same pre-game rating.
+_CH_ELO_START = 400
+_CH_ELO_FLOOR = 100
+_CH_ELO_MIN_PLIES = 4          # games shorter than this (2 moves each) aren't rated
+
+def _ch_int(v, default=0):
+    try:
+        return int(round(float(v)))
+    except Exception:
+        return default
+
+def _ch_elo_k(games_before):
+    return 40 if games_before < 10 else 20          # new players move faster until they have 10 rated games
+
+def _ch_elo_delta(r_me, games_me, r_opp, score_me):
+    """Rating change for me. score_me: 1 win, 0.5 draw, 0 loss."""
+    expected = 1.0 / (1.0 + 10 ** ((r_opp - r_me) / 400.0))
+    return int(round(_ch_elo_k(games_me) * (score_me - expected)))
+
+def _ch_elo_pre(rec, gid):
+    """(rating before this game, games before it, delta already applied for it or None, current rating)."""
+    rec = rec if isinstance(rec, dict) else {}
+    cur = _ch_int(rec.get("r"), _CH_ELO_START)
+    n = max(0, _ch_int(rec.get("g"), 0))
+    last = rec.get("last") if isinstance(rec.get("last"), dict) else {}
+    if gid and last.get("gid") == gid:
+        return _ch_int(last.get("before"), cur), max(0, n - 1), _ch_int(last.get("delta"), 0), cur
+    return cur, n, None, cur
+
+def _ch_round_png(key, path, letter, size=22):
+    """Round avatar saved as a small png, so rich-text labels (the leaderboard) can show it with <img>. -> file url or ''."""
+    try:
+        folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_avatars")
+        os.makedirs(folder, exist_ok=True)
+        out = os.path.join(folder, re.sub(r"[^A-Za-z0-9]", "_", str(key)) + f"_{size}.png")
+        _fo_avatar(path, letter or "?", size * 2).save(out, "PNG")
+        return QUrl.fromLocalFile(out).toString()
+    except Exception:
+        return ""
+
+def _ch_theme():
+    """The launcher's live theme (the New theme or the account theme) so chess always matches it."""
+    try:
+        return dict(SUNSET_THEME)
+    except Exception:
+        return dict(THEMES["dark"])
+
+def _ch_mix(a, b, t):
+    ca, cb = QColor(a), QColor(b)
+    return QColor(int(ca.red() + (cb.red() - ca.red()) * t), int(ca.green() + (cb.green() - ca.green()) * t),
+                  int(ca.blue() + (cb.blue() - ca.blue()) * t))
+
+def _ch_board_colors(t):
+    """Board squares follow the theme accent: greys for the white/black theme, tinted for coloured themes."""
+    acc = QColor(t.get("accent", "#fcfcfc"))
+    h, s, _l, _a = acc.getHslF()
+    if h < 0:
+        h, s = 0.0, 0.0
+    s = min(s * 0.6, 0.5)
+    return QColor.fromHslF(h, s, 0.80), QColor.fromHslF(h, s, 0.38), acc
+
+def _ch_css(t=None):
+    t = t or _ch_theme()
+    txt, sub = t.get("text", "#ffffff"), t.get("subtext", "#aaaaaa")
+    acc, acc_h, acc_p = t.get("accent", "#fcfcfc"), t.get("accent_hover", "#ffffff"), t.get("accent_press", "#c4c4c4")
+    on = t.get("on_accent", "#ffffff")
+    btn, btn_h = t.get("button", "#222222"), t.get("button_hover", "#303030")
+    dis_bg, dis_tx = t.get("disabled_bg", "#161616"), t.get("disabled_text", "#666666")
+    inp, bor, pan = t.get("input", "#0d0d0d"), t.get("border", "#2e2e2e"), t.get("panel", "#1a1a1a")
+    acc_lo, acc_h_lo = _ch_mix(acc, acc_p, 0.5).name(), _ch_mix(acc_h, acc_p, 0.5).name()
+    glass = "background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); border-radius: 16px;"
+    return f"""
+#ChessPage {{ background: transparent; }}
+#ChessPage QLabel {{ color:{txt}; background:transparent; border:none; }}
+#ChessPage #ChTitle {{ color:{txt}; font-size:22px; font-weight:700; }}
+#ChessPage #ChHead {{ color:{txt}; font-size:16px; font-weight:700; }}
+#ChessPage #ChMuted {{ color:{sub}; }}
+#ChessPage #ChStatus {{ color:{txt}; font-size:15px; font-weight:600; }}
+#ChessPage #ChName {{ color:{txt}; font-weight:600; font-size:14px; }}
+#ChessPage #ChCaps {{ font-size:15px; }}
+#ChessPage #ChElo {{ color:{acc}; font-size:38px; font-weight:800; }}
+#ChessPage #ChEloBadge {{ background:rgba(255,255,255,0.10); color:{sub}; font-size:12px; font-weight:700; padding:1px 8px; border-radius:9px; }}
+#ChessPage #ChClock {{ background:rgba(255,255,255,0.08); color:{sub}; font-family:Consolas,'DejaVu Sans Mono',monospace; font-size:20px;
+    font-weight:700; padding:2px 8px; border-radius:8px; }}
+#ChessPage #ChClock[active="true"] {{ background:{acc}; color:{on}; }}
+#ChessPage #ChClock[low="true"] {{ background:#c0392b; color:#ffffff; }}
+#ChessPage #ChCard {{ {glass} }}
+#ChessPage #ChPanel {{ {glass} }}
+#ChessPage QPushButton {{ background:{btn}; color:{txt}; border:none; border-radius:8px; padding:8px 14px; font-weight:600; }}
+#ChessPage QPushButton:hover {{ background:{btn_h}; }}
+#ChessPage QPushButton:disabled {{ background:{dis_bg}; color:{dis_tx}; }}
+#ChessPage QPushButton#ChGreen {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc}, stop:1 {acc_lo}); color:{on}; font-size:15px; padding:11px 14px; }}
+#ChessPage QPushButton#ChGreen:hover {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc_h}, stop:1 {acc_h_lo}); }}
+#ChessPage QPushButton#ChGreen:disabled {{ background:{dis_bg}; color:{dis_tx}; }}
+#ChessPage QPushButton#ChDanger {{ background:rgba(229,72,77,0.22); color:{txt}; }}
+#ChessPage QPushButton#ChDanger:hover {{ background:rgba(229,72,77,0.45); }}
+#ChessPage QComboBox {{ background:{inp}; color:{txt}; border:1px solid {bor}; border-radius:8px; padding:6px 8px; min-height:22px; }}
+#ChessPage QComboBox QAbstractItemView {{ background:{pan}; color:{txt}; border:1px solid {bor}; selection-background-color:{acc}; selection-color:{on}; }}
+#ChessPage QCheckBox {{ color:{txt}; }}
+#ChessPage QTextBrowser {{ background:{inp}; color:{sub}; border:1px solid {bor}; border-radius:10px; font-size:14px; padding:6px; }}
+"""
+
+# ================================================================ NCZ Chess: game review (PGN -> Chesskit through Playwright)
+# The finished game is exported as PGN, a hidden Chromium (Playwright) opens Chesskit's analysis page, loads the PGN,
+# lets Chesskit's Stockfish review it, and the report is copied back here (a screenshot of it + the numbers we can read).
+# Needs: pip install playwright && playwright install chromium
+CHESSKIT_URL = "https://chesskit.org/"
+
+def _ch_review_dir():
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_reviews")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _ch_pgn(game, white, black, white_elo=None, black_elo=None):
+    """The game as a standard PGN string (tags + SAN movetext + result)."""
+    def tag(v):
+        return re.sub(r'["\\\r\n]', "", str(v or "?")).strip() or "?"
+    r = game.result
+    res = "*" if not r else ("1-0" if r.get("winner") == "w" else "0-1" if r.get("winner") == "b" else "1/2-1/2")
+    tags = [("Event", "NCZ Chess"), ("Site", "NCZ Games Launcher"), ("Date", time.strftime("%Y.%m.%d")),
+            ("Round", "-"), ("White", tag(white)), ("Black", tag(black)), ("Result", res)]
+    if white_elo:
+        tags.append(("WhiteElo", str(white_elo)))
+    if black_elo:
+        tags.append(("BlackElo", str(black_elo)))
+    parts = []
+    for i, san in enumerate(game.sans):
+        parts.append((f"{i // 2 + 1}. " if i % 2 == 0 else "") + san)
+    head = "\n".join(f'[{k} "{v}"]' for k, v in tags)
+    return head + "\n\n" + " ".join(parts + [res]) + "\n"
+
+# ---- opening / gambit names (longest matching start of the game wins; moves written without move numbers)
+_CH_OPENINGS_TXT = """
+e4|King's Pawn Game
+e4 e5|King's Pawn Game: Open Game
+e4 e5 Ke2|Bongcloud Attack
+e4 e5 Qh5|Wayward Queen Attack
+e4 e5 Nf3|King's Knight Opening
+e4 e5 Nf3 Nc6|King's Knight Opening: Normal Variation
+e4 e5 Nf3 Nc6 Bb5|Ruy Lopez
+e4 e5 Nf3 Nc6 Bb5 a6|Ruy Lopez: Morphy Defense
+e4 e5 Nf3 Nc6 Bb5 a6 Bxc6|Ruy Lopez: Exchange Variation
+e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Nxe4|Ruy Lopez: Open Variation
+e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7|Ruy Lopez: Closed Variation
+e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7 Re1 b5 Bb3 O-O c3 d5|Ruy Lopez: Marshall Attack
+e4 e5 Nf3 Nc6 Bb5 Nf6|Ruy Lopez: Berlin Defense
+e4 e5 Nf3 Nc6 Bb5 f5|Ruy Lopez: Schliemann Defense
+e4 e5 Nf3 Nc6 Bb5 Bc5|Ruy Lopez: Classical Defense
+e4 e5 Nf3 Nc6 Bb5 d6|Ruy Lopez: Steinitz Defense
+e4 e5 Nf3 Nc6 Bb5 Nge7|Ruy Lopez: Cozio Defense
+e4 e5 Nf3 Nc6 Bc4|Italian Game
+e4 e5 Nf3 Nc6 Bc4 Bc5|Italian Game: Giuoco Piano
+e4 e5 Nf3 Nc6 Bc4 Bc5 d3|Italian Game: Giuoco Pianissimo
+e4 e5 Nf3 Nc6 Bc4 Bc5 b4|Evans Gambit
+e4 e5 Nf3 Nc6 Bc4 Be7|Italian Game: Hungarian Defense
+e4 e5 Nf3 Nc6 Bc4 Nf6|Italian Game: Two Knights Defense
+e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5|Two Knights Defense: Knight Attack
+e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5 d5 exd5 Na5|Two Knights Defense: Polerio Defense
+e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5 d5 exd5 Nxd5 Nxf7|Fried Liver Attack
+e4 e5 Nf3 Nc6 d4|Scotch Game
+e4 e5 Nf3 Nc6 d4 exd4 Bc4|Scotch Gambit
+e4 e5 Nf3 Nc6 d4 exd4 c3|Goring Gambit
+e4 e5 Nf3 Nc6 d4 exd4 Nxd4 Bc5|Scotch Game: Classical Variation
+e4 e5 Nf3 Nc6 d4 exd4 Nxd4 Qh4|Scotch Game: Steinitz Variation
+e4 e5 Nf3 Nc6 c3|Ponziani Opening
+e4 e5 Nf3 Nc6 Nc3|Three Knights Game
+e4 e5 Nf3 Nc6 Nc3 Nf6|Four Knights Game
+e4 e5 Nf3 Nc6 Nc3 Nf6 Bb5|Four Knights Game: Spanish Variation
+e4 e5 Nf3 Nc6 Nc3 Nf6 d4|Four Knights Game: Scotch Variation
+e4 e5 Nf3 Nc6 Nc3 Nf6 Nxe5|Halloween Gambit
+e4 e5 Nf3 Nf6|Petrov's Defense
+e4 e5 Nf3 Nf6 Nxe5|Petrov's Defense: Classical Attack
+e4 e5 Nf3 Nf6 Nxe5 Nc6|Stafford Gambit
+e4 e5 Nf3 Nf6 d4|Petrov's Defense: Steinitz Attack
+e4 e5 Nf3 Nf6 Nc3|Petrov's Defense: Three Knights Game
+e4 e5 Nf3 d6|Philidor Defense
+e4 e5 Nf3 d5|Elephant Gambit
+e4 e5 Nf3 f5|Latvian Gambit
+e4 e5 Nf3 f6|Damiano Defense
+e4 e5 Bc4|Bishop's Opening
+e4 e5 Bc4 Nf6|Bishop's Opening: Berlin Defense
+e4 e5 Nc3|Vienna Game
+e4 e5 Nc3 Nf6 f4|Vienna Gambit
+e4 e5 f4|King's Gambit
+e4 e5 f4 exf4|King's Gambit Accepted
+e4 e5 f4 exf4 Nf3|King's Knight's Gambit
+e4 e5 f4 exf4 Nf3 g5|King's Gambit Accepted: Classical Variation
+e4 e5 f4 exf4 Nf3 Be7|King's Gambit Accepted: Cunningham Defense
+e4 e5 f4 exf4 Bc4|Bishop's Gambit
+e4 e5 f4 Bc5|King's Gambit Declined: Classical Defense
+e4 e5 f4 d5|Falkbeer Counter Gambit
+e4 e5 d4|Center Game
+e4 e5 d4 exd4 c3|Danish Gambit
+e4 c5|Sicilian Defense
+e4 c5 Nf3|Sicilian Defense: Open
+e4 c5 Nf3 d6|Sicilian Defense: Modern Variations
+e4 c5 Nf3 d6 Bb5|Sicilian Defense: Moscow Variation
+e4 c5 Nf3 d6 d4 cxd4 Nxd4|Sicilian Defense: Open
+e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6|Sicilian Defense: Najdorf Variation
+e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 g6|Sicilian Defense: Dragon Variation
+e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 e6|Sicilian Defense: Scheveningen Variation
+e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 Nc6|Sicilian Defense: Classical Variation
+e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 Nc6 Bg5|Sicilian Defense: Richter-Rauzer Attack
+e4 c5 Nf3 Nc6|Sicilian Defense: Old Sicilian
+e4 c5 Nf3 Nc6 Bb5|Sicilian Defense: Rossolimo Variation
+e4 c5 Nf3 Nc6 d4 cxd4 Nxd4 g6|Sicilian Defense: Accelerated Dragon
+e4 c5 Nf3 e6|Sicilian Defense: French Variation
+e4 c5 Nf3 e6 d4 cxd4 Nxd4 Nc6|Sicilian Defense: Taimanov Variation
+e4 c5 Nf3 e6 d4 cxd4 Nxd4 a6|Sicilian Defense: Kan Variation
+e4 c5 Nf3 Nf6|Sicilian Defense: Nimzowitsch Variation
+e4 c5 Nc3|Sicilian Defense: Closed
+e4 c5 c3|Sicilian Defense: Alapin Variation
+e4 c5 f4|Sicilian Defense: Grand Prix Attack
+e4 c5 b4|Sicilian Defense: Wing Gambit
+e4 c5 d4 cxd4 c3|Smith-Morra Gambit
+e4 e6|French Defense
+e4 e6 d3|King's Indian Attack
+e4 e6 d4 d5|French Defense: Normal Variation
+e4 e6 d4 d5 e5|French Defense: Advance Variation
+e4 e6 d4 d5 exd5|French Defense: Exchange Variation
+e4 e6 d4 d5 Nd2|French Defense: Tarrasch Variation
+e4 e6 d4 d5 Nc3|French Defense: Classical Variation
+e4 e6 d4 d5 Nc3 Bb4|French Defense: Winawer Variation
+e4 e6 d4 d5 Nc3 dxe4|French Defense: Rubinstein Variation
+e4 c6|Caro-Kann Defense
+e4 c6 Nc3 d5 Nf3|Caro-Kann Defense: Two Knights Attack
+e4 c6 d4 d5|Caro-Kann Defense: Main Line
+e4 c6 d4 d5 e5|Caro-Kann Defense: Advance Variation
+e4 c6 d4 d5 f3|Caro-Kann Defense: Fantasy Variation
+e4 c6 d4 d5 exd5 cxd5|Caro-Kann Defense: Exchange Variation
+e4 c6 d4 d5 exd5 cxd5 c4|Caro-Kann Defense: Panov-Botvinnik Attack
+e4 c6 d4 d5 Nc3 dxe4 Nxe4|Caro-Kann Defense: Classical Variation
+e4 c6 d4 d5 Nc3 dxe4 Nxe4 Bf5|Caro-Kann Defense: Classical Variation
+e4 c6 d4 d5 Nc3 dxe4 Nxe4 Nd7|Caro-Kann Defense: Karpov Variation
+e4 d5|Scandinavian Defense
+e4 d5 exd5 Qxd5|Scandinavian Defense: Main Line
+e4 d5 exd5 Nf6|Scandinavian Defense: Modern Variation
+e4 d5 exd5 Nf6 c4 e6|Scandinavian Defense: Icelandic-Palme Gambit
+e4 Nf6|Alekhine's Defense
+e4 Nf6 e5 Nd5|Alekhine's Defense: Normal Variation
+e4 Nf6 e5 Nd5 d4 d6|Alekhine's Defense: Modern Variation
+e4 Nf6 e5 Nd5 c4 Nb6 d4 d6 f4|Alekhine's Defense: Four Pawns Attack
+e4 d6|Pirc Defense
+e4 d6 d4 Nf6 Nc3 g6|Pirc Defense: Main Line
+e4 d6 d4 Nf6 Nc3 g6 f4|Pirc Defense: Austrian Attack
+e4 g6|Modern Defense
+e4 a6|St. George Defense
+e4 b6|Owen's Defense
+e4 Nc6|Nimzowitsch Defense
+e4 b5|Polish Defense
+d4|Queen's Pawn Game
+d4 d5|Queen's Pawn Game: Closed Game
+d4 d5 e4|Blackmar Gambit
+d4 d5 e4 dxe4 Nc3 Nf6 f3|Blackmar-Diemer Gambit
+d4 d5 Nc3|Queen's Pawn Game: Chigorin Variation
+d4 d5 Bf4|London System
+d4 d5 Nf3 Nf6 Bf4|London System
+d4 d5 Nf3 Nf6 e3|Colle System
+d4 Nf6 Nf3 d5 e3|Colle System
+d4 Nf6 Bf4|London System
+d4 Nf6 Nf3 d5 Bf4|London System
+d4 Nf6 Nf3 e6 Bg5|Torre Attack
+d4 Nf6 Bg5|Trompowsky Attack
+d4 d5 c4|Queen's Gambit
+d4 d5 c4 dxc4|Queen's Gambit Accepted
+d4 d5 c4 e6|Queen's Gambit Declined
+d4 d5 c4 e6 cxd5|Queen's Gambit Declined: Exchange Variation
+d4 d5 c4 e6 Nc3 c5|Queen's Gambit Declined: Tarrasch Defense
+d4 d5 c4 c6|Slav Defense
+d4 d5 c4 c6 Nf3 Nf6 Nc3 e6|Semi-Slav Defense
+d4 d5 c4 Nc6|Queen's Gambit Declined: Chigorin Defense
+d4 d5 c4 e5|Albin Countergambit
+d4 e5|Englund Gambit
+d4 c5|Benoni Defense
+d4 f5|Dutch Defense
+d4 f5 e4|Dutch Defense: Staunton Gambit
+d4 f5 c4 Nf6 g3 g6|Dutch Defense: Leningrad Variation
+d4 Nf6|Indian Defense
+d4 Nf6 c4|Indian Game
+d4 Nf6 c4 e5|Budapest Gambit
+d4 Nf6 c4 d6|Old Indian Defense
+d4 Nf6 c4 e6 g3|Catalan Opening
+d4 Nf6 c4 e6 Nc3 Bb4|Nimzo-Indian Defense
+d4 Nf6 c4 e6 Nf3 b6|Queen's Indian Defense
+d4 Nf6 c4 e6 Nf3 Bb4|Bogo-Indian Defense
+d4 Nf6 c4 g6|King's Indian Defense
+d4 Nf6 c4 g6 Nc3 Bg7 e4 d6|King's Indian Defense: Normal Variation
+d4 Nf6 c4 g6 Nc3 d5|Grunfeld Defense
+d4 Nf6 c4 c5 d5 e6|Benoni Defense: Modern Benoni
+d4 Nf6 c4 c5 d5 b5|Benko Gambit
+c4|English Opening
+c4 e5|English Opening: King's English Variation
+c4 c5|English Opening: Symmetrical Variation
+c4 Nf6|English Opening: Anglo-Indian Defense
+c4 f5|English Opening: Anglo-Dutch Defense
+c4 c6|English Opening: Caro-Kann Defensive System
+Nf3|Zukertort Opening
+Nf3 d5 c4|Reti Opening
+Nf3 d5 g3|King's Indian Attack
+f4|Bird Opening
+f4 d5|Bird Opening: Dutch Variation
+f4 e5|Bird Opening: From Gambit
+b3|Nimzo-Larsen Attack
+g3|King's Fianchetto Opening
+b4|Polish Opening
+g4|Grob Opening
+Nc3|Van Geet Opening
+e3|Van't Kruijs Opening
+h4|Kadas Opening
+a3|Anderssen's Opening
+"""
+_CH_OPENINGS = {}
+for _ln in _CH_OPENINGS_TXT.strip().splitlines():
+    _mv, _, _nm = _ln.partition("|")
+    if _nm:
+        _CH_OPENINGS[_mv.strip()] = _nm.strip()
+
+def _ch_opening(sans):
+    """Name of the opening / gambit for the moves played so far ('' when there is none). Longest known start wins."""
+    norm = [re.sub(r"[+#!?]", "", s) for s in sans[:30]]
+    for k in range(len(norm), 0, -1):
+        nm = _CH_OPENINGS.get(" ".join(norm[:k]))
+        if nm:
+            return nm
+    return ""
+
+def _ch_opening_label(sans):
+    nm = _ch_opening(sans)
+    if not nm:
+        return ""
+    return ("\u2694 " if "gambit" in nm.lower() and not nm.startswith("Queen's Gambit") else "\U0001F4D6 ") + nm
+
+_CH_REVIEW_BTN = re.compile(r"^(?!.*again).*(analy[sz]e|run analysis|start analysis|generate|game review|game report|\breview\b)", re.I)
+_CH_REVIEW_PCT = re.compile(r"accuracy[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%", re.I)
+_CH_SAN = re.compile(r"^(?:O-O(?:-O)?|[KQRBN][a-h]?[1-8]?x?[a-h][1-8]|(?:[a-h]x)?[a-h][1-8](?:=[QRBN])?)[+#]?$")
+_CH_CLS_COLORS = {"splendid": "#1baca6", "perfect": "#5c8bb0", "book": "#a88865", "opening": "#a88865", "forced": "#9aa0a6", "best": "#26c281", "brilliant": "#1baca6",
+                  "great": "#5c8bb0", "splendid": "#1baca6", "perfect": "#1baca6", "excellent": "#81b64c", "okay": "#81b64c",
+                  "good": "#95b776", "inaccuracy": "#f7c631", "mistake": "#ffa459", "blunder": "#fa412d"}
+
+def _ch_pgn_sans(pgn):
+    """The SAN moves of a PGN, in order (tags, comments, move numbers and the result removed)."""
+    body = re.sub(r"\[[^\]]*\]", " ", pgn or "")
+    body = re.sub(r"\{[^}]*\}", " ", body)
+    body = re.sub(r"\d+\.(?:\.\.)?", " ", body)
+    return [t for t in body.split() if _CH_SAN.match(t)]
+
+def _ch_align(entries, sans):
+    """Match what was scraped from Chesskit's move list (san + classification icon) to the game's own move list."""
+    ent = [e for e in entries if _CH_SAN.match(e.get("san", ""))]
+    n = len(sans)
+    for i in range(len(ent)):                                  # a clean run that equals the game
+        if [e["san"] for e in ent[i:i + n]] == sans:
+            return [{"san": e["san"], "cls": e.get("cls", "")} for e in ent[i:i + n]]
+    out, j = [], 0                                             # otherwise follow the moves in order
+    for s in sans:
+        k = j
+        while k < len(ent) and ent[k]["san"] != s:
+            k += 1
+        if k < len(ent):
+            out.append({"san": s, "cls": ent[k].get("cls", "")})
+            j = k + 1
+        else:
+            out.append({"san": s, "cls": ""})
+    return out
+
+def _ch_review_parse(text):
+    """Whatever numbers can be read from the report text. Never raises; returns {} when nothing matched."""
+    out = {}
+    try:
+        m = _CH_REVIEW_PCT.search(text or "")
+        if m:
+            out["acc"] = (float(m.group(1)), float(m.group(2)))
+        m = re.search(r"(?:estimated|est\.?)\s*(?:elo|rating)[\s\S]{0,60}?(\d{3,4})[\s\S]{0,60}?(\d{3,4})", text or "", re.I)
+        if m:
+            out["elo"] = (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+    return out
+
+_CH_SCRAPE_JS = r"""() => {
+  const isNum = e => e.children.length === 0 && /^\d+\.$/.test((e.textContent || '').trim());
+  const nums = [...document.querySelectorAll('body *')].filter(isNum);
+  const rows = [];
+  for (const n of nums) {
+    const k = parseInt(n.textContent, 10);
+    let row = n;
+    while (row.parentElement && [...row.parentElement.querySelectorAll('*')].filter(isNum).length === 1) row = row.parentElement;
+    const icons = [...row.querySelectorAll('img')].map(img => {
+      const src = decodeURIComponent(img.getAttribute('src') || '');
+      const m = src.match(/icons\/([a-z_]+)\.(?:png|svg|webp)/i);
+      return {cls: ((m && m[1]) || img.alt || '').toLowerCase(), x: img.getBoundingClientRect().left};
+    });
+    rows.push({k: k, icons: icons});
+  }
+  return rows;
+}"""
+
+_CH_STATS_JS = r"""() => {
+  const res = {};
+  const leaves = [...document.querySelectorAll('body *')].filter(e => e.children.length === 0 && e.offsetParent !== null);
+  const rect = e => e.getBoundingClientRect();
+  const txt = e => (e.textContent || '').trim();
+  for (const [key, re] of [['acc', /^accuracy$/i], ['elo', /^game rating$/i]]) {
+    const lab = leaves.find(e => re.test(txt(e)));
+    if (!lab) continue;
+    const lr = rect(lab), cy = lr.top + lr.height / 2;
+    const near = leaves.filter(e => /^\d{1,4}(\.\d+)?\s*%?$/.test(txt(e)))
+      .filter(e => Math.abs(rect(e).top + rect(e).height / 2 - cy) < 18)
+      .sort((x, y) => rect(x).left - rect(y).left);
+    const l = near.filter(e => rect(e).left < lr.left), r = near.filter(e => rect(e).left > lr.left);
+    if (l.length && r.length) res[key] = [parseFloat(txt(l[l.length - 1])), parseFloat(txt(r[0]))];
+  }
+  return res;
+}"""
+
+class _ChessReviewWorker(QThread):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(dict)          # {"moves": [{"san","cls"}...], "text": page text, "summary": {...}}
+    failed = pyqtSignal(str, str)    # message, debug screenshot file ("" if none)
+
+    def __init__(self, pgn, key, plies, parent=None):
+        super().__init__(parent)
+        self.pgn, self.key, self.plies = pgn, key, plies
+        self.sans = _ch_pgn_sans(pgn)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    @staticmethod
+    def _controls(page):
+        """Visible buttons / tabs / links on the page (for the error message and the debug file)."""
+        try:
+            items = page.evaluate(r"""() => [...document.querySelectorAll('button,[role=tab],[role=button],[role=combobox],a,[role=menuitem],[role=option]')]
+                .filter(e => e.offsetParent !== null)
+                .map(e => (e.innerText || e.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' '))
+                .filter(t => t && t.length < 40)""")
+            seen, out = set(), []
+            for t in items:
+                if t not in seen:
+                    seen.add(t)
+                    out.append(t)
+            return out[:50]
+        except Exception:
+            return []
+
+    def _dump(self, page, base, tag):
+        try:
+            page.screenshot(path=f"{base}_{tag}.png")
+            with open(f"{base}_{tag}.txt", "w", encoding="utf-8") as f:
+                f.write("URL: " + page.url + "\nCONTROLS: " + " | ".join(self._controls(page)) + "\n\n")
+                f.write(page.evaluate("document.body.innerText") or "")
+        except Exception:
+            pass
+
+    def _click_first(self, page, locators, timeout=1500):
+        for loc in locators:
+            try:
+                el = loc.first
+                el.wait_for(state="visible", timeout=timeout)
+                el.click(timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _step(self, page, base, what, ok):
+        if not ok:
+            self._dump(page, base, "failed")
+            raise RuntimeError(f"Couldn't {what} on Chesskit (its page may have changed). Buttons I could see: "
+                               + " | ".join(self._controls(page)) + f".  Debug files are in {_ch_review_dir()}")
+
+    def _scrape(self, page):
+        """One entry per ply: the game's own SAN plus the classification icon Chesskit shows next to that move."""
+        try:
+            rows = page.evaluate(_CH_SCRAPE_JS) or []
+        except Exception:
+            return []
+        xs = [i["x"] for r in rows for i in r["icons"]]
+        if not xs:
+            return []
+        split = (min(xs) + max(xs)) / 2          # white moves sit in the left column, black moves in the right one
+        by = {}
+        for r in rows:
+            for i in r["icons"]:
+                by.setdefault((r["k"] - 1) * 2 + (1 if i["x"] > split else 0), i["cls"])
+        total = len(self.sans) or (max(by) + 1)
+        return [{"san": self.sans[i] if i < len(self.sans) else "", "cls": by.get(i, "")} for i in range(total)]
+
+    def _stats(self, page):
+        out = {}
+        try:
+            d = page.evaluate(_CH_STATS_JS) or {}
+            if d.get("acc"):
+                out["acc"] = (round(float(d["acc"][0]), 1), round(float(d["acc"][1]), 1))
+            if d.get("elo"):
+                out["elo"] = (int(d["elo"][0]), int(d["elo"][1]))
+        except Exception:
+            pass
+        return out
+
+    def run(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.failed.emit("Playwright isn't installed. Run: pip install playwright && playwright install chromium", "")
+            return
+        base = os.path.join(_ch_review_dir(), self.key)
+        n = len(self.sans)
+        limit = min(600, 90 + 6 * max(self.plies, 10))
+        moves, text, stats = [], "", {}
+        try:
+            with sync_playwright() as p:
+                self.progress.emit("Starting the browser...")
+                hidden = True                        # the Chesskit browser runs hidden (headless)
+                browser = p.chromium.launch(headless=hidden, args=["--window-size=1400,1000"])
+                try:
+                    ctx = browser.new_context(viewport={"width": 1400, "height": 900},
+                                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                                         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+                    page = ctx.new_page()
+                    # 1. open Chesskit and do NOT wait for it to finish loading: go on as soon as the request is answered
+                    self.progress.emit("Opening Chesskit...")
+                    page.goto(CHESSKIT_URL, wait_until="commit", timeout=60000)
+                    # 2. LOAD GAME (waits for the button itself, no fixed delay)
+                    self.progress.emit("Clicking Load game...")
+                    ok = self._click_first(page, [page.get_by_role("button", name=re.compile(r"load game", re.I)),
+                                                  page.get_by_text(re.compile(r"^\s*load game\s*$", re.I))], 45000)
+                    self._step(page, base, "find the Load game button", ok)
+                    if self._stop:
+                        return
+                    # 3. game origin dropdown -> PGN (instead of Chess.com)
+                    self.progress.emit("Choosing PGN as the game origin...")
+                    dlg = page.get_by_role("dialog")
+                    ok = self._click_first(page, [dlg.get_by_role("combobox"), page.get_by_label(re.compile(r"origin", re.I)),
+                                                  dlg.get_by_text(re.compile(r"chess\.com", re.I))], 8000)
+                    if ok:
+                        ok = self._click_first(page, [page.get_by_role("option", name=re.compile(r"^\s*pgn\s*$", re.I)),
+                                                      page.get_by_role("listbox").get_by_text(re.compile(r"^\s*pgn\s*$", re.I)),
+                                                      page.get_by_text(re.compile(r"^\s*pgn\s*$", re.I))], 4000)
+                    else:                                      # a plain <select>
+                        try:
+                            page.locator("select:visible").first.select_option(label="PGN", timeout=3000)
+                            ok = True
+                        except Exception:
+                            ok = False
+                    self._step(page, base, "set the game origin to PGN", ok)
+                    # 4. click "Enter PGN here..." and paste the PGN
+                    self.progress.emit("Pasting the PGN...")
+                    box = None
+                    for loc in (page.get_by_placeholder(re.compile(r"enter pgn here", re.I)), page.locator("textarea:visible"),
+                                page.get_by_placeholder(re.compile(r"pgn", re.I))):
+                        try:
+                            loc.first.wait_for(state="visible", timeout=5000)
+                            box = loc.first
+                            break
+                        except Exception:
+                            continue
+                    self._step(page, base, "find the 'Enter PGN here...' box", box is not None)
+                    box.click()
+                    box.fill(self.pgn)
+                    page.wait_for_timeout(300)
+                    # 5. ADD
+                    self.progress.emit("Clicking Add...")
+                    ok = self._click_first(page, [dlg.get_by_role("button", name=re.compile(r"^\s*add\s*$", re.I)),
+                                                  page.get_by_role("button", name=re.compile(r"^\s*add\s*$", re.I))], 4000)
+                    self._step(page, base, "find the Add button", ok)
+                    try:
+                        dlg.first.wait_for(state="hidden", timeout=20000)
+                    except Exception:
+                        pass
+                    if self._stop:
+                        return
+                    # 6. when it has finished loading (Chesskit's engine marks every move), scrape the moves
+                    self.progress.emit("Chesskit is analysing the game...")
+                    self._click_first(page, [page.get_by_role("button", name=_CH_REVIEW_BTN)], 1500)   # an Analyze button, if it asks for one
+                    t0, settled = time.time(), 0
+                    while time.time() - t0 < limit and not self._stop:
+                        page.wait_for_timeout(1000)
+                        moves = self._scrape(page)
+                        have = sum(1 for m in moves if m["cls"])
+                        finished = False
+                        try:                                    # "ANALYZE AGAIN" only shows once the analysis is complete
+                            finished = page.get_by_role("button", name=re.compile(r"analy[sz]e again", re.I)).first.is_visible()
+                        except Exception:
+                            pass
+                        self.progress.emit(f"Chesskit is analysing the game... {have}/{n} moves  ({int(time.time() - t0)}s)")
+                        if have and ((n and have >= n) or finished):
+                            settled += 1
+                            if settled >= 2:
+                                break
+                        else:
+                            settled = 0
+                    if self._stop:
+                        return
+                    self.progress.emit("Reading the report...")
+                    moves = self._scrape(page) or moves
+                    stats = self._stats(page)
+                    if not any(m["cls"] for m in moves):
+                        self._dump(page, base, "failed")
+                        raise RuntimeError("Chesskit loaded the game but I couldn't read the move classifications (its page may have changed). "
+                                           f"Debug files are in {_ch_review_dir()}")
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.failed.emit(str(e) or type(e).__name__, "")
+            return
+        if self._stop:
+            return
+        summary = stats
+        try:
+            with open(base + ".json", "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "moves": moves}, f)
+        except Exception:
+            pass
+        self.done.emit({"moves": moves, "text": text, "summary": summary})
+
+from PyQt6.QtWidgets import QTableWidget as _ChTable, QTableWidgetItem as _ChItem, QHeaderView as _ChHeader
+
+def _ch_dot_icon(color, size=12):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    pt = QPainter(pm)
+    pt.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pt.setPen(Qt.PenStyle.NoPen)
+    pt.setBrush(QColor(color))
+    pt.drawEllipse(1, 1, size - 2, size - 2)
+    pt.end()
+    return QIcon(pm)
+
+class _ChessReviewPanel(QFrame):
+    """The Chesskit review, shown in place of the game page's right sidebar. Click a move to jump the board to it."""
+    plyRequested = pyqtSignal(int)      # board position to show (0 = start, n = after move n)
+    closeRequested = pyqtSignal()
+
+    def __init__(self, pgn, white, black, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChPanel")
+        self.pgn, self.worker = pgn, None
+        self.key = _hashlib.sha1(pgn.encode("utf-8")).hexdigest()[:16]
+        self.plies = len(re.findall(r"\d+\.", pgn)) * 2
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        title = QLabel("Game review")
+        title.setObjectName("ChHead")
+        sub = QLabel(f"{white}  vs  {black}")
+        sub.setObjectName("ChMuted")
+        sub.setWordWrap(True)
+        self.head = QLabel("")
+        self.head.setWordWrap(True)
+        self.head.setTextFormat(Qt.TextFormat.RichText)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)
+        self.bar.setFixedHeight(8)
+        self.bar.setTextVisible(False)
+        self.table = _ChTable(0, 3)
+        self.table.setHorizontalHeaderLabels(["#", "White", "Black"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)      # arrow keys keep moving the board
+        self.table.setShowGrid(False)
+        self.table.setCursor(Qt.CursorShape.PointingHandCursor)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, _ChHeader.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, _ChHeader.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, _ChHeader.ResizeMode.Stretch)
+        self.table.cellClicked.connect(self._clicked)
+        self._style()
+        r1 = QHBoxLayout()
+        self.b_back = QPushButton("Back to game")
+        self.b_back.setObjectName("ChGreen")
+        self.b_back.clicked.connect(self.closeRequested.emit)
+        r1.addWidget(self.b_back)
+        r2 = QHBoxLayout()
+        self.b_redo = QPushButton("Review again")
+        self.b_copy = QPushButton("Copy PGN")
+        self.b_open = QPushButton("Open Chesskit")
+        self.b_open.setToolTip("Copies the PGN, then opens Chesskit so you can paste it in yourself")
+        self.b_redo.clicked.connect(lambda: self.start(force=True))
+        self.b_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.pgn))
+        self.b_open.clicked.connect(self._open_site)
+        for b in (self.b_redo, self.b_copy, self.b_open):
+            r2.addWidget(b)
+        lay.addWidget(title)
+        lay.addWidget(sub)
+        lay.addWidget(self.head)
+        lay.addWidget(self.status)
+        lay.addWidget(self.bar)
+        lay.addWidget(self.table, 1)
+        lay.addLayout(r2)
+        lay.addLayout(r1)
+        self.start()
+
+    def _style(self):
+        t = _ch_theme()
+        txt, sub = t.get("text", "#ffffff"), t.get("subtext", "#aaaaaa")
+        inp, acc, on = t.get("input", "#0d0d0d"), t.get("accent", "#fcfcfc"), t.get("on_accent", "#ffffff")
+        self.table.setStyleSheet(
+            f"QTableWidget {{ background:{inp}; color:{txt}; border:none; border-radius:10px; outline:0; font-size:14px; }}"
+            f"QTableWidget::item {{ padding:3px 4px; border-radius:4px; }}"
+            f"QTableWidget::item:selected {{ background:{acc}; color:{on}; }}"
+            f"QHeaderView::section {{ background:transparent; color:{sub}; border:none; padding:4px; font-weight:600; }}")
+
+    def _open_site(self):
+        QApplication.clipboard().setText(self.pgn)
+        webbrowser.open(CHESSKIT_URL)
+        self.status.setText("PGN copied. On Chesskit press Load game, set the origin to PGN, paste it, then Add.")
+
+    def _clicked(self, row, col):
+        if col in (1, 2) and self.table.item(row, col) is not None:
+            self.plyRequested.emit(row * 2 + (col - 1) + 1)
+
+    def mark(self, view):
+        """Highlight the move the board is showing (view = number of moves played on the board)."""
+        self.table.blockSignals(True)
+        try:
+            if view <= 0:
+                self.table.clearSelection()
+            else:
+                i = view - 1
+                it = self.table.item(i // 2, 1 + i % 2)
+                if it is not None:
+                    self.table.setCurrentItem(it)
+                    self.table.scrollToItem(it)
+        finally:
+            self.table.blockSignals(False)
+
+    def _show(self, moves, summary):
+        self.table.setRowCount(0)
+        counts = {0: {}, 1: {}}
+        for i, m in enumerate(moves or []):
+            r, side = i // 2, i % 2
+            if side == 0:
+                self.table.insertRow(r)
+                num = _ChItem(str(r + 1))
+                num.setForeground(QColor("#888888"))
+                num.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.table.setItem(r, 0, num)
+            cls = (m.get("cls") or "").strip()
+            it = _ChItem(m.get("san", ""))
+            if cls:
+                it.setIcon(_ch_dot_icon(_CH_CLS_COLORS.get(cls, "#9aa0a6")))
+                it.setToolTip(cls.replace("_", " ").title())
+                counts[side][cls] = counts[side].get(cls, 0) + 1
+            self.table.setItem(r, 1 + side, it)
+        bits = []
+        _op = _ch_opening_label(_ch_pgn_sans(self.pgn))
+        if _op:
+            bits.append(f"<b>{html_lib.escape(_op)}</b>")
+        acc, elo = (summary or {}).get("acc"), (summary or {}).get("elo")
+        if acc:
+            bits.append(f"<b>Accuracy</b> &nbsp; {acc[0]:g}% &nbsp;/&nbsp; {acc[1]:g}%")
+        if elo:
+            bits.append(f"<b>Game rating</b> &nbsp; {int(elo[0])} &nbsp;/&nbsp; {int(elo[1])}")
+        line = "<br>".join(bits)
+        order = ["splendid", "perfect", "brilliant", "great", "best", "excellent", "good", "okay", "book", "opening", "forced",
+                 "inaccuracy", "mistake", "blunder"]
+        for side, label in ((0, "White"), (1, "Black")):
+            parts = [f"<span style='color:{_CH_CLS_COLORS.get(k, '#9aa0a6')}'>{counts[side][k]} {k}</span>" for k in order if counts[side].get(k)]
+            parts += [f"{v} {k}" for k, v in counts[side].items() if k not in order]
+            if parts:
+                line += ("<br>" if line else "") + f"<b>{label}</b> &nbsp; " + " &nbsp; ".join(parts)
+        self.head.setText(line)
+        self.head.setVisible(bool(line))
+
+    def start(self, force=False):
+        base = os.path.join(_ch_review_dir(), self.key)
+        if not force and os.path.exists(base + ".json"):
+            try:
+                with open(base + ".json", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("moves"):
+                    self.bar.hide()
+                    self.status.setText("Saved review - click a move to jump to it.")
+                    self._show(data["moves"], data.get("summary", {}))
+                    return
+            except Exception:
+                pass
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.bar.show()
+        self.b_redo.setEnabled(False)
+        self.table.setRowCount(0)
+        self.head.hide()
+        self.status.setText("Starting...")
+        self.worker = _ChessReviewWorker(self.pgn, self.key, self.plies, self)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.done.connect(self._done)
+        self.worker.failed.connect(self._failed)
+        self.worker.start()
+
+    def _done(self, res):
+        self.bar.hide()
+        self.b_redo.setEnabled(True)
+        self.status.setText("Review copied from Chesskit - click a move to jump to it.")
+        self._show(res.get("moves"), res.get("summary"))
+
+    def _failed(self, msg, png):
+        self.bar.hide()
+        self.b_redo.setEnabled(True)
+        self.status.setText(msg + "  You can still use Open Chesskit (it copies the PGN for you).")
+
+    def shutdown(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(4000)
+
+class NczChessPage(QWidget):
+    back_requested = pyqtSignal()
+
+    def restyle(self):
+        """Re-colour the page and board from the launcher's current theme."""
+        try:
+            t = _ch_theme()
+            self.setStyleSheet(_ch_css(t))
+            self.board.set_theme(*_ch_board_colors(t))
+            if getattr(self, "game", None) is not None or getattr(self, "net_gid", None):
+                try:
+                    self._refresh()
+                except Exception:
+                    pass
+        except RuntimeError:
+            pass
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("ChessPage")
+        self.setStyleSheet(_ch_css())
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.bg = _ChessBg(self)
+        # game state
+        self.game = None
+        self.mode = None                  # "local" / "online" / "bot"
+        self.my = None                    # my colour in an online game
+        self.names = {"w": "White", "b": "Black"}
+        self.base = 0                     # ms per side (0 = no clock)
+        self.inc = 0
+        self.left = {"w": 0, "b": 0}
+        self.tick_ref = None              # when the side to move's clock started (local: monotonic ms, online: server ms)
+        self.clk_hist = []
+        self.view_ply = 0
+        self.mts = []                     # online: server timestamp of every move
+        self.started = 0
+        self.net_gid = None
+        self.net_state = ""               # "loading" / "waiting" / "active" / "over"
+        self.opp_uid = ""
+        self.draw_offer = None
+        self._polling = False
+        self._inbox_polling = False
+        self._inbox_etag, self._inbox_data = None, {}
+        self._game_etag, self._game_etag_gid = None, None
+        self._last_inbox = None
+        self._friends_loaded = False
+        self._busy = False
+        self._oriented = False
+        self.my_rating = None             # my chess/ratings record (None = unrated so far)
+        self.friend_ratings = {}          # uid -> record
+        self._friend_names = {}           # uid -> name
+        self._friend_base = {}            # uid -> combo text without the rating
+        self.rating_info = {"w": None, "b": None}     # online game: {"r": rating shown, "d": change or None}
+        self.avatars = {"w": None, "b": None}         # online game: profile picture file of each side
+        self._my_av, self._my_name = None, ""         # my own picture / username (from the launcher's profile cache)
+        self._friend_av = {}                          # uid -> friend avatar file (lobby)
+        self._rated_gids = set()
+        self._rinfo_gid = None
+        self.bot = None                   # the bot config while playing one (mode "bot"); self.my = the human's colour
+        self._bot_busy = False
+        self._bot_token = 0               # bumped to throw away a bot move that is still being computed
+        self._bot_moving = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 18, 24, 18)
+        outer.setSpacing(12)
+        head = QHBoxLayout()
+        back = QPushButton("\u25C0 Library")
+        back.setCursor(Qt.CursorShape.PointingHandCursor)
+        back.clicked.connect(self.back_requested.emit)
+        title = QLabel("\u265E NCZ Chess")
+        title.setObjectName("ChTitle")
+        self.note = QLabel("")
+        self.note.setObjectName("ChMuted")
+        self.note.setWordWrap(True)
+        head.addWidget(back)
+        head.addSpacing(10)
+        head.addWidget(title)
+        head.addSpacing(16)
+        head.addWidget(self.note, 1)
+        self.btn_sound = QPushButton("\U0001F50A")
+        self.btn_sound.setToolTip("Move sounds on / off")
+        self.btn_sound.setFixedWidth(44)
+        self.btn_sound.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sound.clicked.connect(self._toggle_sound)
+        head.addWidget(self.btn_sound)
+        outer.addLayout(head)
+        self.stack = QStackedWidget()
+        outer.addWidget(self.stack, 1)
+        self.stack.addWidget(self._build_lobby())
+        self.stack.addWidget(self._build_game())
+        self.restyle()
+        _theme_listeners.append(self.restyle)
+
+        self.clock_timer = QTimer(self)
+        self.clock_timer.setInterval(100)
+        self.clock_timer.timeout.connect(self._tick)
+        self.clock_timer.start()
+        self.game_timer = QTimer(self)
+        self.game_timer.setInterval(1500)
+        self.game_timer.timeout.connect(self._poll_game)
+        self.game_timer.start()
+        self.inbox_timer = QTimer(self)
+        self.inbox_timer.setInterval(10000)
+        self.inbox_timer.timeout.connect(self._poll_inbox)
+        self.inbox_timer.start()
+
+    def _toggle_sound(self):
+        _ch_snd["on"] = not _ch_snd["on"]
+        self.btn_sound.setText("\U0001F50A" if _ch_snd["on"] else "\U0001F507")
+        if _ch_snd["on"]:
+            _ch_play("move")
+
+    def _sound_last(self):
+        g = self.game
+        if g and g.sans:
+            _ch_play(_ch_sound_for(g.sans[-1], g.result))
+
+    def setGraphicsEffect(self, effect):       # the launcher's page fade-in fights custom painting; skip it
+        if effect is None:
+            super().setGraphicsEffect(None)
+
+    # ================================================================ lobby
+    def _card(self, title, sub=""):
+        card = QFrame()
+        card.setObjectName("ChCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+        h = QLabel(title)
+        h.setObjectName("ChHead")
+        lay.addWidget(h)
+        if sub:
+            s = QLabel(sub)
+            s.setObjectName("ChMuted")
+            s.setWordWrap(True)
+            lay.addWidget(s)
+        return card, lay
+
+    def _tc_combo(self, default=5):
+        cb = QComboBox()
+        for label, mins, inc in _CH_TIMES:
+            cb.addItem(label, (mins, inc))
+        cb.setCurrentIndex(default)
+        return cb
+
+    def _build_lobby(self):
+        page = QWidget()
+        row = QHBoxLayout(page)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(16)
+        left = QVBoxLayout()
+        left.setSpacing(14)
+
+        card, lay = self._card("Play on this computer", "Two players, one board. Pass the mouse back and forth.")
+        self.tc_local = self._tc_combo(0)
+        self.flip_chk = QCheckBox("Flip the board after every move")
+        btn = QPushButton("Start local game")
+        btn.setObjectName("ChGreen")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self.start_local)
+        lay.addWidget(self.tc_local)
+        lay.addWidget(self.flip_chk)
+        lay.addWidget(btn)
+        left.addWidget(card)
+
+        card, lay = self._card("Play a friend", "Pick one of your launcher friends. They get a message and can accept from their chess page.")
+        self.friend_combo = QComboBox()
+        self.friend_combo.setIconSize(QSize(24, 24))
+        self.friend_combo.addItem("Loading friends...", "")
+        tcrow = QHBoxLayout()
+        self.tc_online = self._tc_combo(5)
+        self.color_combo = QComboBox()
+        for t in ("Random", "I play White", "I play Black"):
+            self.color_combo.addItem(t)
+        tcrow.addWidget(self.tc_online)
+        tcrow.addWidget(self.color_combo)
+        self.btn_challenge = QPushButton("Send challenge")
+        self.btn_challenge.setObjectName("ChGreen")
+        self.btn_challenge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_challenge.clicked.connect(self.send_challenge)
+        lay.addWidget(self.friend_combo)
+        lay.addLayout(tcrow)
+        lay.addWidget(self.btn_challenge)
+        left.addWidget(card)
+
+        card, lay = self._card("Play a bot", "Nine bots, from beginner to strong. Bot games are unrated.")
+        self.bot_combo = QComboBox()
+        for cfg in _CH_BOT_LIST:
+            self.bot_combo.addItem(f"{cfg['name']}   \u00B7   {cfg['elo']}", cfg["elo"])
+        self.bot_combo.setCurrentIndex(4)
+        self.bot_blurb = QLabel("")
+        self.bot_blurb.setObjectName("ChMuted")
+        self.bot_blurb.setWordWrap(True)
+        self.bot_combo.currentIndexChanged.connect(self._bot_blurb_update)
+        botrow = QHBoxLayout()
+        self.tc_bot = self._tc_combo(0)
+        self.bot_color = QComboBox()
+        for t in ("Random", "I play White", "I play Black"):
+            self.bot_color.addItem(t)
+        botrow.addWidget(self.tc_bot)
+        botrow.addWidget(self.bot_color)
+        btn = QPushButton("Play bot")
+        btn.setObjectName("ChGreen")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self.start_bot)
+        lay.addWidget(self.bot_combo)
+        lay.addWidget(self.bot_blurb)
+        lay.addLayout(botrow)
+        lay.addWidget(btn)
+        self._bot_blurb_update()
+        left.addWidget(card)
+        left.addStretch(1)
+        row.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        card, lay = self._card("Your rating", "Online games against friends are rated (Elo, start 400, at least 4 moves).")
+        self.elo_big = QLabel(str(_CH_ELO_START))
+        self.elo_big.setObjectName("ChElo")
+        self.elo_sub = QLabel("")
+        self.elo_sub.setObjectName("ChMuted")
+        self.elo_sub.setWordWrap(True)
+        self.elo_board = QLabel("")
+        self.elo_board.setTextFormat(Qt.TextFormat.RichText)
+        self.elo_board.setWordWrap(True)
+        who = QHBoxLayout()
+        who.setSpacing(12)
+        self.elo_av = QLabel()
+        self.elo_av.setFixedSize(56, 56)
+        self.elo_name = QLabel("")
+        self.elo_name.setObjectName("ChName")
+        wv = QVBoxLayout()
+        wv.setSpacing(0)
+        wv.addWidget(self.elo_name)
+        wv.addWidget(self.elo_big)
+        who.addWidget(self.elo_av)
+        who.addLayout(wv, 1)
+        lay.addLayout(who)
+        lay.addWidget(self.elo_sub)
+        lay.addWidget(self.elo_board)
+        right.addWidget(card)
+        card, lay = self._card("Challenges & online games")
+        self.inbox_lay = QVBoxLayout()
+        self.inbox_lay.setSpacing(8)
+        self.inbox_empty = QLabel("Nothing here yet. Send a friend a challenge to start an online game.")
+        self.inbox_empty.setObjectName("ChMuted")
+        self.inbox_empty.setWordWrap(True)
+        lay.addLayout(self.inbox_lay)
+        lay.addWidget(self.inbox_empty)
+        lay.addStretch(1)
+        right.addWidget(card, 1)
+        row.addLayout(right, 1)
+        return page
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.stack.currentIndex() == 0:
+            self._paint_my_identity()
+            self._load_friends()
+            self._load_my_rating()
+            self._poll_inbox()
+
+    def _set_note(self, text):
+        self.note.setText(text or "")
+
+    def _net_msg(self, err):
+        if isinstance(err, CloudError):
+            code = getattr(err, "code", "")
+            if "PERMISSION" in str(code).upper() or "permission" in str(err).lower():
+                return ("The cloud database isn't set up for chess yet (it needs a 'chess' rule in Firebase). "
+                        "Local games still work.")
+            return str(err)
+        return str(err) or "Something went wrong."
+
+    def _load_friends(self):
+        def fn():
+            return cloud_fetch_friends()
+        def cb(res, err):
+            cur = self.friend_combo.currentData()
+            self.friend_combo.clear()
+            if err or not isinstance(res, dict):
+                msg = "Log in to the launcher to play friends" if isinstance(err, CloudError) and getattr(err, "code", "") == "NOT_LOGGED_IN" else "Couldn't load friends"
+                self.friend_combo.addItem(msg, "")
+                return
+            if not res:
+                self.friend_combo.addItem("No friends yet - add some in the Friends page", "")
+                return
+            idx = 0
+            for i, (uid, d) in enumerate(sorted(res.items(), key=lambda kv: (kv[1].get("username") or "").lower())):
+                name = d.get("username") or "Unknown"
+                try:
+                    status = _friend_status(d)[0]
+                except Exception:
+                    status = ""
+                base = f"{name}   \u00B7   {status}" if status else name
+                self._friend_names[uid] = name
+                self._friend_base[uid] = base
+                av = None
+                try:
+                    av = _friend_avatar_file(uid, d.get("photo")) if d.get("photo") else None
+                except Exception:
+                    av = None
+                self._friend_av[uid] = av
+                self.friend_combo.addItem(QIcon(_fo_avatar(av, name[:1].upper(), 28)), base, (uid, name))
+                if cur and cur[0] == uid:
+                    idx = i
+            self.friend_combo.setCurrentIndex(idx)
+            self._apply_friend_ratings()
+            self._load_friend_ratings(list(res.keys()))
+        self.bg.run(fn, cb)
+
+    # ---- ratings
+    def _paint_my_identity(self):
+        try:
+            uname, av = load_profile_cache()
+        except Exception:
+            uname, av = "", None
+        uname = uname or _my_display_name()
+        self.elo_name.setText(uname)
+        self.elo_av.setPixmap(_fo_avatar(av, uname[:1].upper(), 56))
+
+    def _show_my_rating(self):
+        self._paint_my_identity()
+        rec = self.my_rating or {}
+        n = max(0, _ch_int(rec.get("g"), 0))
+        self.elo_big.setText(str(_ch_int(rec.get("r"), _CH_ELO_START)))
+        if not n:
+            self.elo_sub.setText(f"No rated games yet - you start at {_CH_ELO_START}.")
+            return
+        txt = (f"{n} rated game{'s' if n != 1 else ''}  \u00B7  {_ch_int(rec.get('w'))}W "
+               f"{_ch_int(rec.get('l'))}L {_ch_int(rec.get('d'))}D")
+        if n < 10:
+            txt += f"  \u00B7  provisional ({n}/10)"
+        self.elo_sub.setText(txt)
+
+    def _render_board(self):
+        rows = []
+        for uid, rec in self.friend_ratings.items():
+            if isinstance(rec, dict) and _ch_int(rec.get("g"), 0) > 0:
+                rows.append((_ch_int(rec.get("r"), _CH_ELO_START), self._friend_names.get(uid, "Friend"), False, uid))
+        mine = self.my_rating or {}
+        if _ch_int(mine.get("g"), 0) > 0:
+            rows.append((_ch_int(mine.get("r"), _CH_ELO_START), "You", True, ""))
+        if not rows:
+            self.elo_board.setText("")
+            return
+        rows.sort(key=lambda r: (-r[0], r[1].lower()))
+        try:
+            my_av = load_profile_cache()[1]
+        except Exception:
+            my_av = None
+        html = "<table width='100%' cellspacing='3'>"
+        for i, (r, name, me, uid) in enumerate(rows[:6]):
+            b0, b1 = ("<b>", "</b>") if me else ("", "")
+            url = _ch_round_png("me" if me else uid, my_av if me else self._friend_av.get(uid), name[:1].upper(), 22)
+            img = f"<img src='{url}' width='22' height='22'>" if url else ""
+            html += (f"<tr><td width='24'>{i + 1}.</td><td width='28' valign='middle'>{img}</td>"
+                     f"<td valign='middle'>{b0}{html_lib.escape(name)}{b1}</td>"
+                     f"<td align='right' valign='middle'>{b0}{r}{b1}</td></tr>")
+        self.elo_board.setText(html + "</table>")
+
+    def _apply_friend_ratings(self):
+        for i in range(self.friend_combo.count()):
+            data = self.friend_combo.itemData(i)
+            if not data:
+                continue
+            uid = data[0]
+            base = self._friend_base.get(uid)
+            rec = self.friend_ratings.get(uid)
+            if base and isinstance(rec, dict) and _ch_int(rec.get("g"), 0) > 0:
+                self.friend_combo.setItemText(i, f"{base}   \u00B7   {_ch_int(rec.get('r'), _CH_ELO_START)}")
+            elif base:
+                self.friend_combo.setItemText(i, base)
+
+    def _load_my_rating(self):
+        def fn():
+            token, uid = get_id_token()
+            return _http_json(_fdb(f"chess/ratings/{uid}", token))
+        def cb(rec, err):
+            if err:
+                code = str(getattr(err, "code", ""))
+                self.elo_sub.setText("Log in to the launcher to get a rating." if code == "NOT_LOGGED_IN"
+                                     else "Ratings couldn't be loaded (needs the cloud database).")
+                return
+            self.my_rating = rec if isinstance(rec, dict) else None
+            self._show_my_rating()
+            self._render_board()
+        self.bg.run(fn, cb)
+
+    def _load_friend_ratings(self, uids):
+        uids = list(uids)[:40]
+        def fn():
+            token, _uid = get_id_token()
+            out = {}
+            for fuid in uids:
+                try:
+                    rec = _http_json(_fdb(f"chess/ratings/{fuid}", token))
+                except CloudError:
+                    continue
+                if isinstance(rec, dict):
+                    out[fuid] = rec
+            return out
+        def cb(res, err):
+            if err or not isinstance(res, dict):
+                return
+            self.friend_ratings = res
+            self._apply_friend_ratings()
+            self._render_board()
+        self.bg.run(fn, cb)
+
+    def _strip_name(self, col):
+        return self.names[col]
+
+    def _elo_badge(self, r, d=None):
+        txt = html_lib.escape(str(r))
+        if d is not None:
+            sub = _ch_theme().get("subtext", "#aaaaaa")
+            colr = "#3fb950" if d > 0 else "#f85149" if d < 0 else sub
+            txt += f" <span style='color:{colr}'>{d:+d}</span>"
+        return txt
+
+    def _strip_elo(self, col):
+        """Rating badge next to the name: online = both players, bot = my rating and the bot's rating."""
+        if self.mode == "online":
+            ri = self.rating_info.get(col)
+            return self._elo_badge(ri["r"], ri.get("d")) if ri else ""
+        if self.mode == "bot":
+            if col == self.my:
+                return self._elo_badge(_ch_int((self.my_rating or {}).get("r"), _CH_ELO_START))
+            if self.bot:
+                return self._elo_badge(self.bot["elo"])
+        return ""
+
+    def _strip_avatar(self, col):
+        """-> (show a picture?, image file or None, initial for the no-picture fallback)"""
+        name = self.names.get(col) or "?"
+        if self.mode == "online":
+            mine = (col == self.my)
+            path = (self._my_av if mine and self._my_av else None) or self.avatars.get(col)
+            return True, path, ((self._my_name or name) if mine else name)[:1].upper()
+        if self.mode == "bot":
+            if col == self.my:
+                return True, self._my_av, (self._my_name or "Y")[:1].upper()
+            return True, None, ((self.bot or {}).get("name") or "B")[:1].upper()
+        return False, None, ""
+
+    def _load_game_ratings(self, doc):
+        """Online game just became active: fetch both players' ratings so the name strips can show them."""
+        gid = self.net_gid
+        self._rinfo_gid = gid
+        wuid, buid = doc.get("w"), doc.get("b")
+        if not wuid or not buid:
+            return
+        def fn():
+            token, _uid = get_id_token()
+            out = {}
+            for col, uid in (("w", wuid), ("b", buid)):
+                try:
+                    out[col] = _http_json(_fdb(f"chess/ratings/{uid}", token))
+                except CloudError:
+                    out[col] = None
+                try:
+                    photo = _http_json(_fdb(f"public/{uid}/photo", token))
+                    out["av_" + col] = _friend_avatar_file(uid, photo) if isinstance(photo, str) and photo else None
+                except Exception:
+                    out["av_" + col] = None
+            return out
+        def cb(res, err):
+            if err or gid != self.net_gid or not isinstance(res, dict):
+                return
+            self.avatars = {"w": res.get("av_w"), "b": res.get("av_b")}
+            if gid in self._rated_gids:                 # the finished game already set the final ratings
+                self._paint_strips()
+                return
+            for col in ("w", "b"):
+                before, _n, _done, _cur = _ch_elo_pre(res.get(col), gid)
+                self.rating_info[col] = {"r": before, "d": None}
+            self._paint_strips()
+        self.bg.run(fn, cb)
+
+    def _rate_game(self, doc):
+        """The online game is over: update MY rating once (the opponent's client updates theirs)."""
+        g, gid = self.game, self.net_gid
+        if not g or not g.result or not gid or self.my not in ("w", "b") or gid in self._rated_gids:
+            return
+        wuid, buid = doc.get("w"), doc.get("b")
+        if not wuid or not buid or wuid == buid:
+            return
+        self._rated_gids.add(gid)
+        if len(g.moves) < _CH_ELO_MIN_PLIES:
+            self._set_note("Too short to be rated (needs at least 4 moves).")
+            return
+        me = self.my
+        opp_c = "b" if me == "w" else "w"
+        opp_uid = buid if me == "w" else wuid
+        win = g.result.get("winner")
+        score_me = 0.5 if win not in ("w", "b") else (1.0 if win == me else 0.0)
+        def fn():
+            token, uid = get_id_token()
+            mine = _http_json(_fdb(f"chess/ratings/{uid}", token))
+            opp = _http_json(_fdb(f"chess/ratings/{opp_uid}", token))
+            r_me, n_me, done_me, cur_me = _ch_elo_pre(mine, gid)
+            r_op, n_op, done_op, cur_op = _ch_elo_pre(opp, gid)
+            rec = dict(mine) if isinstance(mine, dict) else {}
+            if done_me is not None:                       # this game is already counted for me
+                d_me, after_me = done_me, cur_me
+            else:
+                d_me = _ch_elo_delta(r_me, n_me, r_op, score_me)
+                after_me = max(_CH_ELO_FLOOR, r_me + d_me)
+                rec["r"], rec["g"] = after_me, n_me + 1
+                rec["w"] = _ch_int(rec.get("w")) + (1 if score_me == 1.0 else 0)
+                rec["l"] = _ch_int(rec.get("l")) + (1 if score_me == 0.0 else 0)
+                rec["d"] = _ch_int(rec.get("d")) + (1 if score_me == 0.5 else 0)
+                rec["last"] = {"gid": gid, "before": r_me, "delta": d_me, "opp": opp_uid}
+                _http_json(_fdb(f"chess/ratings/{uid}", token), "PUT", rec)
+            if done_op is not None:
+                d_op, after_op = done_op, cur_op
+            else:
+                d_op = _ch_elo_delta(r_op, n_op, r_me, 1.0 - score_me)
+                after_op = max(_CH_ELO_FLOOR, r_op + d_op)
+            return rec, (r_me, after_me, d_me), (after_op, d_op)
+        def cb(res, err):
+            if err:
+                self._rated_gids.discard(gid)             # opening the game again from the lobby retries
+                if gid == self.net_gid:
+                    self._set_note("Your rating wasn't updated: " + self._net_msg(err))
+                return
+            rec, (r_me, after_me, d_me), (after_op, d_op) = res
+            self.my_rating = rec
+            self._show_my_rating()
+            if gid == self.net_gid:
+                self.rating_info[me] = {"r": after_me, "d": d_me}
+                self.rating_info[opp_c] = {"r": after_op, "d": d_op}
+                self._paint_strips()
+                self._set_note(f"Rating {r_me} \u2192 {after_me} ({d_me:+d})")
+        self.bg.run(fn, cb)
+
+    # ---- inbox (challenges + online games you're in)
+    def _poll_inbox(self):
+        if self._inbox_polling or not self.isVisible() or self.stack.currentIndex() != 0:
+            return
+        self._inbox_polling = True
+        etag = self._inbox_etag
+        def fn():
+            token, uid = get_id_token()
+            return _http_json_etag(_fdb(f"chess/inbox/{uid}", token), etag)
+        def cb(res, err):
+            self._inbox_polling = False
+            if err:
+                self._inbox_etag, self._inbox_data = None, {}
+                if not isinstance(err, CloudError) or getattr(err, "code", "") != "NOT_LOGGED_IN":
+                    self._set_note(self._net_msg(err))
+                self._render_inbox({})
+                return
+            self._set_note("")
+            data, new_etag, changed = res
+            if changed:
+                self._inbox_etag = new_etag
+                self._inbox_data = data if isinstance(data, dict) else {}
+            self._render_inbox(self._inbox_data)         # unchanged: nothing was downloaded, just redraw from the last copy
+        self.bg.run(fn, cb)
+
+    def _render_inbox(self, data):
+        now = _ch_server_now()
+        items = []
+        for gid, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            ts = info.get("ts")
+            if info.get("kind") == "invite" and isinstance(ts, (int, float)) and now - ts > _CH_INVITE_TTL_MS:
+                continue
+            items.append((gid, info))
+        sig = repr(sorted((g, i.get("kind"), i.get("opp")) for g, i in items))
+        if sig == self._last_inbox:
+            return
+        self._last_inbox = sig
+        while self.inbox_lay.count():
+            w = self.inbox_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self.inbox_empty.setVisible(not items)
+        for gid, info in sorted(items, key=lambda x: 0 if x[1].get("kind") == "invite" else 1):
+            opp = info.get("opp") or "A friend"
+            row = QFrame()
+            row.setObjectName("ChPanel")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(12, 8, 12, 8)
+            if info.get("kind") == "invite":
+                lab = QLabel(f"<b>{html_lib.escape(opp)}</b> challenged you ({html_lib.escape(str(info.get('tc') or ''))})")
+                lab.setTextFormat(Qt.TextFormat.RichText)
+                ok = QPushButton("Accept")
+                ok.setObjectName("ChGreen")
+                ok.clicked.connect(lambda _c=False, g=gid, i=info: self.accept_invite(g, i))
+                no = QPushButton("Decline")
+                no.setObjectName("ChDanger")
+                no.clicked.connect(lambda _c=False, g=gid: self.decline_invite(g))
+                rl.addWidget(lab, 1)
+                rl.addWidget(ok)
+                rl.addWidget(no)
+            else:
+                lab = QLabel(f"Game vs <b>{html_lib.escape(opp)}</b>")
+                lab.setTextFormat(Qt.TextFormat.RichText)
+                go = QPushButton("Open")
+                go.clicked.connect(lambda _c=False, g=gid, i=info: self.open_online(g, i.get("oppUid", "")))
+                x = QPushButton("\u2715")
+                x.setToolTip("Remove from this list")
+                x.setFixedWidth(36)
+                x.clicked.connect(lambda _c=False, g=gid: self._dismiss(g))
+                rl.addWidget(lab, 1)
+                rl.addWidget(go)
+                rl.addWidget(x)
+            self.inbox_lay.addWidget(row)
+
+    def _dismiss(self, gid):
+        def fn():
+            token, uid = get_id_token()
+            _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
+        def cb(_r, err):
+            self._last_inbox = None
+            self._poll_inbox()
+        self.bg.run(fn, cb)
+
+    # ---- challenges
+    def send_challenge(self):
+        data = self.friend_combo.currentData()
+        if not data:
+            self._set_note("Pick a friend first.")
+            return
+        fuid, fname = data
+        mins, inc = self.tc_online.currentData()
+        tc_label = self.tc_online.currentText()
+        choice = self.color_combo.currentIndex()
+        self.btn_challenge.setEnabled(False)
+        def fn():
+            token, uid = get_id_token()
+            me = _my_display_name()
+            gid = _uuid.uuid4().hex[:12]
+            mine = _random.choice("wb") if choice == 0 else ("w" if choice == 1 else "b")
+            w, b = (uid, fuid) if mine == "w" else (fuid, uid)
+            wn, bn = (me, fname) if mine == "w" else (fname, me)
+            _http_json(_fdb(f"chess/games/{gid}", token), "PUT", {
+                "w": w, "b": b, "wn": wn, "bn": bn, "base": mins * 60000, "inc": inc * 1000,
+                "status": "waiting", "by": uid, "created": {".sv": "timestamp"}})
+            _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "PUT",
+                       {"kind": "game", "opp": fname, "oppUid": fuid, "ts": {".sv": "timestamp"}})
+            _http_json(_fdb(f"chess/inbox/{fuid}/{gid}", token), "PUT",
+                       {"kind": "invite", "opp": me, "oppUid": uid, "tc": tc_label, "ts": {".sv": "timestamp"}})
+            try:
+                cloud_send_message(fuid, f"\u265F {me} challenged you to a game of chess ({tc_label}). "
+                                         f"Open NCZ Chess in your library to accept.")
+            except Exception:
+                pass
+            return gid, fuid
+        def cb(res, err):
+            self.btn_challenge.setEnabled(True)
+            if err:
+                self._set_note(self._net_msg(err))
+                return
+            self.open_online(res[0], res[1])
+        self.bg.run(fn, cb)
+
+    def accept_invite(self, gid, info):
+        def fn():
+            token, uid = get_id_token()
+            doc = _http_json(_fdb(f"chess/games/{gid}", token))
+            if not isinstance(doc, dict) or doc.get("status") not in ("waiting", "active"):
+                raise CloudError("That challenge isn't available any more.", "GONE")
+            if doc.get("status") == "waiting":
+                _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"status": "active", "started": {".sv": "timestamp"}})
+            _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "PUT",
+                       {"kind": "game", "opp": info.get("opp") or "", "oppUid": info.get("oppUid") or "", "ts": {".sv": "timestamp"}})
+            return True
+        def cb(_r, err):
+            if err:
+                self._set_note(self._net_msg(err))
+                self._last_inbox = None
+                self._dismiss(gid)
+                return
+            self.open_online(gid, info.get("oppUid") or "")
+        self.bg.run(fn, cb)
+
+    def decline_invite(self, gid):
+        def fn():
+            token, uid = get_id_token()
+            try:
+                _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"status": "declined"})
+            except CloudError:
+                pass
+            _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
+        def cb(_r, err):
+            self._last_inbox = None
+            self._poll_inbox()
+        self.bg.run(fn, cb)
+
+    # ================================================================ game view
+    def _build_game(self):
+        page = QWidget()
+        row = QHBoxLayout(page)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(16)
+        self.strip_top, self.strip_bot = _ChessStrip(), _ChessStrip()
+        self.board = _ChessBoard()
+        self.board.moveRequested.connect(self._on_move)
+        self.board.keyNav.connect(self._on_key)
+        self.host = _SquareHost(self.strip_top, self.board, self.strip_bot)
+        row.addWidget(self.host, 1)
+
+        panel = QFrame()
+        panel.setObjectName("ChPanel")
+        panel.setFixedWidth(310)
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(14, 14, 14, 14)
+        pl.setSpacing(10)
+        self.status = QLabel("")
+        self.status.setObjectName("ChStatus")
+        self.status.setWordWrap(True)
+        pl.addWidget(self.status)
+        self.opening_lbl = QLabel("")
+        self.opening_lbl.setObjectName("ChMuted")
+        self.opening_lbl.setWordWrap(True)
+        self.opening_lbl.hide()
+        pl.addWidget(self.opening_lbl)
+
+        self.draw_bar = QFrame()
+        dl = QHBoxLayout(self.draw_bar)
+        dl.setContentsMargins(0, 0, 0, 0)
+        self.draw_lbl = QLabel("Draw offered")
+        self.draw_lbl.setWordWrap(True)
+        da = QPushButton("Accept")
+        da.setObjectName("ChGreen")
+        da.clicked.connect(self._accept_draw)
+        dd = QPushButton("Decline")
+        dd.clicked.connect(self._decline_draw)
+        dl.addWidget(self.draw_lbl, 1)
+        dl.addWidget(da)
+        dl.addWidget(dd)
+        self.draw_bar.hide()
+        pl.addWidget(self.draw_bar)
+
+        self.moves_view = QTextBrowser()
+        self.moves_view.setOpenLinks(False)
+        self.moves_view.anchorClicked.connect(self._on_anchor)
+        pl.addWidget(self.moves_view, 1)
+
+        nav = QHBoxLayout()
+        self.nav_btns = []
+        for txt, k in (("\u23EE", Qt.Key.Key_Home), ("\u25C0", Qt.Key.Key_Left), ("\u25B6", Qt.Key.Key_Right), ("\u23ED", Qt.Key.Key_End)):
+            b = QPushButton(txt)
+            b.clicked.connect(lambda _c=False, kk=int(k): self._on_key(kk))
+            nav.addWidget(b)
+            self.nav_btns.append(b)
+        pl.addLayout(nav)
+
+        r1 = QHBoxLayout()
+        self.btn_flip = QPushButton("Flip board")
+        self.btn_flip.clicked.connect(self._flip)
+        self.btn_undo = QPushButton("Take back")
+        self.btn_undo.clicked.connect(self._undo)
+        r1.addWidget(self.btn_flip)
+        r1.addWidget(self.btn_undo)
+        pl.addLayout(r1)
+        r2 = QHBoxLayout()
+        self.btn_draw = QPushButton("Offer draw")
+        self.btn_draw.clicked.connect(self._offer_draw)
+        self.btn_resign = QPushButton("Resign")
+        self.btn_resign.setObjectName("ChDanger")
+        self.btn_resign.clicked.connect(self._resign)
+        r2.addWidget(self.btn_draw)
+        r2.addWidget(self.btn_resign)
+        pl.addLayout(r2)
+        r3 = QHBoxLayout()
+        self.btn_again = QPushButton("Play again")
+        self.btn_again.setObjectName("ChGreen")
+        self.btn_again.clicked.connect(self._again)
+        self.btn_lobby = QPushButton("Lobby")
+        self.btn_lobby.clicked.connect(self.to_lobby)
+        r3.addWidget(self.btn_again)
+        r3.addWidget(self.btn_lobby)
+        pl.addLayout(r3)
+        self.btn_review = QPushButton("Game review")
+        self.btn_review.setToolTip("Sends the finished game to Chesskit's Stockfish and copies the report back here")
+        self.btn_review.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_review.clicked.connect(self._review_game)
+        pl.addWidget(self.btn_review)
+        self.side_stack = QStackedWidget()          # page 0 = the normal sidebar, page 1 = the game review
+        self.side_stack.setFixedWidth(310)
+        self.side_stack.addWidget(panel)
+        self.review_panel = None
+        row.addWidget(self.side_stack)
+        return page
+
+    def _review_game(self):
+        g = self.game
+        if not g or not g.result or len(g.moves) < 2:
+            return
+        elo, who = {}, dict(self.names)
+        for col in ("w", "b"):
+            ri = self.rating_info.get(col) if self.mode == "online" else None
+            if ri:
+                elo[col] = ri["r"]
+            elif self.mode == "bot" and self.bot and col != self.my:
+                elo[col] = self.bot["elo"]
+            if self.mode == "bot" and col == self.my:
+                who[col] = self._my_name or "You"
+        white, black = who["w"], who["b"]
+        pgn = _ch_pgn(g, white, black, elo.get("w"), elo.get("b"))
+        self._review_close()
+        rp = _ChessReviewPanel(pgn, white, black, self)
+        rp.plyRequested.connect(self._review_jump)
+        rp.closeRequested.connect(self._review_close)
+        self.review_panel = rp
+        self.side_stack.addWidget(rp)
+        self.side_stack.setFixedWidth(390)
+        self.side_stack.setCurrentWidget(rp)
+        rp.mark(self.view_ply)
+
+    def _review_jump(self, ply):
+        if not self.game:
+            return
+        self.view_ply = max(0, min(len(self.game.moves), int(ply)))
+        self.board.clear_selection()
+        self._refresh()
+
+    def _review_close(self):
+        rp = getattr(self, "review_panel", None)
+        if rp is None:
+            return
+        self.review_panel = None
+        try:
+            rp.shutdown()
+            self.side_stack.setCurrentIndex(0)
+            self.side_stack.setFixedWidth(310)
+            self.side_stack.removeWidget(rp)
+            rp.deleteLater()
+        except Exception:
+            pass
+
+    # ---- starting games
+    def _mark(self, on):
+        try:
+            if on:
+                _web_until["t"] = time.time() + 1800
+                _now_playing["name"] = "NCZ Chess"
+            elif _now_playing["name"] == "NCZ Chess":
+                _web_until["t"] = 0.0
+                _now_playing["name"] = next(iter(_running), None)
+            for cb in _playing_listeners:
+                cb()
+        except Exception:
+            pass
+
+    def _reset_game(self, mode, base, inc):
+        self._review_close()
+        try:
+            self._my_name, self._my_av = load_profile_cache()
+        except Exception:
+            self._my_name, self._my_av = "", None
+        self.game = _ChessGame()
+        self.mode = mode
+        self.base, self.inc = base, inc
+        self.left = {"w": base, "b": base}
+        self.tick_ref = None
+        self.clk_hist = []
+        self.mts = []
+        self.view_ply = 0
+        self.draw_offer = None
+        self._oriented = False
+        self.board.clear_selection()
+
+    # ---- bots
+    def _bot_blurb_update(self, *_a):
+        i = self.bot_combo.currentIndex()
+        if 0 <= i < len(_CH_BOT_LIST):
+            self.bot_blurb.setText(_CH_BOT_LIST[i]["blurb"])
+
+    def start_bot(self):
+        cfg = _CH_BOT_LIST[max(0, self.bot_combo.currentIndex())]
+        mins, inc = self.tc_bot.currentData()
+        choice = self.bot_color.currentIndex()
+        mine = _random.choice("wb") if choice == 0 else ("w" if choice == 1 else "b")
+        self._bot_token += 1
+        self._bot_busy = False
+        self._reset_game("bot", mins * 60000, inc * 1000)
+        self.bot, self.my = cfg, mine
+        self.net_gid, self.net_state = None, ""
+        self.rating_info = {"w": None, "b": None}
+        self.avatars = {"w": None, "b": None}
+        other = "b" if mine == "w" else "w"
+        self.names = {mine: "You", other: cfg["name"]}
+        self.board.flipped = (mine == "b")
+        self.tick_ref = self._now()
+        self.stack.setCurrentIndex(1)
+        self._mark(True)
+        self._set_note("")
+        self._refresh()
+        self.board.setFocus()
+        _ch_play("start")
+        self._bot_think()
+
+    def _bot_think(self):
+        g = self.game
+        if self.mode != "bot" or not g or g.result or g.turn == self.my or self._bot_busy or not self.bot:
+            return
+        self._bot_busy = True
+        token, cfg, pos, hist = self._bot_token, self.bot, g.pos, list(g.hist)
+        secs = cfg["secs"]
+        left = self._clocks().get(g.turn)
+        if left is not None:                              # don't burn the bot's whole clock on one move
+            secs = max(0.15, min(secs, left / 1000.0 / 25.0))
+        t0 = time.time()
+        # a bot never answers instantly: it "thinks" for a human-ish time, a bit longer for the stronger ones
+        think = (0.9 + min(cfg["elo"], 1500) / 1000.0) * _random.uniform(0.7, 1.4)
+        if left is not None:
+            think = min(think, max(0.3, left / 1000.0 / 30.0))
+        def fn():
+            return _bot_choose(pos, hist, cfg, secs)
+        def cb(m, err):
+            if token != self._bot_token:
+                return
+            if err or not m:
+                self._bot_busy = False
+                self._set_note("The bot couldn't find a move.")
+                return
+            wait = max(0.0, think - (time.time() - t0))    # search time counts towards the thinking time
+            QTimer.singleShot(int(wait * 1000), lambda: self._bot_apply(m, token))
+        self.bg.run(fn, cb)
+        self._refresh()
+
+    def _bot_apply(self, m, token):
+        if token != self._bot_token or self.mode != "bot" or not self.game or self.game.result:
+            return
+        self._bot_busy = False
+        self.view_ply = len(self.game.moves)               # a bot move always lands on the live position
+        self._bot_moving = True
+        try:
+            self._on_move(*m)
+        finally:
+            self._bot_moving = False
+
+    def start_local(self):
+        mins, inc = self.tc_local.currentData()
+        self._reset_game("local", mins * 60000, inc * 1000)
+        self.net_gid, self.net_state, self.my = None, "", None
+        self.rating_info = {"w": None, "b": None}
+        self.avatars = {"w": None, "b": None}
+        self.names = {"w": "White", "b": "Black"}
+        self.board.flipped = False
+        self.tick_ref = self._now()
+        self.stack.setCurrentIndex(1)
+        self._mark(True)
+        self._refresh()
+        self.board.setFocus()
+        _ch_play("start")
+
+    def _again(self):
+        if self.mode == "local":
+            self._restart_local()
+        elif self.mode == "bot":
+            self.start_bot()
+        else:
+            self.to_lobby()
+
+    def _restart_local(self):
+        base, inc = self.base, self.inc
+        self._reset_game("local", base, inc)
+        self.board.flipped = False
+        self.tick_ref = self._now()
+        self._mark(True)
+        self._refresh()
+        _ch_play("start")
+
+    def open_online(self, gid, opp_uid=""):
+        self._reset_game("online", 0, 0)
+        self.net_gid, self.net_state, self.opp_uid = gid, "loading", opp_uid
+        self.my = None
+        self.rating_info = {"w": None, "b": None}
+        self.avatars = {"w": None, "b": None}
+        self._rinfo_gid = None
+        self.stack.setCurrentIndex(1)
+        self._refresh()
+        self._polling = False
+        self._poll_game()
+
+    def to_lobby(self):
+        self._review_close()
+        if self.mode == "online" and self.net_gid and self.net_state in ("over", "cancelled"):
+            gid = self.net_gid
+            def fn():
+                token, uid = get_id_token()
+                _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
+            self.bg.run(fn, lambda _r, _e: None)
+        self.net_gid, self.net_state = None, ""
+        self._bot_token += 1
+        self._bot_busy = False
+        self.bot = None
+        self.game, self.mode = None, None
+        self._mark(False)
+        self._last_inbox = None
+        self.stack.setCurrentIndex(0)
+        self._set_note("")
+        self._load_friends()
+        self._load_my_rating()
+        self._poll_inbox()
+
+    # ---- clocks
+    def _now(self):
+        return _ch_server_now() if self.mode == "online" else time.monotonic() * 1000.0
+
+    def _clocks(self):
+        """{'w': ms or None, 'b': ...} as they are right now."""
+        if not self.base:
+            return {"w": None, "b": None}
+        out = dict(self.left)
+        g = self.game
+        if g and not g.result and len(g.moves) >= 2 and self.tick_ref is not None and self.net_state != "waiting":
+            if self.mode in ("local", "bot") or self.net_state == "active":
+                out[g.turn] = self.left[g.turn] - (self._now() - self.tick_ref)
+        return out
+
+    def _tick(self):
+        g = self.game
+        if not g or self.stack.currentIndex() != 1:
+            return
+        c = self._clocks()
+        if self.base and not g.result and len(g.moves) >= 2:
+            t = g.turn
+            if c[t] is not None and c[t] <= 0 and (self.mode in ("local", "bot") or self.net_state == "active"):
+                self._flag(t)
+        self._paint_strips(c)
+
+    def _flag(self, color):
+        opp = "b" if color == "w" else "w"
+        winner = opp if _ch_can_mate(self.game.pos, opp) else None
+        self._finish(winner, "timeout" if winner else "timeout vs insufficient material")
+
+    def _paint_strips(self, clocks=None):
+        g = self.game
+        if not g:
+            return
+        clocks = clocks or self._clocks()
+        lost = g.captured()
+        diff = g.material_diff()
+        bottom = "b" if self.board.flipped else "w"
+        top = "w" if bottom == "b" else "b"
+        for strip, col in ((self.strip_top, top), (self.strip_bot, bottom)):
+            taken = lost["b" if col == "w" else "w"]          # what this side has captured
+            order = {"Q": 0, "R": 1, "B": 2, "N": 3, "P": 4}
+            taken = sorted(taken, key=lambda p: order[p[1]])
+            tone = "#8f8d8a" if col == "w" else "#f2f2f2"
+            glyphs = "".join(_CH_GLYPH[p[1]] + "\ufe0e" for p in taken)
+            adv = diff if col == "w" else -diff
+            html = f"<span style='color:{tone}'>{glyphs}</span>"
+            if adv > 0:
+                _adv_col = _ch_theme().get("subtext", "#8b8987")
+                html += f" <span style='color:{_adv_col};font-size:12px'>+{adv}</span>"
+            ms = clocks[col]
+            running = bool(self.base) and not g.result and g.turn == col and len(g.moves) >= 2 and self.net_state != "waiting"
+            show_av, av_path, av_letter = self._strip_avatar(col)
+            strip.set(col, self._strip_name(col), html, _ch_fmt_clock(ms),
+                      running, ms is not None and ms < 10000 and running,
+                      avatar=av_path, letter=av_letter, show_avatar=show_av, elo_html=self._strip_elo(col))
+
+    # ---- moves
+    def _on_move(self, f, t, promo):
+        g = self.game
+        if not g or g.result or self.view_ply != len(g.moves):
+            return
+        if self.mode == "online" and (self.net_state != "active" or g.turn != self.my):
+            return
+        if self.mode == "bot" and not self._bot_moving and (g.turn != self.my or self._bot_busy):
+            return
+        mover = g.turn
+        ply = len(g.moves)
+        snap = (dict(self.left), self.tick_ref)
+        m = (f, t, promo)
+        if g.play(m) is None:
+            return
+        now = self._now()
+        if self.base and ply >= 2 and self.tick_ref is not None:
+            self.left[mover] -= now - self.tick_ref
+        flagged = bool(self.base) and ply >= 2 and self.left[mover] <= 0
+        if self.base and ply >= 2 and not flagged:
+            self.left[mover] += self.inc
+        self.tick_ref = now
+        self.clk_hist.append(snap)
+        self.view_ply = len(g.moves)
+        self._sound_last()
+        had_offer = bool(self.draw_offer)
+        self.draw_offer = None
+        self._mark(True)
+        if self.mode == "online":
+            self.mts.append(now)
+            self._push_move(ply, m, g.result, had_offer)
+        if flagged and not g.result:
+            self._finish("b" if mover == "w" else "w", "timeout")
+        if self.mode == "local" and self.flip_chk.isChecked() and not g.result:
+            self.board.flipped = (g.turn == "b")
+        self._refresh()
+        if self.mode == "bot" and not g.result and g.turn != self.my:
+            self._bot_think()
+
+    def _push_move(self, ply, m, result, had_offer=False):
+        gid = self.net_gid
+        def fn():
+            token, _uid = get_id_token()
+            _http_json(_fdb(f"chess/games/{gid}/moves/m{ply:03d}", token), "PUT",
+                       {"m": _ch_enc(m), "ts": {".sv": "timestamp"}})
+            if had_offer:
+                _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"draw": None})
+            if result:
+                self._patch_result(token, gid, result)
+            return True
+        def cb(_r, err):
+            if err and gid == self.net_gid and self.game and len(self.game.moves) == ply + 1:
+                self.game.undo()
+                if self.mts:
+                    self.mts.pop()
+                if self.clk_hist:
+                    self.left, self.tick_ref = self.clk_hist.pop()
+                self.view_ply = len(self.game.moves)
+                self._set_note("Your move wasn't sent: " + self._net_msg(err))
+                self._refresh()
+        self.bg.run(fn, cb)
+
+    @staticmethod
+    def _patch_result(token, gid, result):
+        w = result.get("winner")
+        _http_json(_fdb(f"chess/games/{gid}", token), "PATCH",
+                   {"status": "over", "result": w or "d", "reason": result.get("reason") or "", "draw": None})
+
+    def _finish(self, winner, reason):
+        g = self.game
+        if not g or g.result:
+            return
+        g.end(winner, reason)
+        _ch_play("end")
+        if self.mode == "online" and self.net_gid:
+            gid, res = self.net_gid, dict(g.result)
+            def fn():
+                token, _u = get_id_token()
+                self._patch_result(token, gid, res)
+            self.bg.run(fn, lambda _r, _e: None)
+        self._refresh()
+
+    def _undo(self):
+        g = self.game
+        if g and self.mode == "bot" and g.moves:
+            self._bot_token += 1                              # drop a reply that is still being computed
+            self._bot_busy = False
+            while g.moves:
+                if g.undo() and self.clk_hist:
+                    self.left, _ref = self.clk_hist.pop()
+                if g.turn == self.my:
+                    break
+            self.tick_ref = self._now()
+            self.view_ply = len(g.moves)
+            self._refresh()
+            self._bot_think()                                 # the bot opens if it plays White
+            return
+        if not g or self.mode != "local" or not g.moves:
+            return
+        if g.undo():
+            if self.clk_hist:
+                self.left, _ref = self.clk_hist.pop()
+            self.tick_ref = self._now()
+            self.view_ply = len(g.moves)
+            self._refresh()
+
+    def _flip(self):
+        self.board.flipped = not self.board.flipped
+        self._refresh()
+
+    def _resign(self):
+        g = self.game
+        if not g or g.result:
+            return
+        who = g.turn if self.mode == "local" else self.my
+        if QMessageBox.question(self, "Resign", f"{self.names[who]}: resign this game?") != QMessageBox.StandardButton.Yes:
+            return
+        self._finish("b" if who == "w" else "w", "resignation")
+
+    def _offer_draw(self):
+        g = self.game
+        if not g or g.result:
+            return
+        if self.mode == "bot":
+            if self.bot and _bot_eval_for(g.pos, "b" if self.my == "w" else "w") <= 30:
+                self._finish(None, "agreement")
+            else:
+                self._set_note(f"{self.bot['name'] if self.bot else 'The bot'} declined the draw.")
+            return
+        if self.mode == "local":
+            if QMessageBox.question(self, "Draw", "Do both players agree to a draw?") == QMessageBox.StandardButton.Yes:
+                self._finish(None, "agreement")
+            return
+        if self.net_state != "active" or self.draw_offer == self.my:
+            return
+        self.draw_offer = self.my
+        gid, me = self.net_gid, self.my
+        def fn():
+            token, _u = get_id_token()
+            _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"draw": me})
+        self.bg.run(fn, lambda _r, e: self._set_note(self._net_msg(e)) if e else None)
+        self._refresh()
+
+    def _accept_draw(self):
+        if self.game and self.draw_offer and self.draw_offer != self.my:
+            self._finish(None, "agreement")
+
+    def _decline_draw(self):
+        if not self.net_gid:
+            return
+        gid = self.net_gid
+        self.draw_offer = None
+        def fn():
+            token, _u = get_id_token()
+            _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"draw": None})
+        self.bg.run(fn, lambda _r, _e: None)
+        self._refresh()
+
+    # ---- review
+    def _on_anchor(self, url):
+        s = url.toString()
+        if s.startswith("ply:") and self.game:
+            try:
+                self.view_ply = max(0, min(len(self.game.moves), int(s[4:])))
+            except ValueError:
+                return
+            self.board.clear_selection()
+            self._refresh()
+
+    def _on_key(self, k):
+        g = self.game
+        if not g:
+            return
+        n = len(g.moves)
+        if k == int(Qt.Key.Key_Left):
+            self.view_ply = max(0, self.view_ply - 1)
+        elif k == int(Qt.Key.Key_Right):
+            self.view_ply = min(n, self.view_ply + 1)
+        elif k == int(Qt.Key.Key_Home):
+            self.view_ply = 0
+        elif k == int(Qt.Key.Key_End):
+            self.view_ply = n
+        self.board.clear_selection()
+        self._refresh()
+
+    def keyPressEvent(self, e):
+        if self.stack.currentIndex() == 1 and e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home, Qt.Key.Key_End):
+            self._on_key(int(e.key()))
+        else:
+            super().keyPressEvent(e)
+
+    # ---- drawing the state
+    def _result_text(self):
+        r = self.game.result
+        if not r:
+            return ""
+        w, why = r.get("winner"), r.get("reason") or ""
+        if w:
+            how = {"checkmate": "checkmate", "resignation": "resignation", "timeout": "timeout"}.get(why, why)
+            who = self.names[w]
+            return f"{who} {'win' if who == 'You' else 'wins'} by {how}"
+        if why == "agreement":
+            return "Draw by agreement"
+        return f"Draw - {why}" if why else "Draw"
+
+    def _refresh(self):
+        g = self.game
+        if not g:
+            return
+        n = len(g.moves)
+        self.view_ply = max(0, min(self.view_ply, n))
+        view = self.view_ply
+        live = view == n
+        last = g.moves[view - 1][:2] if view > 0 else None
+        who = None
+        if live and not g.result:
+            if self.mode == "local":
+                who = "both"
+            elif self.mode == "bot":
+                who = self.my
+            elif self.net_state == "active":
+                who = self.my
+        if self.mode == "online" and self.my and not getattr(self, "_oriented", False):
+            self.board.flipped = (self.my == "b")
+            self._oriented = True
+        self.board.set_state(g.hist[view], last, g.legal() if live else [], who)
+        self._paint_strips()
+        # status line
+        if self.net_state == "loading":
+            txt = "Connecting..."
+        elif self.net_state == "waiting":
+            txt = f"Waiting for {self.names['b' if self.my == 'w' else 'w']} to accept your challenge..."
+        elif g.result:
+            txt = self._result_text()
+        else:
+            t = g.turn
+            if self.mode == "online":
+                txt = "Your move" if t == self.my else f"Waiting for {self.names[t]}..."
+            elif self.mode == "bot":
+                txt = "Your move" if t == self.my else f"{self.bot['name'] if self.bot else 'Bot'} is thinking..."
+            else:
+                txt = f"{self.names[t]} to move"
+            if g.pos.in_check():
+                txt += " - check!"
+        if not live:
+            txt += f"   (viewing move {view} of {n})"
+        self.status.setText(txt)
+        try:
+            _op = _ch_opening_label(g.sans[:view])
+            self.opening_lbl.setText(_op)
+            self.opening_lbl.setVisible(bool(_op))
+        except Exception:
+            self.opening_lbl.hide()
+        if getattr(self, "review_panel", None) is not None:
+            self.review_panel.mark(view)
+        # moves list
+        rows = []
+        def cell(i):
+            if i >= n:
+                return ""
+            bg = ("background-color:" + _ch_mix(_ch_theme().get("input", "#0d0d0d"), "#ffffff", 0.22).name() + ";") if i + 1 == view else ""
+            col = _ch_theme().get("text", "#ffffff") if i + 1 == view else _ch_theme().get("subtext", "#bababa")
+            return f"<a href='ply:{i + 1}' style='color:{col};text-decoration:none;{bg}'>&nbsp;{g.sans[i]}&nbsp;</a>"
+        for i in range(0, n, 2):
+            _num_col = _ch_theme().get("disabled_text", "#6f6d6a")
+            rows.append(f"<tr><td style='color:{_num_col};padding-right:8px'>{i // 2 + 1}.</td><td width='80'>{cell(i)}</td><td>{cell(i + 1)}</td></tr>")
+        self.moves_view.setHtml("<table cellspacing='2'>" + "".join(rows) + "</table>")
+        sb = self.moves_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        # buttons
+        over = bool(g.result)
+        online = self.mode == "online"
+        active = (not online) or self.net_state == "active"
+        self.btn_undo.setVisible(not online)
+        self.btn_undo.setEnabled(n > 0)
+        self.btn_draw.setEnabled(not over and active and n > 0)
+        self.btn_resign.setEnabled(not over and active and n > 0)
+        self.btn_again.setVisible(over and not online)
+        self.btn_review.setEnabled(over and n >= 2)          # only once the game is over, so it can't help during play
+        self.btn_lobby.setText("Lobby" if not (online and self.net_state == "waiting") else "Cancel challenge")
+        self.btn_draw.setText("Draw offered" if online and self.draw_offer == self.my and self.my else "Offer draw")
+        offered_to_me = online and self.draw_offer and self.draw_offer != self.my and not over
+        self.draw_bar.setVisible(bool(offered_to_me))
+        if offered_to_me:
+            self.draw_lbl.setText(f"{self.names[self.draw_offer]} offers a draw")
+        for b in self.nav_btns:
+            b.setEnabled(n > 0)
+
+    # ================================================================ online polling
+    def _poll_game(self):
+        gid = self.net_gid
+        if not gid or self._polling or self.net_state in ("over", "cancelled"):
+            return
+        # poll less when nothing is expected: my own turn, or the chess page isn't on screen
+        try:
+            iv = 1500
+            if self.net_state == "active" and self.my and self.game.turn == self.my:
+                iv = 3000
+            if not self.isVisible():
+                iv = 5000
+            if self.game_timer.interval() != iv:
+                self.game_timer.setInterval(iv)
+        except Exception:
+            pass
+        if self._game_etag_gid != gid or self.net_state != "active":
+            self._game_etag, self._game_etag_gid = None, gid      # always do a full read until the game is running
+        etag = self._game_etag
+        self._polling = True
+        def fn():
+            token, uid = get_id_token()
+            doc, new_etag, changed = _http_json_etag(_fdb(f"chess/games/{gid}", token), etag)
+            return uid, doc, new_etag, changed
+        def cb(res, err):
+            self._polling = False
+            if gid != self.net_gid:
+                return
+            if err:
+                self._game_etag = None
+                self._set_note("Reconnecting... " + self._net_msg(err))
+                return
+            self._set_note("")
+            uid, doc, new_etag, changed = res
+            if not changed:                       # same as last time: nothing was downloaded, nothing to apply
+                return
+            self._game_etag = new_etag
+            self._apply_doc(uid, doc)
+        self.bg.run(fn, cb)
+
+    def _doc_moves(self, doc):
+        raw = doc.get("moves")
+        items = []
+        if isinstance(raw, dict):
+            items = [raw[k] for k in sorted(raw) if isinstance(raw[k], dict)]
+        elif isinstance(raw, list):
+            items = [x for x in raw if isinstance(x, dict)]
+        out = []
+        for it in items:
+            try:
+                out.append((_ch_dec(it.get("m", "")), it.get("ts")))
+            except Exception:
+                break
+        return out
+
+    def _apply_doc(self, uid, doc):
+        if not isinstance(doc, dict):
+            self._set_note("That game no longer exists.")
+            self.net_state = "cancelled"
+            self.to_lobby()
+            return
+        self.names = {"w": doc.get("wn") or "White", "b": doc.get("bn") or "Black"}
+        self.my = "w" if doc.get("w") == uid else "b" if doc.get("b") == uid else None
+        status = doc.get("status")
+        self.base, self.inc = int(doc.get("base") or 0), int(doc.get("inc") or 0)
+        if status in ("declined", "cancelled"):
+            self._set_note("The challenge was declined." if status == "declined" else "The challenge was cancelled.")
+            self.net_state = "cancelled"
+            self.to_lobby()
+            return
+        if status == "waiting":
+            self.net_state = "waiting"
+            self.left = {"w": self.base, "b": self.base}
+            if self._rinfo_gid != self.net_gid:
+                self._load_game_ratings(doc)
+            self._refresh()
+            return
+        remote = self._doc_moves(doc)
+        g = self.game
+        mismatch = any(i < len(remote) and g.moves[i] != remote[i][0] for i in range(len(g.moves)))
+        fresh_load = self.net_state in ("loading", "waiting") or mismatch
+        if fresh_load:
+            self._reset_game("online", self.base, self.inc)
+            self._oriented = False
+            g = self.game
+            self.net_state = "active"
+        if len(remote) < len(g.moves):          # our own move is still being sent; wait for the next poll
+            self._refresh()
+            return
+        was_live = self.view_ply >= len(g.moves)
+        before = len(g.moves)
+        for i in range(len(g.moves), len(remote)):
+            if g.play(remote[i][0]) is None:
+                break
+        if len(g.moves) > before and not fresh_load:
+            self._sound_last()
+        self.mts = [ts for _m, ts in remote[:len(g.moves)]]
+        self.started = doc.get("started") or 0
+        self.net_state = "active"
+        self._rebuild_online_clock()
+        self.draw_offer = doc.get("draw") if doc.get("draw") in ("w", "b") else None
+        if status == "over" and not g.result:
+            res = doc.get("result")
+            g.end(res if res in ("w", "b") else None, doc.get("reason") or ("agreement" if res == "d" else ""))
+            if not fresh_load:
+                _ch_play("end")
+        if was_live:
+            self.view_ply = len(g.moves)
+        if g.result:
+            self.net_state = "over"
+            self._mark(False)
+            self._rate_game(doc)
+        elif fresh_load or self._rinfo_gid != self.net_gid:
+            self._load_game_ratings(doc)
+        self._refresh()
+
+    def _rebuild_online_clock(self):
+        g = self.game
+        self.left = {"w": self.base, "b": self.base}
+        prev = self.started or (self.mts[0] if self.mts else _ch_server_now())
+        for i, ts in enumerate(self.mts):
+            if not isinstance(ts, (int, float)):
+                ts = prev
+            mover = "w" if i % 2 == 0 else "b"
+            if self.base and i >= 2:
+                self.left[mover] -= ts - prev
+                if self.left[mover] > 0:
+                    self.left[mover] += self.inc
+            prev = ts
+        self.tick_ref = prev
+
+# ---- "Play" on the NCZ Chess card opens the chess page inside the launcher
+def _open_chess(self):
+    page = self.__dict__.get("chess_page")
+    if page is None:
+        page = NczChessPage()
+        self.chess_page = page
+        self.pages.addWidget(page)
+        page.back_requested.connect(self._leave_web_page)
+    self.pages.setCurrentWidget(page)
+
+AdaptiveApp.open_chess = _open_chess
+
+
 
 
 # ================================================================ Poll results: Discord picture sync + itch.io fan games
