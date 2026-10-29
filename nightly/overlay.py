@@ -630,6 +630,10 @@ class InviteToast(PlayingToast):
     Accept opens the Steam join link, exactly like accepting an invite in Steam. Unlike the other toasts this one takes
     mouse clicks (it still never takes keyboard focus away from the game)."""
 
+    SUBTITLE = "invited you to play"
+    ACCEPT_TEXT, DISMISS_TEXT = "Accept", "Dismiss"
+    COVER_LETTER = ""
+
     def __init__(self, user, game, link, avatar_path=None, cover_path=None, duration_ms=20000):
         super().__init__(user, game, avatar_path, duration_ms=duration_ms, prefix="invited you to play ")
         self.link = link if str(link).startswith("steam://") else ""
@@ -670,11 +674,21 @@ class InviteToast(PlayingToast):
         if getattr(self, "_leaving", False):
             return
         w = self._which(e)
-        if w == "accept" and self.link:
-            _accept_invite(self.link)
-            self.slide_out()
+        if w == "accept":
+            if self._do_accept():
+                self.slide_out()
         elif w == "dismiss":
+            self._do_dismiss()
             self.slide_out()
+
+    def _do_accept(self):
+        if not self.link:
+            return False
+        _accept_invite(self.link)
+        return True
+
+    def _do_dismiss(self):
+        pass
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -706,7 +720,7 @@ class InviteToast(PlayingToast):
             p.fillRect(r, AVATAR_COLOR)
             p.setPen(QColor("white") if AVATAR_COLOR.lightnessF() < 0.6 else QColor("#111111"))
             p.setFont(_make_font(40, True))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.game[:1] or "?").upper())
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.COVER_LETTER or self.game[:1] or "?").upper())
         p.restore()
 
         # sender: small avatar + name, then "invited you to play", then the game
@@ -732,14 +746,14 @@ class InviteToast(PlayingToast):
         _draw_text(p, QRectF(nx, 10, W - nx - 12 - ICON_RESERVE, 30), self.user)
         p.setPen(TEXT_COLOR)
         p.setFont(_make_font(15, False))
-        p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, "invited you to play")
+        p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, self.SUBTITLE)
         p.setPen(GAME_COLOR)
         p.setFont(_fit_font(self.game, 21, full_w))
         _draw_text(p, QRectF(tx, 64, full_w, 28), self.game)
 
         # buttons
-        for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
-                                         (self._dismiss_r, "Dismiss", False, "dismiss")):
+        for rect, text, primary, key in ((self._accept_r, self.ACCEPT_TEXT, True, "accept"),
+                                         (self._dismiss_r, self.DISMISS_TEXT, False, "dismiss")):
             hot = self._hover == key
             bp = QPainterPath()
             bp.addRoundedRect(rect, 8, 8)
@@ -753,6 +767,128 @@ class InviteToast(PlayingToast):
             p.setPen(txt)
             p.setFont(_make_font(16, True))
             p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+
+# ---- chess challenges: toast with Accept / Decline. main.py sets the two hooks (gid, opp_uid, user). In the XWayland
+# helper process there are no hooks, so the click is sent back to the launcher as a tagged line on the helper's stdout.
+chess_accept_hook = None
+chess_decline_hook = None
+_IS_HELPER = False
+_ACTION_TAG = "@@ncz-action@@ "
+
+
+def _emit_action(d):
+    try:
+        sys.stdout.write(_ACTION_TAG + json.dumps(d) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _chess_action(kind, gid, opp_uid, user):
+    hook = chess_accept_hook if kind == "accept" else chess_decline_hook
+    if hook is not None:
+        try:
+            hook(gid, opp_uid, user)
+        except Exception:
+            pass
+        return
+    if _IS_HELPER:
+        _emit_action({"action": "chess_" + kind, "gid": gid, "opp_uid": opp_uid, "user": user})
+
+
+class ChessInviteToast(InviteToast):
+    """'<friend> challenged you to chess' with the time control and clickable Accept / Decline buttons."""
+    SUBTITLE = "challenged you to chess"
+    ACCEPT_TEXT, DISMISS_TEXT = "Accept", "Decline"
+    COVER_LETTER = "\u265F"
+
+    def __init__(self, user, tc, gid, opp_uid, avatar_path=None, cover_path=None, duration_ms=30000):
+        super().__init__(user, tc or "Chess", "", avatar_path, cover_path, duration_ms)
+        self.prefix = "challenged you to chess"
+        self.gid, self.opp_uid = gid, opp_uid
+
+    def _do_accept(self):
+        _chess_action("accept", self.gid, self.opp_uid, self.user)
+        return True
+
+    def _do_dismiss(self):
+        _chess_action("decline", self.gid, self.opp_uid, self.user)
+
+
+class _ActionBridge(QObject):
+    got = pyqtSignal(dict)
+
+    @pyqtSlot(dict)
+    def on_got(self, d):
+        a = str(d.get("action", ""))
+        if a in ("chess_accept", "chess_decline"):
+            _chess_action(a[6:], str(d.get("gid", "")), str(d.get("opp_uid", "")), str(d.get("user", "")))
+
+
+_action_bridge_obj = None
+
+
+def _action_bridge():
+    """Created on the GUI thread (first call comes from there) so signals emitted by worker threads arrive on it."""
+    global _action_bridge_obj
+    if _action_bridge_obj is None:
+        b = _ActionBridge()
+        b.got.connect(b.on_got)
+        _action_bridge_obj = b
+    return _action_bridge_obj
+
+
+def _helper_reader(proc, logpath, bridge):
+    """Reads the helper's stdout: tagged lines are button clicks, everything else goes to its log file."""
+    try:
+        with open(logpath, "a", encoding="utf-8", errors="replace") as log:
+            for line in proc.stdout:
+                if line.startswith(_ACTION_TAG):
+                    try:
+                        bridge.got.emit(json.loads(line[len(_ACTION_TAG):]))
+                    except ValueError:
+                        pass
+                else:
+                    log.write(line)
+                    log.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _linux_notify_chess(user, tc, chess, icon=None):
+    """Wayland fallback: a libnotify notification with Accept / Decline actions (needs notify-send with --action)."""
+    exe = shutil.which("notify-send")
+    if not exe:
+        return False
+    body = html.escape(f"challenged you to chess ({tc})" if tc else "challenged you to chess")
+    try:
+        helptext = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=3)
+        has_actions = "--action" in (helptext.stdout + helptext.stderr)
+    except Exception:
+        has_actions = False
+    cmd = [exe, "-a", "NCZ Games Launcher", "-t", "30000", "-i", icon or "applications-games"]
+    if has_actions:
+        cmd += ["-A", "accept=Accept", "-A", "decline=Decline"]
+    cmd += [str(user), body]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if has_actions else subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return False
+    if has_actions:
+        bridge = _action_bridge()
+
+        def wait():
+            try:
+                out = (proc.communicate(timeout=60)[0] or "").strip()
+            except Exception:
+                return
+            if out in ("accept", "decline"):
+                bridge.got.emit({"action": "chess_" + out, "gid": chess.get("gid", ""),
+                                 "opp_uid": chess.get("opp_uid", ""), "user": str(user)})
+        threading.Thread(target=wait, daemon=True).start()
+    return True
 
 
 def _linux_notify(user, game, prefix, icon=None, link=None):
@@ -826,12 +962,14 @@ class OverlayManager:
         env.pop("QT_WAYLAND_DISABLE_WINDOWDECORATION", None)
         cmd = ([sys.executable, "--ncz-overlay-server"] if getattr(sys, "frozen", False)
                else [sys.executable, os.path.abspath(__file__), "--server"])
-        log = open(os.path.join(tempfile.gettempdir(), "ncz_overlay_helper.log"), "w")
+        logpath = os.path.join(tempfile.gettempdir(), "ncz_overlay_helper.log")
+        log = open(logpath, "w")
         try:
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=log,
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                                           env=env, text=True, bufsize=1, start_new_session=True)
         finally:
             log.close()                       # the child keeps its own copy of the handle
+        threading.Thread(target=_helper_reader, args=(self._proc, logpath, _action_bridge()), daemon=True).start()
         self._pending = []
         QTimer.singleShot(2500, self._check_helper)
 
@@ -844,10 +982,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix, image, link, badge, plain in pending:
-            self._show_local(user, game, avatar, prefix, image, link, badge, plain)
+        for user, game, avatar, prefix, image, link, badge, plain, chess in pending:
+            self._show_local(user, game, avatar, prefix, image, link, badge, plain, chess)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False, chess=None):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -861,12 +999,12 @@ class OverlayManager:
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
-                                         "badge": badge or "", "plain": bool(plain),
+                                         "badge": badge or "", "plain": bool(plain), "chess": chess or {},
                                          "accent": _accent_hex, "light": _light, "sunset": _sunset,
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain))
+                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain, chess))
             return True
         except (OSError, ValueError):
             self._proc = None
@@ -901,17 +1039,32 @@ class OverlayManager:
             return
         self._show_local(user, game, avatar_path, prefix, image, link)
 
-    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
+    def notify_chess_invite(self, user, tc, gid, opp_uid, avatar_path=None, image=None):
+        """'<user> challenged you to chess (<tc>)' with Accept / Decline buttons. image: path of the chess cover."""
+        if self.mode == "off":
+            return
+        chess = {"gid": gid, "opp_uid": opp_uid}
+        prefix = "challenged you to chess"
+        if self._wants_helper() and self._send_to_helper(user, tc, avatar_path, prefix, image, None, None, False, chess):
+            return
+        self._show_local(user, tc, avatar_path, prefix, image, None, None, False, chess)
+
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False, chess=None):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
-            if _linux_notify(user, game, prefix, image, link):
+            if chess:
+                if _linux_notify_chess(user, game, chess, image or avatar_path):
+                    return
+            elif _linux_notify(user, game, prefix, image, link):
                 return
         # "inject" backend is a later phase; use the window backend for now.
         live = [x for x in self._toasts if x.isVisible()]
         while len(live) >= MAX_STACK:          # keep the stack on screen: drop the oldest
             live.pop(0).dismiss()
-        if link:
+        if chess:
+            t = ChessInviteToast(user, game, chess.get("gid", ""), chess.get("opp_uid", ""), avatar_path, image)
+        elif link:
             t = InviteToast(user, game, link, avatar_path, image)
         else:
             t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge, plain=plain)
@@ -1228,6 +1381,11 @@ class _ServerBridge(QObject):
             set_sunset(bool(d["sunset"]))
         if "light" in d:
             set_light(bool(d["light"]))
+        ch = d.get("chess")
+        if isinstance(ch, dict) and ch.get("gid"):
+            overlay.notify_chess_invite(str(d.get("user", "")), str(d.get("game", "")), str(ch["gid"]),
+                                        str(ch.get("opp_uid", "")), d.get("avatar") or None, d.get("image") or None)
+            return
         if d.get("link"):
             overlay.notify_invite(str(d.get("user", "")), str(d.get("game", "")), str(d["link"]),
                                   d.get("avatar") or None, d.get("image") or None)
@@ -1244,6 +1402,8 @@ def run_server():
     """Helper process: draws the toasts the launcher sends as JSON lines on stdin, using the X11 (xcb) platform so
     the windows can be placed exactly, stay out of the taskbar and sit above XWayland (Proton) games.
     Exits when the launcher closes the pipe."""
+    global _IS_HELPER
+    _IS_HELPER = True
     os.environ["QT_QPA_PLATFORM"] = "xcb"
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
