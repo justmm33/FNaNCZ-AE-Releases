@@ -3,7 +3,9 @@
 NCZ Games Launcher - sign-in + installer.
 
 Flow
-  * Already signed in (and the launcher is installed)  -> main.py starts straight away, no window.
+  * Already signed in (and the launcher is installed)  -> main.py starts straight away, no window. Before that a silent
+                check compares the repo's assets/ folder with the local one; only if files are new or changed does the
+                "Downloading Launcher..." screen appear, and it downloads just those files.
   * Sign in  -> Firebase email/password login. An account that already has a profile in the database passes.
                 An account with no profile yet (a new one) goes through the Discord check first.
   * Create Account -> the same Discord check runs BEFORE the account is created.
@@ -623,11 +625,11 @@ def send_ban_webhook(user_id):
 
 
 # ------------------------------------------------------------------------------------------------ GitHub download
-def _gh_open(url):
+def _gh_open(url, timeout=30):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher",
                                                    "Accept": "application/vnd.github+json"})
-        return urllib.request.urlopen(req, timeout=30)
+        return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 403 or e.code == 429:
             raise CloudError("GitHub is limiting this connection right now. Try again in a few minutes.")
@@ -660,6 +662,35 @@ def git_blob_sha(path):
         return h.hexdigest()
     except OSError:
         return None
+
+
+def list_asset_updates(timeout=8):
+    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
+    different from the local copy. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    try:
+        with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out = []
+        for e in data.get("tree", []):
+            path = e.get("path", "")
+            if e.get("type") != "blob" or not path.startswith(ASSETS_PREFIX):
+                continue
+            dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
+            if not dest.startswith(INSTALL_DIR + os.sep):
+                continue
+            size, sha = int(e.get("size", 0)), e.get("sha", "")
+            if os.path.exists(dest):
+                if path in KEEP_LOCAL_ASSETS or not sha:
+                    continue                                   # locally built / can't compare: leave it alone
+                try:
+                    if os.path.getsize(dest) == size and git_blob_sha(dest) == sha:
+                        continue                               # identical: nothing to download
+                except OSError:
+                    pass
+            out.append((path, size, sha))
+        return sorted(out)
+    except Exception:
+        return []
 
 
 def _download_to(url, dest, on_bytes, is_cancelled):
@@ -696,10 +727,13 @@ def _download_to(url, dest, on_bytes, is_cancelled):
     raise last_err or CloudError("Download failed.")
 
 
-def install_launcher(progress, is_cancelled):
+def install_launcher(progress, is_cancelled, entries=None):
     """Downloads the launcher into INSTALL_DIR. progress(fraction, text). Files that are already identical are
-    skipped; replaced scripts keep a one-time .bak copy of what was there before."""
-    entries = list_launcher_files()
+    skipped; replaced scripts keep a one-time .bak copy of what was there before.
+    entries: a ready-made [(path, size, sha)] list (an assets update) -> only those files are downloaded."""
+    full = entries is None
+    if full:
+        entries = list_launcher_files()
     total = sum(size for _p, size, _s in entries) or 1
     state = {"done": 0, "name": "", "last": 0.0}
 
@@ -708,7 +742,10 @@ def install_launcher(progress, is_cancelled):
         if force or now - state["last"] > 0.05:
             state["last"] = now
             frac = max(0.0, min(1.0, state["done"] / total))
-            progress(frac, f"{state['done'] / 1048576:.1f} / {total / 1048576:.1f} MB   {state['name']}")
+            if total < 1048576:                                   # a small update: KB reads better than 0.0 MB
+                progress(frac, f"{max(state['done'], 0) / 1024:.0f} / {total / 1024:.0f} KB   {state['name']}")
+            else:
+                progress(frac, f"{state['done'] / 1048576:.1f} / {total / 1048576:.1f} MB   {state['name']}")
 
     def bump(n):
         state["done"] += n
@@ -733,8 +770,9 @@ def install_launcher(progress, is_cancelled):
         _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
                      dest, bump, is_cancelled)
     emit(force=True)
-    with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
-        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    if full:
+        with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 # ------------------------------------------------------------------------------------------------ threads
@@ -760,13 +798,14 @@ class DownloadWorker(QThread):
     done = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, entries=None):
         super().__init__(parent)
         self.cancel = False
+        self.entries = entries
 
     def run(self):
         try:
-            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel)
+            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel, self.entries)
             self.done.emit()
         except CloudError as e:
             if not self.cancel:
@@ -1728,13 +1767,14 @@ class LoginWindow(QWidget):
             self.start_download()
 
     # ---- download + launch
-    def start_download(self):
+    def start_download(self, entries=None):
         self._busy_flag = False
+        self._update_only = entries is not None            # an assets update (launcher already installed)
         self.set_status("")
         self.progress.value = self.progress.shown = 0.0
         self.progress.text = "Connecting to GitHub..."
         self._go("downloading")
-        self._dl = DownloadWorker(self)
+        self._dl = DownloadWorker(self, entries)
         self._dl.progress.connect(self._on_progress)
         self._dl.done.connect(self._on_downloaded)
         self._dl.failed.connect(self._on_download_failed)
@@ -1750,6 +1790,9 @@ class LoginWindow(QWidget):
         QTimer.singleShot(650, self.launch_now)
 
     def _on_download_failed(self, message):
+        if getattr(self, "_update_only", False):
+            self.launch_now()                               # the launcher is already installed: don't block it on an asset update
+            return
         self._go("dl_error")
         self._idle()
         self.set_status(message)
@@ -1790,12 +1833,15 @@ class LoginWindow(QWidget):
 
 def main():
     # signed in and installed: skip the window completely and open the launcher
+    changed = []
     if not is_flagged_banned() and load_account() and install_complete():
-        try:
-            launch_launcher()
-            return
-        except Exception:
-            pass                                      # couldn't start it -> fall through to the window
+        changed = list_asset_updates()                # silent: new or modified files in assets/ (empty when offline)
+        if not changed:
+            try:
+                launch_launcher()
+                return
+            except Exception:
+                pass                                  # couldn't start it -> fall through to the window
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = LoginWindow()
@@ -1803,8 +1849,8 @@ def main():
     win.play_intro()
     if is_flagged_banned():                           # banned earlier: no sign-in, just the message and close
         QTimer.singleShot(0, lambda: win.ban(None, notify=False))
-    elif load_account():                              # signed in but the launcher isn't downloaded (yet)
-        QTimer.singleShot(0, win.start_download)
+    elif load_account():                              # signed in but the launcher isn't downloaded (yet), or assets changed
+        QTimer.singleShot(0, lambda: win.start_download(changed or None))
     sys.exit(app.exec())
 
 _old_init = LoginWindow.__init__
