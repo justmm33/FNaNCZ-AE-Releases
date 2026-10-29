@@ -23290,6 +23290,104 @@ def _overlay_show_invite(uid, name, inv, avatar):
         bridge.done.emit(name, inv["game"] or "a game", avatar or "", cover or "", inv["link"])
     threading.Thread(target=work, daemon=True).start()
 
+# ---- chess challenges: the chat message ("♟ X challenged you to a game of chess (5+3). Open NCZ Chess ...") shows up as
+# a toast with Accept / Decline. The game id isn't in the message, so it is looked up in chess/inbox (kind "invite").
+_CHESS_CHALLENGE_RE = re.compile(r"^\u265F\s+.+? challenged you to a game of chess(?:\s*\((.*?)\))?[.\s]")
+
+def _chess_challenge_tc(text):
+    """-> the time-control label of a chess challenge message ('' when it has none), None for any other message."""
+    m = _CHESS_CHALLENGE_RE.match(str(text or "").strip())
+    return None if m is None else (m.group(1) or "")
+
+def _chess_find_invite(sender_uid):
+    """Worker thread -> (gid, inbox entry) of the newest still-valid challenge from sender_uid, or None."""
+    token, me = get_id_token()
+    data = _http_json(_fdb(f"chess/inbox/{me}", token))
+    best = None
+    if isinstance(data, dict):
+        now = _ch_server_now()
+        for gid, info in data.items():
+            if not isinstance(info, dict) or info.get("kind") != "invite" or info.get("oppUid") != sender_uid:
+                continue
+            ts = info.get("ts") if isinstance(info.get("ts"), (int, float)) else 0
+            if ts and now - ts > _CH_INVITE_TTL_MS:
+                continue
+            if best is None or ts > best[0]:
+                best = (ts, gid, info)
+    return (best[1], best[2]) if best else None
+
+def _chess_overlay_accept(gid, opp_uid="", name=""):
+    """Overlay Accept: same as pressing Accept in the NCZ Chess lobby, then the launcher shows the game."""
+    win = _invite_main_window()
+    if win is None:
+        return
+    try:
+        win.showNormal()
+        win.raise_()
+        win.activateWindow()
+        win.open_chess()
+        win.chess_page.accept_invite(gid, {"opp": name, "oppUid": opp_uid})
+    except Exception as e:
+        print(f"chess: couldn't accept the challenge from the overlay: {e}")
+
+def _chess_overlay_decline(gid, opp_uid="", name=""):
+    def work():
+        try:
+            token, uid = get_id_token()
+            try:
+                _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"status": "declined"})
+            except CloudError:
+                pass
+            _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
+        except Exception as e:
+            print(f"chess: couldn't decline the challenge from the overlay: {e}")
+    threading.Thread(target=work, daemon=True).start()
+
+try:
+    import overlay as _ovm_chess
+    _ovm_chess.chess_accept_hook = _chess_overlay_accept
+    _ovm_chess.chess_decline_hook = _chess_overlay_decline
+except Exception:
+    pass
+
+class _OvChessBridge(QObject):
+    done = pyqtSignal(str, str, str, str, str)      # sender name, time control, avatar path, game id ('' = not found), sender uid
+
+_ov_chess_bridge = None
+
+def _overlay_chess_ready(name, tc, avatar, gid, uid):
+    if not gid:                                      # challenge already gone / not readable: plain text toast
+        _overlay_show(name, "", avatar, "challenged you to chess")
+        return
+    _overlay.set_mode("window")
+    try:
+        cover = asset_path("nczchess.png")
+        cover = cover if cover and os.path.exists(cover) else None
+    except Exception:
+        cover = None
+    _overlay.notify_chess_invite(name, tc, gid, uid, avatar or None, cover)
+
+def _overlay_show_chess_invite(uid, name, tc, avatar):
+    global _ov_chess_bridge
+    if _ov_chess_bridge is None:
+        _ov_chess_bridge = _OvChessBridge()
+        _ov_chess_bridge.done.connect(_overlay_chess_ready)
+    bridge = _ov_chess_bridge
+
+    def work():
+        gid, label = "", tc
+        for _try in range(3):                        # the inbox entry is written just before the message: allow a moment
+            try:
+                found = _chess_find_invite(uid)
+            except Exception:
+                found = None
+            if found:
+                gid, label = found[0], (found[1].get("tc") or tc)
+                break
+            time.sleep(1.0)
+        bridge.done.emit(name, label or "", avatar or "", gid, uid)
+    threading.Thread(target=work, daemon=True).start()
+
 def _overlay_group_look(page, gid, group_name, msg):
     """Group chat message -> (group icon file, sender picture file, sender uid, sender name)."""
     g = (getattr(page, "groups", None) or {}).get(gid) or {}
@@ -23322,6 +23420,17 @@ def _overlay_friend_event(page, name, text, uid):
     inv = parse_invite(str(msg.get("text") or "")) if isinstance(msg, dict) else None
     g_icon = g_badge = None
     inviter = None                           # group chat: the toast names whoever wrote, not the group
+    if not (isinstance(uid, str) and uid.startswith("group:")) and hasattr(_overlay, "notify_chess_invite"):
+        ch_tc = _chess_challenge_tc((msg.get("text") if isinstance(msg, dict) else "") or text)
+        if ch_tc is not None:
+            if mode == "inject":                 # the injected in-game toast is text only, so the clickable one comes on top
+                try:
+                    from overlay import send_to_injected
+                    send_to_injected(name, "chess", "challenged you to ")
+                except Exception:
+                    pass
+            _overlay_show_chess_invite(uid, name, ch_tc, _friend_avatar_file(uid, (page.friends.get(uid) or {}).get("photo")))
+            return
     if isinstance(uid, str) and uid.startswith("group:"):
         g_icon, g_badge, s_uid, s_name = _overlay_group_look(page, uid[6:], name, msg)
         if s_uid and s_name:
@@ -23644,6 +23753,7 @@ class _FriendsPanel(QWidget):
     got_chat = pyqtSignal(object)
     got_invite = pyqtSignal(object)
     invite_sent = pyqtSignal(object)
+    got_media = pyqtSignal(object)
     closed = pyqtSignal()
 
     STYLE = """
@@ -23674,6 +23784,15 @@ class _FriendsPanel(QWidget):
     #Send:hover{background:#b794ff;}
     #Invite{background:#2d2740;border:none;border-radius:18px;}
     #Invite:hover{background:#3d3458;}
+    #InvCard{background:#262038;border:1px solid #3d3458;border-radius:12px;}
+    #InvCover{background:#3a2f66;color:#d6c5ff;border-radius:10px;font-size:26px;font-weight:700;}
+    #InvTag{font-size:10px;font-weight:700;color:#a97cff;}
+    #InvName{font-size:14px;font-weight:700;color:#ffffff;}
+    #InvSub{font-size:11px;color:#9a93b0;}
+    #InvJoin{background:#a97cff;color:#ffffff;border:none;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;}
+    #InvJoin:hover{background:#b794ff;}
+    #InvJoin:disabled{background:#3d3458;color:#9a93b0;}
+    #Pic{background:#2d2740;color:#9a93b0;border-radius:12px;font-size:12px;}
     """
 
     def __init__(self):
@@ -23688,6 +23807,7 @@ class _FriendsPanel(QWidget):
         self.friends, self.uid, self.fname = {}, None, ""
         self._sig, self._bubbles = None, []
         self._inviting = False
+        self._media_paths, self._media_waiters = {}, {}     # picture cache for the chat: attachment id -> file / waiting labels
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -23819,6 +23939,7 @@ class _FriendsPanel(QWidget):
         self.got_chat.connect(self._fill_chat)
         self.got_invite.connect(self._on_invite)
         self.invite_sent.connect(self._on_invite_sent)
+        self.got_media.connect(self._on_media)
         self.timer = QTimer(self)             # chat refresh
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self._load_chat)
@@ -23949,23 +24070,179 @@ class _FriendsPanel(QWidget):
             self.cv.addWidget(e)
         for m in msgs:
             mine = m.get("from") == me
-            b = QLabel(chat_preview(m))
-            b.setObjectName("Mine" if mine else "Theirs")
-            b.setWordWrap(True)
-            b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            b.setMaximumWidth(self._bubble_w())
-            self._bubbles.append(b)
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            if mine:
-                row.addStretch()
-                row.addWidget(b)
-            else:
-                row.addWidget(b)
-                row.addStretch()
-            self.cv.addLayout(row)
+            for b in self._message_widgets(m, mine, _other):
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                if mine:
+                    row.addStretch()
+                    row.addWidget(b)
+                else:
+                    row.addWidget(b)
+                    row.addStretch()
+                self.cv.addLayout(row)
         if stick:
             self._scroll_bottom()
+
+    # ---- what one chat message is drawn as: a game invite card, picture(s) with the caption, or a text bubble
+    def _text_bubble(self, text, mine):
+        b = QLabel(text)
+        b.setObjectName("Mine" if mine else "Theirs")
+        b.setWordWrap(True)
+        b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        b.setMaximumWidth(self._bubble_w())
+        self._bubbles.append(b)
+        return b
+
+    def _message_widgets(self, m, mine, other):
+        text = str(m.get("text", "") or "").strip()
+        inv = parse_invite(text)
+        if inv:
+            return [self._invite_card(inv, mine, other)]
+        atts = [a for a in (m.get("att") if isinstance(m.get("att"), list) else []) if isinstance(a, dict)]
+        pics = [a for a in atts if a.get("k") in ("img", "gif")]
+        if not pics:
+            return [self._text_bubble(chat_preview(m), mine)]
+        out = [self._text_bubble(text, mine)] if text else []
+        out += [self._picture(a, other) for a in pics]
+        rest = [a for a in atts if a not in pics]
+        if rest:
+            out.append(self._text_bubble(", ".join("[Video]" if a.get("k") == "vid" else "[File]" for a in rest), mine))
+        return out
+
+    def _invite_card(self, inv, mine, other):
+        card = QFrame()
+        card.setObjectName("InvCard")
+        card.setFixedWidth(250)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(10, 10, 12, 10)
+        row.setSpacing(10)
+        cover = QLabel()
+        cover.setObjectName("InvCover")
+        cover.setFixedSize(INVITE_COVER_W, INVITE_COVER_H)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sender = None if mine else other
+        path = invite_cover_path(inv, sender)
+        pix = rounded_cover_pixmap(path, INVITE_COVER_W, INVITE_COVER_H, 8) if path else None
+        if pix:
+            cover.setPixmap(pix)
+        else:
+            cover.setText((inv["game"] or "?")[:1].upper())
+            want_invite_cover(inv, sender, cover)
+        row.addWidget(cover, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        tag = QLabel("GAME INVITE")
+        tag.setObjectName("InvTag")
+        name = QLabel(inv["game"] or "A Steam game")
+        name.setObjectName("InvName")
+        name.setWordWrap(True)
+        sub = QLabel("Invite sent" if mine else "Wants you to join their game")
+        sub.setObjectName("InvSub")
+        sub.setWordWrap(True)
+        col.addWidget(tag)
+        col.addWidget(name)
+        col.addWidget(sub)
+        col.addStretch()
+        if not mine:
+            btn = QPushButton("Join game")
+            btn.setObjectName("InvJoin")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            def join(_c=False, b=btn, i=inv):
+                def state(waiting, b=b):
+                    try:
+                        b.setEnabled(not waiting)
+                        b.setText("Starting game..." if waiting else "Join game")
+                    except RuntimeError:           # the chat was rebuilt meanwhile
+                        pass
+                accept_invite(i["link"], i.get("game", ""), state)
+            btn.clicked.connect(join)
+            col.addWidget(btn)
+        row.addLayout(col, 1)
+        return card
+
+    def _picture(self, att, other):
+        lab = QLabel("Loading picture...")
+        lab.setObjectName("Pic")
+        lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bw = min(self._bubble_w(), 300)
+        w0, h0 = att.get("w"), att.get("h")
+        if isinstance(w0, int) and isinstance(h0, int) and w0 > 0 and h0 > 0:
+            k = min(bw / w0, 240 / h0, 1.0)
+            lab.setFixedSize(max(90, int(w0 * k)), max(50, int(h0 * k)))
+        else:
+            lab.setFixedSize(bw, 150)
+        key = str(att.get("id") or "")
+        if not key:
+            lab.setText("Picture unavailable")
+        elif self._media_paths.get(key):
+            self._show_picture(lab, self._media_paths[key])
+        else:
+            waiters = self._media_waiters.setdefault(key, [])
+            waiters.append(_weakref.ref(lab))
+            if len(waiters) == 1:                 # first label asking for it starts the download
+                def work(att=att):
+                    try:
+                        p = cloud_fetch_media(other, att)
+                    except Exception:
+                        p = ""
+                    try:
+                        self.got_media.emit((key, p))
+                    except Exception:
+                        pass
+                threading.Thread(target=work, daemon=True).start()
+        return lab
+
+    def _on_media(self, res):
+        key, path = res
+        if path:
+            self._media_paths[key] = path
+        for ref in self._media_waiters.pop(key, []):
+            lab = ref()
+            if lab is None:
+                continue
+            try:
+                self._show_picture(lab, path)
+            except RuntimeError:                  # the chat was rebuilt and this label is gone
+                pass
+
+    def _show_picture(self, lab, path):
+        bw = min(self._bubble_w(), 300)
+        if not path:
+            lab.setText("Couldn't load picture")
+            return
+        if path.lower().endswith(".gif"):
+            mv = QMovie(path)
+            if mv.isValid():
+                mv.jumpToFrame(0)
+                sz = mv.currentPixmap().size()
+                if not sz.isEmpty():
+                    k = min(bw / sz.width(), 240 / sz.height(), 1.0)
+                    sz = QSize(max(1, int(sz.width() * k)), max(1, int(sz.height() * k)))
+                    mv.setScaledSize(sz)
+                    lab.setFixedSize(sz)
+                    lab.setMovie(mv)
+                    lab._mv = mv                  # keep the animation alive with its label
+                    mv.start()
+                    return
+        pm = QPixmap(path)
+        if pm.isNull():
+            lab.setText("Couldn't load picture")
+            return
+        k = min(bw / pm.width(), 240 / pm.height(), 1.0)
+        pm = pm.scaled(max(1, int(pm.width() * k)), max(1, int(pm.height() * k)),
+                       Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        out = QPixmap(pm.size())
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, pm.width(), pm.height()), 12, 12)
+        p.setClipPath(clip)
+        p.drawPixmap(0, 0, pm)
+        p.end()
+        lab.setFixedSize(out.size())
+        lab.setPixmap(out)
 
     def _scroll_bottom(self):
         sb = self.chat_scroll.verticalScrollBar()
