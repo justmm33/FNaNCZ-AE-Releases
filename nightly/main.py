@@ -7199,6 +7199,7 @@ def _demo_py_present():
 def main():
     import traceback
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
+    _ban_check_startup()                 # banned (or still locked out after logging out): crash before anything opens
     if sys.platform.startswith("win"):
         # Without its own AppUserModelID, Windows groups the window under python.exe and shows Python's icon.
         try:
@@ -7254,6 +7255,7 @@ def main():
 
     window = AdaptiveApp()
     app._ncz_main_window = window
+    _acct_watch_start(window)
     apply_startup_setting()
     set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
@@ -34066,23 +34068,40 @@ import wave as _wave
 import struct as _struct
 
 _ch_snd = {"on": True, "fx": {}, "dir": None, "broken": False}
-_CH_SOUNDS = ("move", "capture", "check", "castle", "promote", "end", "start")
+_CH_SOUNDS = ("move", "capture", "check", "castle", "promote", "end", "start", "premove")
 
 def _ch_synth(kind):
+    """Wood-board style sounds: a filtered noise 'clack' plus a short low 'knock', chimes for check / promotion / game end."""
     rate = 44100
-    rnd = _random.Random(7)
-    def thump(freq, dur, vol, decay, noise, nd):
-        n = int(rate * dur)
+    TAU = 2 * _math.pi
+    rnd = _random.Random(11)
+    def norm(x, peak):
+        m = max(1e-9, max(abs(v) for v in x))
+        return [v / m * peak for v in x]
+    def reson(x, freq, r):                                   # two-pole resonator = a ringing band-pass
+        c, r2, g = 2 * r * _math.cos(TAU * freq / rate), r * r, 1.0 - r
+        y1 = y2 = 0.0
         out = []
-        for i in range(n):
-            t = i / rate
-            f = freq * (1.0 + 0.5 * _math.exp(-t * 90))          # a quick pitch drop reads as a "knock"
-            s = _math.sin(2 * _math.pi * f * t) + 0.45 * _math.sin(2 * _math.pi * f * 2.02 * t)
-            out.append(vol * (s * _math.exp(-t * decay) * 0.7 + noise * (rnd.random() * 2 - 1) * _math.exp(-t * nd)))
+        for v in x:
+            y = g * v + c * y1 - r2 * y2
+            out.append(y)
+            y2, y1 = y1, y
         return out
+    def add(a, b):
+        if len(a) < len(b):
+            a, b = b, a
+        return [v + (b[i] if i < len(b) else 0.0) for i, v in enumerate(a)]
+    def tock(freq=1600, r=0.98, dur=0.07, decay=100, vol=1.0, body=200, body_vol=0.7, body_decay=55, bd=0.11):
+        n = int(rate * dur)
+        click = norm(reson([(rnd.random() * 2 - 1) * _math.exp(-(i / rate) * decay) for i in range(n)], freq, r), vol)
+        bn = int(rate * bd)
+        bod = [body_vol * vol * _math.sin(TAU * body * (1 + 0.35 * _math.exp(-(i / rate) * 80)) * (i / rate)) * _math.exp(-(i / rate) * body_decay)
+               for i in range(bn)]
+        return add(click, bod)
     def bell(freq, dur, vol, decay):
         n = int(rate * dur)
-        return [vol * _math.sin(2 * _math.pi * freq * (i / rate)) * _math.exp(-(i / rate) * decay) for i in range(n)]
+        return [vol * (_math.sin(TAU * freq * (i / rate)) + 0.3 * _math.sin(TAU * freq * 2.76 * (i / rate)) * _math.exp(-(i / rate) * 14))
+                * _math.exp(-(i / rate) * decay) for i in range(n)]
     def mix(parts):
         total = max(int(off * rate) + len(sm) for off, sm in parts)
         buf = [0.0] * total
@@ -34091,22 +34110,28 @@ def _ch_synth(kind):
             for i, v in enumerate(sm):
                 buf[o + i] += v
         return buf
+    peak = 0.85
     if kind == "move":
-        buf = thump(190, 0.12, 0.9, 42, 0.5, 130)
+        buf, peak = tock(1700, 0.98, 0.06, 110, 0.8, 200, 0.6, 60, 0.1), 0.78
     elif kind == "capture":
-        buf = mix([(0.0, thump(150, 0.18, 1.0, 30, 0.8, 80)), (0.045, thump(230, 0.12, 0.7, 45, 0.5, 110))])
+        buf, peak = mix([(0.0, tock(1250, 0.985, 0.09, 70, 1.0, 150, 1.0, 40, 0.16)), (0.034, tock(2100, 0.98, 0.06, 100, 0.6, 260, 0.4, 70, 0.08))]), 0.95
     elif kind == "check":
-        buf = mix([(0.0, thump(190, 0.12, 0.8, 42, 0.5, 130)), (0.07, bell(1180, 0.22, 0.45, 16)), (0.13, bell(1480, 0.22, 0.35, 16))])
+        buf, peak = mix([(0.0, tock(1700, 0.98, 0.06, 110, 0.8, 200, 0.6, 60, 0.1)), (0.06, bell(1568, 0.25, 0.35, 22)), (0.11, bell(2093, 0.25, 0.3, 22))]), 0.9
     elif kind == "castle":
-        buf = mix([(0.0, thump(170, 0.12, 0.85, 42, 0.5, 130)), (0.11, thump(210, 0.12, 0.85, 42, 0.5, 130))])
+        buf, peak = mix([(0.0, tock(1500, 0.98, 0.07, 100, 0.8, 190, 0.6, 55, 0.11)), (0.09, tock(1900, 0.98, 0.07, 100, 0.85, 230, 0.6, 55, 0.11))]), 0.85
     elif kind == "promote":
-        buf = mix([(0.0, thump(190, 0.1, 0.7, 42, 0.5, 130)), (0.07, bell(660, 0.3, 0.4, 9)), (0.14, bell(880, 0.3, 0.4, 9)), (0.21, bell(1320, 0.4, 0.4, 7))])
+        buf, peak = mix([(0.0, tock(1700, 0.98, 0.06, 110, 0.7, 200, 0.5, 60, 0.1)), (0.08, bell(784, 0.35, 0.35, 9)),
+                         (0.15, bell(988, 0.35, 0.35, 9)), (0.22, bell(1319, 0.5, 0.35, 7))]), 0.85
     elif kind == "end":
-        buf = mix([(0.0, bell(523, 0.5, 0.5, 6)), (0.16, bell(392, 0.5, 0.5, 6)), (0.32, bell(262, 0.8, 0.55, 4))])
+        buf, peak = mix([(0.0, tock(900, 0.99, 0.12, 40, 0.7, 110, 1.0, 25, 0.25)), (0.02, bell(659, 0.6, 0.35, 6)),
+                         (0.16, bell(523, 0.6, 0.35, 6)), (0.30, bell(392, 0.9, 0.4, 4))]), 0.8
+    elif kind == "premove":
+        buf, peak = tock(2400, 0.97, 0.04, 160, 0.5, 260, 0.25, 90, 0.06), 0.42
     else:   # start
-        buf = mix([(0.0, bell(740, 0.18, 0.4, 20)), (0.09, bell(990, 0.25, 0.4, 16))])
-    peak = max(1e-6, max(abs(v) for v in buf))
-    return b"".join(_struct.pack("<h", int(max(-1.0, min(1.0, v / peak * 0.85)) * 32767)) for v in buf), rate
+        buf, peak = mix([(0.0, tock(1900, 0.98, 0.05, 130, 0.7, 240, 0.4, 70, 0.07)), (0.08, tock(2400, 0.98, 0.05, 130, 0.7, 300, 0.4, 70, 0.07)),
+                         (0.11, bell(1175, 0.3, 0.22, 18))]), 0.75
+    buf = norm(buf, peak)
+    return b"".join(_struct.pack("<h", int(max(-1.0, min(1.0, v)) * 32767)) for v in buf), rate
 
 def _ch_sound_path(kind):
     d = os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_sounds")
@@ -34114,7 +34139,7 @@ def _ch_sound_path(kind):
     custom = os.path.join(asset_path("chess"), "sounds", kind + ".wav")
     if os.path.exists(custom):
         return custom
-    path = os.path.join(d, kind + ".wav")
+    path = os.path.join(d, kind + "_v2.wav")             # v2 = the newer, chess.com-style sounds
     if not os.path.exists(path):
         data, rate = _ch_synth(kind)
         with _wave.open(path, "wb") as w:
@@ -34155,7 +34180,8 @@ def _ch_sound_for(san, result):
     return "move"
 
 # ================================================================ NCZ Chess: board widget
-from PyQt6.QtGui import QBrush, QRadialGradient, QCursor, QFontMetricsF
+from PyQt6.QtGui import QBrush, QRadialGradient, QCursor, QFontMetricsF, QLinearGradient, QPolygonF
+from PyQt6.QtCore import QPointF
 from PyQt6.QtWidgets import QTextBrowser, QCheckBox
 
 _CH_GLYPH = {"K": "\u265A", "Q": "\u265B", "R": "\u265C", "B": "\u265D", "N": "\u265E", "P": "\u265F"}
@@ -34166,6 +34192,7 @@ _CH_PIECE_NAMES = {"Q": "Queen", "R": "Rook", "B": "Bishop", "N": "Knight"}
 class _ChessBoard(QWidget):
     moveRequested = pyqtSignal(int, int, str)       # from, to, promotion letter ('' if none): always a legal move
     keyNav = pyqtSignal(int)
+    premoveSet = pyqtSignal()
 
     LIGHT, DARK, HL = QColor("#cccccc"), QColor("#616161"), QColor("#fcfcfc")   # replaced by set_theme() to match the launcher
 
@@ -34188,6 +34215,18 @@ class _ChessBoard(QWidget):
         self._drag = -1
         self._drag_xy = QPoint(0, 0)
         self._paths = {}
+        self._mv = []                     # the moves the player can pick from right now (legal moves, or premoves while waiting)
+        self.pre_who = None               # colour that may premove right now (None = no premoves)
+        self.premove = None               # (from, to, promo) waiting to be played
+        self.pre_col = None
+        self._pm_key, self._pm_list = None, []
+        self.arrows, self.marks = {}, {}  # right-click arrows {(from, to): colour} and highlighted squares {sq: colour}
+        self._ar_from, self._ar_to, self._ar_col = -1, -1, "#eb6150"
+        self._anim = None                 # (from, to, piece, start time): the piece that is sliding to its new square
+        self._skip_anim = False
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)
+        self._anim_timer.timeout.connect(self._anim_tick)
 
     # ---- geometry
     def _geo(self):
@@ -34210,9 +34249,41 @@ class _ChessBoard(QWidget):
             r, c = 7 - r, 7 - c
         return r * 8 + c
 
-    def set_state(self, pos, last, legal, who):
+    def _pre_moves(self, pos, me):
+        """Moves `me` could make if it were their turn (king safety ignored, like chess.com premoves)."""
+        key = (pos.key(), me)
+        if self._pm_key == key:
+            return self._pm_list
+        n = _ChessPos.__new__(_ChessPos)
+        n.b, n.turn, n.castle, n.ep, n.half, n.full = list(pos.b), me, pos.castle, -1, pos.half, pos.full
+        try:
+            out = [m for m in n.pseudo() if n.b[m[0]] and n.b[m[0]][0] == me]
+        except Exception:
+            out = []
+        self._pm_key, self._pm_list = key, out
+        return out
+
+    def _anim_tick(self):
+        if not self._anim or time.monotonic() - self._anim[3] >= 0.16:
+            self._anim = None
+            self._anim_timer.stop()
+        self.update()
+
+    def set_state(self, pos, last, legal, who, pre=None):
+        if last != self.last:
+            self.arrows.clear()
+            self.marks.clear()
+            if last and not self._skip_anim and self.isVisible():
+                f, t = last
+                op, npc = self.pos.b[f], pos.b[t]
+                if op and npc and pos.b[f] is None and self.pos.b[t] != npc:
+                    self._anim = (f, t, op, time.monotonic())
+                    self._anim_timer.start()
+            self._skip_anim = False
         self.pos, self.last, self.legal, self.who = pos, last, legal, who
-        if self.sel >= 0 and not any(m[0] == self.sel for m in legal):
+        self.pre_who = pre if (pre and pos.turn != pre) else None
+        self._mv = self._pre_moves(pos, pre) if self.pre_who else list(legal)
+        if self.sel >= 0 and not any(m[0] == self.sel for m in self._mv):
             self.sel = -1
         self._drag = -1
         self.update()
@@ -34239,6 +34310,7 @@ class _ChessBoard(QWidget):
         dpr = self.devicePixelRatioF() or 1.0
         pm = _ch_icon_pixmap(piece, max(8, int(size * 0.9 * dpr)))
         if pm is not None:
+            pm = _ch_tint_piece(pm, piece)
             w, h = pm.width() / dpr, pm.height() / dpr
             p.drawPixmap(QRectF(cx - w / 2.0, cy - h / 2.0, w, h), pm, QRectF(pm.rect()))
             return
@@ -34250,12 +34322,14 @@ class _ChessBoard(QWidget):
         dx = cx - (rect.left() + rect.right()) / 2.0
         p.save()
         p.translate(dx, dy)
-        if piece[0] == "w":
-            p.setPen(QPen(QColor("#1b1b1b"), max(1.2, size / 38.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.setBrush(QColor("#fbfbfb"))
-        else:
-            p.setPen(QPen(QColor("#050505"), max(1.0, size / 48.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.setBrush(QColor("#2c2a29"))
+        _st = _CH_PIECE_STYLES[_ch_piece_style["i"] % len(_CH_PIECE_STYLES)]
+        _top, _bot, _out = _st[1] if piece[0] == "w" else _st[2]
+        _rc = pth.boundingRect()
+        _g = QLinearGradient(0, _rc.top(), 0, _rc.bottom())
+        _g.setColorAt(0.0, QColor(_top))
+        _g.setColorAt(1.0, QColor(_bot))
+        p.setPen(QPen(QColor(_out), max(1.2, size / 38.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(QBrush(_g))
         p.drawPath(pth)
         p.restore()
 
@@ -34273,15 +34347,22 @@ class _ChessBoard(QWidget):
         king_chk = self.pos.king_sq(self.pos.turn) if self.pos.in_check() else -1
         targets = {}
         if self.sel >= 0:
-            for m in self.legal:
+            for m in self._mv:
                 if m[0] == self.sel:
                     targets[m[1]] = True
+        _clip = QPainterPath()
+        _clip.addRoundedRect(QRectF(ox, oy, s * 8, s * 8), s * 0.14, s * 0.14)
+        p.setClipPath(_clip)                                   # rounded board corners
         for sq in range(64):
             x, y, _ = self._cell(sq, geo)
             r, c = divmod(sq, 8)
             light = (r + c) % 2 == 0
             rect = QRectF(x, y, s, s)
-            p.fillRect(rect, self.LIGHT if light else self.DARK)
+            _base = QColor(self.LIGHT if light else self.DARK)
+            _gr = QLinearGradient(x, y, x, y + s)
+            _gr.setColorAt(0.0, _base.lighter(107))
+            _gr.setColorAt(1.0, _base.darker(107))
+            p.fillRect(rect, QBrush(_gr))
             if self.last and sq in self.last:
                 _hc = QColor(self.HL)
                 _hc.setAlpha(115)
@@ -34290,6 +34371,12 @@ class _ChessBoard(QWidget):
                 _hc = QColor(self.HL)
                 _hc.setAlpha(175)
                 p.fillRect(rect, _hc)
+            if sq in self.marks:
+                _mc = QColor(self.marks[sq])
+                _mc.setAlpha(150)
+                p.fillRect(rect, _mc)
+            if self.premove and sq in self.premove[:2]:
+                p.fillRect(rect, QColor(214, 69, 65, 150))
             if sq == king_chk:
                 g = QRadialGradient(x + s / 2, y + s / 2, s * 0.62)
                 g.setColorAt(0.0, QColor(255, 0, 0, 230))
@@ -34304,12 +34391,23 @@ class _ChessBoard(QWidget):
                 p.drawText(QRectF(x + s * 0.05, y + s * 0.03, s * 0.4, s * 0.3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, str(8 - r))
             if dr == 7:
                 p.drawText(QRectF(x + s * 0.55, y + s * 0.68, s * 0.4, s * 0.3), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, _CH_FILES[c])
+        p.setClipping(False)
         for sq in range(64):
             pc = self.pos.b[sq]
-            if not pc or (sq == self._drag):
+            if not pc or (sq == self._drag) or (self._anim and sq == self._anim[1]):
                 continue
             x, y, _ = self._cell(sq, geo)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 40))                    # soft shadow under the piece
+            p.drawEllipse(QRectF(x + s * 0.2, y + s * 0.78, s * 0.6, s * 0.11))
             self._draw_piece(p, pc, x + s / 2, y + s / 2, s)
+        if self._anim:
+            _af, _at, _apc, _t0 = self._anim
+            _k = min(1.0, (time.monotonic() - _t0) / 0.15)
+            _e = 1 - (1 - _k) ** 3
+            _x1, _y1, _ = self._cell(_af, geo)
+            _x2, _y2, _ = self._cell(_at, geo)
+            self._draw_piece(p, _apc, _x1 + (_x2 - _x1) * _e + s / 2, _y1 + (_y2 - _y1) * _e + s / 2, s)
         # legal move hints
         p.setPen(Qt.PenStyle.NoPen)
         for sq in targets:
@@ -34322,29 +34420,76 @@ class _ChessBoard(QWidget):
             else:
                 p.setBrush(QColor(0, 0, 0, 62))
                 p.drawEllipse(QRectF(x + s * 0.34, y + s * 0.34, s * 0.32, s * 0.32))
+        for (af, at), acol in self.arrows.items():
+            self._draw_arrow(p, af, at, acol, geo, 215)
+        if self._ar_from >= 0 and self._ar_to >= 0 and self._ar_to != self._ar_from:
+            self._draw_arrow(p, self._ar_from, self._ar_to, self._ar_col, geo, 140)
         if self._drag >= 0 and self.pos.b[self._drag]:
             self._draw_piece(p, self.pos.b[self._drag], self._drag_xy.x(), self._drag_xy.y(), s * 1.12)
         p.end()
+
+    def _draw_arrow(self, p, f, t, col, geo, alpha):
+        x1, y1, s = self._cell(f, geo)
+        x2, y2, _ = self._cell(t, geo)
+        ax, ay, bx, by = x1 + s / 2, y1 + s / 2, x2 + s / 2, y2 + s / 2
+        L = _math.hypot(bx - ax, by - ay)
+        if L < 1:
+            return
+        ux, uy = (bx - ax) / L, (by - ay) / L
+        nx, ny = -uy, ux
+        w, hw, hl = s * 0.11, s * 0.27, s * 0.38
+        sx, sy = ax + ux * s * 0.2, ay + uy * s * 0.2
+        tx, ty = bx - ux * s * 0.08, by - uy * s * 0.08
+        qx, qy = tx - ux * hl, ty - uy * hl
+        pts = [(sx + nx * w, sy + ny * w), (qx + nx * w, qy + ny * w), (qx + nx * hw, qy + ny * hw), (tx, ty),
+               (qx - nx * hw, qy - ny * hw), (qx - nx * w, qy - ny * w), (sx - nx * w, sy - ny * w)]
+        c = QColor(col)
+        c.setAlpha(alpha)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
 
     # ---- mouse / keyboard
     def _can_pick(self, sq):
         pc = self.pos.b[sq] if sq >= 0 else None
         if not pc or self.who is None:
             return False
-        return (self.who == "both" or self.who == pc[0]) and pc[0] == self.pos.turn
+        if (self.who == "both" or self.who == pc[0]) and pc[0] == self.pos.turn:
+            return True
+        return bool(self.pre_who) and pc[0] == self.pre_who        # waiting for the opponent: this piece can be premoved
+
+    def _arrow_colour(self, mods):
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            return "#6ab04c"
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            return "#3b8fe8"
+        if mods & Qt.KeyboardModifier.AltModifier:
+            return "#f5c542"
+        return "#eb6150"
 
     def mousePressEvent(self, e):
         self.setFocus()
+        self._skip_anim = False
         if e.button() == Qt.MouseButton.RightButton:
             self.clear_selection()
+            if self.premove:                                # right-click cancels a premove (like chess.com) and starts an arrow
+                self.premove = None
+            sq = self._square_at(e.position().toPoint())
+            self._ar_from = self._ar_to = sq
+            self._ar_col = self._arrow_colour(e.modifiers())
+            self.update()
             return
+        if e.button() == Qt.MouseButton.LeftButton and (self.arrows or self.marks):
+            self.arrows.clear()
+            self.marks.clear()
+            self.update()
         if e.button() != Qt.MouseButton.LeftButton or self.who is None:
             return
         sq = self._square_at(e.position().toPoint())
         if sq < 0:
             self.clear_selection()
             return
-        if self.sel >= 0 and sq != self.sel and any(m[0] == self.sel and m[1] == sq for m in self.legal):
+        if self.sel >= 0 and sq != self.sel and any(m[0] == self.sel and m[1] == sq for m in self._mv):
             self._attempt(self.sel, sq)
             return
         if self._can_pick(sq):
@@ -34356,6 +34501,12 @@ class _ChessBoard(QWidget):
         self.update()
 
     def mouseMoveEvent(self, e):
+        if self._ar_from >= 0:
+            sq = self._square_at(e.position().toPoint())
+            if sq >= 0 and sq != self._ar_to:
+                self._ar_to = sq
+                self.update()
+            return
         if self._drag >= 0:
             self._drag_xy = e.position().toPoint()
             self.update()
@@ -34364,12 +34515,28 @@ class _ChessBoard(QWidget):
             self.setCursor(Qt.CursorShape.PointingHandCursor if self._can_pick(sq) else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton and self._ar_from >= 0:
+            f, t, col = self._ar_from, self._ar_to, self._ar_col
+            self._ar_from = self._ar_to = -1
+            if f >= 0 and t >= 0:
+                if f == t:
+                    if self.marks.get(f) == col:
+                        del self.marks[f]
+                    else:
+                        self.marks[f] = col
+                elif self.arrows.get((f, t)) == col:
+                    del self.arrows[(f, t)]
+                else:
+                    self.arrows[(f, t)] = col
+            self.update()
+            return
         if e.button() != Qt.MouseButton.LeftButton or self._drag < 0:
             return
         src = self._drag
         self._drag = -1
         sq = self._square_at(e.position().toPoint())
-        if sq >= 0 and sq != src and any(m[0] == src and m[1] == sq for m in self.legal):
+        if sq >= 0 and sq != src and any(m[0] == src and m[1] == sq for m in self._mv):
+            self._skip_anim = True                          # a dragged piece is already on its square: no slide
             self._attempt(src, sq)
         else:
             if sq != src:
@@ -34377,7 +34544,7 @@ class _ChessBoard(QWidget):
         self.update()
 
     def _attempt(self, f, t):
-        opts = [m for m in self.legal if m[0] == f and m[1] == t]
+        opts = [m for m in self._mv if m[0] == f and m[1] == t]
         if not opts:
             return
         promo = ""
@@ -34393,6 +34560,11 @@ class _ChessBoard(QWidget):
                 return
             promo = acts[chosen]
         self.sel = -1
+        if self.pre_who:                                    # not our turn yet: queue it as a premove
+            self.premove, self.pre_col = (f, t, promo), self.pre_who
+            self.premoveSet.emit()
+            self.update()
+            return
         self.moveRequested.emit(f, t, promo)
         self.update()
 
@@ -34987,6 +35159,212 @@ def _bot_eval_for(pos, bot_color):
     return sc if bot.side == (1 if bot_color == "w" else -1) else -sc
 
 
+# ---- NCZ bots (their own tab). The Elo is a target: depth / time / noise / blunder rate are interpolated between the built-in bots.
+_CH_NCZ_TIERS = ((701, "Beginner", "Still learning how the pieces move and hangs pieces often."),
+                 (1001, "Casual", "Plays on instinct and drops the odd piece."),
+                 (1500, "Club player", "Solid, and punishes loose pieces."),
+                 (9999, "Advanced", "Calculates deep and rarely slips."))
+_CH_NCZ_COLORS = ["#ff7a59", "#ffb703", "#2ec4b6", "#4cc9f0", "#9b5de5", "#f15bb5", "#80ed99", "#ff9f1c", "#5390d9", "#e56b6f"]
+_CH_NCZ_BOT_DATA = [("Notacape", 600), ("Eyad", 700), ("Omar V4", 900), ("Bird", 1000), ("Hamza", 1000),
+                    ("MM33", 1250), ("Amr", 1400), ("Pyke", 1450), ("Goose", 1700), ("Leaguy", 1725)]
+
+def _ch_bot_from_elo(name, elo, color):
+    lo, hi = _CH_BOT_LIST[0], _CH_BOT_LIST[-1]
+    for a, b in zip(_CH_BOT_LIST, _CH_BOT_LIST[1:]):
+        if a["elo"] <= elo <= b["elo"]:
+            lo, hi = a, b
+            break
+    t = max(0.0, min(1.0, (elo - lo["elo"]) / float(max(1, hi["elo"] - lo["elo"]))))
+    mix = lambda k: lo[k] + (hi[k] - lo[k]) * t
+    tier, blurb = next((n, d) for lim, n, d in _CH_NCZ_TIERS if elo < lim)
+    return dict(elo=elo, name=name, blurb=blurb, tier=tier, color=color, ncz=True,
+                depth=max(1, int(round(mix("depth")))), secs=round(mix("secs"), 2), noise=int(mix("noise")),
+                blunder=round(mix("blunder"), 3), quiesce=bool(hi["quiesce"] if t >= 0.5 else lo["quiesce"]))
+
+_CH_NCZ_BOTS = [_ch_bot_from_elo(n, e, _CH_NCZ_COLORS[i % len(_CH_NCZ_COLORS)]) for i, (n, e) in enumerate(_CH_NCZ_BOT_DATA)]
+_ch_bot_av_cache = {}
+
+# ---- NCZ bot pictures from Discord: slug of the bot's name -> Discord user id. The pictures are looked up once (in the background,
+# through a public Discord lookup site, no token needed) and kept in <launcher settings folder>/chess_bot_discord/<slug>.png.
+_CH_BOT_DISCORD = {
+    "notacape": "1117393016773152821", "omarv4": "1321446023071273034", "hamza": "1225527076187017287",
+    "amr": "617742579538067506", "goose": "1022676670198595616", "eyad": "680385451089330182",
+    "bird": "942876070091300976", "mm33": "880175193262272533", "pyke": "1465116253134782496",
+    "leaguy": "819957868514115604",
+}
+_CH_DISCORD_LOOKUPS = (          # tried in order; each answers with JSON that contains the avatar (or is the picture itself)
+    "https://discordlookup.mesalytic.moe/v1/user/{id}",
+    "https://japi.rest/discord/v1/user/{id}",
+    "https://api.lanyard.rest/v1/users/{id}",
+    "https://dcdn.dstn.to/avatars/{id}",
+)
+_CH_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "Accept": "*/*"}
+
+_ch_discord_state = {"running": True, "offline": False}   # running: the pictures are still being fetched; offline: no internet
+
+def _ch_discord_dir():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_bot_discord")
+
+def _ch_bot_has_real_pic(cfg):
+    slug = re.sub(r"[^a-z0-9]+", "", cfg["name"].lower())
+    cands = [os.path.join(asset_path("chess"), "bots", slug + "." + e) for e in ("png", "jpg", "jpeg", "webp")]
+    cands.append(os.path.join(_ch_discord_dir(), slug + ".png"))
+    return any(os.path.isfile(f) for f in cands)
+
+def _ch_bot_pic(cfg, size=64):
+    """The bot's round picture; while its Discord picture is still being fetched (and we're online) it says Loading..."""
+    if (_ch_discord_state["running"] and not _ch_discord_state["offline"] and not _ch_bot_has_real_pic(cfg)
+            and re.sub(r"[^a-z0-9]+", "", cfg["name"].lower()) in _CH_BOT_DISCORD):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        circ = QPainterPath()
+        circ.addEllipse(0, 0, size, size)
+        q.setClipPath(circ)
+        q.fillRect(0, 0, size, size, QColor(255, 255, 255, 30))
+        q.setPen(QColor(255, 255, 255, 170))
+        f = QFont()
+        f.setPixelSize(max(9, size // 6))
+        f.setBold(True)
+        q.setFont(f)
+        q.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "Loading...")
+        q.end()
+        return pm
+    return _fo_avatar(_ch_bot_avatar_file(cfg), cfg["name"][:1].upper(), size)
+
+def _ch_discord_log(msg):
+    print("chess: " + msg)
+    try:
+        with open(os.path.join(_ch_discord_dir(), "log.txt"), "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+def _ch_find_avatar_url(obj, uid):
+    """Dig a Discord avatar picture URL out of whatever JSON a lookup site returned (or build it from the avatar hash)."""
+    if isinstance(obj, str):
+        return obj if re.search(r"discord(app)?\.(com|net)/avatars/", obj) else ""
+    if isinstance(obj, dict):
+        h = obj.get("avatar")
+        if isinstance(h, str) and h and "/" not in h and str(obj.get("id", uid)) == str(uid):
+            return f"https://cdn.discordapp.com/avatars/{uid}/{h}.png"
+        for v in obj.values():
+            r = _ch_find_avatar_url(v, uid)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _ch_find_avatar_url(v, uid)
+            if r:
+                return r
+    return ""
+
+def _ch_http_bytes(url):
+    hdr = dict(_CH_UA)
+    if "klipy" in url:
+        hdr["Referer"] = "https://klipy.com/"
+    req = urllib.request.Request(url, headers=hdr)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.read(), (r.headers.get("Content-Type") or "").lower()
+
+def _ch_discord_fetch_one(uid, out):
+    for tpl in _CH_DISCORD_LOOKUPS:
+        url = tpl.format(id=uid)
+        try:
+            data, ctype = _ch_http_bytes(url)
+            if "json" in ctype or data[:1] in (b"{", b"["):
+                link = _ch_find_avatar_url(json.loads(data.decode("utf-8", "replace")), uid)
+                if not link:
+                    _ch_discord_log(f"{uid}: {url} gave no avatar")
+                    continue
+                data, ctype = _ch_http_bytes(link.split("?")[0] + "?size=256")
+            img = QImage.fromData(data)
+            if img.isNull():
+                _ch_discord_log(f"{uid}: {url} didn't give a picture")
+                continue
+            if img.width() > 256:
+                img = img.scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            if img.save(out, "PNG"):
+                return True
+        except urllib.error.HTTPError as e:
+            _ch_discord_log(f"{uid}: {url} failed: {e}")
+        except Exception as e:
+            _ch_discord_log(f"{uid}: {url} failed: {e}")
+            if isinstance(e, (urllib.error.URLError, OSError, TimeoutError)):
+                _ch_discord_state["offline"] = True          # couldn't even reach the site: probably no internet, stop waiting
+                return False
+    return False
+
+def _ch_discord_fetch_all():
+    """Worker thread: download every bot picture that isn't saved yet. (Failures are written to chess_bot_discord/log.txt.)"""
+    d = _ch_discord_dir()
+    got = False
+    try:
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "log.txt"), "w").close()
+        for slug, uid in _CH_BOT_DISCORD.items():
+            out = os.path.join(d, slug + ".png")
+            if os.path.isfile(out):
+                continue
+            if _ch_discord_fetch_one(uid, out):
+                got = True
+            elif _ch_discord_state["offline"]:
+                break
+    except Exception as e:
+        print(f"chess: bot picture download failed: {e}")
+    finally:
+        _ch_discord_state["running"] = False
+        _ch_bot_av_cache.clear()          # the next time a bot card is drawn it finds the new pictures
+    return got
+
+def _ch_bot_avatar_file(cfg):
+    """Picture of an NCZ bot: assets/chess/bots/<name>.png if you drop one there, otherwise a coloured initial that is generated once."""
+    if not cfg or not cfg.get("ncz"):
+        return None
+    name = cfg["name"]
+    if name in _ch_bot_av_cache:
+        return _ch_bot_av_cache[name]
+    slug = re.sub(r"[^a-z0-9]+", "", name.lower())
+    out = None
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        f = os.path.join(asset_path("chess"), "bots", slug + "." + ext)
+        if os.path.isfile(f):
+            out = f
+            break
+    if out is None:
+        f = os.path.join(_ch_discord_dir(), slug + ".png")       # the picture fetched from Discord
+        if os.path.isfile(f):
+            out = f
+    if out is None:
+        try:
+            d = os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_bot_avatars")
+            os.makedirs(d, exist_ok=True)
+            out = os.path.join(d, f"{slug}_{cfg['color'].lstrip('#')}.png")
+            if not os.path.isfile(out):
+                pm = QPixmap(128, 128)
+                pm.fill(Qt.GlobalColor.transparent)
+                q = QPainter(pm)
+                q.setRenderHint(QPainter.RenderHint.Antialiasing)
+                g = QLinearGradient(0, 0, 128, 128)
+                g.setColorAt(0.0, QColor(cfg["color"]).lighter(115))
+                g.setColorAt(1.0, QColor(cfg["color"]).darker(150))
+                q.fillRect(0, 0, 128, 128, QBrush(g))
+                q.setPen(QColor("#ffffff"))
+                f = QFont()
+                f.setPixelSize(64)
+                f.setBold(True)
+                q.setFont(f)
+                q.drawText(QRectF(0, 0, 128, 128), Qt.AlignmentFlag.AlignCenter, name[:1].upper())
+                q.end()
+                pm.save(out, "PNG")
+        except Exception:
+            out = None
+    _ch_bot_av_cache[name] = out
+    return out
+
+
 _CH_TIMES = [("No clock", 0, 0), ("1 min", 1, 0), ("1 | 1", 1, 1), ("3 min", 3, 0), ("3 | 2", 3, 2),
              ("5 min", 5, 0), ("10 min", 10, 0), ("15 | 10", 15, 10), ("30 min", 30, 0)]
 _CH_INVITE_TTL_MS = 15 * 60 * 1000
@@ -35016,6 +35394,92 @@ def _ch_can_mate(pos, color):
                 return True
     return minors >= 2
 
+# ---- bot trash talk: a speech bubble next to the bot's name during the game. Fill the lists with texts (use {name} for the player's
+# name). "*" is used by every bot; add a bot's lowercase name without spaces (e.g. "omarv4") to give that bot its own lines too.
+# events: bot_capture (bot took my piece), bot_check (bot checked me), my_capture (I took the bot's piece), my_check (I checked the bot),
+#         quiet (random chatter on a normal move), bot_win / bot_lose / draw (when the game ends)
+_CH_TRASH = {
+    "*": {"bot_capture": [], "bot_check": [], "my_capture": [], "my_check": [], "quiet": [], "bot_win": [], "bot_lose": [], "draw": []},
+}
+_CH_TRASH_CHANCE = {"bot_capture": 0.5, "bot_check": 0.6, "my_capture": 0.4, "my_check": 0.4, "quiet": 0.07}
+_CH_TRASH_COOLDOWN = 4       # at least this many half-moves between two bubbles in the middle of a game
+
+# ---- the winner's gif bubble (shown next to the winner's name when a game is won). If the lookup of the klipy page ever fails, paste
+# the direct link to the gif (right-click the gif -> copy image address) into _CH_WIN_GIF_DIRECT.
+_CH_WIN_GIF_PAGE = "https://klipy.com/gifs/checkmate-19"
+_CH_WIN_GIF_DIRECT = "https://static2.klipy.com/ii/a8ada81afc59159ea5c8927feffa2e31/2e/4f/S9CKoccEfeWp1OXxW.gif"
+
+def _ch_win_gif_file():
+    d = os.path.dirname(get_launcher_settings_path())
+    for e in ("gif", "webp"):
+        f = os.path.join(d, "chess_win." + e)
+        if os.path.isfile(f) and os.path.getsize(f) > 500:
+            return f
+    return None
+
+def _ch_klipy_urls(html):
+    t = html.replace("\\u002F", "/").replace("\\/", "/").replace("&amp;", "&")
+    pat = r'https?://[^\s"\'<>\\)]+?\.(?:gif|webp)(?:\?[^\s"\'<>\\)]*)?'
+    first = []
+    for m in re.finditer(r'<meta[^>]+(?:og:image|og:video|twitter:image)[^>]*>', t, re.I):
+        first += re.findall(pat, m.group(0), re.I)
+    rest = re.findall(pat, t, re.I)
+    out = []
+    for u in first + sorted(rest, key=lambda u: (".gif" not in u.lower(), "klipy" not in u.lower())):
+        if u not in out:
+            out.append(u)
+    return out
+
+def _ch_klipy_via_browser(url):
+    from playwright.sync_api import sync_playwright
+    found = []
+    with sync_playwright() as p:
+        br = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        try:
+            pg = br.new_context(user_agent=_CH_UA["User-Agent"]).new_page()
+            pg.on("response", lambda r: found.append(r.url) if re.search(r"\.(gif|webp)(\?|$)", r.url, re.I) else None)
+            pg.goto(url, wait_until="domcontentloaded", timeout=45000)
+            pg.wait_for_timeout(4000)
+            html = pg.content()
+        finally:
+            br.close()
+    return _ch_klipy_urls(html) + [u for u in found if u not in _ch_klipy_urls(html)]
+
+def _ch_fetch_win_gif():
+    """Worker thread: save the win gif next to the launcher settings (once). Returns its path or None."""
+    have = _ch_win_gif_file()
+    if have:
+        return have
+    cands = [_CH_WIN_GIF_DIRECT] if _CH_WIN_GIF_DIRECT else []
+    if not cands:
+        try:
+            data, _ct = _ch_http_bytes(_CH_WIN_GIF_PAGE)
+            cands = _ch_klipy_urls(data.decode("utf-8", "replace"))
+        except Exception as e:
+            print(f"chess: couldn't read the gif page directly ({e}); trying a hidden browser")
+        if not cands:
+            try:
+                cands = _ch_klipy_via_browser(_CH_WIN_GIF_PAGE)
+            except Exception as e:
+                print(f"chess: couldn't get the win gif through the browser either: {e}")
+    d = os.path.dirname(get_launcher_settings_path())
+    for u in cands[:8]:
+        try:
+            data, _ct = _ch_http_bytes(u)
+            if data[:4] == b"GIF8":
+                ext = "gif"
+            elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                ext = "webp"
+            else:
+                continue
+            out = os.path.join(d, "chess_win." + ext)
+            with open(out, "wb") as f:
+                f.write(data)
+            return out
+        except Exception as e:
+            print(f"chess: win gif download failed ({u}): {e}")
+    return None
+
 class _ChessBg(QObject):
     """Runs a function on a worker thread and hands (result, error) back on the GUI thread."""
     done = pyqtSignal(int, object, object)
@@ -35042,6 +35506,25 @@ class _ChessBg(QObject):
         if cb:
             cb(res, err)
 
+class _RoundGif(QLabel):
+    """The big gif bubble: a rounded frosted frame with the gif inside it, the gif's own corners rounded too."""
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        r = QRectF(self.rect())
+        frame = QPainterPath()
+        frame.addRoundedRect(r, 24, 24)
+        p.fillPath(frame, QColor(255, 255, 255, 56))
+        mv = self.movie()
+        if mv is not None:
+            inner = r.adjusted(8, 8, -8, -8)
+            clip = QPainterPath()
+            clip.addRoundedRect(inner, 17, 17)
+            p.setClipPath(clip)
+            p.drawPixmap(inner.toRect(), mv.currentPixmap())
+        p.end()
+
 class _ChessStrip(QFrame):
     AV = 30
 
@@ -35064,6 +35547,13 @@ class _ChessStrip(QFrame):
         self.elo.setTextFormat(Qt.TextFormat.RichText)
         self.elo.hide()
         self._elo_html = ""
+        self.bubble = QLabel("")
+        self.bubble.setObjectName("ChBubble")
+        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bubble.hide()
+        self._bub_key, self._movie = None, None
+        self._aspect = 1.0
+        self._big = None                  # the big gif bubble: a child of the board host, left of this strip
         self.caps = QLabel("")
         self.caps.setObjectName("ChCaps")
         self.caps.setTextFormat(Qt.TextFormat.RichText)
@@ -35075,8 +35565,83 @@ class _ChessStrip(QFrame):
         row.addWidget(self.avatar)
         row.addWidget(self.name)
         row.addWidget(self.elo)
+        row.addWidget(self.bubble)
         row.addWidget(self.caps, 1)
         row.addWidget(self.clock)
+
+    def _place_big(self):
+        """Big gif bubble: in the free space LEFT of the board (never over the board or the name), growing up from the bottom strip /
+        down from the top strip. It is sized to fit that space; if there is almost none, a small bubble next to the name is used."""
+        mv, host, big = self._movie, self.parentWidget(), self._big
+        if mv is None or host is None or big is None:
+            return
+        asp = self._aspect
+        aw = self.x() - 12 - 16 - 4                    # gif width that fits left of the strip (minus padding and margins)
+        h = int(min(240, host.height() - 36, aw / asp)) if aw > 0 else 0
+        if aw < 60 or h < 40:                          # no room beside the board: small bubble inside the strip
+            big.hide()
+            big.setMovie(None)
+            mv.setScaledSize(QSize(max(24, int(30 * asp)), 30))
+            self.bubble.setStyleSheet("background: rgba(255,255,255,0.18); border-radius: 12px; padding: 3px;")
+            self.bubble.setFixedSize(max(24, int(30 * asp)) + 12, 38)
+            self.bubble.setMovie(mv)
+            mv.start()
+            self.bubble.show()
+            return
+        w = int(h * asp)
+        self.bubble.hide()
+        self.bubble.setMovie(None)
+        mv.setScaledSize(QSize(w, h))
+        big.setFixedSize(w + 16, h + 16)
+        big.setMovie(mv)
+        mv.start()
+        big.show()
+        x = max(0, self.x() - big.width() - 12)
+        y = self.y() + self.height() - big.height() if self.y() > host.height() / 2 else self.y()
+        big.move(x, max(0, min(y, host.height() - big.height())))
+        big.raise_()
+
+    def set_bubble(self, spec):
+        """spec: None (no bubble), ("text", str) or ("gif", file). Only rebuilt when it changes."""
+        if spec == self._bub_key:
+            return
+        self._bub_key = spec
+        if self._movie is not None:
+            self._movie.stop()
+            self._movie = None
+            self.bubble.setMovie(None)
+            if self._big is not None:
+                self._big.setMovie(None)
+        self.bubble.clear()
+        if self._big is not None:
+            self._big.hide()
+        if not spec:
+            self.bubble.hide()
+            return
+        kind, val = spec
+        self.bubble.setMaximumSize(16777215, 16777215)
+        self.bubble.setMinimumSize(0, 0)
+        if kind == "gif":
+            mv = QMovie(val)
+            host = self.parentWidget()
+            if not mv.isValid() or host is None:
+                self.bubble.hide()
+                return
+            if self._big is None or self._big.parentWidget() is not host:
+                self._big = _RoundGif(host)
+            mv.jumpToFrame(0)
+            sz = mv.currentPixmap().size()
+            self._aspect = (sz.width() / float(sz.height())) if sz.height() else 1.0
+            self._movie = mv
+            self._place_big()
+            return
+        else:
+            txt = str(val)
+            self.bubble.setStyleSheet(f"background: rgba(255,255,255,0.18); color: {_ch_theme().get('text', '#ffffff')}; "
+                                      "border-radius: 12px; padding: 3px 11px; font-size: 12px; font-weight: 600;")
+            self.bubble.setText(txt if len(txt) <= 46 else txt[:45] + "\u2026")
+            self.bubble.setFixedHeight(28)
+        self.bubble.show()
 
     def set(self, color, name, caps_html, clock_text, active, low, avatar=None, letter="", show_avatar=False, elo_html=""):
         self.dot.setStyleSheet(f"border-radius:7px;border:1px solid #111;background:{'#f4f4f4' if color == 'w' else '#2b2b2b'};")
@@ -35121,6 +35686,8 @@ class _SquareHost(QWidget):
         self.top.setGeometry(x, y, side, sh)
         self.board.setGeometry(x, y + sh + 4, side, side)
         self.bottom.setGeometry(x, y + sh + 4 + side + 4, side, sh)
+        for st in (self.top, self.bottom):
+            st._place_big()
 
 # ---------------------------------------------------------------- Elo ratings (online games between friends)
 # Every player keeps one record at chess/ratings/<uid> = {r: rating, g: games, w, l, d, last: {gid, before, delta, opp}}.
@@ -35165,26 +35732,455 @@ def _ch_round_png(key, path, letter, size=22):
     except Exception:
         return ""
 
-def _ch_theme():
-    """The launcher's live theme (the New theme or the account theme) so chess always matches it."""
+def _ch_theme_base():
+    """The launcher's live theme (the New theme or the account theme)."""
     try:
-        return dict(SUNSET_THEME)
+        return dict(_ch_orig["theme"] or SUNSET_THEME)
     except Exception:
         return dict(THEMES["dark"])
+
+def _ch_theme():
+    """The launcher theme with the colours of the chess theme the player picked on top (none picked = plain launcher look)."""
+    t = _ch_theme_base()
+    th = _ch_cur_theme()
+    if th and th.get("ui"):
+        t.update(th["ui"])
+    return t
 
 def _ch_mix(a, b, t):
     ca, cb = QColor(a), QColor(b)
     return QColor(int(ca.red() + (cb.red() - ca.red()) * t), int(ca.green() + (cb.green() - ca.green()) * t),
                   int(ca.blue() + (cb.blue() - ca.blue()) * t))
 
+def _ch_icon(kind, color="#ffffff", size=48):
+    """Small vector icons painted on the fly (no emoji, no image files)."""
+    from PyQt6.QtGui import QPolygonF
+    from PyQt6.QtCore import QPointF
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    q = QPainter(pm)
+    q.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = QColor(color)
+    S = float(size)
+    pt = lambda x, y: QPointF(x * S, y * S)
+    line = QPen(c, S * 0.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    def fill(*pts):
+        q.setPen(Qt.PenStyle.NoPen)
+        q.setBrush(c)
+        q.drawPolygon(QPolygonF([pt(*p) for p in pts]))
+    def stroke(*pts):
+        q.setPen(line)
+        q.setBrush(Qt.BrushStyle.NoBrush)
+        for a, b in zip(pts, pts[1:]):
+            q.drawLine(pt(*a), pt(*b))
+    if kind == "back":
+        stroke((0.62, 0.2), (0.32, 0.5), (0.62, 0.8))
+    elif kind == "close":
+        stroke((0.25, 0.25), (0.75, 0.75))
+        stroke((0.75, 0.25), (0.25, 0.75))
+    elif kind == "prev":
+        fill((0.68, 0.2), (0.68, 0.8), (0.28, 0.5))
+    elif kind == "next":
+        fill((0.32, 0.2), (0.32, 0.8), (0.72, 0.5))
+    elif kind == "first":
+        fill((0.78, 0.2), (0.78, 0.8), (0.38, 0.5))
+        stroke((0.24, 0.2), (0.24, 0.8))
+    elif kind == "last":
+        fill((0.22, 0.2), (0.22, 0.8), (0.62, 0.5))
+        stroke((0.76, 0.2), (0.76, 0.8))
+    elif kind in ("sound_on", "sound_off"):
+        fill((0.12, 0.38), (0.28, 0.38), (0.46, 0.2), (0.46, 0.8), (0.28, 0.62), (0.12, 0.62))
+        q.setPen(line)
+        q.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "sound_on":
+            q.drawArc(QRectF(0.26 * S, 0.3 * S, 0.4 * S, 0.4 * S), -45 * 16, 90 * 16)
+            q.drawArc(QRectF(0.14 * S, 0.18 * S, 0.64 * S, 0.64 * S), -45 * 16, 90 * 16)
+        else:
+            stroke((0.62, 0.36), (0.88, 0.64))
+            stroke((0.88, 0.36), (0.62, 0.64))
+    q.end()
+    return QIcon(pm)
+
+_CH_PIECE_STYLES = [          # name, white (top, bottom, outline), black (top, bottom, outline)
+    ("Bright", ("#ffffff", "#ffe7a3", "#6b4a00"), ("#4f78d8", "#22397d", "#0a1536")),
+    ("Sunset", ("#fff3e0", "#ffc98a", "#7a3b12"), ("#a455d0", "#52206f", "#26092f")),
+    ("Ocean", ("#f5fbff", "#b5defa", "#12486b"), ("#2a9bb8", "#0e4a63", "#052230")),
+    ("Candy", ("#fff0f6", "#ffbad6", "#8c1d52"), ("#6f5cf0", "#3a2ca8", "#181060")),
+    ("Classic", ("#ffffff", "#e6e6e6", "#1b1b1b"), ("#3c3a38", "#1a1817", "#050505")),
+]
+_ch_piece_style = {"i": 0}
+
+def _ch_piece_file():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_pieces.txt")
+
+def _ch_load_piece_style():
+    try:
+        with open(_ch_piece_file(), "r", encoding="utf-8") as f:
+            n = f.read().strip()
+        for i, st in enumerate(_CH_PIECE_STYLES):
+            if st[0] == n:
+                _ch_piece_style["i"] = i
+        return
+    except Exception:
+        pass
+    try:                                    # nothing saved yet: people with their own piece pictures start on their untouched look
+        if _ch_icon_pixmap("wK", 64) is not None:
+            _ch_piece_style["i"] = [st[0] for st in _CH_PIECE_STYLES].index("Classic")
+    except Exception:
+        pass
+
+_ch_tint_cache = {}
+
+def _ch_tint_piece(pm, piece):
+    """Recolour a piece PICTURE (your own knight.png etc.) with the chosen piece style. White pieces: multiply the picture with the
+    gradient and lift the black outline to the style's outline colour. Black pieces: screen the picture over the gradient, so the
+    black body takes the style colour and the white details stay light. The picture's own shape / transparency is kept."""
+    i = _ch_piece_style["i"] % len(_CH_PIECE_STYLES)
+    st = _CH_PIECE_STYLES[i]
+    if st[0] == "Classic":
+        return pm
+    key = (piece, pm.width(), pm.height(), i)
+    out = _ch_tint_cache.get(key)
+    if out is not None:
+        return out
+    try:
+        white = piece[0] == "w"
+        top, bot, outl = st[1] if white else st[2]
+        w, h = pm.width(), pm.height()
+        src = QPixmap(pm)
+        src.setDevicePixelRatio(1.0)
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(0)
+        q = QPainter(img)
+        g = QLinearGradient(0, 0, 0, h)
+        g.setColorAt(0.0, QColor(top))
+        g.setColorAt(1.0, QColor(bot))
+        q.fillRect(0, 0, w, h, QBrush(g))
+        CM = QPainter.CompositionMode
+        q.setCompositionMode(CM.CompositionMode_Multiply if white else CM.CompositionMode_Screen)
+        q.drawPixmap(0, 0, src)
+        if white:
+            q.setCompositionMode(CM.CompositionMode_Lighten)
+            q.fillRect(0, 0, w, h, QColor(outl))
+        q.setCompositionMode(CM.CompositionMode_DestinationIn)
+        q.drawPixmap(0, 0, src)
+        q.end()
+        out = QPixmap.fromImage(img)
+        out.setDevicePixelRatio(pm.devicePixelRatio())
+    except Exception:
+        out = pm
+    if len(_ch_tint_cache) > 240:
+        _ch_tint_cache.clear()
+    _ch_tint_cache[key] = out
+    return out
+
+def _ch_save_piece_style():
+    try:
+        with open(_ch_piece_file(), "w", encoding="utf-8") as f:
+            f.write(_CH_PIECE_STYLES[_ch_piece_style["i"]][0])
+    except Exception:
+        pass
+
+_CH_BOARD_STYLES = [
+    ("Classic green", ("#eeeed2", "#769656", "#f6f669")),
+    ("Sunset", ("#ffe3c8", "#d9765a", "#ffe066")),
+    ("Wood", ("#f0d9b5", "#b58863", "#f7ec59")),
+    ("Ice", ("#dee9f4", "#6f93b8", "#7fd3ff")),
+    ("Lavender", ("#e6dcf5", "#8e75c2", "#ffd36b")),
+    ("Candy", ("#ffe0ec", "#e86a9a", "#fff176")),
+    ("Launcher (old)", None),
+]
+_ch_board_style = {"i": 0}
+
+def _ch_board_file():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_board.txt")
+
+def _ch_load_board_style():
+    try:
+        with open(_ch_board_file(), "r", encoding="utf-8") as f:
+            n = f.read().strip()
+        for i, (nm, _c) in enumerate(_CH_BOARD_STYLES):
+            if nm == n:
+                _ch_board_style["i"] = i
+    except Exception:
+        pass
+
+def _ch_save_board_style():
+    try:
+        with open(_ch_board_file(), "w", encoding="utf-8") as f:
+            f.write(_CH_BOARD_STYLES[_ch_board_style["i"]][0])
+    except Exception:
+        pass
+
 def _ch_board_colors(t):
-    """Board squares follow the theme accent: greys for the white/black theme, tinted for coloured themes."""
+    st = _CH_BOARD_STYLES[_ch_board_style["i"] % len(_CH_BOARD_STYLES)][1]
+    if st:
+        return QColor(st[0]), QColor(st[1]), QColor(st[2])
+    return _ch_board_colors_launcher(t)
+
+def _ch_board_colors_launcher(t):
+    """Board squares follow the theme accent (greys for the white/black theme, tinted for coloured themes); highlighted moves are blue."""
     acc = QColor(t.get("accent", "#fcfcfc"))
     h, s, _l, _a = acc.getHslF()
     if h < 0:
         h, s = 0.0, 0.0
     s = min(s * 0.6, 0.5)
-    return QColor.fromHslF(h, s, 0.80), QColor.fromHslF(h, s, 0.38), acc
+    return QColor.fromHslF(h, s, 0.80), QColor.fromHslF(h, s, 0.38), QColor("#3d8bfd")   # blue highlight so it never blends with the white-ish squares
+
+# ---- chess themes: a theme = board colours + piece colours + the page colours. The player picks one the first time NCZ Chess
+# is opened (a window with a preview picture of each) and can change it any time with the "Theme" button at the top.
+def _ch_ui(top, bot, acc, acc_h, acc_p, on, pan, inp, bor, btn, btn_h, dis, dis_t, txt, sub):
+    return dict(page_bg=(top, bot), accent=acc, accent_hover=acc_h, accent_press=acc_p, on_accent=on, panel=pan, input=inp,
+                border=bor, button=btn, button_hover=btn_h, disabled_bg=dis, disabled_text=dis_t, text=txt, subtext=sub)
+
+_CH_THEMES = [
+    dict(name="Classic Green", board="Classic green", pieces="Classic",
+         ui=_ch_ui("#312e2b", "#262421", "#81b64c", "#95c75f", "#6a9a3b", "#ffffff", "#262421", "#211f1d", "#4a4643",
+                   "#3d3a37", "#4d4945", "#2b2927", "#7a7672", "#ffffff", "#c3c1bf")),
+    dict(name="Wood", board="Wood", pieces="Classic",
+         ui=_ch_ui("#4a3424", "#2c1d12", "#e0a458", "#ecb872", "#bf8840", "#2c1d12", "#2c1d12", "#231710", "#6b4d36",
+                   "#5a4030", "#6d4f3c", "#34241a", "#8a7260", "#fff6ea", "#d6c2ad")),
+    dict(name="Ocean", board="Ice", pieces="Ocean",
+         ui=_ch_ui("#24506f", "#143047", "#4cc3f0", "#74d3f5", "#2da0cc", "#0a2233", "#143047", "#0f2638", "#3a6f94",
+                   "#2e5f82", "#3a7199", "#1c3e58", "#6f93ad", "#ffffff", "#bcd6e8")),
+    dict(name="Candy", board="Candy", pieces="Candy",
+         ui=_ch_ui("#8a3b6e", "#5a2148", "#ff8cc0", "#ffa7d0", "#e0669f", "#3a0f2b", "#5a2148", "#4a1a3b", "#a85b8c",
+                   "#7a3361", "#8f4174", "#6a2a54", "#c08aa9", "#ffffff", "#f2cde0")),
+    dict(name="Lavender", board="Lavender", pieces="Bright",
+         ui=_ch_ui("#4b3d80", "#2f2552", "#b79cff", "#cab6ff", "#947ae0", "#1e1638", "#2f2552", "#261e45", "#6a5aa8",
+                   "#5a4a96", "#6b5aab", "#3a2f66", "#8d82bd", "#ffffff", "#d3c9f0")),
+    dict(name="Sunset", board="Sunset", pieces="Sunset",
+         ui=_ch_ui("#8a4325", "#4a2014", "#ffa45c", "#ffb97f", "#e0813a", "#3d1c12", "#4a2014", "#3a190f", "#a6623f",
+                   "#7a3a22", "#8e4a2e", "#5a2a1a", "#c08a70", "#fff5ec", "#f0cdb5")),
+    dict(name="Original dark", board="Launcher (old)", pieces="Classic", ui={}),
+]
+_ch_cur = {"name": None}
+
+def _ch_theme_file():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "chess_theme.txt")
+
+def _ch_theme_saved():
+    return os.path.isfile(_ch_theme_file())
+
+def _ch_cur_theme():
+    for th in _CH_THEMES:
+        if th["name"] == _ch_cur["name"]:
+            return th
+    return None
+
+def _ch_load_theme():
+    try:
+        with open(_ch_theme_file(), "r", encoding="utf-8") as f:
+            _ch_cur["name"] = f.read().strip()
+    except Exception:
+        pass
+
+def _ch_apply_theme(name):
+    """Make `name` the chess theme: board colours, piece colours and page colours, and remember it."""
+    th = next((t for t in _CH_THEMES if t["name"] == name), _CH_THEMES[0])
+    _ch_cur["name"] = th["name"]
+    try:
+        _ch_board_style["i"] = [b[0] for b in _CH_BOARD_STYLES].index(th["board"])
+        _ch_piece_style["i"] = [st[0] for st in _CH_PIECE_STYLES].index(th["pieces"])
+    except ValueError:
+        pass
+    _ch_tint_cache.clear()
+    _ch_save_board_style()
+    _ch_save_piece_style()
+    try:
+        with open(_ch_theme_file(), "w", encoding="utf-8") as f:
+            f.write(th["name"])
+    except Exception:
+        pass
+
+def _ch_theme_preview(th, w=220):
+    """A picture of what the theme looks like: the page colour, a board with the pieces in this theme's colours, and the accent button."""
+    ui = th.get("ui") or {}
+    top, bot = ui.get("page_bg") or ("#2a2a2a", "#0b0b0b")
+    pad = 12
+    bsz = w - 2 * pad
+    h = pad + bsz + 12 + 32 + pad
+    bp = None
+    saved = _ch_piece_style["i"]
+    try:
+        _ch_piece_style["i"] = [st[0] for st in _CH_PIECE_STYLES].index(th["pieces"])
+        b = _ChessBoard()
+        b.resize(320, 320)
+        cols = dict(_CH_BOARD_STYLES).get(th["board"])
+        b.set_theme(*(cols if cols else _ch_board_colors_launcher(_ch_theme_base())))
+        bp = b.grab().scaled(bsz, bsz, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        b.deleteLater()
+    except Exception as e:
+        print(f"chess: couldn't draw the theme preview: {e}")
+    finally:
+        _ch_piece_style["i"] = saved
+    pm = QPixmap(w, h)
+    pm.fill(Qt.GlobalColor.transparent)
+    q = QPainter(pm)
+    q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    card = QPainterPath()
+    card.addRoundedRect(QRectF(0, 0, w, h), 16, 16)
+    g = QLinearGradient(0, 0, 0, h)
+    g.setColorAt(0.0, QColor(top))
+    g.setColorAt(1.0, QColor(bot))
+    q.fillPath(card, QBrush(g))
+    if bp is not None:
+        q.save()
+        bc = QPainterPath()
+        bc.addRoundedRect(QRectF(pad, pad, bsz, bsz), 8, 8)
+        q.setClipPath(bc)
+        q.drawPixmap(pad, pad, bp)
+        q.restore()
+    acc = ui.get("accent", "#fcfcfc")
+    on = ui.get("on_accent", "#1c1c1c")
+    pill = QPainterPath()
+    pill.addRoundedRect(QRectF(pad, pad + bsz + 12, bsz, 32), 10, 10)
+    q.fillPath(pill, QColor(acc))
+    f = QFont()
+    f.setPixelSize(15)
+    f.setBold(True)
+    q.setFont(f)
+    q.setPen(QColor(on))
+    q.drawText(QRectF(pad, pad + bsz + 12, bsz, 32), Qt.AlignmentFlag.AlignCenter, th["name"])
+    q.end()
+    return pm
+
+class _ChessThemeDialog(QDialog):
+    """'Choose your look': one tile per theme with a preview picture. Closing the window keeps the highlighted theme."""
+    def __init__(self, parent=None, first=False, current=None):
+        super().__init__(parent)
+        self.setWindowTitle("NCZ Chess - choose your theme")
+        self.setModal(True)
+        self.chosen = current if current in [t["name"] for t in _CH_THEMES] else _CH_THEMES[0]["name"]
+        self.setStyleSheet("QDialog { background:#262421; } QLabel { color:#ffffff; background:transparent; }"
+                           "QScrollArea { border:none; background:transparent; } QScrollArea > QWidget > QWidget { background:transparent; }")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
+        title = QLabel("Choose your look" if first else "Change your theme")
+        title.setStyleSheet("font-size:24px; font-weight:800;")
+        sub = QLabel("Pick the board and colours you like best. You can change it any time with the Theme button at the top of NCZ Chess.")
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color:#bababa; font-size:13px;")
+        lay.addWidget(title)
+        lay.addWidget(sub)
+        holder = QWidget()
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 8, 0, 8)
+        grid.setSpacing(14)
+        from PyQt6.QtWidgets import QButtonGroup as _QBG
+        self._grp = _QBG(self)
+        self._grp.setExclusive(True)
+        for i, th in enumerate(_CH_THEMES):
+            pm = _ch_theme_preview(th)
+            b = QPushButton()
+            b.setCheckable(True)
+            b.setChecked(th["name"] == self.chosen)
+            b.setIcon(QIcon(pm))
+            b.setIconSize(pm.size())
+            b.setFixedSize(pm.width() + 20, pm.height() + 20)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(th["name"])
+            b.setStyleSheet("QPushButton { background:transparent; border:3px solid transparent; border-radius:22px; }"
+                            "QPushButton:hover { border:3px solid rgba(255,255,255,0.35); }"
+                            "QPushButton:checked { border:3px solid #ffffff; }")
+            b.clicked.connect(lambda _c=False, n=th["name"]: self._pick(n))
+            self._grp.addButton(b)
+            grid.addWidget(b, i // 3, i % 3, Qt.AlignmentFlag.AlignCenter)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(holder)
+        lay.addWidget(sc, 1)
+        self.btn = QPushButton("Play with this theme")
+        self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn.setStyleSheet("QPushButton { background:#81b64c; color:#ffffff; border:none; border-radius:10px; padding:12px 18px;"
+                               " font-size:15px; font-weight:700; } QPushButton:hover { background:#95c75f; }")
+        self.btn.clicked.connect(self.accept)
+        lay.addWidget(self.btn)
+        self.resize(860, 700)
+
+    def _pick(self, name):
+        self.chosen = name
+
+# ---- while NCZ Chess is on screen the whole launcher (top bar, side rail, buttons, background) wears the chess theme; it goes back to
+# the normal look as soon as another page is shown.
+_ch_orig = {"theme": None, "extra": None, "on": False}
+
+_CH_LOOK_EXTRA = """
+QMainWindow, QWidget#Content, QWidget#GridContainer { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 @TOP@, stop:1 @BOT@); }
+QWidget#GridContainer { background: transparent; }
+QFrame#Sidebar { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @DEEP@, stop:1 @PAN@); border-bottom: 1px solid @BOR@; }
+QFrame#SideRail { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 @DEEP@, stop:1 @PAN@); border-right: 1px solid @BOR@; }
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: @SUB@; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.08); color: @TXT@; }
+QFrame#SideRail QPushButton#NavButton:checked {
+    color: @TXT@; border: none; border-left: 3px solid @ACC@;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(@ACCRGB@,0.28), stop:1 rgba(@ACCRGB@,0));
+}
+QPushButton#Primary { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 @ACC@, stop:1 @ACCP@); border-radius: 8px; color: @ON@; }
+QPushButton#Primary:hover { background: @ACCH@; }
+QPushButton#Primary:pressed { background: @ACCP@; }
+QPushButton#Primary:disabled { background: @DIS@; color: @DIST@; }
+QProgressBar::chunk { background: @ACC@; border-radius: 3px; }
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); }
+QFrame#GameCard { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(255, 255, 255, 0.10); border: 1px solid @ACC@; }
+QFrame#ToolBar { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 16px; }
+QFrame#ToolBar QLabel { background: transparent; border: none; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: rgba(255, 255, 255, 0.08); }
+QFrame#SidePanel { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 16px; }
+QFrame#SidePanel QLabel { background: transparent; border: none; }
+QLabel#PaneHeader { color: @SUB@; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+QLabel#Avatar, QLabel#AvatarLarge, QLabel#SyncAvatar { color: @ON@; }
+QMenu::item:selected { color: @ON@; }
+QPushButton#Danger:hover, QPushButton#Uninstall:hover { background: @ACC@; color: @ON@; }
+"""
+
+def _ch_launcher_look(th):
+    """(theme dict, extra stylesheet) that dress the whole launcher in the chess theme `th`."""
+    ui = th["ui"]
+    top, bot = ui["page_bg"]
+    acc = QColor(ui["accent"])
+    theme = dict(_ch_orig["theme"] or SUNSET_THEME)
+    theme.update(bg=bot, sidebar=_ch_mix(bot, "#000000", 0.35).name(), panel=ui["panel"], input=ui["input"], border=ui["border"],
+                 text=ui["text"], subtext=ui["subtext"], accent=ui["accent"], accent_hover=ui["accent_hover"],
+                 accent_press=ui["accent_press"], on_accent=ui["on_accent"], button=ui["button"], button_hover=ui["button_hover"],
+                 disabled_bg=ui["disabled_bg"], disabled_text=ui["disabled_text"], handle=ui["border"], hover=ui["button"],
+                 red=ui["accent"], red_hover=ui["accent_hover"], red_press=ui["accent_press"],
+                 accent_fill=f"rgba({acc.red()},{acc.green()},{acc.blue()},0.22)", nav_text=ui["subtext"], nav_active=ui["text"],
+                 brand=ui["text"], sidebar_border=ui["border"])
+    rep = {"@TOP@": top, "@BOT@": bot, "@DEEP@": theme["sidebar"], "@PAN@": ui["panel"], "@BOR@": ui["border"], "@SUB@": ui["subtext"],
+           "@TXT@": ui["text"], "@ACC@": ui["accent"], "@ACCH@": ui["accent_hover"], "@ACCP@": ui["accent_press"], "@ON@": ui["on_accent"],
+           "@DIS@": ui["disabled_bg"], "@DIST@": ui["disabled_text"], "@ACCRGB@": f"{acc.red()},{acc.green()},{acc.blue()}"}
+    extra = _CH_LOOK_EXTRA
+    for k, v in rep.items():
+        extra = extra.replace(k, v)
+    return theme, extra
+
+def _ch_sync_launcher_look(page):
+    """Put the chess look on the whole launcher while `page` is the page on screen, and take it off again when it isn't."""
+    global SUNSET_THEME, _SUNSET_EXTRA
+    try:
+        if globals().get("_UI_STYLE_AT_START") != "new":
+            return
+        pages = getattr(page.window(), "pages", None)
+        th = _ch_cur_theme()
+        want = bool(pages is not None and pages.currentWidget() is page and th and th.get("ui"))
+        if want:
+            if not _ch_orig["on"]:
+                _ch_orig.update(theme=SUNSET_THEME, extra=_SUNSET_EXTRA, on=True)
+            SUNSET_THEME, _SUNSET_EXTRA = _ch_launcher_look(th)
+            _ui_apply_sunset()
+        elif _ch_orig["on"]:
+            SUNSET_THEME, _SUNSET_EXTRA = _ch_orig["theme"], _ch_orig["extra"]
+            _ch_orig["on"] = False
+            _ui_apply_sunset()
+    except Exception as e:
+        print(f"chess: couldn't change the launcher look: {e}")
 
 def _ch_css(t=None):
     t = t or _ch_theme()
@@ -35196,8 +36192,10 @@ def _ch_css(t=None):
     inp, bor, pan = t.get("input", "#0d0d0d"), t.get("border", "#2e2e2e"), t.get("panel", "#1a1a1a")
     acc_lo, acc_h_lo = _ch_mix(acc, acc_p, 0.5).name(), _ch_mix(acc_h, acc_p, 0.5).name()
     glass = "background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); border-radius: 16px;"
+    _pb = t.get("page_bg")
+    page_bg = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_pb[0]}, stop:1 {_pb[1]})" if _pb else "transparent")
     return f"""
-#ChessPage {{ background: transparent; }}
+#ChessPage {{ background: {page_bg}; }}
 #ChessPage QLabel {{ color:{txt}; background:transparent; border:none; }}
 #ChessPage #ChTitle {{ color:{txt}; font-size:22px; font-weight:700; }}
 #ChessPage #ChHead {{ color:{txt}; font-size:16px; font-weight:700; }}
@@ -35225,6 +36223,10 @@ def _ch_css(t=None):
 #ChessPage QComboBox QAbstractItemView {{ background:{pan}; color:{txt}; border:1px solid {bor}; selection-background-color:{acc}; selection-color:{on}; }}
 #ChessPage QCheckBox {{ color:{txt}; }}
 #ChessPage QTextBrowser {{ background:{inp}; color:{sub}; border:1px solid {bor}; border-radius:10px; font-size:14px; padding:6px; }}
+#ChessPage QPushButton#ChSeg {{ background:rgba(255,255,255,0.08); color:{sub}; border-radius:18px; padding:8px 22px; font-size:14px; }}
+#ChessPage QPushButton#ChSeg:hover {{ background:rgba(255,255,255,0.16); color:{txt}; }}
+#ChessPage QPushButton#ChSeg:checked {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc}, stop:1 {acc_lo}); color:{on}; }}
+#ChessPage #ChTier {{ font-size:11px; font-weight:800; }}
 """
 
 # ================================================================ NCZ Chess: game review (PGN -> Chesskit through Playwright)
@@ -35455,7 +36457,7 @@ def _ch_opening_label(sans):
     nm = _ch_opening(sans)
     if not nm:
         return ""
-    return ("\u2694 " if "gambit" in nm.lower() and not nm.startswith("Queen's Gambit") else "\U0001F4D6 ") + nm
+    return nm
 
 _CH_REVIEW_BTN = re.compile(r"^(?!.*again).*(analy[sz]e|run analysis|start analysis|generate|game review|game report|\breview\b)", re.I)
 _CH_REVIEW_PCT = re.compile(r"accuracy[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%", re.I)
@@ -35949,6 +36951,7 @@ class NczChessPage(QWidget):
             t = _ch_theme()
             self.setStyleSheet(_ch_css(t))
             self.board.set_theme(*_ch_board_colors(t))
+            self._set_icons()
             if getattr(self, "game", None) is not None or getattr(self, "net_gid", None):
                 try:
                     self._refresh()
@@ -35960,11 +36963,14 @@ class NczChessPage(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("ChessPage")
+        _ch_load_theme()
         self.setStyleSheet(_ch_css())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.bg = _ChessBg(self)
         # game state
         self.game = None
+        self._bubbles = {"w": None, "b": None}        # speech bubble next to each colour's name: None, ("text", s) or ("gif", file)
+        self._win_shown, self._trash_ply = False, -99
         self.mode = None                  # "local" / "online" / "bot"
         self.my = None                    # my colour in an online game
         self.names = {"w": "White", "b": "Black"}
@@ -36007,32 +37013,58 @@ class NczChessPage(QWidget):
         outer.setContentsMargins(24, 18, 24, 18)
         outer.setSpacing(12)
         head = QHBoxLayout()
-        back = QPushButton("\u25C0 Library")
+        back = QPushButton(" Library")
+        self.btn_back = back
         back.setCursor(Qt.CursorShape.PointingHandCursor)
         back.clicked.connect(self.back_requested.emit)
-        title = QLabel("\u265E NCZ Chess")
+        title = QLabel("NCZ Chess")
         title.setObjectName("ChTitle")
         self.note = QLabel("")
         self.note.setObjectName("ChMuted")
         self.note.setWordWrap(True)
         head.addWidget(back)
         head.addSpacing(10)
+        _logo = asset_path("nczchess.png")
+        if os.path.isfile(_logo):
+            _ll = QLabel()
+            _ll.setPixmap(_fo_avatar(_logo, "", 30))
+            head.addWidget(_ll)
+            head.addSpacing(8)
         head.addWidget(title)
         head.addSpacing(16)
         head.addWidget(self.note, 1)
-        self.btn_sound = QPushButton("\U0001F50A")
+        self.btn_sound = QPushButton("")
         self.btn_sound.setToolTip("Move sounds on / off")
         self.btn_sound.setFixedWidth(44)
         self.btn_sound.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sound.clicked.connect(self._toggle_sound)
+        self.btn_board = QPushButton("Board")
+        self.btn_board.setToolTip("Change the board colours")
+        self.btn_board.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_board.clicked.connect(self._cycle_board)
+        self.btn_pieces = QPushButton("Pieces")
+        self.btn_pieces.setToolTip("Change the piece colours")
+        self.btn_pieces.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pieces.clicked.connect(self._cycle_pieces)
+        self.btn_theme = QPushButton("Theme")
+        self.btn_theme.setToolTip("Choose a theme (board, pieces and colours)")
+        self.btn_theme.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_theme.clicked.connect(lambda _c=False: self.choose_theme())
+        head.addWidget(self.btn_theme)
+        head.addWidget(self.btn_pieces)
+        head.addWidget(self.btn_board)
         head.addWidget(self.btn_sound)
         outer.addLayout(head)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.stack.addWidget(self._build_lobby())
         self.stack.addWidget(self._build_game())
+        _ch_load_board_style()
+        _ch_load_piece_style()
         self.restyle()
         _theme_listeners.append(self.restyle)
+        self.bg.run(_ch_discord_fetch_all, lambda _r, _e: self._refresh_bot_avatars())
+        self.bg.run(_ch_fetch_win_gif, lambda _r, _e: None)
 
         self.clock_timer = QTimer(self)
         self.clock_timer.setInterval(100)
@@ -36047,9 +37079,60 @@ class NczChessPage(QWidget):
         self.inbox_timer.timeout.connect(self._poll_inbox)
         self.inbox_timer.start()
 
+    def _set_icons(self):
+        col = _ch_theme().get("text", "#ffffff")
+        try:
+            self.btn_back.setIcon(_ch_icon("back", col))
+            self.btn_back.setIconSize(QSize(16, 16))
+            self.btn_sound.setIcon(_ch_icon("sound_on" if _ch_snd["on"] else "sound_off", col))
+            self.btn_sound.setIconSize(QSize(22, 22))
+            for b in self.nav_btns:
+                b.setIcon(_ch_icon(b._kind, col))
+                b.setIconSize(QSize(18, 18))
+        except Exception:
+            pass
+
+    def choose_theme(self, first=False):
+        """Open the theme picker (with preview pictures) and apply what the player picked."""
+        if getattr(self, "_theme_dlg_open", False):
+            return
+        self._theme_dlg_open = True
+        try:
+            dlg = _ChessThemeDialog(self, first, _ch_cur["name"])
+            dlg.exec()
+            _ch_apply_theme(dlg.chosen)
+            self.restyle()
+            _ch_sync_launcher_look(self)
+            self._set_note("Theme: " + dlg.chosen)
+        except Exception as e:
+            print(f"chess: theme picker failed: {e}")
+            if first and not _ch_theme_saved():
+                _ch_apply_theme(_CH_THEMES[0]["name"])      # never get stuck asking on every open
+                self.restyle()
+                _ch_sync_launcher_look(self)
+        finally:
+            self._theme_dlg_open = False
+
+    def maybe_first_run_theme(self):
+        """The first time NCZ Chess is opened: let the player choose their theme."""
+        if not _ch_theme_saved():
+            self.choose_theme(first=True)
+
+    def _cycle_pieces(self):
+        _ch_piece_style["i"] = (_ch_piece_style["i"] + 1) % len(_CH_PIECE_STYLES)
+        _ch_save_piece_style()
+        self.board.update()
+        self._set_note("Pieces: " + _CH_PIECE_STYLES[_ch_piece_style["i"]][0])
+
+    def _cycle_board(self):
+        _ch_board_style["i"] = (_ch_board_style["i"] + 1) % len(_CH_BOARD_STYLES)
+        _ch_save_board_style()
+        self.restyle()
+        self._set_note("Board: " + _CH_BOARD_STYLES[_ch_board_style["i"]][0])
+
     def _toggle_sound(self):
         _ch_snd["on"] = not _ch_snd["on"]
-        self.btn_sound.setText("\U0001F50A" if _ch_snd["on"] else "\U0001F507")
+        self._set_icons()
         if _ch_snd["on"]:
             _ch_play("move")
 
@@ -36087,6 +37170,184 @@ class NczChessPage(QWidget):
         return cb
 
     def _build_lobby(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(12)
+        seg = QHBoxLayout()
+        seg.setSpacing(8)
+        self.lobby_tabs = []
+        self.lobby_stack = QStackedWidget()
+        for i, label in enumerate(("Play", "NCZ Bots")):
+            b = QPushButton(label)
+            b.setObjectName("ChSeg")
+            b.setCheckable(True)
+            b.setChecked(i == 0)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=i: self._lobby_tab(k))
+            seg.addWidget(b)
+            self.lobby_tabs.append(b)
+        seg.addStretch(1)
+        col.addLayout(seg)
+        self.lobby_stack.addWidget(self._build_lobby_play())
+        self.lobby_stack.addWidget(self._build_bots_page())
+        col.addWidget(self.lobby_stack, 1)
+        return page
+
+    def _lobby_tab(self, k):
+        self.lobby_stack.setCurrentIndex(k)
+        for i, b in enumerate(self.lobby_tabs):
+            b.setChecked(i == k)
+
+    def _build_bots_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        card, cl = self._card("NCZ Bots", "Bots that resemble us when youre bored and everyones offline")
+        opts = QHBoxLayout()
+        self.tc_ncz = self._tc_combo(0)
+        self.ncz_color = QComboBox()
+        for t in ("Random", "I play White", "I play Black"):
+            self.ncz_color.addItem(t)
+        opts.addWidget(self.tc_ncz)
+        opts.addWidget(self.ncz_color)
+        cl.addLayout(opts)
+        lay.addWidget(card)
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        host = QWidget()
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 8, 0)
+        grid.setSpacing(12)
+        bots = sorted(_CH_NCZ_BOTS, key=lambda c: c["elo"])
+        for n, cfg in enumerate(bots):
+            grid.addWidget(self._bot_card(cfg), n // 2, n % 2)
+        grid.setRowStretch(len(bots) // 2 + 1, 1)
+        sa.setWidget(host)
+        lay.addWidget(sa, 1)
+        return page
+
+    def _say(self, col, spec, ms=0):
+        """Show a speech bubble next to `col`'s name (ms > 0: it goes away again by itself)."""
+        self._bubbles[col] = spec
+        self._paint_strips()
+        if ms:
+            def gone():
+                try:
+                    if self._bubbles.get(col) == spec:
+                        self._bubbles[col] = None
+                        self._paint_strips()
+                except RuntimeError:
+                    pass
+            QTimer.singleShot(ms, gone)
+
+    def _after_move_chat(self, mover):
+        """The bot's trash talk (texts live in _CH_TRASH)."""
+        try:
+            g, cfg = self.game, self.bot
+            if self.mode != "bot" or not g or not cfg or not cfg.get("ncz") or self.my not in ("w", "b"):
+                return
+            botc = "b" if self.my == "w" else "w"
+            ply = len(g.moves)
+            slug = re.sub(r"[^a-z0-9]+", "", cfg["name"].lower())
+            if g.result:
+                w = g.result.get("winner")
+                ev = "draw" if w is None else ("bot_win" if w == botc else "bot_lose")
+                ms = 12000
+            else:
+                cap = bool(g.caps[-1]) if g.caps else False
+                chk = g.pos.in_check()
+                if chk:
+                    ev = "bot_check" if mover == botc else "my_check"
+                elif cap:
+                    ev = "bot_capture" if mover == botc else "my_capture"
+                else:
+                    ev = "quiet"
+                if ply - self._trash_ply < _CH_TRASH_COOLDOWN or _random.random() > _CH_TRASH_CHANCE.get(ev, 0.0):
+                    return
+                ms = 7000
+            texts = list((_CH_TRASH.get("*") or {}).get(ev, [])) + list((_CH_TRASH.get(slug) or {}).get(ev, []))
+            if not texts:
+                return
+            if not g.result:
+                self._trash_ply = ply
+            name = (self._my_name or "").strip() or "you"
+            self._say(botc, ("text", _random.choice(texts).replace("{name}", name)), ms)
+        except Exception as e:
+            print(f"chess: trash talk failed: {e}")
+
+    def _win_gif_check(self):
+        """When the game was won (by me, or by either side in a two-player game on this PC) the checkmate gif appears next to the winner."""
+        g = self.game
+        if not g or not g.result or self._win_shown or len(g.moves) < 2:
+            return
+        w = g.result.get("winner")
+        if w not in ("w", "b") or (self.mode != "local" and w != self.my):
+            return
+        self._win_shown = True
+        path = _ch_win_gif_file()
+        if path:
+            self._say(w, ("gif", path))
+            return
+        def done(p, _e):
+            if p and self.game is g:
+                self._say(w, ("gif", p))
+            elif not p:
+                self._set_note("Couldn't download the win gif (check your internet connection).")
+        self.bg.run(_ch_fetch_win_gif, done)
+
+    def _refresh_bot_avatars(self):
+        for av, cfg in getattr(self, "_bot_avs", []):
+            try:
+                av.setPixmap(_ch_bot_pic(cfg, 64))
+            except RuntimeError:
+                pass
+
+    def _bot_card(self, cfg):
+        col = cfg["color"]
+        card = QFrame()
+        card.setObjectName("ChBotCard")
+        card.setStyleSheet(f"#ChBotCard {{ background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); "
+                           f"border-left: 6px solid {col}; border-radius: 16px; }}")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(14, 12, 14, 12)
+        row.setSpacing(12)
+        av = QLabel()
+        av.setFixedSize(64, 64)
+        av.setPixmap(_ch_bot_pic(cfg, 64))
+        if not hasattr(self, "_bot_avs"):
+            self._bot_avs = []
+        self._bot_avs.append((av, cfg))
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        top = QHBoxLayout()
+        nm = QLabel(cfg["name"])
+        nm.setObjectName("ChHead")
+        elo_l = QLabel(f"{cfg['elo']} Elo")
+        elo_l.setObjectName("ChMuted")
+        elo_l.setStyleSheet("font-size:13px;")
+        top.addWidget(nm)
+        top.addStretch(1)
+        info.addLayout(top)
+        info.addWidget(elo_l)
+        info.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        btn = QPushButton("Play")
+        btn.setObjectName("ChGreen")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _c=False, c=cfg: self._play_ncz_bot(c))
+        row.addWidget(av)
+        row.addLayout(info, 1)
+        row.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        return card
+
+    def _play_ncz_bot(self, cfg):
+        mins, inc = self.tc_ncz.currentData()
+        self.start_bot(cfg, mins, inc, self.ncz_color.currentIndex())
+
+    def _build_lobby_play(self):
         page = QWidget()
         row = QHBoxLayout(page)
         row.setContentsMargins(0, 0, 0, 0)
@@ -36384,7 +37645,7 @@ class NczChessPage(QWidget):
         if self.mode == "bot":
             if col == self.my:
                 return True, self._my_av, (self._my_name or "Y")[:1].upper()
-            return True, None, ((self.bot or {}).get("name") or "B")[:1].upper()
+            return True, _ch_bot_avatar_file(self.bot), ((self.bot or {}).get("name") or "B")[:1].upper()
         return False, None, ""
 
     def _load_game_ratings(self, doc):
@@ -36545,7 +37806,9 @@ class NczChessPage(QWidget):
                 lab.setTextFormat(Qt.TextFormat.RichText)
                 go = QPushButton("Open")
                 go.clicked.connect(lambda _c=False, g=gid, i=info: self.open_online(g, i.get("oppUid", "")))
-                x = QPushButton("\u2715")
+                x = QPushButton("")
+                x.setIcon(_ch_icon("close", _ch_theme().get("text", "#ffffff")))
+                x.setIconSize(QSize(14, 14))
                 x.setToolTip("Remove from this list")
                 x.setFixedWidth(36)
                 x.clicked.connect(lambda _c=False, g=gid: self._dismiss(g))
@@ -36644,6 +37907,7 @@ class NczChessPage(QWidget):
         self.strip_top, self.strip_bot = _ChessStrip(), _ChessStrip()
         self.board = _ChessBoard()
         self.board.moveRequested.connect(self._on_move)
+        self.board.premoveSet.connect(lambda: _ch_play("premove"))
         self.board.keyNav.connect(self._on_key)
         self.host = _SquareHost(self.strip_top, self.board, self.strip_bot)
         row.addWidget(self.host, 1)
@@ -36687,8 +37951,9 @@ class NczChessPage(QWidget):
 
         nav = QHBoxLayout()
         self.nav_btns = []
-        for txt, k in (("\u23EE", Qt.Key.Key_Home), ("\u25C0", Qt.Key.Key_Left), ("\u25B6", Qt.Key.Key_Right), ("\u23ED", Qt.Key.Key_End)):
-            b = QPushButton(txt)
+        for txt, k in (("first", Qt.Key.Key_Home), ("prev", Qt.Key.Key_Left), ("next", Qt.Key.Key_Right), ("last", Qt.Key.Key_End)):
+            b = QPushButton("")
+            b._kind = txt
             b.clicked.connect(lambda _c=False, kk=int(k): self._on_key(kk))
             nav.addWidget(b)
             self.nav_btns.append(b)
@@ -36799,6 +38064,8 @@ class NczChessPage(QWidget):
         except Exception:
             self._my_name, self._my_av = "", None
         self.game = _ChessGame()
+        self._bubbles = {"w": None, "b": None}
+        self._win_shown, self._trash_ply = False, -99
         self.mode = mode
         self.base, self.inc = base, inc
         self.left = {"w": base, "b": base}
@@ -36809,6 +38076,9 @@ class NczChessPage(QWidget):
         self.draw_offer = None
         self._oriented = False
         self.board.clear_selection()
+        self.board.premove = None
+        self.board.arrows.clear()
+        self.board.marks.clear()
 
     # ---- bots
     def _bot_blurb_update(self, *_a):
@@ -36816,10 +38086,12 @@ class NczChessPage(QWidget):
         if 0 <= i < len(_CH_BOT_LIST):
             self.bot_blurb.setText(_CH_BOT_LIST[i]["blurb"])
 
-    def start_bot(self):
-        cfg = _CH_BOT_LIST[max(0, self.bot_combo.currentIndex())]
-        mins, inc = self.tc_bot.currentData()
-        choice = self.bot_color.currentIndex()
+    def start_bot(self, cfg=None, mins=None, inc=None, choice=None):
+        if not isinstance(cfg, dict):                     # the "Play a bot" card
+            cfg = _CH_BOT_LIST[max(0, self.bot_combo.currentIndex())]
+            mins, inc = self.tc_bot.currentData()
+            choice = self.bot_color.currentIndex()
+        self._bot_last = (cfg, mins, inc, choice)
         mine = _random.choice("wb") if choice == 0 else ("w" if choice == 1 else "b")
         self._bot_token += 1
         self._bot_busy = False
@@ -36899,7 +38171,7 @@ class NczChessPage(QWidget):
         if self.mode == "local":
             self._restart_local()
         elif self.mode == "bot":
-            self.start_bot()
+            self.start_bot(*(getattr(self, "_bot_last", None) or ()))
         else:
             self.to_lobby()
 
@@ -37002,6 +38274,7 @@ class NczChessPage(QWidget):
             strip.set(col, self._strip_name(col), html, _ch_fmt_clock(ms),
                       running, ms is not None and ms < 10000 and running,
                       avatar=av_path, letter=av_letter, show_avatar=show_av, elo_html=self._strip_elo(col))
+            strip.set_bubble(self._bubbles.get(col))
 
     # ---- moves
     def _on_move(self, f, t, promo):
@@ -37039,8 +38312,19 @@ class NczChessPage(QWidget):
         if self.mode == "local" and self.flip_chk.isChecked() and not g.result:
             self.board.flipped = (g.turn == "b")
         self._refresh()
+        self._after_move_chat(mover)
         if self.mode == "bot" and not g.result and g.turn != self.my:
             self._bot_think()
+
+    def _play_premove(self):
+        g, pm = self.game, self.board.premove
+        if pm is None or not g or g.result or self.view_ply != len(g.moves) or g.turn != self.my:
+            return
+        self.board.premove = None
+        if pm in g.legal():
+            self._on_move(*pm)
+        else:
+            self.board.update()
 
     def _push_move(self, ply, m, result, had_offer=False):
         gid = self.net_gid
@@ -37228,7 +38512,20 @@ class NczChessPage(QWidget):
         if self.mode == "online" and self.my and not getattr(self, "_oriented", False):
             self.board.flipped = (self.my == "b")
             self._oriented = True
-        self.board.set_state(g.hist[view], last, g.legal() if live else [], who)
+        pre = None
+        if live and not g.result and self.my and g.turn != self.my and (self.mode == "bot" or (self.mode == "online" and self.net_state == "active")):
+            pre = self.my
+        self.board.set_state(g.hist[view], last, g.legal() if live else [], who, pre)
+        if self.board.premove is not None:
+            _pm = self.board.premove
+            if g.result or self.mode not in ("bot", "online"):
+                self.board.premove = None
+            elif live:
+                _pc = g.pos.b[_pm[0]]
+                if not _pc or _pc[0] != self.my:            # the piece was captured, so the premove is gone
+                    self.board.premove = None
+                elif g.turn == self.my:
+                    QTimer.singleShot(60, self._play_premove)
         self._paint_strips()
         # status line
         if self.net_state == "loading":
@@ -37272,6 +38569,7 @@ class NczChessPage(QWidget):
         self.moves_view.setHtml("<table cellspacing='2'>" + "".join(rows) + "</table>")
         sb = self.moves_view.verticalScrollBar()
         sb.setValue(sb.maximum())
+        self._win_gif_check()
         # buttons
         over = bool(g.result)
         online = self.mode == "online"
@@ -37430,7 +38728,11 @@ def _open_chess(self):
         self.chess_page = page
         self.pages.addWidget(page)
         page.back_requested.connect(self._leave_web_page)
+        self.pages.currentChanged.connect(lambda _i, p=page: _ch_sync_launcher_look(p))     # chess look on while chess is shown
     self.pages.setCurrentWidget(page)
+    _ch_sync_launcher_look(page)
+    if not _ch_theme_saved():
+        QTimer.singleShot(150, page.maybe_first_run_theme)
 
 AdaptiveApp.open_chess = _open_chess
 
@@ -39938,6 +41240,634 @@ def _bp_init(self, *a, **k):
 
 
 AdaptiveApp.__init__ = _bp_init
+
+
+# ================================================================ Admin panel + bans
+# The admin panel is for ADMIN_UID only: the button is hidden for everyone else AND every call refuses to run for other
+# accounts. The real gate is the Firebase database rules (see firebase_rules_admin.txt): the client check is only UI.
+# Bans: bans/<uid> in the database. A banned launcher crashes on startup, and a local ban.lock keeps it crashing after
+# logging out (any account) until the ban is removed. Running launchers also check every ~45 s and crash when banned.
+ADMIN_UID = "XcqSn5Zvhsf1npoNl3FNG1bKpU63"
+
+def _adm_is_admin():
+    try:
+        return (load_account() or {}).get("uid", "") == ADMIN_UID
+    except Exception:
+        return False
+
+def _adm_require():
+    if not _adm_is_admin():
+        raise CloudError("Admin only.", "NOT_ADMIN")
+
+# ---- ban lock (survives log out, lives next to launcher.json)
+def _ban_lock_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "ban.lock")
+
+def _ban_lock_read():
+    try:
+        with open(_ban_lock_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("uid"):
+            return d
+    except Exception:
+        pass
+    return None
+
+def _ban_lock_write(uid):
+    try:
+        os.makedirs(os.path.dirname(_ban_lock_path()), exist_ok=True)
+        with open(_ban_lock_path(), "w", encoding="utf-8") as f:
+            json.dump({"uid": uid}, f)
+    except OSError:
+        pass
+
+def _ban_lock_clear():
+    try:
+        os.remove(_ban_lock_path())
+    except OSError:
+        pass
+
+def _ban_fetch(uid):
+    """bans/<uid> without logging in (the rules let anyone read bans). None = not banned. Raises CloudError."""
+    base = FIREBASE_DB_URL.strip().rstrip("/")
+    return _http_json(f"{base}/bans/{urllib.parse.quote(uid, safe='')}.json", timeout=8)
+
+def _ban_crash():
+    try:
+        sys.stderr.write("NCZ Games Launcher: this account is banned.\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(1)
+
+def _ban_check_startup():
+    """Runs first thing in main(). Crashes if the locked-out uid or the logged-in account is banned."""
+    if not cloud_configured():
+        return
+    lock = _ban_lock_read()
+    acct = load_account()
+    uids = []
+    if lock:
+        uids.append(lock["uid"])
+    if acct and acct.get("uid") and acct["uid"] not in uids:
+        uids.append(acct["uid"])
+    lock_unknown = False
+    for uid in uids:
+        try:
+            banned = _ban_fetch(uid)
+        except CloudError:
+            if lock and uid == lock["uid"]:
+                lock_unknown = True          # can't tell (offline): stay locked
+            continue
+        if banned:
+            _ban_lock_write(uid)
+            _ban_crash()
+        elif lock and uid == lock["uid"]:
+            _ban_lock_clear()                # unbanned
+            lock = None
+    if lock and lock_unknown:
+        _ban_crash()
+
+class _AcctBus(QObject):
+    changed = pyqtSignal()
+
+def _acct_watch_start(window):
+    """Background: crash when the account gets banned while running; pick up admin edits to the profile / library."""
+    bus = _AcctBus(window)
+    bus.changed.connect(lambda: window.account_page.account_changed.emit())
+    window._acct_bus = bus
+
+    def loop():
+        last_prof = None
+        while True:
+            time.sleep(45)
+            try:
+                acct = load_account()
+                if not acct:
+                    continue
+                uid = acct["uid"]
+                try:
+                    if _ban_fetch(uid):
+                        _ban_lock_write(uid)
+                        _ban_crash()
+                except CloudError:
+                    pass
+                token, _u = get_id_token()
+                upd = _http_json(_fdb(f"users/{uid}/profile/updated", token))
+                lib = _http_json(_fdb(f"users/{uid}/library/updated", token))
+                changed = False
+                if last_prof is not None and upd != last_prof:
+                    cloud_pull_profile()
+                    changed = True
+                last_prof = upd
+                if lib is not None and lib != _lib_load_state().get("rev"):
+                    changed = True
+                if changed:
+                    bus.changed.emit()
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True).start()
+
+# ---- admin cloud operations (all need the admin's token + the admin database rules)
+def _adm_sv():
+    return {".sv": "timestamp"}
+
+def _adm_fetch_users():
+    _adm_require()
+    token, _me = get_id_token()
+    shallow = _http_json(_fdb("users", token, "shallow=true"), timeout=40)
+    uids = sorted(shallow) if isinstance(shallow, dict) else []
+    bans = _http_json(_fdb("bans", token))
+    bans = bans if isinstance(bans, dict) else {}
+
+    def one(u):
+        try:
+            name = _http_json(_fdb(f"users/{u}/profile/username", token))
+        except CloudError:
+            name = None
+        return {"uid": u, "username": name if isinstance(name, str) else "", "banned": u in bans, "ban": bans.get(u)}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(one, uids))
+
+def _adm_fetch_profile(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    d = _http_json(_fdb(f"users/{uid}/profile", token))
+    d = d if isinstance(d, dict) else {}
+    return {"username": d.get("username") if isinstance(d.get("username"), str) else "",
+            "png": _decode_photo(d.get("photo")),
+            "country": str(d.get("country") or "").upper()}
+
+def _adm_patch_both(uid, fields):
+    """Writes to the account's profile and to the public copy friends read."""
+    _adm_require()
+    token, _me = get_id_token()
+    _http_json(_fdb(f"users/{uid}/profile", token), "PATCH", dict(fields, updated=_adm_sv()))
+    try:
+        _http_json(_fdb(f"public/{uid}", token), "PATCH", fields)
+    except CloudError:
+        pass
+
+def _adm_set_username(uid, name):
+    err = validate_username(name)
+    if err:
+        raise CloudError(err, "BAD_NAME")
+    _adm_patch_both(uid, {"username": name})
+
+def _adm_set_picture(uid, png):
+    _adm_patch_both(uid, {"photo": base64.b64encode(png).decode("ascii") if png else None})
+
+def _adm_set_country(uid, code):
+    code = str(code or "").upper()
+    _adm_patch_both(uid, {"country": code if code in COUNTRIES else None})
+
+def _adm_get_library(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    d = _http_json(_fdb(f"users/{uid}/library", token))
+    d = d if isinstance(d, dict) else {}
+    return _lib_as_dict(d.get("games")), _lib_as_dict(d.get("fan"))
+
+def _adm_save_library(uid, games, fan):
+    _adm_require()
+    token, _me = get_id_token()
+    _http_json(_fdb(f"users/{uid}/library", token), "PATCH",
+               {"updated": _adm_sv(), "device": "Admin", "games": games or None, "fan": fan or None})
+
+def _adm_get_friends(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    ids = _http_json(_fdb(f"friends/{uid}", token))
+    ids = sorted(ids) if isinstance(ids, dict) else []
+
+    def one(f):
+        try:
+            n = _http_json(_fdb(f"users/{f}/profile/username", token))
+        except CloudError:
+            n = None
+        return {"uid": f, "username": n if isinstance(n, str) else ""}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return list(ex.map(one, ids))
+
+def _adm_remove_friend(uid, other):
+    _adm_require()
+    token, _me = get_id_token()
+    _http_json(_fdb(f"friends/{uid}/{other}", token), "DELETE")
+    _http_json(_fdb(f"friends/{other}/{uid}", token), "DELETE")
+
+def _adm_add_friend(uid, other):
+    _adm_require()
+    if uid == other:
+        raise CloudError("An account can't be its own friend.", "SELF")
+    token, _me = get_id_token()
+    _http_json(_fdb(f"friends/{uid}/{other}", token), "PUT", True)
+    _http_json(_fdb(f"friends/{other}/{uid}", token), "PUT", True)
+    for a, b in ((uid, other), (other, uid)):
+        try:
+            _http_json(_fdb(f"requests/{a}/{b}", token), "DELETE")
+        except CloudError:
+            pass
+
+def _adm_ban(uid, reason):
+    _adm_require()
+    if uid == ADMIN_UID:
+        raise CloudError("You can't ban the admin account.", "SELF")
+    token, _me = get_id_token()
+    _http_json(_fdb(f"bans/{uid}", token), "PUT",
+               {"reason": (reason or "")[:200], "by": ADMIN_UID, "time": _adm_sv()})
+    try:
+        _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "playing": "", "idle": False})
+    except CloudError:
+        pass
+
+def _adm_unban(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    _http_json(_fdb(f"bans/{uid}", token), "DELETE")
+
+# ---- admin UI
+def _adm_run(owner, func, done=None, busy="Working..."):
+    """Runs func on a worker thread with a wait dialog; shows errors; calls done(result) on success."""
+    dlg = BusyDialog(busy, func, owner)
+    ok, value, error = dlg.run()
+    if not ok:
+        QMessageBox.warning(owner, "Admin", error or "Something went wrong.")
+        return False
+    if done:
+        done(value)
+    return True
+
+def _adm_label(u):
+    name = u.get("username") or "(no username)"
+    return f"{name}  -  {u['uid']}" + ("   [BANNED]" if u.get("banned") else "")
+
+class _AdminLibraryDialog(QDialog):
+    def __init__(self, uid, name, parent=None):
+        super().__init__(parent)
+        self.uid = uid
+        self.setWindowTitle(f"Library - {name}")
+        self.resize(460, 520)
+        self.games, self.fan = {}, {}
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Games in this account's library (applies the next time their launcher syncs)."))
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add store game")
+        add.clicked.connect(self._add)
+        rem = QPushButton("Remove selected")
+        rem.clicked.connect(self._remove)
+        row.addWidget(add)
+        row.addWidget(rem)
+        row.addStretch()
+        lay.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setObjectName("Primary")
+        save.clicked.connect(self._save)
+        row2.addWidget(cancel)
+        row2.addWidget(save)
+        lay.addLayout(row2)
+        self.ok_loaded = _adm_run(self, lambda: _adm_get_library(uid), self._loaded, "Loading library...")
+
+    def _loaded(self, res):
+        self.games, self.fan = dict(res[0]), dict(res[1])
+        self._fill()
+
+    def _fill(self):
+        self.list.clear()
+        for aid, info in sorted(self.games.items(), key=lambda kv: str((kv[1] or {}).get("title", "")).lower()):
+            it = QListWidgetItem(f"{(info or {}).get('title', '?')}   (store {aid})")
+            it.setData(Qt.ItemDataRole.UserRole, ("games", aid))
+            self.list.addItem(it)
+        for gid, info in sorted(self.fan.items(), key=lambda kv: str((kv[1] or {}).get("title", "")).lower()):
+            it = QListWidgetItem(f"{(info or {}).get('title', '?')}   (fan game {gid})")
+            it.setData(Qt.ItemDataRole.UserRole, ("fan", gid))
+            self.list.addItem(it)
+
+    def _add(self):
+        aid, ok = QInputDialog.getText(self, "Add store game", "Steam appid (numbers):")
+        aid = (aid or "").strip()
+        if not ok or not aid.isdigit():
+            return
+        title, ok = QInputDialog.getText(self, "Add store game", "Game title:")
+        title = (title or "").strip()
+        if not ok or not title:
+            return
+        self.games[aid] = {"title": title}
+        self._fill()
+
+    def _remove(self):
+        for it in self.list.selectedItems():
+            kind, key = it.data(Qt.ItemDataRole.UserRole)
+            (self.games if kind == "games" else self.fan).pop(key, None)
+        self._fill()
+
+    def _save(self):
+        if _adm_run(self, lambda: _adm_save_library(self.uid, self.games, self.fan), None, "Saving..."):
+            self.accept()
+
+class _AdminFriendsDialog(QDialog):
+    def __init__(self, uid, name, users, parent=None):
+        super().__init__(parent)
+        self.uid, self.users = uid, users
+        self.setWindowTitle(f"Friends - {name}")
+        self.resize(440, 480)
+        lay = QVBoxLayout(self)
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add friend")
+        add.clicked.connect(self._add)
+        rem = QPushButton("Remove selected")
+        rem.clicked.connect(self._remove)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(add)
+        row.addWidget(rem)
+        row.addStretch()
+        row.addWidget(close)
+        lay.addLayout(row)
+        self.friends = []
+        self._reload()
+
+    def _reload(self):
+        def got(res):
+            self.friends = res
+            self.list.clear()
+            for f in res:
+                it = QListWidgetItem(f"{f['username'] or '(no username)'}  -  {f['uid']}")
+                it.setData(Qt.ItemDataRole.UserRole, f["uid"])
+                self.list.addItem(it)
+        _adm_run(self, lambda: _adm_get_friends(self.uid), got, "Loading friends...")
+
+    def _add(self):
+        have = {f["uid"] for f in self.friends} | {self.uid}
+        pool = [u for u in self.users if u["uid"] not in have]
+        if not pool:
+            QMessageBox.information(self, "Admin", "No other accounts to add.")
+            return
+        labels = [_adm_label(u) for u in pool]
+        pick, ok = QInputDialog.getItem(self, "Add friend", "Account:", labels, 0, False)
+        if not ok:
+            return
+        other = pool[labels.index(pick)]["uid"]
+        if _adm_run(self, lambda: _adm_add_friend(self.uid, other), None, "Adding..."):
+            self._reload()
+
+    def _remove(self):
+        ids = [it.data(Qt.ItemDataRole.UserRole) for it in self.list.selectedItems()]
+        if not ids:
+            return
+
+        def work():
+            for o in ids:
+                _adm_remove_friend(self.uid, o)
+        if _adm_run(self, work, None, "Removing..."):
+            self._reload()
+
+class AdminPanel(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Admin panel")
+        self.resize(860, 560)
+        self.users = []
+        self.sel = None                       # the selected user dict
+        root = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search username or uid")
+        self.search.textChanged.connect(self._filter)
+        left.addWidget(self.search)
+        self.list = QListWidget()
+        self.list.currentItemChanged.connect(self._picked)
+        left.addWidget(self.list, 1)
+        refresh = QPushButton("Refresh accounts")
+        refresh.clicked.connect(self.reload)
+        left.addWidget(refresh)
+        root.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        head = QHBoxLayout()
+        self.avatar = QLabel()
+        self.avatar.setFixedSize(96, 96)
+        head.addWidget(self.avatar)
+        info = QVBoxLayout()
+        self.name_lbl = QLabel("Select an account")
+        f = self.name_lbl.font()
+        f.setPointSize(f.pointSize() + 4)
+        f.setBold(True)
+        self.name_lbl.setFont(f)
+        self.uid_lbl = QLabel("")
+        self.uid_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_lbl = QLabel("")
+        info.addWidget(self.name_lbl)
+        info.addWidget(self.uid_lbl)
+        info.addWidget(self.status_lbl)
+        info.addStretch()
+        head.addLayout(info, 1)
+        right.addLayout(head)
+        self.buttons = []
+        for text, fn in (("Change picture", self._picture), ("Change username", self._username),
+                         ("Change profile country", self._country), ("Manage library", self._library),
+                         ("Manage friends", self._friends)):
+            b = QPushButton(text)
+            b.setMinimumHeight(36)
+            b.clicked.connect(fn)
+            right.addWidget(b)
+            self.buttons.append(b)
+        self.ban_btn = QPushButton("Ban")
+        self.ban_btn.setMinimumHeight(36)
+        self.ban_btn.clicked.connect(self._ban)
+        right.addWidget(self.ban_btn)
+        self.buttons.append(self.ban_btn)
+        right.addStretch()
+        root.addLayout(right, 1)
+        self._set_enabled(False)
+        QTimer.singleShot(0, self.reload)
+
+    def _set_enabled(self, on):
+        for b in self.buttons:
+            b.setEnabled(on)
+
+    def reload(self):
+        keep = self.sel["uid"] if self.sel else None
+        def got(res):
+            self.users = sorted(res, key=lambda u: (u.get("username") or "~").lower())
+            self._filter(self.search.text())
+            if keep:
+                for i in range(self.list.count()):
+                    if self.list.item(i).data(Qt.ItemDataRole.UserRole)["uid"] == keep:
+                        self.list.setCurrentRow(i)
+                        break
+        _adm_run(self, _adm_fetch_users, got, "Loading accounts...")
+
+    def _filter(self, text=""):
+        text = (text or "").strip().lower()
+        self.list.blockSignals(True)
+        self.list.clear()
+        for u in self.users:
+            if text and text not in u["uid"].lower() and text not in (u.get("username") or "").lower():
+                continue
+            it = QListWidgetItem(_adm_label(u))
+            it.setData(Qt.ItemDataRole.UserRole, u)
+            self.list.addItem(it)
+        self.list.blockSignals(False)
+        self._picked(None, None)
+
+    def _picked(self, cur, _prev):
+        it = self.list.currentItem()
+        if it is None:
+            self.sel = None
+            self.name_lbl.setText("Select an account")
+            self.uid_lbl.setText("")
+            self.status_lbl.setText("")
+            self.avatar.clear()
+            self._set_enabled(False)
+            return
+        self.sel = it.data(Qt.ItemDataRole.UserRole)
+        u = self.sel
+        self.name_lbl.setText(u.get("username") or "(no username)")
+        self.uid_lbl.setText(u["uid"])
+        ban = u.get("ban")
+        reason = (ban.get("reason") if isinstance(ban, dict) else "") or ""
+        self.status_lbl.setText(("BANNED" + (f": {reason}" if reason else "")) if u["banned"] else "Active")
+        self.ban_btn.setText("Unban" if u["banned"] else "Ban")
+        self._set_enabled(True)
+        self.avatar.clear()
+        uid = u["uid"]
+
+        def got(p):
+            if self.sel and self.sel["uid"] == uid and p.get("png"):
+                pm = QPixmap()
+                pm.loadFromData(p["png"])
+                self.avatar.setPixmap(pm.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+            if self.sel and self.sel["uid"] == uid:
+                self.sel["country"] = p.get("country", "")
+        w = TaskWorker(lambda: _adm_fetch_profile(uid))
+        w.done.connect(got)
+        self._pw = w                           # keep a reference while it runs
+        w.start()
+
+    def _picture(self):
+        u = self.sel
+        box = QMessageBox(self)
+        box.setWindowTitle("Change picture")
+        box.setText(f"New profile picture for {u.get('username') or u['uid']}")
+        choose = box.addButton("Choose image...", QMessageBox.ButtonRole.AcceptRole)
+        remove = box.addButton("Remove picture", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        png = None
+        if clicked is choose:
+            path, _f = QFileDialog.getOpenFileName(self, "Choose a picture", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+            if not path:
+                return
+            try:
+                png = prepare_avatar_png(path)
+            except CloudError as e:
+                QMessageBox.warning(self, "Admin", str(e))
+                return
+        elif clicked is not remove:
+            return
+        if _adm_run(self, lambda: _adm_set_picture(u["uid"], png), None, "Saving..."):
+            self._picked(None, None)
+
+    def _username(self):
+        u = self.sel
+        name, ok = QInputDialog.getText(self, "Change username", "New username:", text=u.get("username") or "")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        err = validate_username(name)
+        if err:
+            QMessageBox.warning(self, "Admin", err)
+            return
+        def done(_r):
+            u["username"] = name
+            self.reload()
+        _adm_run(self, lambda: _adm_set_username(u["uid"], name), done, "Saving...")
+
+    def _country(self):
+        u = self.sel
+        dlg = CountryDialog(self, u.get("country", ""))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        code = dlg.code()
+        def done(_r):
+            u["country"] = code
+        _adm_run(self, lambda: _adm_set_country(u["uid"], code), done, "Saving...")
+
+    def _library(self):
+        u = self.sel
+        _AdminLibraryDialog(u["uid"], u.get("username") or u["uid"], self).exec()
+
+    def _friends(self):
+        u = self.sel
+        _AdminFriendsDialog(u["uid"], u.get("username") or u["uid"], self.users, self).exec()
+
+    def _ban(self):
+        u = self.sel
+        uid = u["uid"]
+        if u["banned"]:
+            if QMessageBox.question(self, "Unban", f"Unban {u.get('username') or uid}?") != QMessageBox.StandardButton.Yes:
+                return
+            if _adm_run(self, lambda: _adm_unban(uid), None, "Unbanning..."):
+                self.reload()
+            return
+        if uid == ADMIN_UID:
+            QMessageBox.warning(self, "Admin", "You can't ban the admin account.")
+            return
+        reason, ok = QInputDialog.getText(self, "Ban", f"Reason for banning {u.get('username') or uid} (optional):")
+        if not ok:
+            return
+        if _adm_run(self, lambda: _adm_ban(uid, reason), None, "Banning..."):
+            self.reload()
+
+def _adm_open(window):
+    if not _adm_is_admin():
+        return
+    AdminPanel(window).exec()
+
+_adm_prev_init = AdaptiveApp.__init__
+
+def _adm_init(self, *a, **k):
+    _adm_prev_init(self, *a, **k)
+    try:
+        box = QFrame()
+        bl = QHBoxLayout(box)
+        bl.setContentsMargins(0, 18, 0, 0)
+        btn = QPushButton("Admin panel")
+        btn.setObjectName("Primary")
+        btn.setMinimumHeight(36)
+        btn.clicked.connect(lambda _c=False: _adm_open(self))
+        bl.addWidget(btn)
+        bl.addStretch()
+        content = self.settings_page._content_layout
+        last = content.itemAt(content.count() - 1)
+        if last is not None and last.spacerItem() is not None:
+            content.insertWidget(content.count() - 1, box)
+        else:
+            content.addWidget(box)
+        box.setVisible(_adm_is_admin())
+        self.account_page.account_changed.connect(lambda: box.setVisible(_adm_is_admin()))
+        self._adm_box = box
+        sc = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
+        sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc.activated.connect(lambda: _adm_open(self))
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+AdaptiveApp.__init__ = _adm_init
+
 
 
 if __name__ == "__main__":
