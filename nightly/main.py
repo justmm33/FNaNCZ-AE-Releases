@@ -3657,6 +3657,7 @@ class CreditsPage(QWidget):
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
         ("mr.fancypigeon", "Linux Script for FNaNCZ 1 and 2, Garry's Mod Addon Manager, and ideas", "pigeon.png"),
         ("notacape", "NCZFront", "notacape.png"),
+        ("Kablooey", "Terms and Conditions, Ideas", "kablooey.png"),
     )
 
     @staticmethod
@@ -7409,6 +7410,78 @@ def _demo_py_present():
     return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py"))
 
 
+# ---------------------------------------------------------------- Terms and Conditions (shown once per terms version)
+TERMS_VERSION = "2026-10-31"          # bump this to show the terms again to everyone
+TERMS_TEXT = 'NCZ LAUNCHER\n\nTERMS AND CONDITIONS\n\nLast Updated: October 31, 2026\n\nWelcome to NCZ LAUNCHER. By downloading, installing, accessing, or using NCZ LAUNCHER, you agree to comply with the following Terms and Conditions. If you do not agree to these terms, you must not use the launcher.\n\n1. ELIGIBILITY AND ACCESS RESTRICTIONS\n\n1.1 NCZ Membership Requirement\n\nNCZ LAUNCHER is exclusively intended for authorized members of NCZ. If you are not a member of NCZ, you are strictly prohibited from downloading, accessing, or using the launcher.\n\n1.2 FHA Restriction\n\nIndividuals who are members of, affiliated with, or otherwise associated with FHA are strictly prohibited from using NCZ LAUNCHER. This restriction applies regardless of whether the individual is also a member of NCZ, unless explicit written authorization is granted by NCZ leadership.\n\n1.3 Authorized Users Only\n\nAccess to NCZ LAUNCHER is a privilege, not a right. NCZ reserves the right to verify membership, restrict access, suspend accounts, or revoke access from any individual who does not meet the eligibility requirements.\n\n1.4 No Unauthorized Distribution\n\nUsers may not distribute, share, upload, sell, or otherwise provide NCZ LAUNCHER or its restricted access credentials to unauthorized individuals, including non-NCZ members and FHA affiliates.\n\n2. ACCEPTABLE USE\n\nBy using NCZ LAUNCHER, you agree to:\n\n* Use the launcher only for its intended purposes.\n* Follow all applicable NCZ rules, policies, and instructions.\n* Respect the privacy and security of other users.\n* Refrain from exploiting bugs, vulnerabilities, or technical issues for unauthorized purposes.\n* Avoid using the launcher to harass, threaten, impersonate, or harm other individuals.\n* Refrain from attempting to bypass membership verification or access restrictions.\n\n3. PROHIBITED ACTIVITIES\n\nThe following activities are strictly prohibited:\n\n* Using NCZ LAUNCHER without authorized NCZ membership.\n* Accessing or attempting to access restricted features without permission.\n* Circumventing security measures or membership verification systems.\n* Modifying, reverse-engineering, or redistributing the launcher without authorization.\n* Introducing malware, malicious code, or other harmful software.\n* Impersonating NCZ leadership, staff, or authorized members.\n* Sharing confidential NCZ materials with unauthorized individuals.\n* Using the launcher in violation of applicable laws or third-party platform rules.\n\n4. SECURITY AND PRIVACY\n\nUsers are responsible for maintaining the confidentiality of their login credentials and any other information used to access NCZ LAUNCHER.\n\nYou must promptly report suspected unauthorized access, security vulnerabilities, or misuse of the launcher to the appropriate NCZ administrators.\n\nNCZ LAUNCHER should not be used to collect, disclose, or distribute another person’s private information without proper authorization.\n\n5. INTELLECTUAL PROPERTY\n\nUnless otherwise stated, NCZ LAUNCHER, including its branding, logos, design, original code, and associated materials, is the property of its respective owners.\n\nUsers may not copy, modify, reproduce, redistribute, or commercially exploit these materials without prior authorization from the relevant rights holder.\n\n6. SUSPENSION AND TERMINATION\n\nNCZ reserves the right to suspend, restrict, or permanently revoke access to NCZ LAUNCHER if a user:\n\n* Violates these Terms and Conditions.\n* Is found to be ineligible for access.\n* Is affiliated with FHA in violation of Section 1.2.\n* Shares the launcher with unauthorized individuals.\n* Attempts to bypass security restrictions.\n* Engages in conduct that compromises the security or integrity of NCZ LAUNCHER.\n\nDepending on the circumstances, NCZ administrators may issue a warning, temporarily suspend access, or permanently revoke access without prior notice.\n\n7. AVAILABILITY AND UPDATES\n\nNCZ LAUNCHER is provided on an as-available basis. Features may be modified, updated, temporarily disabled, or discontinued at any time.\n\nNCZ does not guarantee uninterrupted operation, compatibility with every device, or freedom from technical errors.\n\nUsers may be required to install updates to continue using the launcher.\n\n8. DISCLAIMER OF WARRANTIES\n\nTo the extent permitted by applicable law, NCZ LAUNCHER is provided “as is” and “as available,” without guarantees that it will always function correctly, remain available, or meet every user’s requirements.\n\nNothing in these terms excludes any rights or protections that cannot legally be excluded.\n\n9. LIMITATION OF LIABILITY\n\nTo the extent permitted by applicable law, NCZ and the individuals responsible for maintaining NCZ LAUNCHER shall not be liable for indirect or consequential losses arising from the use or inability to use the launcher.\n\nThis section does not exclude liability where such exclusion is prohibited by applicable law.\n\n10. CHANGES TO THESE TERMS\n\nNCZ reserves the right to modify these Terms and Conditions when necessary.\n\nUpdated terms may be published alongside the launcher or communicated through official NCZ channels. Continued use of NCZ LAUNCHER following the effective date of an update constitutes acceptance of the revised terms, to the extent permitted by applicable law.\n\n11. CONTACT AND SUPPORT\n\nQuestions, concerns, or reports regarding NCZ LAUNCHER should be directed to an authorized NCZ administrator through the appropriate official communication channels.\n\n12. ACCEPTANCE OF TERMS\n\nBy installing, launching, or using NCZ LAUNCHER, you acknowledge that you have read, understood, and agreed to these Terms and Conditions.\n\nIf you are not a member of NCZ, you are not permitted to use NCZ LAUNCHER.\n\nIf you are affiliated with FHA, you are not permitted to use NCZ LAUNCHER unless explicitly authorized in writing by NCZ leadership.\n\nUnauthorized access or distribution may result in immediate revocation of access.\n\nNCZ LAUNCHER\nAuthorized access. Restricted distribution. NCZ members only'
+
+def _terms_accepted_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "terms_accepted.json")
+
+def terms_accepted():
+    try:
+        with open(_terms_accepted_path(), encoding="utf-8") as f:
+            return json.load(f).get("version") == TERMS_VERSION
+    except Exception:
+        return False
+
+def record_terms_accepted():
+    path = _terms_accepted_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": TERMS_VERSION}, f)
+    except Exception:
+        pass
+
+class TermsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("NCZ Launcher - Terms and Conditions")
+        self.setModal(True)
+        self.resize(720, 640)
+        icon_path = asset_path("icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(12)
+
+        title = QLabel("Terms and Conditions")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        note = QLabel("The terms have been updated. Please read and accept them to keep using the launcher.")
+        note.setObjectName("RowDesc")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(TERMS_TEXT)
+        layout.addWidget(self.text, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        decline = QPushButton("Decline and exit")
+        decline.setCursor(Qt.CursorShape.PointingHandCursor)
+        decline.clicked.connect(self.reject)
+        self.accept_btn = QPushButton("I have read and accept")
+        self.accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.accept_btn.setDefault(True)
+        self.accept_btn.clicked.connect(self.accept)
+        buttons.addWidget(decline)
+        buttons.addWidget(self.accept_btn)
+        layout.addLayout(buttons)
+
+def ensure_terms_accepted():
+    """Shows the terms until they are accepted; returns False if the user declines."""
+    if terms_accepted():
+        return True
+    if TermsDialog().exec() == QDialog.DialogCode.Accepted:
+        record_terms_accepted()
+        return True
+    return False
+
+
 def main():
     import traceback
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
@@ -7465,6 +7538,9 @@ def main():
         app.styleHints().colorSchemeChanged.connect(on_system_color_scheme_changed)
     except Exception:
         pass
+
+    if not ensure_terms_accepted():
+        sys.exit(0)
 
     window = AdaptiveApp()
     app._ncz_main_window = window
