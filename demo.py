@@ -66,7 +66,7 @@ REQUIRE_DISCORD_FOR_NEW_ACCOUNTS = True
 # next login counts as "already in the database".
 WRITE_PROFILE_FOR_NEW_ACCOUNTS = True
 BAN_CLOSE_DELAY_MS = 16
-VERSION_TEXT = "v12.1.0"
+VERSION_TEXT = "v12.4.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
