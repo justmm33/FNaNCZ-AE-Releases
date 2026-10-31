@@ -40324,7 +40324,8 @@ class _BigPicture(QWidget):
         self._wheel = 0
         self._lfact, self._lfact_t, self._lseen = None, 0.0, False      # loading card: current fact, when it was picked, drawn this frame?
         self._ltimer = QTimer(self)                                      # ticks only while a loading card is on screen
-        self._ltimer.setInterval(33)
+        self._ltimer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._ltimer.setInterval(16)
         self._ltimer.timeout.connect(self.update)
 
         self._input = _BPInput(self)
@@ -41314,17 +41315,29 @@ class _BigPicture(QWidget):
         size = h * 0.17
         cx, cy = area.center().x(), area.top() + area.height() * 0.36
         pm = lc_logo_pixmap()
+        side = max(8, int(size))
+        dpr = self.devicePixelRatioF()
+        key = (pm.cacheKey(), side, dpr)
+        if getattr(self, "_lpm_key", None) != key:       # round logo rendered once, then only rotated + blitted each frame
+            px = int(side * dpr)
+            rp = QPixmap(px, px)
+            rp.fill(Qt.GlobalColor.transparent)
+            q = QPainter(rp)
+            q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addEllipse(QRectF(0, 0, px, px))
+            q.setClipPath(clip)
+            if pm.isNull():
+                q.fillRect(QRectF(0, 0, px, px), QColor(166, 102, 255))
+            else:
+                q.drawPixmap(QRectF(0, 0, px, px), pm, QRectF(pm.rect()))
+            q.end()
+            rp.setDevicePixelRatio(dpr)
+            self._lpm, self._lpm_key = rp, key
         p.save()
         p.translate(cx, cy)
         p.rotate((now * 140) % 360)
-        box = QRectF(-size / 2, -size / 2, size, size)
-        clip = QPainterPath()
-        clip.addEllipse(box)
-        p.setClipPath(clip)
-        if pm.isNull():
-            p.fillRect(box, QColor(166, 102, 255))
-        else:
-            p.drawPixmap(box, pm, QRectF(pm.rect()))
+        p.drawPixmap(QPointF(-side / 2.0, -side / 2.0), self._lpm)
         p.restore()
         text, src = self._lfact
         y = cy + size / 2 + h * 0.025

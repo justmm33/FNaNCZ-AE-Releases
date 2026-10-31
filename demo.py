@@ -1213,20 +1213,38 @@ def _a(v):
     return int(max(0, min(255, v)))
 
 
+_glow_cache = {}
+
+
 def _glow(p, cx, cy, rx, ry, rgb, alpha):
-    """Soft elliptical light."""
+    """Soft elliptical light. The gradient is rendered once per size/colour and then just blitted with an opacity
+    (drawing big radial gradients every frame was the most expensive part of a repaint)."""
     if alpha <= 0.5:
         return
+    pw, ph = max(2, int(2 * rx + 0.5)), max(2, int(2 * ry + 0.5))
+    key = (pw, ph, rgb[0], rgb[1], rgb[2])
+    pm = _glow_cache.get(key)
+    if pm is None:
+        if len(_glow_cache) > 24:
+            _glow_cache.clear()
+        pm = QPixmap(pw, ph)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        q.translate(pw / 2, ph / 2)
+        q.scale(1.0, ph / float(pw))
+        g = QRadialGradient(QPointF(0, 0), pw / 2)
+        g.setColorAt(0.0, QColor(rgb[0], rgb[1], rgb[2], 255))
+        g.setColorAt(0.5, QColor(rgb[0], rgb[1], rgb[2], 82))
+        g.setColorAt(1.0, QColor(rgb[0], rgb[1], rgb[2], 0))
+        q.setPen(Qt.PenStyle.NoPen)
+        q.setBrush(QBrush(g))
+        q.drawEllipse(QPointF(0, 0), pw / 2, pw / 2)
+        q.end()
+        _glow_cache[key] = pm
     p.save()
-    p.translate(cx, cy)
-    p.scale(1.0, ry / rx)
-    g = QRadialGradient(QPointF(0, 0), rx)
-    g.setColorAt(0.0, QColor(rgb[0], rgb[1], rgb[2], _a(alpha)))
-    g.setColorAt(0.5, QColor(rgb[0], rgb[1], rgb[2], _a(alpha * 0.32)))
-    g.setColorAt(1.0, QColor(rgb[0], rgb[1], rgb[2], 0))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(g))
-    p.drawEllipse(QPointF(0, 0), rx, rx)
+    p.setOpacity(p.opacity() * max(0.0, min(1.0, alpha / 255.0)))
+    p.drawPixmap(QPointF(cx - pw / 2, cy - ph / 2), pm)
     p.restore()
 
 
@@ -1341,6 +1359,7 @@ class LoginWindow(QWidget):
         self._ban_t = 0.0
         self._logo_reveal = 0.0
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
 
@@ -1568,13 +1587,12 @@ class LoginWindow(QWidget):
             path = QPainterPath()
             if self.state in ("downloading", "launching") and not self._ncz_logo.isNull():
                 # loading: the round NCZ logo, spinning
+                spin = self._spin_pixmap(size)
+                half = spin.width() / spin.devicePixelRatio() / 2
                 p.save()
                 p.translate(cx, cy)
                 p.rotate((t * 140) % 360)
-                box = QRectF(-size / 2, -size / 2, size, size)
-                path.addEllipse(box)
-                p.setClipPath(path)
-                p.drawPixmap(box, self._ncz_logo, QRectF(self._ncz_logo.rect()))
+                p.drawPixmap(QPointF(-half, -half), spin)
                 p.restore()
                 p.setPen(QPen(QColor(255, 255, 255, 40), 1))
                 p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1635,6 +1653,26 @@ class LoginWindow(QWidget):
         if self._ban_t > 0.01:
             _glow(p, w / 2, h * 0.5, w * 0.55, h * 0.55, (170, 20, 20), 60 * self._ban_t)
         p.end()
+
+    def _spin_pixmap(self, size):
+        """The round NCZ logo rendered ONCE at the size it is drawn (and cached), so spinning is just a rotated blit."""
+        size = max(8, int(round(size)))
+        dpr = self.devicePixelRatioF()
+        key = (self._ncz_logo.cacheKey(), size, dpr)
+        if getattr(self, "_spin_key", None) != key:
+            px = int(size * dpr)
+            pm = QPixmap(px, px)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addEllipse(QRectF(0, 0, px, px))
+            q.setClipPath(clip)
+            q.drawPixmap(QRectF(0, 0, px, px), self._ncz_logo, QRectF(self._ncz_logo.rect()))
+            q.end()
+            pm.setDevicePixelRatio(dpr)
+            self._spin_pm, self._spin_key = pm, key
+        return self._spin_pm
 
     # ---- reveal animations (fade + rise)
     def _reveal(self, widget, delay=0, dur=620, rise=26):
@@ -1731,6 +1769,7 @@ class LoginWindow(QWidget):
             self._ncz_logo = ncz_logo_pixmap(self._logo)
             self._fact, self._fact_t0 = lc_next_fact(), self._t
         self.state = state
+        self._timer.setInterval(16 if state in ("downloading", "launching") else 33)     # smooth spin while loading
         self._apply_state()
         self.relayout()
         self._reveal_visible()
