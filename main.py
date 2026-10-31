@@ -3743,11 +3743,205 @@ class TaskWorker(QThread):
         else:
             self.done.emit(result)
 
+# ================================================================ Loading card: spinning NCZ logo + a Wikipedia fact
+# Logo = the NCZ Discord server icon (guild 1043135802932203641), cached on disk; if it can't be fetched -> assets/ncz.png.
+# Facts are prefetched in the background (never fetched when the card opens), with a built-in list as the offline fallback.
+from PyQt6.QtCore import QVariantAnimation as _LcAnim, QEasingCurve as _LcEase
+import random as _lc_random
+
+NCZ_GUILD_ID = "1043135802932203641"
+_LC_FALLBACK_FACTS = [
+    "Honey never spoils: edible honey has been found in ancient Egyptian tombs.",
+    "Octopuses have three hearts and blue blood.",
+    "A day on Venus is longer than a year on Venus.",
+    "Bananas are berries, but strawberries are not.",
+    "The Eiffel Tower grows a few centimetres taller in summer because the iron expands in the heat.",
+    "Sharks existed before trees did.",
+    "There are more possible chess games than atoms in the observable universe.",
+    "Wombat droppings are cube-shaped.",
+    "The shortest war in history lasted about 40 minutes (Anglo-Zanzibar War, 1896).",
+    "Pac-Man was originally going to be called Puck-Man.",
+    "Scotland's national animal is the unicorn.",
+    "Sound travels roughly four times faster in water than in air.",
+    "The first computer mouse was made of wood.",
+    "Cleopatra lived closer in time to the Moon landing than to the building of the Great Pyramid.",
+    "Tetris was created in 1984 by Soviet engineer Alexey Pajitnov.",
+]
+_lc_facts = []                     # prefetched Wikipedia facts, consumed one per card
+_lc_fetching = False
+_lc_logo_checked = False
+
+def _lc_cache_dir():
+    # fixed folder (not the per-profile one) so demo.py and every profile share the same cached server icon
+    if sys.platform.startswith("win"):
+        d = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
+    else:
+        d = os.path.expanduser("~/.config/NCZ_Games_Launcher")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _lc_logo_cache():
+    return os.path.join(_lc_cache_dir(), "ncz_server_icon.png")
+
+def ncz_logo_path():
+    """Cached Discord server icon if we have one, else assets/ncz.png, else the launcher icon."""
+    cached = _lc_logo_cache()
+    if os.path.exists(cached) and os.path.getsize(cached) > 200:
+        return cached
+    for name in ("ncz.png", "icon.png"):
+        p = asset_path(name)
+        if os.path.exists(p):
+            return p
+    return ""
+
+def _lc_fetch_logo():
+    """Discord only shows a server's icon hash through its invite, so: widget.json -> instance_invite -> /invites/<code> -> icon.
+    Needs the server's Widget turned on (Server Settings > Widget). Any failure is silent: assets/ncz.png is used."""
+    global _lc_logo_checked
+    if _lc_logo_checked:
+        return
+    _lc_logo_checked = True
+    cached = _lc_logo_cache()
+    try:
+        if os.path.exists(cached) and time.time() - os.path.getmtime(cached) < 86400:
+            return                                    # refreshed at most once a day
+        widget = json.loads(_http_get(f"https://discord.com/api/v10/guilds/{NCZ_GUILD_ID}/widget.json", timeout=8))
+        invite = str(widget.get("instance_invite") or "")
+        code = invite.rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z0-9\-]{2,32}", code):
+            return
+        info = json.loads(_http_get(f"https://discord.com/api/v10/invites/{code}", timeout=8))
+        guild = info.get("guild") or {}
+        icon = str(guild.get("icon") or "")
+        if str(guild.get("id")) != NCZ_GUILD_ID or not re.fullmatch(r"[A-Za-z0-9_]{5,64}", icon):
+            return
+        ext = "gif" if icon.startswith("a_") else "png"
+        raw = _http_get(f"https://cdn.discordapp.com/icons/{NCZ_GUILD_ID}/{icon}.png?size=256", timeout=10)
+        img = QImage.fromData(raw)
+        if not img.isNull():
+            tmp = cached + ".tmp"
+            img.save(tmp, "PNG")
+            os.replace(tmp, cached)
+    except Exception:
+        pass
+
+def _lc_trim(text, limit=170):
+    text = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", text or "")).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    dot = cut.rfind(". ")
+    return cut[:dot + 1] if dot > 60 else cut.rsplit(" ", 1)[0] + "..."
+
+def _lc_fetch_facts(n=6):
+    global _lc_fetching
+    try:
+        for _ in range(n):
+            d = json.loads(_http_get("https://en.wikipedia.org/api/rest_v1/page/random/summary", timeout=8))
+            if d.get("type") != "standard":
+                continue
+            ext = _lc_trim(d.get("extract", ""))
+            title = str(d.get("title") or "")
+            if len(ext) >= 60 and title:
+                _lc_facts.append((ext, title))
+    except Exception:
+        pass
+    finally:
+        _lc_fetching = False
+
+def lc_prefetch():
+    """Call at startup; also tops the queue up whenever it runs low. Never blocks."""
+    global _lc_fetching
+    if not _lc_logo_checked:
+        threading.Thread(target=_lc_fetch_logo, daemon=True).start()
+    if len(_lc_facts) < 3 and not _lc_fetching:
+        _lc_fetching = True
+        threading.Thread(target=_lc_fetch_facts, daemon=True).start()
+
+def lc_next_fact():
+    """-> (text, source_or_empty). Wikipedia fact if one is ready, else a built-in one."""
+    lc_prefetch()
+    if _lc_facts:
+        text, title = _lc_facts.pop(0)
+        return text, f"Wikipedia: {title}"
+    return _lc_random.choice(_LC_FALLBACK_FACTS), ""
+
+_lc_pm_cache = {}
+
+def lc_logo_pixmap():
+    """The NCZ logo as a square pixmap (centre-cropped), cached until the file changes."""
+    path = ncz_logo_path()
+    if not path:
+        return QPixmap()
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        key = (path, 0)
+    pm = _lc_pm_cache.get(key)
+    if pm is None:
+        pm = QPixmap(path)
+        if not pm.isNull():
+            side = min(pm.width(), pm.height())
+            pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+        _lc_pm_cache.clear()
+        _lc_pm_cache[key] = pm
+    return pm
+
+class SpinLogo(QWidget):
+    """The NCZ logo, round, turning smoothly. Only animates while visible."""
+    def __init__(self, size=84, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self.setFixedSize(size + 8, size + 8)
+        self._angle = 0.0
+        self._pm = QPixmap()
+        path = ncz_logo_path()
+        if path:
+            self._pm = QPixmap(path)
+        self._anim = _LcAnim(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(2400)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(_LcEase.Type.Linear)
+        self._anim.valueChanged.connect(self._tick)
+
+    def _tick(self, v):
+        self._angle = float(v)
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._anim.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._anim.stop()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        s = self._size
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(self._angle)
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(-s / 2, -s / 2, s, s))
+        p.setClipPath(clip)
+        if not self._pm.isNull():
+            scaled = self._pm.scaled(s, s, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(int(-scaled.width() / 2), int(-scaled.height() / 2), scaled)
+        else:
+            p.fillRect(QRectF(-s / 2, -s / 2, s, s), QColor("#a666ff"))
+        p.end()
+
 class BusyDialog(QDialog):
     def __init__(self, message, func, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Please wait")
-        self.setFixedSize(300, 90)
+        self.setFixedSize(380, 270)
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self._finished = False
@@ -3756,15 +3950,33 @@ class BusyDialog(QDialog):
         self.error = ""
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 15, 20, 15)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(8)
+        logo = SpinLogo(84)
+        layout.addWidget(logo, 0, Qt.AlignmentFlag.AlignHCenter)
         label = QLabel(message)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        f = label.font()
+        f.setBold(True)
+        label.setFont(f)
         layout.addWidget(label)
         bar = QProgressBar()
         bar.setRange(0, 0)
         bar.setTextVisible(False)
+        bar.setFixedHeight(6)
         layout.addWidget(bar)
+        fact, source = lc_next_fact()
+        fact_label = QLabel(fact)
+        fact_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fact_label.setWordWrap(True)
+        fact_label.setStyleSheet("color: gray;")
+        layout.addWidget(fact_label, 1)
+        if source:
+            src_label = QLabel(source)
+            src_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            src_label.setStyleSheet("color: gray; font-size: 10px;")
+            layout.addWidget(src_label)
 
         self.worker = TaskWorker(func)
         self.worker.done.connect(self._on_done)
@@ -7257,6 +7469,7 @@ def main():
     app._ncz_main_window = window
     _acct_watch_start(window)
     apply_startup_setting()
+    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
     set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
     if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
@@ -37204,7 +37417,7 @@ class NczChessPage(QWidget):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
-        card, cl = self._card("NCZ Bots", "Play the NCZ crew. Their Elo is a target strength, and bot games are unrated.")
+        card, cl = self._card("NCZ Bots", "Bots that resemble us when youre bored and everyones offline")
         opts = QHBoxLayout()
         self.tc_ncz = self._tc_combo(0)
         self.ncz_color = QComboBox()
@@ -40109,6 +40322,10 @@ class _BigPicture(QWidget):
         self._stimer.setInterval(600)
         self._stimer.timeout.connect(self._store_reset)
         self._wheel = 0
+        self._lfact, self._lfact_t, self._lseen = None, 0.0, False      # loading card: current fact, when it was picked, drawn this frame?
+        self._ltimer = QTimer(self)                                      # ticks only while a loading card is on screen
+        self._ltimer.setInterval(33)
+        self._ltimer.timeout.connect(self.update)
 
         self._input = _BPInput(self)
         self._input.action.connect(self._act)
@@ -40159,6 +40376,7 @@ class _BigPicture(QWidget):
     def _stop_awake(self):
         self._input.stop()
         self._clock.stop()
+        self._ltimer.stop()
         for a in (self._anim, self._sanim, self._tanim, self._banim, self._fade):
             a.stop()
         self._stimer.stop()
@@ -40833,6 +41051,7 @@ class _BigPicture(QWidget):
 
     # ---------------------------------------------------------------- painting
     def paintEvent(self, e):
+        self._lseen = False
         p = QPainter(self)
         p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.TextAntialiasing)
         w, h = self.width(), self.height()
@@ -40879,6 +41098,12 @@ class _BigPicture(QWidget):
             p.drawRoundedRect(box, h * 0.03, h * 0.03)
             p.setPen(QColor(245, 245, 252))
             p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), self._toast)
+        if self._lseen:
+            if not self._ltimer.isActive():
+                self._ltimer.start()
+        else:
+            self._ltimer.stop()
+            self._lfact = None
         p.end()
 
     def _paint_header(self, p, w, h, m, acc):
@@ -41077,6 +41302,45 @@ class _BigPicture(QWidget):
                 p.drawText(r, al_c, _BP_CATS[n - 1][0])
         p.restore()
 
+    def _paint_loading(self, p, w, h, area, msg):
+        """Spinning NCZ logo + message + a Wikipedia fact. Drives its own 33 ms timer only while it is visible."""
+        from PyQt6.QtGui import QTextOption
+        self._lseen = True
+        now = time.time()
+        if self._lfact is None or now - self._lfact_t > 10:
+            self._lfact, self._lfact_t = lc_next_fact(), now
+        age = now - self._lfact_t
+        fa = max(0.0, min(1.0, age / 0.8, (10.0 - age) / 0.8))
+        size = h * 0.17
+        cx, cy = area.center().x(), area.top() + area.height() * 0.36
+        pm = lc_logo_pixmap()
+        p.save()
+        p.translate(cx, cy)
+        p.rotate((now * 140) % 360)
+        box = QRectF(-size / 2, -size / 2, size, size)
+        clip = QPainterPath()
+        clip.addEllipse(box)
+        p.setClipPath(clip)
+        if pm.isNull():
+            p.fillRect(box, QColor(166, 102, 255))
+        else:
+            p.drawPixmap(box, pm, QRectF(pm.rect()))
+        p.restore()
+        text, src = self._lfact
+        y = cy + size / 2 + h * 0.025
+        p.setFont(self._font(h * 0.032))
+        p.setPen(QColor(200, 200, 220))
+        p.drawText(QRectF(0, y, w, h * 0.05), int(Qt.AlignmentFlag.AlignCenter), msg)
+        opt = QTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+        p.setFont(self._font(h * 0.024))
+        p.setPen(QColor(175, 175, 200, int(225 * fa)))
+        p.drawText(QRectF(w * 0.26, y + h * 0.07, w * 0.48, h * 0.1), text, opt)
+        if src:
+            p.setFont(self._font(h * 0.017))
+            p.setPen(QColor(150, 150, 175, int(170 * fa)))
+            p.drawText(QRectF(w * 0.26, y + h * 0.175, w * 0.48, h * 0.03), int(Qt.AlignmentFlag.AlignCenter), src)
+
     def _paint_store(self, p, w, h, m, acc, k):
         al_c = int(Qt.AlignmentFlag.AlignCenter)
         p.setOpacity(k)
@@ -41088,7 +41352,10 @@ class _BigPicture(QWidget):
             p.setFont(self._font(h * 0.032))
             p.setPen(QColor(200, 200, 220))
             msg = self._serror or ("Loading games..." if (self._sloading or not self._sstarted) else "No games found")
-            p.drawText(QRectF(0, top, w, bottom - top), al_c, msg)
+            if msg == "Loading games...":
+                self._paint_loading(p, w, h, QRectF(0, top, w, bottom - top), msg)
+            else:
+                p.drawText(QRectF(0, top, w, bottom - top), al_c, msg)
             return
         p.save()
         p.setClipRect(QRectF(0, top, w, bottom - top))
@@ -41868,492 +42135,6 @@ def _adm_init(self, *a, **k):
 
 AdaptiveApp.__init__ = _adm_init
 
-
-
-# ================================================================ Halloween update: classic Home page
-# The old launcher's home screen (welcome line, big cover columns with a "Manage" button, "Other Stuff" button).
-# It sits in front of the Library and drives the exact same actions as the Library cards, so nothing is lost:
-# every button here clicks / triggers the matching Library card button or menu action.
-from PyQt6.QtCore import (QPropertyAnimation as _HmAnim, QSequentialAnimationGroup as _HmSeq,
-                          QPoint as _HmPoint, QTimer as _HmTimer, Qt as _HmQt, QSize as _HmSize)
-from PyQt6.QtWidgets import (QGraphicsOpacityEffect as _HmOpacity, QMenu as _HmMenu, QScrollArea as _HmScroll,
-                             QFrame as _HmFrame, QDialog as _HmDialog, QWidget as _HmWidget,
-                             QVBoxLayout as _HmV, QHBoxLayout as _HmH, QLabel as _HmLabel,
-                             QPushButton as _HmButton)
-
-_HOME_DEDICATED = ("Edit Current Save", "Edit Current Settings", "Save Data", "Sync Data", "Uninstall")
-
-def _home_source(app, gid):
-    """(primary button, menu) of the Library card for a game, looked up fresh every time."""
-    btn = {"ae": getattr(app, "btn_ae_action", None), "ncz2": getattr(app, "btn_ncz2_action", None)}.get(gid)
-    card = btn.parentWidget() if btn is not None else None
-    more = card.findChild(_HmButton, "MoreButton") if card is not None else None
-    return btn, (more.menu() if more is not None else None)
-
-def _home_toggle(manage_btn, actions_frame, back_btn):
-    """The old Manage / back animation: Manage slides up and fades, the action buttons appear."""
-    def forward():
-        manage_btn.setEnabled(False)
-        opacity = _HmOpacity(manage_btn)
-        manage_btn.setGraphicsEffect(opacity)
-        slide = _HmAnim(manage_btn, b"pos")
-        slide.setDuration(220)
-        slide.setStartValue(_HmPoint(0, 0))
-        slide.setEndValue(_HmPoint(0, -15))
-        fade = _HmAnim(opacity, b"opacity")
-        fade.setDuration(180)
-        fade.setStartValue(1.0)
-        fade.setEndValue(0.0)
-        manage_btn._group = _HmSeq()
-        manage_btn._group.addAnimation(slide)
-        manage_btn._group.addAnimation(fade)
-        def complete():
-            manage_btn.hide()
-            actions_frame.show()
-            back_btn.show()
-        manage_btn._group.finished.connect(complete)
-        manage_btn._group.start()
-
-    def reverse():
-        back_btn.hide()
-        actions_frame.hide()
-        manage_btn.show()
-        opacity = _HmOpacity(manage_btn)
-        manage_btn.setGraphicsEffect(opacity)
-        slide = _HmAnim(manage_btn, b"pos")
-        slide.setDuration(220)
-        slide.setStartValue(_HmPoint(0, -15))
-        slide.setEndValue(_HmPoint(0, 0))
-        fade = _HmAnim(opacity, b"opacity")
-        fade.setDuration(180)
-        fade.setStartValue(0.0)
-        fade.setEndValue(1.0)
-        manage_btn._reverse_group = _HmSeq()
-        manage_btn._reverse_group.addAnimation(slide)
-        manage_btn._reverse_group.addAnimation(fade)
-        def complete_return():
-            manage_btn.setEnabled(True)
-            manage_btn.setGraphicsEffect(None)
-        manage_btn._reverse_group.finished.connect(complete_return)
-        manage_btn._reverse_group.start()
-
-    manage_btn.clicked.connect(forward)
-    back_btn.clicked.connect(reverse)
-
-def _home_column(app, title_html, image, gid, syncers):
-    """One game: cover on the left; title, (status) and the Manage button on the right (same sizes as before)."""
-    column = _HmV()
-    column.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-    row = _HmH()
-    row.setSpacing(15)
-    row.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-
-    cover = _HmLabel()
-    cover.setFixedSize(120, 180)
-    pix = app.get_rounded_pixmap(image, 120, 180, 12) if os.path.exists(image) else None
-    if pix:
-        cover.setPixmap(pix)
-    else:
-        cover.setText("[ Missing\\nCover ]")
-        cover.setAlignment(_HmQt.AlignmentFlag.AlignCenter)
-        cover.setStyleSheet("border: 1px dashed gray; border-radius: 12px; color: gray;")
-
-    details = _HmV()
-    details.setContentsMargins(0, 0, 0, 0)
-    details.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-    head = _HmH()
-    head.setContentsMargins(0, 0, 0, 0)
-    title = _HmLabel(title_html)
-    tf = title.font()
-    tf.setPointSize(11)
-    tf.setBold(True)
-    title.setFont(tf)
-    title.setWordWrap(True)
-    simple = gid in ("nczfront", "chess")
-    title.setFixedSize(130, 30 if simple else 75)
-    head.addWidget(title)
-    back = _HmButton("\\u2715")
-    back.setFixedSize(22, 22)
-    back.setCursor(_HmQt.CursorShape.PointingHandCursor)
-    back.setStyleSheet("QPushButton { border: none; border-radius: 11px; background-color: transparent;"
-                       " font-weight: bold; color: gray; }"
-                       "QPushButton:hover { background-color: rgba(128,128,128,0.25); color: red; }")
-    back.hide()
-    head.addWidget(back, alignment=_HmQt.AlignmentFlag.AlignTop)
-    details.addLayout(head)
-
-    if gid == "nczfront":
-        status = _HmLabel("Checking...")
-        sf = status.font()
-        sf.setBold(True)
-        status.setFont(sf)
-        details.addWidget(status)
-        def sync_status(s=status):
-            src = app.card_status.get("nczfront")
-            if src is not None:
-                s.setText(src.text().replace("\\u25CF", "").strip())
-                s.setStyleSheet(src.styleSheet() + " font-weight: bold;")
-        syncers.append(sync_status)
-    details.addSpacing(8)
-
-    box = _HmWidget()
-    box.setFixedSize(160, 40 if simple else 272)
-    manage = _HmButton("Manage", box)
-    manage.setFixedWidth(100)
-    manage.move(0, 0)
-    frame = _HmWidget(box)
-    frame.hide()
-    lay = _HmV(frame)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(4)
-
-    def add(btn):
-        btn.setFixedWidth(150)
-        lay.addWidget(btn)
-        return btn
-
-    if gid == "nczfront":
-        add(_HmButton("Play")).clicked.connect(lambda _c=False: app.open_nczfront())
-        add(_HmButton("Refresh")).clicked.connect(lambda _c=False: app.check_nczfront_status())
-    elif gid == "chess":
-        add(_HmButton("Play")).clicked.connect(lambda _c=False: app.open_chess())
-    else:
-        def act(text):
-            _b, menu = _home_source(app, gid)
-            for a in (menu.actions() if menu is not None else []):
-                if a.text() == text:
-                    return a
-            return None
-        def trigger(text):
-            a = act(text)
-            if a is not None and a.isEnabled():
-                a.trigger()
-        b_action = add(_HmButton("Install"))
-        b_update = add(_HmButton("Update"))
-        b_uninstall = add(_HmButton("Uninstall"))
-        b_save = add(_HmButton("Edit Current Save"))
-        b_settings = add(_HmButton("Edit Current Settings"))
-        b_csave = add(_HmButton("Save Data"))
-        b_csync = add(_HmButton("Sync Data"))
-        b_more = add(_HmButton("More..."))
-        b_update.hide()
-        b_csave.setToolTip("Upload this device's save and settings to your account")
-        b_csync.setToolTip("Download your account's save and settings to this device")
-        b_action.clicked.connect(lambda _c=False: (lambda s: s[0] is not None and s[0].click())(_home_source(app, gid)))
-        b_update.clicked.connect(lambda _c=False: (lambda u: u is not None and u.click())(app.update_buttons.get(gid)))
-        for btn, text in ((b_uninstall, "Uninstall"), (b_save, "Edit Current Save"),
-                          (b_settings, "Edit Current Settings"), (b_csave, "Save Data"), (b_csync, "Sync Data")):
-            btn.clicked.connect(lambda _c=False, t=text: trigger(t))
-
-        more_menu = _HmMenu(b_more)
-        more_menu.setToolTipsVisible(True)
-        b_more.setMenu(more_menu)
-        def fill_more():
-            for a in more_menu.actions():
-                more_menu.removeAction(a)
-            _b, src = _home_source(app, gid)
-            last_sep = True
-            for a in (src.actions() if src is not None else []):
-                if a.isSeparator():
-                    if not last_sep:
-                        more_menu.addSeparator()
-                        last_sep = True
-                elif a.text() not in _HOME_DEDICATED:
-                    more_menu.addAction(a)
-                    last_sep = False
-        more_menu.aboutToShow.connect(fill_more)
-
-        def sync_game():
-            src, _m = _home_source(app, gid)
-            if src is not None:
-                b_action.setText(src.text())
-                b_action.setEnabled(src.isEnabled())
-            for btn, text in ((b_uninstall, "Uninstall"), (b_save, "Edit Current Save"),
-                              (b_settings, "Edit Current Settings"), (b_csave, "Save Data"),
-                              (b_csync, "Sync Data")):
-                a = act(text)
-                if a is not None:
-                    btn.setEnabled(a.isEnabled())
-                    if btn is b_uninstall:
-                        btn.setVisible(a.isEnabled())
-            upd = app.update_buttons.get(gid)
-            show = upd is not None and not upd.isHidden()
-            b_update.setVisible(show)
-            if upd is not None:
-                b_update.setEnabled(upd.isEnabled())
-        syncers.append(sync_game)
-
-    _home_toggle(manage, frame, back)
-    details.addWidget(box)
-    row.addWidget(cover, 0, _HmQt.AlignmentFlag.AlignTop)
-    row.addLayout(details)
-    column.addLayout(row)
-    column.addStretch()
-    return column
-
-class _HomeOtherStuff(_HmDialog):
-    """"Other Stuff": a button for every page of the launcher (Account, Library, Store, Settings, ...)."""
-    def __init__(self, app):
-        super().__init__(app)
-        self.setWindowTitle("Other Stuff")
-        self.setModal(True)
-        lay = _HmV(self)
-        lay.setContentsMargins(20, 20, 20, 20)
-        lay.setSpacing(10)
-        n = 0
-        for b in app.nav_group.buttons():
-            if b is getattr(app, "_home_nav_btn", None) or b.isHidden():
-                continue
-            name = b.toolTip() or b.text().title()
-            if not name:
-                name = "Account"
-            if name == "Credits":
-                continue                 # credits live at the bottom of Settings now
-            btn = _HmButton(name)
-            btn.setFixedHeight(32)
-            btn.clicked.connect(lambda _c=False, x=b: (self.accept(), x.click()))
-            lay.addWidget(btn)
-            n += 1
-        self.setFixedWidth(220)
-        self.setFixedHeight(40 + 42 * max(n, 1))
-
-def _home_build(app):
-    page = _HmWidget()
-    page.setObjectName("Content")
-    outer = _HmV(page)
-    outer.setContentsMargins(0, 0, 0, 0)
-    scroll = _HmScroll()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(_HmFrame.Shape.NoFrame)
-    outer.addWidget(scroll)
-    body = _HmWidget()
-    body.setObjectName("GridContainer")
-    scroll.setWidget(body)
-    main = _HmV(body)
-    main.setContentsMargins(30, 25, 30, 25)
-    main.addSpacing(15)
-
-    welcome = _HmLabel("Welcome to NCZ Games Launcher! Please select a game to get started.")
-    wf = welcome.font()
-    wf.setPointSize(12)
-    wf.setBold(True)
-    welcome.setFont(wf)
-    welcome.setAlignment(_HmQt.AlignmentFlag.AlignCenter)
-    main.addWidget(welcome)
-    main.addSpacing(25)
-
-    syncers = []
-    def centered(layouts, spacing):
-        row = _HmH()
-        row.setSpacing(spacing)
-        row.addStretch()
-        for l in layouts:
-            row.addLayout(l)
-        row.addStretch()
-        return row
-
-    top = centered([_home_column(app, "Five Nights<br>at NCZ AE<br>", asset_path("fnanczaecover.png"), "ae", syncers),
-                    _home_column(app, "Five Nights<br>at NCZ<br>2", asset_path("fnancz2cover.png"), "ncz2", syncers)], 40)
-    main.addLayout(top)
-    main.addSpacing(20)
-    bottom = centered([_home_column(app, "NCZFront", asset_path("nczfront-cover.png"), "nczfront", syncers),
-                       _home_column(app, "NCZ Chess", asset_path("nczchess.png"), "chess", syncers)], 40)
-    main.addLayout(bottom)
-    main.addStretch()
-
-    main.addSpacing(10)
-
-    def tick():
-        if page.isVisible():
-            for fn in syncers:
-                try:
-                    fn()
-                except RuntimeError:
-                    pass
-    page._home_timer = _HmTimer(page)
-    page._home_timer.setInterval(400)
-    page._home_timer.timeout.connect(tick)
-    page._home_timer.start()
-    tick()
-    return page
-
-_home_prev_init = AdaptiveApp.__init__
-
-def _home_init(self, *a, **k):
-    _home_prev_init(self, *a, **k)
-    try:
-        self.home_page = _home_build(self)
-        self.pages.addWidget(self.home_page)
-        btn = self.make_nav_button("Home", checkable=True)
-        btn.setToolTip("Home")
-        btn.setFixedHeight(44)
-        btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        btn.setIconSize(QSize(18, 18))
-        self.nav_group.addButton(btn, self.pages.indexOf(self.home_page))
-        self._home_nav_btn = btn
-        try:
-            _set_tab_icon(btn, "library")
-        except Exception:
-            pass
-        center = getattr(self, "_nav_center_layout", None)
-        if center is not None:
-            center.insertWidget(0, btn)
-        else:
-            lib = self.nav_group.button(0)
-            lay = lib.parent().layout()
-            lay.insertWidget(lay.indexOf(lib), btn)
-        btn.setChecked(True)
-        self.pages.setCurrentWidget(self.home_page)
-        try:
-            self._nav_center_filter.place()
-        except Exception:
-            pass
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-AdaptiveApp.__init__ = _home_init
-
-
-
-# ================================================================ Halloween update: classic look (from the old launcher)
-# Old grey/blue Fusion palette, native title bar, no nav bar. Home is the launcher; every other page is reached
-# through "Other Stuff" and has a "< Home" bar to come back.
-def _classic_palette(dark):
-    C, R, G = QColor, QPalette.ColorRole, QPalette.ColorGroup
-    p = QPalette()
-    if dark:
-        vals = {R.Window: C(45, 45, 45), R.WindowText: C(230, 230, 230), R.Base: C(32, 32, 32),
-                R.AlternateBase: C(45, 45, 45), R.ToolTipBase: C(45, 45, 45), R.ToolTipText: C(230, 230, 230),
-                R.Text: C(230, 230, 230), R.Button: C(58, 58, 58), R.ButtonText: C(230, 230, 230),
-                R.BrightText: C(255, 80, 80), R.Link: C(42, 130, 218), R.Highlight: C(42, 130, 218),
-                R.HighlightedText: C(255, 255, 255), R.PlaceholderText: C(140, 140, 140)}
-        dis = C(130, 130, 130)
-    else:
-        vals = {R.Window: C(240, 240, 240), R.WindowText: C(20, 20, 20), R.Base: C(255, 255, 255),
-                R.AlternateBase: C(245, 245, 245), R.ToolTipBase: C(255, 255, 255), R.ToolTipText: C(20, 20, 20),
-                R.Text: C(20, 20, 20), R.Button: C(240, 240, 240), R.ButtonText: C(20, 20, 20),
-                R.BrightText: C(200, 0, 0), R.Link: C(0, 100, 200), R.Highlight: C(42, 130, 218),
-                R.HighlightedText: C(255, 255, 255), R.PlaceholderText: C(120, 120, 120)}
-        dis = C(140, 140, 140)
-    for role, col in vals.items():
-        p.setColor(role, col)
-    for role in (R.Text, R.ButtonText, R.WindowText):
-        p.setColor(G.Disabled, role, dis)
-    return p
-
-_CLASSIC_QSS = """
-QLabel#PageTitle { font-size: 22px; font-weight: bold; }
-QLabel#PageCount { color: gray; font-size: 13px; padding-left: 12px; padding-bottom: 3px; }
-QLabel#EmptyState { color: gray; font-size: 14px; padding: 40px; }
-QLabel#RowTitle { font-size: 13px; font-weight: 600; }
-QLabel#RowDesc { color: gray; font-size: 12px; }
-QFrame#Panel, QFrame#AccountCard { border: 1px solid rgba(128,128,128,0.35); border-radius: 10px; }
-QFrame#GameCard { border: 1px solid transparent; border-radius: 12px; }
-QFrame#GameCard:hover { border: 1px solid palette(highlight); }
-QLabel#CardTitle { font-weight: bold; padding-left: 2px; }
-QLabel#CardStatus, QLabel#CardPlaytime { color: gray; font-size: 12px; padding-left: 2px; }
-QLabel#CoverPlaceholder { border: 1px dashed gray; border-radius: 8px; color: gray; }
-QPushButton#Primary { background: palette(highlight); color: white; font-weight: bold; border: none; border-radius: 4px; padding: 6px 14px; }
-QPushButton#Primary:hover { background: #4a9ae8; }
-QPushButton#Primary:pressed { background: #2a6fb8; }
-QPushButton#Primary:disabled { background: rgba(128,128,128,0.3); color: gray; }
-QPushButton#MoreButton { padding: 0; }
-QPushButton#MoreButton::menu-indicator { image: none; width: 0px; }
-QLabel#Avatar { background: palette(highlight); color: white; border-radius: 18px; font-weight: bold; }
-QLabel#AvatarLarge { background: palette(highlight); color: white; border-radius: 40px; font-size: 32px; font-weight: bold; }
-QFrame#AvatarRing { background: transparent; border: 2px solid palette(highlight); border-radius: 48px; }
-QPushButton#LogoutButton { color: #e5484d; border: 1px solid rgba(229,72,77,0.55); }
-QLabel#SyncAvatar { background: palette(highlight); color: white; border-radius: 28px; font-size: 22px; font-weight: bold; }
-QFrame#SyncCard { border: 1px solid rgba(128,128,128,0.35); border-radius: 12px; }
-QFrame#SyncCard:hover, QFrame#SyncCard[selected="true"] { border: 1px solid palette(highlight); }
-QLabel#SyncName { font-size: 14px; font-weight: 600; }
-QMessageBox QPushButton { min-width: 80px; }
-QFrame#SideRail { border-right: 1px solid rgba(128,128,128,0.35); }
-QPushButton#NavButton { background: transparent; border: none; border-left: 3px solid transparent; border-radius: 0; text-align: left; padding: 0px 16px; font-size: 12px; font-weight: bold; }
-QPushButton#NavButton:hover { background: rgba(128,128,128,0.18); }
-QPushButton#NavButton:checked { background: rgba(42,130,218,0.28); border-left: 3px solid palette(highlight); }
-"""
-
-def apply_dark_mode(mode):
-    app = QApplication.instance()
-    if app is None:
-        return
-    app.setStyle("Fusion")
-    use_dark = mode == "on" or (mode == "system" and system_prefers_dark())
-    try:
-        import overlay as _overlay_mod
-        _overlay_mod.set_light(not use_dark)
-    except Exception:
-        pass
-    app.setPalette(_classic_palette(use_dark))
-    app.setStyleSheet(_CLASSIC_QSS)             # Fusion look; only page layout / card rules are kept
-    theme = THEMES["dark" if use_dark else "light"]
-    _theme_state["nav_text"] = theme["nav_text"]
-    _theme_state["nav_active"] = theme["nav_active"]
-    for listener in list(_theme_listeners):
-        try:
-            listener()
-        except Exception:
-            pass
-
-_classic_prev_init = AdaptiveApp.__init__
-
-def _classic_init(self, *a, **k):
-    _classic_prev_init(self, *a, **k)
-    try:
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)     # back to the normal title bar
-        self.setMinimumSize(QSize(800, 640))
-        self.resize(900, 760)
-        self.center_on_screen()
-        top = self.findChild(QFrame, "Sidebar")
-        if top is not None:
-            top.hide()                                                   # the old top bar; its buttons move to the rail
-        rv = getattr(self, "_nav_center_layout", None)
-        proxies = []
-        if rv is not None:
-            for gid_, label in ((6, "Downloads"), (1, "Settings"), (3, "Account")):
-                orig = self.nav_group.button(gid_)
-                if orig is None:
-                    continue
-                pb = QPushButton(label.upper())
-                pb.setObjectName("NavButton")
-                pb.setCheckable(True)
-                pb.setFixedHeight(44)
-                pb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-                pb.setCursor(Qt.CursorShape.PointingHandCursor)
-                pb.clicked.connect(lambda _c=False, o=orig: o.click())
-                rv.insertWidget(rv.count(), pb)                          # below the stretch: bottom of the rail
-                proxies.append((pb, orig))
-            def mirror(*_a):
-                for pb, orig in proxies:
-                    pb.setChecked(orig.isChecked())
-            self.nav_group.buttonToggled.connect(mirror)
-            mirror()
-        def refit(_i=0):                      # Library measures its width only once it is really on screen
-            if self.pages.currentWidget() is self.pages.widget(0):
-                for ms in (0, 120):
-                    QTimer.singleShot(ms, lambda: self.apply_filter(self.search_edit.text()))
-        self.pages.currentChanged.connect(refit)
-        self.setWindowTitle("NCZ Games Launcher")
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-AdaptiveApp.__init__ = _classic_init
-
-
-
-
-# NCZ Chess puts its own look on the whole launcher while it is open and calls _ui_apply_sunset() to take it off again.
-# Inside chess that is fine; everywhere else the classic look is what should come back.
-_classic_prev_sunset = _ui_apply_sunset
-
-def _ui_apply_sunset():
-    if _ch_orig.get("on"):                      # chess is on screen: keep its look
-        _classic_prev_sunset()
-    else:
-        apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
 
 
 if __name__ == "__main__":

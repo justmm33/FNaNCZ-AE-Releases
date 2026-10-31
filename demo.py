@@ -21,6 +21,7 @@ Needs:  pip install PyQt6 pypresence
 import sys
 import os
 import json
+import re
 import math
 import time
 import random
@@ -39,7 +40,7 @@ import http.server
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
-                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor)
+                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect)
 
 # ------------------------------------------------------------------------------------------------ config
@@ -1099,6 +1100,115 @@ def load_logo():
     return pm
 
 
+# ---- NCZ logo (the Discord server icon, fallback assets/ncz.png) + Wikipedia facts for the Downloading / Launching screen
+NCZ_GUILD_ID = "1043135802932203641"
+_LC_FALLBACK_FACTS = [
+    "Honey never spoils: edible honey has been found in ancient Egyptian tombs.",
+    "Octopuses have three hearts and blue blood.",
+    "A day on Venus is longer than a year on Venus.",
+    "Bananas are berries, but strawberries are not.",
+    "Sharks existed before trees did.",
+    "Wombat droppings are cube-shaped.",
+    "The shortest war in history lasted about 40 minutes (Anglo-Zanzibar War, 1896).",
+    "Pac-Man was originally going to be called Puck-Man.",
+    "Sound travels roughly four times faster in water than in air.",
+    "The first computer mouse was made of wood.",
+    "Tetris was created in 1984 by Soviet engineer Alexey Pajitnov.",
+]
+_lc_facts = []
+_lc_fetching = False
+_lc_logo_checked = False
+
+
+def _lc_get(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _lc_logo_cache():
+    return os.path.join(settings_dir(), "ncz_server_icon.png")
+
+
+def _lc_fetch_logo():
+    """widget.json -> instance_invite -> /invites/<code> -> icon hash (needs the server's Widget enabled). Silent on any failure."""
+    global _lc_logo_checked
+    if _lc_logo_checked:
+        return
+    _lc_logo_checked = True
+    cached = _lc_logo_cache()
+    try:
+        if os.path.exists(cached) and time.time() - os.path.getmtime(cached) < 86400:
+            return
+        widget = json.loads(_lc_get(f"https://discord.com/api/v10/guilds/{NCZ_GUILD_ID}/widget.json"))
+        code = str(widget.get("instance_invite") or "").rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z0-9\-]{2,32}", code):
+            return
+        guild = (json.loads(_lc_get(f"https://discord.com/api/v10/invites/{code}")).get("guild") or {})
+        icon = str(guild.get("icon") or "")
+        if str(guild.get("id")) != NCZ_GUILD_ID or not re.fullmatch(r"[A-Za-z0-9_]{5,64}", icon):
+            return
+        raw = _lc_get(f"https://cdn.discordapp.com/icons/{NCZ_GUILD_ID}/{icon}.png?size=256", timeout=10)
+        if raw.startswith(b"\x89PNG") and len(raw) > 200:
+            os.makedirs(settings_dir(), exist_ok=True)
+            with open(cached + ".tmp", "wb") as f:
+                f.write(raw)
+            os.replace(cached + ".tmp", cached)
+    except Exception:
+        pass
+
+
+def _lc_trim(text, limit=170):
+    text = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", text or "")).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    dot = cut.rfind(". ")
+    return cut[:dot + 1] if dot > 60 else cut.rsplit(" ", 1)[0] + "..."
+
+
+def _lc_fetch_facts(n=6):
+    global _lc_fetching
+    try:
+        for _ in range(n):
+            d = json.loads(_lc_get("https://en.wikipedia.org/api/rest_v1/page/random/summary"))
+            ext, title = _lc_trim(d.get("extract", "")), str(d.get("title") or "")
+            if d.get("type") == "standard" and len(ext) >= 60 and title:
+                _lc_facts.append((ext, title))
+    except Exception:
+        pass
+    finally:
+        _lc_fetching = False
+
+
+def lc_prefetch():
+    global _lc_fetching
+    if not _lc_logo_checked:
+        threading.Thread(target=_lc_fetch_logo, daemon=True).start()
+    if len(_lc_facts) < 3 and not _lc_fetching:
+        _lc_fetching = True
+        threading.Thread(target=_lc_fetch_facts, daemon=True).start()
+
+
+def lc_next_fact():
+    lc_prefetch()
+    if _lc_facts:
+        text, title = _lc_facts.pop(0)
+        return text, f"Wikipedia: {title}"
+    return random.choice(_LC_FALLBACK_FACTS), ""
+
+
+def ncz_logo_pixmap(default):
+    """Cached server icon -> assets/ncz.png -> the sign-in icon; centre-cropped to a square."""
+    for path in (_lc_logo_cache(), os.path.join(ASSETS_DIR, "ncz.png")):
+        if os.path.isfile(path):
+            pm = QPixmap(path)
+            if not pm.isNull():
+                side = min(pm.width(), pm.height())
+                return pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+    return default
+
+
 def _a(v):
     return int(max(0, min(255, v)))
 
@@ -1128,6 +1238,9 @@ class LoginWindow(QWidget):
         self.family = load_font_family()          # fallback when an akt_*.ttf is missing
         self.fonts = load_fonts()
         self._logo = load_logo()
+        self._ncz_logo = self._logo
+        self._fact, self._fact_t0 = ("", ""), 0.0
+        lc_prefetch()                       # icon + facts download while you sign in
         self.setWindowIcon(QIcon(self._logo))
 
         # 1920x1080, or scaled down to fit when the screen is smaller
@@ -1346,6 +1459,8 @@ class LoginWindow(QWidget):
             tgt = 1.0 if (wd.isVisible() and wd.hasFocus()) else 0.0
             self._focus[wd] += (tgt - self._focus[wd]) * 0.2
         self._ban_t += ((1.0 if self.state == "banned" else 0.0) - self._ban_t) * 0.06
+        if self.state in ("downloading", "launching") and t - self._fact_t0 > 10.0:
+            self._fact, self._fact_t0 = lc_next_fact(), t
         self.btn_primary.phase = t
         if self.btn_primary.isVisible():
             self.btn_primary.update()
@@ -1451,15 +1566,29 @@ class LoginWindow(QWidget):
             _glow(p, cx, cy, 330 * s, 330 * s, (255, 255, 255), 34 + 12 * math.sin(t * 1.6))
             rect = QRectF(cx - size / 2, cy - size / 2, size, size)
             path = QPainterPath()
-            path.addRoundedRect(rect, 12 * s, 12 * s)
-            if not self._logo.isNull():
+            if self.state in ("downloading", "launching") and not self._ncz_logo.isNull():
+                # loading: the round NCZ logo, spinning
                 p.save()
+                p.translate(cx, cy)
+                p.rotate((t * 140) % 360)
+                box = QRectF(-size / 2, -size / 2, size, size)
+                path.addEllipse(box)
                 p.setClipPath(path)
-                p.drawPixmap(rect.toRect(), self._logo)
+                p.drawPixmap(box, self._ncz_logo, QRectF(self._ncz_logo.rect()))
                 p.restore()
-            p.setPen(QPen(QColor(255, 255, 255, 40), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(path)
+                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(rect)
+            else:
+                path.addRoundedRect(rect, 12 * s, 12 * s)
+                if not self._logo.isNull():
+                    p.save()
+                    p.setClipPath(path)
+                    p.drawPixmap(rect.toRect(), self._logo)
+                    p.restore()
+                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
             p.restore()
 
         # glow under the primary button and the focused field
@@ -1487,6 +1616,21 @@ class LoginWindow(QWidget):
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             p.drawArc(box, int(-t * 360 * 1.3 * 16), 110 * 16)
+
+        # a Wikipedia fact under the progress bar, fading in and out
+        if self.state in ("downloading", "launching") and self._fact[0]:
+            age = t - self._fact_t0
+            fa = max(0.0, min(1.0, age / 0.8, (10.0 - age) / 0.8))
+            text, src = self._fact
+            opt = QTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+            p.setFont(self.make_font(QFont.Weight.Light, 27 * s))
+            p.setPen(QColor(255, 255, 255, _a(215 * fa)))
+            p.drawText(QRectF(ox + 460 * s, oy + 735 * s, 1000 * s, 110 * s), text, opt)
+            if src:
+                p.setFont(self.make_font(QFont.Weight.Normal, 18 * s))
+                p.setPen(QColor(255, 255, 255, _a(120 * fa)))
+                p.drawText(QRectF(ox + 460 * s, oy + 850 * s, 1000 * s, 30 * s), int(Qt.AlignmentFlag.AlignCenter), src)
 
         if self._ban_t > 0.01:
             _glow(p, w / 2, h * 0.5, w * 0.55, h * 0.55, (170, 20, 20), 60 * self._ban_t)
@@ -1583,6 +1727,9 @@ class LoginWindow(QWidget):
         self.lbl_title.setText(TITLES[self.state])
 
     def _go(self, state):
+        if state in ("downloading", "launching") and self.state not in ("downloading", "launching"):
+            self._ncz_logo = ncz_logo_pixmap(self._logo)
+            self._fact, self._fact_t0 = lc_next_fact(), self._t
         self.state = state
         self._apply_state()
         self.relayout()
