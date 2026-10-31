@@ -577,7 +577,8 @@ def load_launcher_settings():
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
                 "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff",
-                "download_server": "1", "archive_tool": "", "discord_pfp_sync": True, "discord_pfp_hash": ""}
+                "download_server": "1", "archive_tool": "", "discord_pfp_sync": True, "discord_pfp_hash": "",
+                "bp_on_startup": False, "bp_on_controller": True, "overlay_sound": True}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -609,7 +610,7 @@ def load_launcher_settings():
                     settings["auto_update"] = loaded["auto_update"]
                 if isinstance(loaded.get("xwayland_mode"), bool):
                     settings["xwayland_mode"] = loaded["xwayland_mode"]
-                for _k in ("start_minimized", "close_to_tray"):
+                for _k in ("start_minimized", "close_to_tray", "bp_on_startup", "bp_on_controller", "overlay_sound"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
                 if isinstance(loaded.get("nsfw_revealed"), bool):
@@ -3743,11 +3744,205 @@ class TaskWorker(QThread):
         else:
             self.done.emit(result)
 
+# ================================================================ Loading card: spinning NCZ logo + a Wikipedia fact
+# Logo = the NCZ Discord server icon (guild 1043135802932203641), cached on disk; if it can't be fetched -> assets/ncz.png.
+# Facts are prefetched in the background (never fetched when the card opens), with a built-in list as the offline fallback.
+from PyQt6.QtCore import QVariantAnimation as _LcAnim, QEasingCurve as _LcEase
+import random as _lc_random
+
+NCZ_GUILD_ID = "1043135802932203641"
+_LC_FALLBACK_FACTS = [
+    "Honey never spoils: edible honey has been found in ancient Egyptian tombs.",
+    "Octopuses have three hearts and blue blood.",
+    "A day on Venus is longer than a year on Venus.",
+    "Bananas are berries, but strawberries are not.",
+    "The Eiffel Tower grows a few centimetres taller in summer because the iron expands in the heat.",
+    "Sharks existed before trees did.",
+    "There are more possible chess games than atoms in the observable universe.",
+    "Wombat droppings are cube-shaped.",
+    "The shortest war in history lasted about 40 minutes (Anglo-Zanzibar War, 1896).",
+    "Pac-Man was originally going to be called Puck-Man.",
+    "Scotland's national animal is the unicorn.",
+    "Sound travels roughly four times faster in water than in air.",
+    "The first computer mouse was made of wood.",
+    "Cleopatra lived closer in time to the Moon landing than to the building of the Great Pyramid.",
+    "Tetris was created in 1984 by Soviet engineer Alexey Pajitnov.",
+]
+_lc_facts = []                     # prefetched Wikipedia facts, consumed one per card
+_lc_fetching = False
+_lc_logo_checked = False
+
+def _lc_cache_dir():
+    # fixed folder (not the per-profile one) so demo.py and every profile share the same cached server icon
+    if sys.platform.startswith("win"):
+        d = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
+    else:
+        d = os.path.expanduser("~/.config/NCZ_Games_Launcher")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _lc_logo_cache():
+    return os.path.join(_lc_cache_dir(), "ncz_server_icon.png")
+
+def ncz_logo_path():
+    """Cached Discord server icon if we have one, else assets/ncz.png, else the launcher icon."""
+    cached = _lc_logo_cache()
+    if os.path.exists(cached) and os.path.getsize(cached) > 200:
+        return cached
+    for name in ("ncz.png", "icon.png"):
+        p = asset_path(name)
+        if os.path.exists(p):
+            return p
+    return ""
+
+def _lc_fetch_logo():
+    """Discord only shows a server's icon hash through its invite, so: widget.json -> instance_invite -> /invites/<code> -> icon.
+    Needs the server's Widget turned on (Server Settings > Widget). Any failure is silent: assets/ncz.png is used."""
+    global _lc_logo_checked
+    if _lc_logo_checked:
+        return
+    _lc_logo_checked = True
+    cached = _lc_logo_cache()
+    try:
+        if os.path.exists(cached) and time.time() - os.path.getmtime(cached) < 86400:
+            return                                    # refreshed at most once a day
+        widget = json.loads(_http_get(f"https://discord.com/api/v10/guilds/{NCZ_GUILD_ID}/widget.json", timeout=8))
+        invite = str(widget.get("instance_invite") or "")
+        code = invite.rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z0-9\-]{2,32}", code):
+            return
+        info = json.loads(_http_get(f"https://discord.com/api/v10/invites/{code}", timeout=8))
+        guild = info.get("guild") or {}
+        icon = str(guild.get("icon") or "")
+        if str(guild.get("id")) != NCZ_GUILD_ID or not re.fullmatch(r"[A-Za-z0-9_]{5,64}", icon):
+            return
+        ext = "gif" if icon.startswith("a_") else "png"
+        raw = _http_get(f"https://cdn.discordapp.com/icons/{NCZ_GUILD_ID}/{icon}.png?size=256", timeout=10)
+        img = QImage.fromData(raw)
+        if not img.isNull():
+            tmp = cached + ".tmp"
+            img.save(tmp, "PNG")
+            os.replace(tmp, cached)
+    except Exception:
+        pass
+
+def _lc_trim(text, limit=170):
+    text = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", text or "")).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    dot = cut.rfind(". ")
+    return cut[:dot + 1] if dot > 60 else cut.rsplit(" ", 1)[0] + "..."
+
+def _lc_fetch_facts(n=6):
+    global _lc_fetching
+    try:
+        for _ in range(n):
+            d = json.loads(_http_get("https://en.wikipedia.org/api/rest_v1/page/random/summary", timeout=8))
+            if d.get("type") != "standard":
+                continue
+            ext = _lc_trim(d.get("extract", ""))
+            title = str(d.get("title") or "")
+            if len(ext) >= 60 and title:
+                _lc_facts.append((ext, title))
+    except Exception:
+        pass
+    finally:
+        _lc_fetching = False
+
+def lc_prefetch():
+    """Call at startup; also tops the queue up whenever it runs low. Never blocks."""
+    global _lc_fetching
+    if not _lc_logo_checked:
+        threading.Thread(target=_lc_fetch_logo, daemon=True).start()
+    if len(_lc_facts) < 3 and not _lc_fetching:
+        _lc_fetching = True
+        threading.Thread(target=_lc_fetch_facts, daemon=True).start()
+
+def lc_next_fact():
+    """-> (text, source_or_empty). Wikipedia fact if one is ready, else a built-in one."""
+    lc_prefetch()
+    if _lc_facts:
+        text, title = _lc_facts.pop(0)
+        return text, f"Wikipedia: {title}"
+    return _lc_random.choice(_LC_FALLBACK_FACTS), ""
+
+_lc_pm_cache = {}
+
+def lc_logo_pixmap():
+    """The NCZ logo as a square pixmap (centre-cropped), cached until the file changes."""
+    path = ncz_logo_path()
+    if not path:
+        return QPixmap()
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        key = (path, 0)
+    pm = _lc_pm_cache.get(key)
+    if pm is None:
+        pm = QPixmap(path)
+        if not pm.isNull():
+            side = min(pm.width(), pm.height())
+            pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+        _lc_pm_cache.clear()
+        _lc_pm_cache[key] = pm
+    return pm
+
+class SpinLogo(QWidget):
+    """The NCZ logo, round, turning smoothly. Only animates while visible."""
+    def __init__(self, size=84, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self.setFixedSize(size + 8, size + 8)
+        self._angle = 0.0
+        self._pm = QPixmap()
+        path = ncz_logo_path()
+        if path:
+            self._pm = QPixmap(path)
+        self._anim = _LcAnim(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(2400)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(_LcEase.Type.Linear)
+        self._anim.valueChanged.connect(self._tick)
+
+    def _tick(self, v):
+        self._angle = float(v)
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._anim.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._anim.stop()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        s = self._size
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(self._angle)
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(-s / 2, -s / 2, s, s))
+        p.setClipPath(clip)
+        if not self._pm.isNull():
+            scaled = self._pm.scaled(s, s, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(int(-scaled.width() / 2), int(-scaled.height() / 2), scaled)
+        else:
+            p.fillRect(QRectF(-s / 2, -s / 2, s, s), QColor("#a666ff"))
+        p.end()
+
 class BusyDialog(QDialog):
     def __init__(self, message, func, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Please wait")
-        self.setFixedSize(300, 90)
+        self.setFixedSize(380, 270)
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self._finished = False
@@ -3756,15 +3951,33 @@ class BusyDialog(QDialog):
         self.error = ""
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 15, 20, 15)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(8)
+        logo = SpinLogo(84)
+        layout.addWidget(logo, 0, Qt.AlignmentFlag.AlignHCenter)
         label = QLabel(message)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        f = label.font()
+        f.setBold(True)
+        label.setFont(f)
         layout.addWidget(label)
         bar = QProgressBar()
         bar.setRange(0, 0)
         bar.setTextVisible(False)
+        bar.setFixedHeight(6)
         layout.addWidget(bar)
+        fact, source = lc_next_fact()
+        fact_label = QLabel(fact)
+        fact_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fact_label.setWordWrap(True)
+        fact_label.setStyleSheet("color: gray;")
+        layout.addWidget(fact_label, 1)
+        if source:
+            src_label = QLabel(source)
+            src_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            src_label.setStyleSheet("color: gray; font-size: 10px;")
+            layout.addWidget(src_label)
 
         self.worker = TaskWorker(func)
         self.worker.done.connect(self._on_done)
@@ -7257,6 +7470,7 @@ def main():
     app._ncz_main_window = window
     _acct_watch_start(window)
     apply_startup_setting()
+    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
     set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
     if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
@@ -16576,7 +16790,42 @@ class _WsClickFrame(QFrame):
         super().mouseReleaseEvent(e)
 
 _WS_MOD_COUNTS = {}   # appid -> number of Workshop items (only successful lookups are cached)
+_WS_COUNT_APPROX = set()   # appids whose count is only a lower bound / estimate (shown as "30+")
 WS_MIN_MODS = 3       # a game is listed in the Workshop picker only with MORE than 2 mods
+_WS_STORE_CACHE = {}  # appid -> True/False: does the Store list the game as supporting the Steam Workshop?
+
+
+def _ws_store_has_workshop(appid):
+    """Store category 30 = 'Steam Workshop'. True / False, or None when the Store couldn't tell."""
+    if appid in _WS_STORE_CACHE:
+        return _WS_STORE_CACHE[appid]
+    res = None
+    try:
+        raw = _http_get("https://store.steampowered.com/api/appdetails?" + urllib.parse.urlencode(
+            {"appids": appid, "filters": "categories", "l": "english"}), timeout=15)
+        d = (json.loads(raw.decode("utf-8", "replace")) or {}).get(str(appid)) or {}
+        if d.get("success"):
+            data = d.get("data")
+            cats = data.get("categories") if isinstance(data, dict) else []
+            res = any(int(c.get("id", 0)) == 30 for c in (cats or []))
+    except Exception:
+        res = None
+    if res is not None:
+        _WS_STORE_CACHE[appid] = res
+    return res
+
+
+def _ws_page_total(text):
+    """Total from the page's own 'Showing 1-30 of N entries' line (and nothing else on the page)."""
+    m = re.search(r'workshopBrowsePagingInfo[^>]*>([^<]{0,160})<', text)
+    if m:
+        n = re.search(r'of\s+([\d][\d,\.\s]*)', m.group(1))
+        if n:
+            digits = re.sub(r"[^\d]", "", n.group(1))
+            if digits:
+                return int(digits)
+    return None
+
 
 class WorkshopCountWorker(QThread):
     done = pyqtSignal(int, int)   # appid, count (-1 = lookup failed)
@@ -16585,19 +16834,64 @@ class WorkshopCountWorker(QThread):
         super().__init__(parent)
         self.appid = appid
 
+    def _api_total(self):
+        key = (load_launcher_settings().get("steam_web_api_key") or "").strip()
+        if not key:
+            return None
+        try:
+            raw = _http_get("https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/?" + urllib.parse.urlencode(
+                {"key": key, "appid": self.appid, "page": 1, "numperpage": 1, "query_type": 1,
+                 "return_total": "true", "filetype": 0}), timeout=20)
+            r = (json.loads(raw.decode("utf-8", "replace")) or {}).get("response") or {}
+            if "total" in r:
+                return int(r["total"])
+        except Exception:
+            pass
+        return None
+
+    def _fetch(self, p):
+        import html as _html_mod
+        params = {"appid": self.appid, "searchtext": "", "childpublishedfileid": 0,
+                  "browsesort": "mostrecent", "section": "readytouseitems", "p": p,
+                  "numperpage": 30, "l": "english"}
+        headers = {"Accept-Language": "en-US,en;q=0.9", "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"}
+        page = _http_get("https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params),
+                         headers=headers, timeout=20).decode("utf-8", "replace")
+        text = _html_mod.unescape(page).replace("\xa0", " ").replace("\u202f", " ")
+        return page, text
+
+    def _page_count(self):
+        page, text = self._fetch(1)
+        items = parse_workshop_items(page)
+        if not items:
+            return 0                                   # no items on the page = no Workshop
+        total = _ws_page_total(text)
+        if total is not None:
+            return total
+        # no total on the page: walk to the real last page and count exactly ((pages - 1) * 30 + items on the last page)
+        last = max([int(x) for x in re.findall(r"[?&;]p=(\d+)", text)] or [1])
+        if last <= 1:
+            return len(items)
+        for _ in range(5):
+            pg, tx = self._fetch(last)
+            nxt = max([int(x) for x in re.findall(r"[?&;]p=(\d+)", tx)] or [last])
+            if nxt > last:
+                last = nxt
+                continue
+            return (last - 1) * 30 + len(parse_workshop_items(pg))
+        _WS_COUNT_APPROX.add(self.appid)
+        return last * 30
+
     def run(self):
         try:
-            params = {"appid": self.appid, "searchtext": "", "childpublishedfileid": 0,
-                      "browsesort": "trend", "section": "readytouseitems", "p": 1,
-                      "numperpage": 30, "l": "english", "days": 7}
-            headers = {"Accept-Language": "en-US,en;q=0.9", "Cookie": "birthtime=568022401; lastagecheckage=1-0-1988"}
-            url = "https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params)
-            page = _http_get(url, headers=headers, timeout=20).decode("utf-8", "replace")
-            m = re.search(r"of\s+([\d,\.]+)\s+entries", page)
-            count = int(re.sub(r"[^\d]", "", m.group(1))) if m else len(parse_workshop_items(page))
-            self.done.emit(self.appid, count)
+            if _ws_store_has_workshop(self.appid) is False:      # the game has no Workshop at all
+                self.done.emit(self.appid, 0)
+                return
+            total = self._api_total()                            # exact, when a Steam Web API key is saved
+            self.done.emit(self.appid, total if total is not None else self._page_count())
         except Exception:
             self.done.emit(self.appid, -1)
+
 
 class WorkshopBrowserWorker(QThread):
     """Opens the game's Steam Workshop in a visible Playwright browser and reports every item the user subscribes to.
@@ -18815,6 +19109,9 @@ class _PwHeadlessKey(_QObject):
     def eventFilter(self, obj, ev):
         if (ev.type() == _QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_H
                 and ev.modifiers() == Qt.KeyboardModifier.NoModifier and not ev.isAutoRepeat()):
+            bp = getattr(self.window, "_big_picture", None)
+            if bp is not None and getattr(bp, "_kb", None) is not None:
+                return False  # Big Picture's on-screen keyboard is open: H is just a letter
             w = QApplication.focusWidget()
             if isinstance(w, (QLineEdit, _QTextEdit, _QPlainTextEdit, _QAbstractSpinBox)) or \
                     (isinstance(w, QComboBox) and w.isEditable()):
@@ -37204,7 +37501,7 @@ class NczChessPage(QWidget):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
-        card, cl = self._card("NCZ Bots", "Play the NCZ crew. Their Elo is a target strength, and bot games are unrated.")
+        card, cl = self._card("NCZ Bots", "Bots that resemble us when youre bored and everyones offline")
         opts = QHBoxLayout()
         self.tc_ncz = self._tc_combo(0)
         self.ncz_color = QComboBox()
@@ -39842,7 +40139,8 @@ def assess_requirements(reqs, platforms, system):
 # Full-screen Library + Store for a couch / controller. Everything is painted by ONE widget (no widget per game), it only
 # animates while something is moving, and it SLEEPS while a game runs (window hidden, controller closed, timers
 # stopped) and wakes up again when the game closes.
-# Tabs: Library (cover carousel) and Store (Steam browser: categories, search, details, add to library). LB/RB switch tabs.
+# Tabs: Library (cover carousel), Store (Steam browser), Friends, Downloads and Workshop. LB/RB switch tabs.
+# An on-screen keyboard opens for text input (Store search when a controller is in use, friend messages, Workshop search).
 # Open it: "Big Picture" button in the Library header, Ctrl+Shift+B, or start the launcher with --bigpicture.
 from PyQt6.QtCore import QVariantAnimation, QPropertyAnimation, QEasingCurve, QSocketNotifier
 from PyQt6.QtGui import QShortcut, QLinearGradient, QFontMetrics
@@ -39951,7 +40249,7 @@ class _BPInput(QObject):
                 if typ & 0x80:                             # initial-state events
                     continue
                 if typ == 1 and val == 1:                  # button down (Xbox layout: A B X Y LB RB back start)
-                    name = {0: "accept", 1: "back", 3: "alt", 4: "prev", 5: "next", 7: "accept"}.get(num)
+                    name = {0: "accept", 1: "back", 2: "x", 3: "alt", 4: "prev", 5: "next", 7: "start"}.get(num)
                     if name:
                         self.action.emit(name)
                 elif typ == 2:                             # axis: 0/1 left stick, 6/7 d-pad
@@ -39995,7 +40293,7 @@ class _BPInput(QObject):
             self._poll.setInterval(16)
         b, g = st.pad.wButtons, st.pad
         new, self._xi_prev = b & ~self._xi_prev, b
-        for mask, name in ((0x1000, "accept"), (0x2000, "back"), (0x0100, "prev"), (0x0200, "next"), (0x0010, "accept"), (0x8000, "alt")):
+        for mask, name in ((0x1000, "accept"), (0x2000, "back"), (0x0100, "prev"), (0x0200, "next"), (0x0010, "start"), (0x8000, "alt"), (0x4000, "x")):
             if new & mask:
                 self.action.emit(name)
         dx = (1 if b & 8 else -1 if b & 4 else 0) or (1 if g.lx > 16000 else -1 if g.lx < -16000 else 0)
@@ -40109,6 +40407,11 @@ class _BigPicture(QWidget):
         self._stimer.setInterval(600)
         self._stimer.timeout.connect(self._store_reset)
         self._wheel = 0
+        self._lfact, self._lfact_t, self._lseen = None, 0.0, False      # loading card: current fact, when it was picked, drawn this frame?
+        self._ltimer = QTimer(self)                                      # ticks only while a loading card is on screen
+        self._ltimer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._ltimer.setInterval(16)
+        self._ltimer.timeout.connect(self.update)
 
         self._input = _BPInput(self)
         self._input.action.connect(self._act)
@@ -40159,6 +40462,7 @@ class _BigPicture(QWidget):
     def _stop_awake(self):
         self._input.stop()
         self._clock.stop()
+        self._ltimer.stop()
         for a in (self._anim, self._sanim, self._tanim, self._banim, self._fade):
             a.stop()
         self._stimer.stop()
@@ -40349,7 +40653,7 @@ class _BigPicture(QWidget):
             if self._items and 0 <= self._sel < len(self._items):
                 it = self._items[self._sel]
                 return ("lib", it["title"]), it["pix"]
-        elif self._sitems and 0 <= self._ssel < len(self._sitems):
+        elif self._tab == 1 and self._sitems and 0 <= self._ssel < len(self._sitems):
             it = self._sitems[self._ssel]
             if it["path"] and not (it["nsfw"] and not nsfw_revealed()):
                 pm = QPixmap(it["path"])
@@ -40364,8 +40668,7 @@ class _BigPicture(QWidget):
             return
         small = None
         if pix is not None and not pix.isNull():     # shrink twice = soft blur, tiny in memory
-            small = pix.scaled(48, 72, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            small = small.scaled(16, 24, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            small = _ncz_dominant_pixmap(pix)        # one flat colour: the cover's most repeated colour (no pixelated art)
         self._bg_prev, self._bg_cur, self._bg_key = self._bg_cur, small, key
         self._banim.stop()
         if animate and self.isVisible():
@@ -40379,7 +40682,7 @@ class _BigPicture(QWidget):
 
     # ---------------------------------------------------------------- navigation
     def _switch_tab(self, t):
-        t %= 2
+        t %= _BP_NTABS
         if t == self._tab:
             return
         self._tabdir = 1 if t > self._tab else -1
@@ -40389,6 +40692,7 @@ class _BigPicture(QWidget):
             self._refresh()
         if t == 1 and not self._sstarted:
             self._store_reset()
+        self._x_enter(t)
         self._tabt = 0.0
         self._tanim.stop()
         self._tanim.setStartValue(0.0)
@@ -40833,6 +41137,7 @@ class _BigPicture(QWidget):
 
     # ---------------------------------------------------------------- painting
     def paintEvent(self, e):
+        self._lseen = False
         p = QPainter(self)
         p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.TextAntialiasing)
         w, h = self.width(), self.height()
@@ -40862,14 +41167,18 @@ class _BigPicture(QWidget):
         p.translate((1 - k) * self._tabdir * w * 0.04, 0)
         if self._tab == 0:
             self._paint_library(p, w, h, m, acc, k)
-        else:
+        elif self._tab == 1:
             self._paint_store(p, w, h, m, acc, k)
+        else:
+            self._paint_extra(p, w, h, m, acc, k)
         p.restore()
         p.setOpacity(1.0)
 
         self._paint_footer(p, w, h, m)
         if self._detail is not None:
             self._paint_detail(p, w, h, acc)
+        if self._kb is not None:
+            self._paint_kb(p, w, h, acc)
         if self._toast:
             p.setFont(self._font(h * 0.026, True))
             tw_ = QFontMetrics(p.font()).horizontalAdvance(self._toast) + h * 0.08
@@ -40879,6 +41188,12 @@ class _BigPicture(QWidget):
             p.drawRoundedRect(box, h * 0.03, h * 0.03)
             p.setPen(QColor(245, 245, 252))
             p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), self._toast)
+        if self._lseen:
+            if not self._ltimer.isActive():
+                self._ltimer.start()
+        else:
+            self._ltimer.stop()
+            self._lfact = None
         p.end()
 
     def _paint_header(self, p, w, h, m, acc):
@@ -40887,27 +41202,34 @@ class _BigPicture(QWidget):
         al_c = int(Qt.AlignmentFlag.AlignCenter)
         p.setFont(self._font(h * 0.03, True))
         p.setPen(QColor(240, 240, 250))
-        p.drawText(QRectF(m, h * 0.035, w * 0.2, h * 0.07), al_l, "NCZ")
 
-        # tab bar (centered pill)
-        labels = ("Library", "Store")
-        tf = self._font(h * 0.026, True)
-        fm = QFontMetrics(tf)
-        bw = max(fm.horizontalAdvance(t) for t in labels) + h * 0.07
+        # tab bar (centered pill); every tab has its own width and the font shrinks a little if five tabs don't fit
+        labels = self._tab_labels()
         bh = h * 0.058
-        total = bw * len(labels) + h * 0.012
-        x0, y0 = (w - total) / 2, h * 0.041
+        left_b, right_b = m + w * 0.06, w - m - w * 0.07 - h * 0.17 - h * 0.02 - h * 0.062
+        size = 0.026
+        while True:
+            tf = self._font(h * size, True)
+            fm = QFontMetrics(tf)
+            widths = [fm.horizontalAdvance(t) + h * 0.05 for t in labels]
+            if sum(widths) + h * 0.012 <= right_b - left_b or size < 0.016:
+                break
+            size -= 0.002
+        total = sum(widths) + h * 0.012
+        x0, y0 = max(left_b, min((w - total) / 2, right_b - total)), h * 0.041
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(255, 255, 255, 22))
         p.drawRoundedRect(QRectF(x0, y0, total, bh + h * 0.012), (bh + h * 0.012) / 2, (bh + h * 0.012) / 2)
         self._tab_rects = []
+        tx = x0 + h * 0.006
         for n, t in enumerate(labels):
-            r = QRectF(x0 + h * 0.006 + n * bw, y0 + h * 0.006, bw, bh)
+            r = QRectF(tx, y0 + h * 0.006, widths[n], bh)
+            tx += widths[n]
             self._tab_rects.append(r)
             if n == self._tab:
                 p.setBrush(acc)
                 p.drawRoundedRect(r, bh / 2, bh / 2)
-                if self._zone == "tabs":
+                if self._zone == "tabs" and not getattr(self, "_hsel", None):
                     p.setPen(QPen(QColor(255, 255, 255, 230), max(2.0, h * 0.004)))
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     g = h * 0.005
@@ -40931,20 +41253,34 @@ class _BigPicture(QWidget):
         p.setFont(self._font(h * 0.02))
         p.setPen(QColor(220, 220, 235))
         p.drawText(self._exit_rect, al_c, "Exit")
+        # settings cog wheel (left of Exit)
+        cs = self._exit_rect.height()
+        self._cog_rect = QRectF(self._exit_rect.left() - h * 0.014 - cs, self._exit_rect.top(), cs, cs)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 28))
+        p.drawEllipse(self._cog_rect)
+        _bpe_draw_cog(p, self._cog_rect.adjusted(cs * 0.2, cs * 0.2, -cs * 0.2, -cs * 0.2), QColor(220, 220, 235))
+        if self._zone == "tabs" and getattr(self, "_hsel", None):
+            self._x_ring(p, self._cog_rect if self._hsel == "cog" else self._exit_rect,
+                         cs / 2 if self._hsel == "cog" else h * 0.023)
 
     def _paint_footer(self, p, w, h, m):
         al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        if self._detail is not None:
+        if self._kb is not None:
+            hint = "Arrows  Move      A  Type      X  Delete      Y  Space      LB  Shift      RB  123      Start  Done      B  Close"
+        elif self._detail is not None:
             hint = "Left / Right  Choose      A / Enter  Select      B / Esc  Close"
         elif self._tab == 0:
-            hint = "Left / Right  Browse      A / Enter  Launch      LB / RB  Store      B / Esc  Exit      Type a letter to jump"
+            hint = "Left / Right  Browse      A / Enter  Launch      X  Game options      LB / RB  Switch tab      B / Esc  Exit"
+        elif self._tab == 1:
+            hint = "Arrows  Browse      A / Enter  Details      Y or type  Search      LB / RB  Switch tab      B / Esc  Back"
         else:
-            hint = "Arrows  Browse      A / Enter  Details      Y or type  Search      LB / RB  Library      B / Esc  Back"
+            hint = self._x_hint()
         p.setFont(self._font(h * 0.0185))
         p.setPen(QColor(150, 150, 175))
         p.drawText(QRectF(m, h * 0.93, w * 0.78, h * 0.04), al_l, hint)
-        if self._detail is None:
+        if self._detail is None and self._tab < 2 and self._kb is None:
             n, sel = (len(self._items), self._sel) if self._tab == 0 else (len(self._sitems), self._ssel)
             if n:
                 txt = "%d / %d" % (sel + 1, n)
@@ -41077,6 +41413,57 @@ class _BigPicture(QWidget):
                 p.drawText(r, al_c, _BP_CATS[n - 1][0])
         p.restore()
 
+    def _paint_loading(self, p, w, h, area, msg):
+        """Spinning NCZ logo + message + a Wikipedia fact. Drives its own 33 ms timer only while it is visible."""
+        from PyQt6.QtGui import QTextOption
+        self._lseen = True
+        now = time.time()
+        if self._lfact is None or now - self._lfact_t > 10:
+            self._lfact, self._lfact_t = lc_next_fact(), now
+        age = now - self._lfact_t
+        fa = max(0.0, min(1.0, age / 0.8, (10.0 - age) / 0.8))
+        size = h * 0.17
+        cx, cy = area.center().x(), area.top() + area.height() * 0.36
+        pm = lc_logo_pixmap()
+        side = max(8, int(size))
+        dpr = self.devicePixelRatioF()
+        key = (pm.cacheKey(), side, dpr)
+        if getattr(self, "_lpm_key", None) != key:       # round logo rendered once, then only rotated + blitted each frame
+            px = int(side * dpr)
+            rp = QPixmap(px, px)
+            rp.fill(Qt.GlobalColor.transparent)
+            q = QPainter(rp)
+            q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addEllipse(QRectF(0, 0, px, px))
+            q.setClipPath(clip)
+            if pm.isNull():
+                q.fillRect(QRectF(0, 0, px, px), QColor(166, 102, 255))
+            else:
+                q.drawPixmap(QRectF(0, 0, px, px), pm, QRectF(pm.rect()))
+            q.end()
+            rp.setDevicePixelRatio(dpr)
+            self._lpm, self._lpm_key = rp, key
+        p.save()
+        p.translate(cx, cy)
+        p.rotate((now * 140) % 360)
+        p.drawPixmap(QPointF(-side / 2.0, -side / 2.0), self._lpm)
+        p.restore()
+        text, src = self._lfact
+        y = cy + size / 2 + h * 0.025
+        p.setFont(self._font(h * 0.032))
+        p.setPen(QColor(200, 200, 220))
+        p.drawText(QRectF(0, y, w, h * 0.05), int(Qt.AlignmentFlag.AlignCenter), msg)
+        opt = QTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+        p.setFont(self._font(h * 0.024))
+        p.setPen(QColor(175, 175, 200, int(225 * fa)))
+        p.drawText(QRectF(w * 0.26, y + h * 0.07, w * 0.48, h * 0.1), text, opt)
+        if src:
+            p.setFont(self._font(h * 0.017))
+            p.setPen(QColor(150, 150, 175, int(170 * fa)))
+            p.drawText(QRectF(w * 0.26, y + h * 0.175, w * 0.48, h * 0.03), int(Qt.AlignmentFlag.AlignCenter), src)
+
     def _paint_store(self, p, w, h, m, acc, k):
         al_c = int(Qt.AlignmentFlag.AlignCenter)
         p.setOpacity(k)
@@ -41088,7 +41475,10 @@ class _BigPicture(QWidget):
             p.setFont(self._font(h * 0.032))
             p.setPen(QColor(200, 200, 220))
             msg = self._serror or ("Loading games..." if (self._sloading or not self._sstarted) else "No games found")
-            p.drawText(QRectF(0, top, w, bottom - top), al_c, msg)
+            if msg == "Loading games...":
+                self._paint_loading(p, w, h, QRectF(0, top, w, bottom - top), msg)
+            else:
+                p.drawText(QRectF(0, top, w, bottom - top), al_c, msg)
             return
         p.save()
         p.setClipRect(QRectF(0, top, w, bottom - top))
@@ -41207,6 +41597,3034 @@ class _BigPicture(QWidget):
             p.drawText(r, al_c, text)
 
 
+# ================================================================ Big Picture extras
+# On-screen keyboard (controller friendly) + three more tabs: Friends, Downloads, Workshop.
+# Added as a separate layer on top of _BigPicture (same pattern as _bp_open below): the original methods keep doing their
+# job, these wrappers only take over when the keyboard is open or one of the new tabs (index >= 2) is showing.
+from PyQt6.QtCore import QRect
+from PyQt6.QtGui import QBrush
+
+_BP_NTABS = 5                       # Library, Store, Friends, Downloads, Workshop (+ Fan Games, GMod Addons: set at runtime)
+_bp_friend_listeners = []           # called after FriendsPage finished a refresh
+
+
+class _BPKeys:
+    """On-screen keyboard model (no Qt): layouts, the highlighted key and the text being typed."""
+
+    @staticmethod
+    def layout(shift, sym):
+        def ch(s, up=False):
+            return [((c.upper() if up else c), (c.upper() if up else c), 1.0) for c in s]
+        if sym:
+            rows = [ch("1234567890"), ch("!@#$%^&*()"), ch("-_=+[]{}\\|"), ch(";:'\",.?/") + [("Del", "@del", 2.0)]]
+            bottom = [("abc", "@sym", 1.5), ("<", "<", 1.0), ("Space", "@space", 4.5), (">", ">", 1.0), ("Done", "@done", 2.0)]
+        else:
+            rows = [ch("1234567890"), ch("qwertyuiop", shift), ch("asdfghjkl'", shift),
+                    [("Shift", "@shift", 1.5)] + ch("zxcvbnm", shift) + [("Del", "@del", 1.5)]]
+            bottom = [("123", "@sym", 1.5), (",", ",", 1.0), ("Space", "@space", 4.5), (".", ".", 1.0), ("Done", "@done", 2.0)]
+        rows.append(bottom)
+        return rows
+
+    def __init__(self, text="", maxlen=120):
+        self.text, self.maxlen = text, maxlen
+        self.shift = self.sym = False
+        self.r, self.c = 2, 4
+
+    def rows(self):
+        return self.layout(self.shift, self.sym)
+
+    @staticmethod
+    def _centers(row):
+        tot, x, out = sum(k[2] for k in row), 0.0, []
+        for k in row:
+            out.append((x + k[2] / 2.0) / tot)
+            x += k[2]
+        return out
+
+    def clamp(self):
+        rows = self.rows()
+        self.r = max(0, min(len(rows) - 1, self.r))
+        self.c = max(0, min(len(rows[self.r]) - 1, self.c))
+
+    def move(self, dx, dy):
+        self.clamp()
+        rows = self.rows()
+        if dy:
+            cx = self._centers(rows[self.r])[self.c]
+            self.r = max(0, min(len(rows) - 1, self.r + dy))
+            cs = self._centers(rows[self.r])
+            self.c = min(range(len(cs)), key=lambda i: abs(cs[i] - cx))
+        if dx:
+            self.c = (self.c + dx) % len(rows[self.r])
+
+    def insert(self, s):
+        if len(self.text) + len(s) > self.maxlen:
+            return False
+        self.text += s
+        return True
+
+    def backspace(self):
+        if not self.text:
+            return False
+        self.text = self.text[:-1]
+        return True
+
+    def toggle_shift(self):
+        if not self.sym:
+            self.shift = not self.shift
+
+    def toggle_sym(self):
+        self.sym, self.shift = not self.sym, False
+        self.clamp()
+
+    def press(self, r=None, c=None):
+        """Presses the highlighted key (or key r, c). Returns 'done', 'changed' or ''."""
+        if r is not None:
+            self.r, self.c = r, c
+        self.clamp()
+        act = self.rows()[self.r][self.c][1]
+        if act == "@done":
+            return "done"
+        if act == "@shift":
+            self.toggle_shift()
+            return ""
+        if act == "@sym":
+            self.toggle_sym()
+            return ""
+        if act == "@del":
+            return "changed" if self.backspace() else ""
+        if act == "@space":
+            return "changed" if self.insert(" ") else ""
+        if self.insert(act):
+            self.shift = False
+            return "changed"
+        return ""
+
+
+def _bpm(name):
+    """Attach the decorated function to _BigPicture as method `name` (the original is kept in _bpx_o by the caller)."""
+    def deco(f):
+        setattr(_BigPicture, name, f)
+        return f
+    return deco
+
+
+def _bpx_signed(fp):
+    try:
+        return bool(fp._signed_in())
+    except Exception:
+        return False
+
+
+_bpx_o = {n: getattr(_BigPicture, n) for n in ("__init__", "enter", "leave", "_show_awake", "_stop_awake", "_act",
+                                                "keyPressEvent", "mousePressEvent", "wheelEvent", "_chip_accept")}
+
+
+def _bpx_connected(self):
+    """True while a game controller is plugged in (Linux js device open / Windows XInput pad answering)."""
+    if sys.platform.startswith("win"):
+        return self._xi is not None and self._poll.interval() == 16
+    return self._fd is not None
+
+
+_BPInput.connected = _bpx_connected
+
+# FriendsPage tells the Big Picture when a refresh finished (it runs on the GUI thread already)
+_bpx_fp_fetched = FriendsPage._on_fetched
+
+
+def _bpx_fp_on_fetched(self, res, err):
+    _bpx_fp_fetched(self, res, err)
+    for fn in list(_bp_friend_listeners):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+FriendsPage._on_fetched = _bpx_fp_on_fetched
+
+
+# ---------------------------------------------------------------- setup / lifecycle
+@_bpm("__init__")
+def _bpx_init(self, app):
+    _bpx_o["__init__"](self, app)
+    self._kb = None                     # open on-screen keyboard: {"k": _BPKeys, "title", "on_change", "on_submit", "rects"}
+    self._pad_last = False              # True while the controller was the last thing used
+    self._from_key = False
+    self._xhits = []                    # (rect, tag) of clickable things painted by the extra tabs
+    self._xscroll = self._xtarget = 0.0
+    self._xticks = 0
+    self._xwheel = False
+    self._xanim = QVariantAnimation(self)
+    self._xanim.setDuration(200)
+    self._xanim.setEasingCurve(QEasingCurve.Type.OutCubic)
+    self._xanim.valueChanged.connect(self._x_on_scroll)
+    self._xtimer = QTimer(self)         # runs only while Friends / Downloads / Workshop is showing
+    self._xtimer.setInterval(600)
+    self._xtimer.timeout.connect(self._x_tick)
+    self._fr = {"rows": [], "sel": 0, "btn": 0, "chat": None, "cbtn": 0, "msgs": [], "me": "", "moff": 0,
+                "loading": False, "sending": False, "av": {}}
+    self._dl = {"sel": 0, "btn": 0}
+    self._wk = {"mode": "games", "games": [], "gsel": 0, "appid": None, "title": "", "items": [], "seen": set(),
+                "sel": 0, "page": 1, "token": 0, "loading": False, "err": "", "query": "", "sort": 0, "more": False,
+                "pix": {}, "asked": set(), "workers": []}
+    _bp_friend_listeners.append(self._fr_changed)
+
+
+@_bpm("enter")
+def _bpx_enter_w(self):
+    _bpx_o["enter"](self)
+    if self._tab >= 2:
+        self._x_enter(self._tab)
+
+
+@_bpm("_show_awake")
+def _bpx_show_awake(self):
+    _bpx_o["_show_awake"](self)
+    if self._tab >= 2:
+        self._xtimer.start()
+
+
+@_bpm("_stop_awake")
+def _bpx_stop_awake(self):
+    _bpx_o["_stop_awake"](self)
+    self._xtimer.stop()
+    self._xanim.stop()
+    self._kb = None
+
+
+@_bpm("leave")
+def _bpx_leave(self, show_main=True):
+    _bpx_o["leave"](self, show_main)
+    self._wk["pix"].clear()
+    self._wk["asked"].clear()
+    self._fr["av"].clear()
+    self._fr["chat"] = None
+
+
+@_bpm("_tab_labels")
+def _bpx_tab_labels(self):
+    fp = getattr(self._app, "friends_page", None)
+    try:
+        nreq = len(fp.requests or {}) if fp is not None else 0
+    except Exception:
+        nreq = 0
+    try:
+        nact = sum(1 for i in self._dl_infos() if i["state"] == "active")
+    except Exception:
+        nact = 0
+    return ("Library", "Store", "Friends" + (" (%d)" % nreq if nreq else ""),
+            "Downloads" + (" (%d)" % nact if nact else ""), "Workshop")
+
+
+@_bpm("_use_vkb")
+def _bpx_use_vkb(self):
+    try:
+        return bool(self._pad_last and self._input.connected())
+    except Exception:
+        return False
+
+
+@_bpm("_x_on_scroll")
+def _bpx_on_scroll(self, v):
+    self._xscroll = float(v)
+    self.update()
+
+
+@_bpm("_x_ensure")
+def _bpx_ensure(self, top, bot, vh):
+    t = self._xtarget
+    if top < t:
+        t = top
+    elif bot > t + vh:
+        t = bot - vh
+    t = max(0.0, t)
+    if t != self._xtarget:
+        self._xtarget = t
+        self._xanim.stop()
+        self._xanim.setStartValue(self._xscroll)
+        self._xanim.setEndValue(t)
+        self._xanim.start()
+
+
+@_bpm("_x_reset_scroll")
+def _bpx_reset_scroll(self):
+    self._xanim.stop()
+    self._xscroll = self._xtarget = 0.0
+
+
+@_bpm("_x_enter")
+def _bpx_x_enter(self, t):
+    self._xtimer.stop()
+    self._xticks = 0
+    self._x_reset_scroll()
+    if t == 2:
+        self._fr_enter()
+    elif t == 3:
+        self._dl_ensure()
+    elif t == 4:
+        self._ws_enter()
+    if t >= 2 and self._active and not self._asleep:
+        self._xtimer.start()
+
+
+@_bpm("_x_tick")
+def _bpx_tick(self):
+    self._xticks += 1
+    if self._tab == 2:
+        fp = getattr(self._app, "friends_page", None)
+        if fp is not None and _bpx_signed(fp):
+            if self._xticks % 25 == 0:
+                fp.refresh()
+            if self._fr["chat"] and self._xticks % 8 == 0 and self._kb is None:
+                self._fr_load_chat(self._fr["chat"], quiet=True)
+    if self._tab >= 2:
+        self.update()
+
+
+# ---------------------------------------------------------------- input
+@_bpm("_act")
+def _bpx_act(self, name):
+    if not self._from_key:
+        self._pad_last = True
+    if name == "start":                                   # Start = "Done" on the keyboard, otherwise the same as A
+        name = "submit" if self._kb is not None else "accept"
+    if self._kb is not None:
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self._kb_act(name)
+        return
+    if self._detail is None and name == "alt" and self._tab == 1 and self._use_vkb():
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self._zone, self._chip = "chips", 0
+        self._kb_open_store()
+        return
+    if self._tab >= 2 and self._detail is None:
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        if name == "prev":
+            self._switch_tab(self._tab - 1)
+        elif name == "next":
+            self._switch_tab(self._tab + 1)
+        elif self._zone == "tabs" and name in ("left", "right"):
+            self._switch_tab(self._tab + (1 if name == "right" else -1))
+            self._zone = "tabs"
+        elif self._zone == "tabs" and name == "down":
+            self._zone = "content"
+        elif self._zone == "tabs" and name in ("up", "accept"):
+            pass
+        else:
+            self._x_act(name)
+        self.update()
+        return
+    _bpx_o["_act"](self, name)
+
+
+@_bpm("_chip_accept")
+def _bpx_chip_accept(self):
+    if self._chip == 0 and self._use_vkb():
+        self._kb_open_store()
+        return
+    _bpx_o["_chip_accept"](self)
+
+
+@_bpm("keyPressEvent")
+def _bpx_key_press(self, e):
+    self._pad_last = False
+    if self._kb is not None:
+        self._kb_key(e)
+        return
+    if self._tab >= 2 and self._detail is None:
+        self._x_key(e)
+        return
+    self._from_key = True
+    try:
+        _bpx_o["keyPressEvent"](self, e)
+    finally:
+        self._from_key = False
+
+
+@_bpm("mousePressEvent")
+def _bpx_mouse_press(self, e):
+    self._pad_last = False
+    pt = e.position()
+    if self._kb is not None:
+        for r, ri, ci in self._kb["rects"]:
+            if r.contains(pt):
+                self._kb_press(ri, ci)
+                return
+        self._kb_close()
+        return
+    if self._tab >= 2 and self._detail is None:
+        if self._exit_rect.contains(pt):
+            self.leave(True)
+            return
+        for n, r in enumerate(self._tab_rects):
+            if r.contains(pt):
+                self._zone = "content"
+                self._switch_tab(n)
+                return
+        self._x_click(pt)
+        return
+    _bpx_o["mousePressEvent"](self, e)
+
+
+@_bpm("wheelEvent")
+def _bpx_wheel(self, e):
+    if self._kb is not None:
+        return
+    if self._tab >= 2 and self._detail is None:
+        self._wheel += e.angleDelta().y() + e.angleDelta().x()
+        self._zone = "content"
+        self._xwheel = True
+        try:
+            while abs(self._wheel) >= 120:
+                self._x_act("up" if self._wheel > 0 else "down")
+                self._wheel -= 120 if self._wheel > 0 else -120
+        finally:
+            self._xwheel = False
+        return
+    _bpx_o["wheelEvent"](self, e)
+
+
+@_bpm("_x_key")
+def _bpx_x_key(self, e):
+    k, K = e.key(), Qt.Key
+    self._from_key = True
+    try:
+        if k == K.Key_Tab:
+            self._switch_tab(self._tab + 1)
+        elif k == K.Key_Backtab:
+            self._switch_tab(self._tab - 1)
+        elif k == K.Key_Left:
+            self._act("left")
+        elif k == K.Key_Right:
+            self._act("right")
+        elif k == K.Key_Up:
+            self._act("up")
+        elif k == K.Key_Down:
+            self._act("down")
+        elif k in (K.Key_Return, K.Key_Enter, K.Key_Space):
+            self._act("accept")
+        elif k in (K.Key_Escape, K.Key_Backspace, K.Key_F11):
+            self._act("back")
+        elif k in (K.Key_Slash, K.Key_F):
+            self._act("alt")
+        elif k == K.Key_S:
+            self._act("x")
+    finally:
+        self._from_key = False
+
+
+@_bpm("_x_act")
+def _bpx_x_act(self, name):
+    if self._tab == 2:
+        self._fr_act(name)
+    elif self._tab == 3:
+        self._dl_act(name)
+    elif self._tab == 4:
+        self._ws_act(name)
+    self.update()
+
+
+def _bpx_top(self):
+    if not self._xwheel:
+        self._zone = "tabs"
+
+
+@_bpm("_x_click")
+def _bpx_click(self, pt):
+    for r, tag in reversed(self._xhits):
+        if r.contains(pt):
+            self._zone = "content"
+            try:
+                self._x_tag(tag)
+            except (IndexError, KeyError):
+                pass
+            return
+
+
+@_bpm("_x_tag")
+def _bpx_tag(self, tag):
+    k = tag[0]
+    fr = self._fr
+    if k == "row":
+        fr["sel"], fr["btn"] = tag[1], 0
+        self._fr_ensure()
+        if fr["rows"][tag[1]]["kind"] == "friend":
+            self._fr_act("accept")
+    elif k == "btn":
+        fr["sel"], fr["btn"] = tag[1], tag[2]
+        self._fr_act("accept")
+    elif k == "cbtn":
+        fr["cbtn"] = tag[1]
+        self._fr_act("accept")
+    elif k == "dbtn":
+        self._dl["sel"], self._dl["btn"] = tag[1], tag[2]
+        self._dl_act("accept")
+    elif k == "drow":
+        self._dl["sel"], self._dl["btn"] = tag[1], 0
+    elif k == "tile":
+        wk = self._wk
+        key = "gsel" if wk["mode"] == "games" else "sel"
+        if wk[key] == tag[1]:
+            self._ws_act("accept")
+        else:
+            wk[key] = tag[1]
+            self._ws_ensure()
+    elif k == "wback":
+        self._ws_act("back")
+    elif k == "wsort":
+        self._ws_act("x")
+    elif k == "wsearch":
+        self._ws_act("alt")
+    self.update()
+
+
+@_bpm("_x_hint")
+def _bpx_hint(self):
+    if self._tab == 2:
+        if self._fr["chat"]:
+            return "Up / Down  Scroll      Left / Right  Choose      A  Select      Y  Write message      B  Back"
+        return "Up / Down  Browse      A  Chat / Accept      Y  Quick message      LB / RB  Switch tab      B  Library"
+    if self._tab == 3:
+        return "Up / Down  Select      Left / Right  Button      A  Press      Y  Clear finished      LB / RB  Switch tab      B  Library"
+    if self._wk["mode"] == "games":
+        return "Arrows  Browse      A  Open Workshop      LB / RB  Switch tab      B  Library"
+    return "Arrows  Browse      A  Install      Y  Search      X  Sort      LB / RB  Switch tab      B  Games"
+
+
+# ---------------------------------------------------------------- on-screen keyboard
+@_bpm("_kb_open")
+def _bpx_kb_open(self, title, text, on_change, on_submit, maxlen=120):
+    self._kb = {"k": _BPKeys(text, maxlen), "title": title, "on_change": on_change, "on_submit": on_submit, "rects": []}
+    self.update()
+
+
+@_bpm("_kb_open_store")
+def _bpx_kb_open_store(self):
+    def chg(t):
+        self._search, self._chip = t, 0
+        self._stimer.start()
+        self.update()
+
+    def sub(t):
+        self._search = t
+        self._store_reset()
+    self._kb_open("Search the Store", self._search, chg, sub, 80)
+
+
+@_bpm("_kb_close")
+def _bpx_kb_close(self):
+    self._kb = None
+    self.update()
+
+
+@_bpm("_kb_changed")
+def _bpx_kb_changed(self):
+    cb = self._kb["on_change"]
+    if cb:
+        cb(self._kb["k"].text)
+
+
+@_bpm("_kb_submit")
+def _bpx_kb_submit(self):
+    kb, self._kb = self._kb, None
+    if kb["on_submit"]:
+        kb["on_submit"](kb["k"].text)
+    self.update()
+
+
+@_bpm("_kb_press")
+def _bpx_kb_press(self, r=None, c=None):
+    res = self._kb["k"].press(r, c)
+    if res == "done":
+        self._kb_submit()
+        return
+    if res == "changed":
+        self._kb_changed()
+    self.update()
+
+
+@_bpm("_kb_act")
+def _bpx_kb_act(self, name):
+    K = self._kb["k"]
+    if name == "left":
+        K.move(-1, 0)
+    elif name == "right":
+        K.move(1, 0)
+    elif name == "up":
+        K.move(0, -1)
+    elif name == "down":
+        K.move(0, 1)
+    elif name == "accept":
+        self._kb_press()
+        return
+    elif name == "back":
+        self._kb_close()
+        return
+    elif name == "x":                                     # X = backspace
+        if K.backspace():
+            self._kb_changed()
+    elif name == "alt":                                   # Y = space
+        if K.insert(" "):
+            self._kb_changed()
+    elif name == "prev":                                  # LB = shift
+        K.toggle_shift()
+    elif name == "next":                                  # RB = numbers / symbols
+        K.toggle_sym()
+    elif name == "submit":                                # Start = done
+        self._kb_submit()
+        return
+    self.update()
+
+
+@_bpm("_kb_key")
+def _bpx_kb_key(self, e):
+    k, K, kb = e.key(), Qt.Key, self._kb["k"]
+    if k in (K.Key_Return, K.Key_Enter):
+        self._kb_submit()
+        return
+    if k == K.Key_Escape:
+        self._kb_close()
+        return
+    if k == K.Key_Backspace:
+        if kb.backspace():
+            self._kb_changed()
+    elif k == K.Key_Left:
+        kb.move(-1, 0)
+    elif k == K.Key_Right:
+        kb.move(1, 0)
+    elif k == K.Key_Up:
+        kb.move(0, -1)
+    elif k == K.Key_Down:
+        kb.move(0, 1)
+    else:
+        t = e.text()
+        if t and t.isprintable() and kb.insert(t):
+            self._kb_changed()
+    self.update()
+
+
+# ---------------------------------------------------------------- shared painting helpers
+@_bpm("_x_text")
+def _bpx_text(self, p, r, text, size, color, bold=False, align=None, elide=True):
+    f = self._font(self.height() * size, bold)
+    p.setFont(f)
+    p.setPen(color if isinstance(color, QColor) else QColor(color))
+    if elide:
+        text = QFontMetrics(f).elidedText(text, Qt.TextElideMode.ElideRight, int(r.width()))
+    p.drawText(r, align if align is not None else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+
+@_bpm("_x_msg")
+def _bpx_msg(self, p, r, text):
+    p.setFont(self._font(self.height() * 0.03))
+    p.setPen(QColor(200, 200, 220))
+    p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), text)
+
+
+@_bpm("_x_pill")
+def _bpx_pill(self, p, r, text, acc, sel=False, primary=False, size=0.0225):
+    h = self.height()
+    rad = r.height() / 2
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(acc if primary else QColor(255, 255, 255, 34))
+    p.drawRoundedRect(r, rad, rad)
+    if sel:
+        g = h * 0.005
+        p.setPen(QPen(QColor(255, 255, 255, 235), max(2.0, h * 0.004)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r.adjusted(-g, -g, g, g), rad + g, rad + g)
+    p.setFont(self._font(h * size, True))
+    p.setPen(QColor(_on_accent()) if primary else QColor(225, 225, 240))
+    p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), text)
+
+
+@_bpm("_x_ring")
+def _bpx_ring(self, p, r, rad):
+    h = self.height()
+    g = h * 0.005
+    p.setPen(QPen(QApplication.palette().color(QPalette.ColorRole.Highlight), max(2.0, h * 0.005)))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(r.adjusted(-g, -g, g, g), rad + g, rad + g)
+
+
+@_bpm("_x_avatar")
+def _bpx_avatar(self, p, r, row):
+    uid, d = row["uid"], row["d"]
+    cache = self._fr["av"]
+    if uid not in cache:
+        pm = None
+        try:
+            path = _friend_avatar_file(uid, d.get("photo"))
+            if path:
+                q = QPixmap(path)
+                if not q.isNull():
+                    pm = q.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        except Exception:
+            pm = None
+        cache[uid] = pm
+    pm = cache[uid]
+    p.save()
+    if pm is not None:
+        clip = QPainterPath()
+        clip.addEllipse(r)
+        p.setClipPath(clip, Qt.ClipOperation.IntersectClip)    # keep the list's scroll clip so avatars can't draw over the header
+        p.drawPixmap(r, pm, QRectF(pm.rect()))
+    else:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor.fromHsv(sum(map(ord, str(uid))) % 360, 150, 190))
+        p.drawEllipse(r)
+        p.setFont(self._font(r.height() * 0.5, True))
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), (row["name"][:1] or "?").upper())
+    p.restore()
+
+
+@_bpm("_paint_extra")
+def _bpx_paint_extra(self, p, w, h, m, acc, k):
+    self._xhits = []
+    p.setOpacity(k)
+    if self._tab == 2:
+        self._paint_friends(p, w, h, m, acc)
+    elif self._tab == 3:
+        self._paint_downloads(p, w, h, m, acc)
+    else:
+        self._paint_workshop(p, w, h, m, acc)
+    p.setOpacity(1.0)
+
+
+@_bpm("_paint_kb")
+def _bpx_paint_kb(self, p, w, h, acc):
+    kb = self._kb
+    K = kb["k"]
+    al_c = int(Qt.AlignmentFlag.AlignCenter)
+    p.setOpacity(1.0)
+    px, pw, py, ph = w * 0.1, w * 0.8, h * 0.44, h * 0.48
+    p.fillRect(QRectF(0, 0, w, py), QColor(0, 0, 0, 130))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(14, 14, 26, 246))
+    p.drawRoundedRect(QRectF(px, py, pw, ph), h * 0.025, h * 0.025)
+    pad = h * 0.022
+    self._x_text(p, QRectF(px + pad, py + h * 0.012, pw - 2 * pad, h * 0.04), kb["title"], 0.022, QColor(170, 170, 200))
+    fld = QRectF(px + pad, py + h * 0.056, pw - 2 * pad, h * 0.07)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(255, 255, 255, 28))
+    p.drawRoundedRect(fld, h * 0.015, h * 0.015)
+    f = self._font(h * 0.034)
+    p.setFont(f)
+    fm = QFontMetrics(f)
+    shown = fm.elidedText(K.text, Qt.TextElideMode.ElideLeft, int(fld.width() - 2 * pad))
+    p.setPen(QColor(245, 245, 252))
+    p.drawText(QRectF(fld.left() + pad, fld.top(), fld.width() - 2 * pad, fld.height()),
+               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), shown)
+    cx = fld.left() + pad + fm.horizontalAdvance(shown) + 2
+    p.setPen(QPen(acc, max(2.0, h * 0.003)))
+    p.drawLine(QPointF(cx, fld.top() + fld.height() * 0.2), QPointF(cx, fld.bottom() - fld.height() * 0.2))
+    rows = K.rows()
+    ky0, kbot, gap = fld.bottom() + h * 0.018, py + ph - h * 0.02, h * 0.008
+    kh = (kbot - ky0 - gap * (len(rows) - 1)) / len(rows)
+    u = (pw - 2 * pad) / 10.0
+    kb["rects"] = []
+    for ri, row in enumerate(rows):
+        x, y = px + pad, ky0 + ri * (kh + gap)
+        for ci, (label, act, wgt) in enumerate(row):
+            r = QRectF(x, y, wgt * u - gap, kh)
+            x += wgt * u
+            sel = (ri == K.r and ci == K.c)
+            kb["rects"].append((r, ri, ci))
+            p.setPen(Qt.PenStyle.NoPen)
+            if sel:
+                p.setBrush(acc)
+            elif act == "@done":
+                p.setBrush(QColor(acc.red(), acc.green(), acc.blue(), 120))
+            elif act == "@shift" and K.shift:
+                p.setBrush(QColor(255, 255, 255, 100))
+            else:
+                p.setBrush(QColor(255, 255, 255, 30))
+            p.drawRoundedRect(r, kh * 0.2, kh * 0.2)
+            p.setFont(self._font(h * (0.03 if len(label) == 1 else 0.021), True))
+            p.setPen(QColor(_on_accent()) if sel else QColor(235, 235, 245))
+            p.drawText(r, al_c, label)
+
+
+# ---------------------------------------------------------------- Friends tab
+@_bpm("_fr_enter")
+def _bpx_fr_enter(self):
+    fp = getattr(self._app, "friends_page", None)
+    if fp is None:
+        return
+    self._fr["chat"] = None
+    signed = _bpx_signed(fp)
+    self._fr["loading"] = bool(signed and not fp.friends)
+    self._fr_build()
+    self._fr_ensure()
+    if signed:
+        fp.refresh()
+
+
+@_bpm("_fr_build")
+def _bpx_fr_build(self):
+    fp = getattr(self._app, "friends_page", None)
+    fr = self._fr
+    keep = None
+    if fr["rows"] and 0 <= fr["sel"] < len(fr["rows"]):
+        keep = (fr["rows"][fr["sel"]]["kind"], fr["rows"][fr["sel"]]["uid"])
+    rows = []
+    if fp is not None:
+        for u, d in (fp.requests or {}).items():
+            if isinstance(d, dict):
+                rows.append({"kind": "req", "uid": u, "name": d.get("username") or "Unknown", "d": d})
+        fl = [(u, d) for u, d in (fp.friends or {}).items() if isinstance(d, dict)]
+        fl.sort(key=lambda kv: (_friend_status(kv[1])[0] == "Offline", (kv[1].get("username") or "").lower()))
+        for u, d in fl:
+            rows.append({"kind": "friend", "uid": u, "name": d.get("username") or "Unknown", "d": d})
+    fr["rows"] = rows
+    fr["sel"] = next((i for i, r in enumerate(rows) if keep and (r["kind"], r["uid"]) == keep),
+                     min(fr["sel"], max(0, len(rows) - 1)))
+    fr["btn"] = 0
+
+
+@_bpm("_fr_changed")
+def _bpx_fr_changed(self):
+    try:
+        self._fr["loading"] = False
+        self._fr_build()
+        if self._tab == 2:
+            self.update()
+    except RuntimeError:
+        pass
+
+
+@_bpm("_fr_ensure")
+def _bpx_fr_ensure(self):
+    h = self.height()
+    pitch, i = h * 0.102, self._fr["sel"]
+    self._x_ensure(i * pitch, (i + 1) * pitch, h * 0.86 - h * 0.19)
+
+
+@_bpm("_fr_act")
+def _bpx_fr_act(self, name):
+    fr = self._fr
+    fp = getattr(self._app, "friends_page", None)
+    if fr["chat"]:
+        if name == "back":
+            fr["chat"] = None
+        elif name in ("left", "right"):
+            fr["cbtn"] = 1 - fr["cbtn"]
+        elif name == "up":
+            fr["moff"] = min(max(0, len(fr["msgs"]) - 1), fr["moff"] + 1)
+        elif name == "down":
+            fr["moff"] = max(0, fr["moff"] - 1)
+        elif name == "alt" or (name == "accept" and fr["cbtn"] == 0):
+            self._fr_compose(fr["chat"])
+        elif name == "accept":
+            fr["chat"] = None
+        return
+    rows = fr["rows"]
+    if name == "back":
+        self._switch_tab(0)
+    elif name == "up":
+        if fr["sel"] <= 0:
+            _bpx_top(self)
+        else:
+            fr["sel"] -= 1
+            fr["btn"] = 0
+            self._fr_ensure()
+    elif name == "down":
+        if fr["sel"] < len(rows) - 1:
+            fr["sel"] += 1
+            fr["btn"] = 0
+            self._fr_ensure()
+    elif name in ("left", "right") and rows and rows[fr["sel"]]["kind"] == "req":
+        fr["btn"] = 0 if name == "left" else 1
+    elif name == "accept" and rows:
+        r = rows[fr["sel"]]
+        if r["kind"] == "req":
+            self._fr_answer(r["uid"], fr["btn"] == 0)
+        else:
+            fr["chat"], fr["cbtn"] = r["uid"], 0
+            self._fr_load_chat(r["uid"])
+    elif name == "alt" and rows and rows[fr["sel"]]["kind"] == "friend":
+        self._fr_compose(rows[fr["sel"]]["uid"])
+
+
+@_bpm("_fr_answer")
+def _bpx_fr_answer(self, uid, accept):
+    fp = getattr(self._app, "friends_page", None)
+    if fp is None:
+        return
+    fn = cloud_accept_friend if accept else cloud_decline_friend
+
+    def done(res, err):
+        try:
+            self._say(str(err) if err else ("Friend added" if accept else "Request declined"), 2500)
+            fp.refresh()
+        except RuntimeError:
+            pass
+    fp._run(lambda: fn(uid), done)
+
+
+@_bpm("_fr_compose")
+def _bpx_fr_compose(self, uid):
+    name = next((r["name"] for r in self._fr["rows"] if r["uid"] == uid), "friend")
+    self._kb_open("Message to %s" % name, "", None, lambda t, u=uid: self._fr_send(u, t), 500)
+
+
+@_bpm("_fr_send")
+def _bpx_fr_send(self, uid, text):
+    text = (text or "").strip()
+    fp = getattr(self._app, "friends_page", None)
+    if not text or fp is None:
+        return
+    fr = self._fr
+    fr["sending"] = True
+    self.update()
+
+    def done(res, err):
+        try:
+            fr["sending"] = False
+            if err:
+                self._say("Couldn't send: %s" % err, 4000)
+            else:
+                self._say("Message sent", 1800)
+                fr["moff"] = 0
+                if fr["chat"] == uid:
+                    self._fr_load_chat(uid, quiet=True)
+            self.update()
+        except RuntimeError:
+            pass
+    fp._run(lambda: cloud_send_message(uid, text), done)
+
+
+@_bpm("_fr_load_chat")
+def _bpx_fr_load_chat(self, uid, quiet=False):
+    fp = getattr(self._app, "friends_page", None)
+    fr = self._fr
+    if fp is None:
+        return
+    if not quiet:
+        fr["msgs"], fr["moff"], fr["me"], fr["loading"] = [], 0, "", True
+
+    def done(res, err, uid=uid):
+        try:
+            if fr["chat"] != uid:
+                return
+            fr["loading"] = False
+            if not err and res:
+                fr["me"], fr["msgs"] = res[0], res[1]
+            if self._tab == 2:
+                self.update()
+        except RuntimeError:
+            pass
+    fp._run(lambda: cloud_get_messages(uid), done, key="bp-chat")
+
+
+@_bpm("_paint_friends")
+def _bpx_paint_friends(self, p, w, h, m, acc):
+    fr = self._fr
+    fp = getattr(self._app, "friends_page", None)
+    area = QRectF(0, h * 0.17, w, h * 0.69)
+    if fp is None or not _bpx_signed(fp):
+        self._x_msg(p, area, "Sign in from the main launcher to use Friends")
+        return
+    if fr["chat"]:
+        self._paint_chat(p, w, h, acc)
+        return
+    rows = fr["rows"]
+    online = sum(1 for r in rows if r["kind"] == "friend" and _friend_status(r["d"])[0] != "Offline")
+    cx, cw = w * 0.18, w * 0.64
+    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Friends   %d online" % online, 0.028, QColor(235, 235, 245), True)
+    top, bot, rh, pitch = h * 0.19, h * 0.86, h * 0.09, h * 0.102
+    if not rows:
+        if fr["loading"]:
+            self._paint_loading(p, w, h, QRectF(0, top, w, bot - top), "Loading friends...")
+        else:
+            self._x_msg(p, area, "No friends yet. Add friends from the main launcher.")
+        return
+    focus = self._zone == "content"
+    p.save()
+    p.setClipRect(QRectF(0, top - h * 0.01, w, bot - top + h * 0.02))
+    for i, r in enumerate(rows):
+        y = top + i * pitch - self._xscroll
+        if y + rh < top - h * 0.01 or y > bot:
+            continue
+        rect = QRectF(cx, y, cw, rh)
+        sel = focus and i == fr["sel"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 48 if sel else 22))
+        p.drawRoundedRect(rect, rh * 0.2, rh * 0.2)
+        if sel:
+            self._x_ring(p, rect, rh * 0.2)
+        self._xhits.append((rect.intersected(QRectF(0, top, w, bot - top)), ("row", i)))
+        ad = rh * 0.7
+        ar = QRectF(cx + rh * 0.15, y + (rh - ad) / 2, ad, ad)
+        self._x_avatar(p, ar, r)
+        tx = ar.right() + rh * 0.22
+        if r["kind"] == "friend":
+            st, col = _friend_status(r["d"])
+            self._x_text(p, QRectF(tx, y + rh * 0.08, cw - tx + cx - rh * 0.3, rh * 0.45), r["name"], 0.028, QColor(245, 245, 252), True)
+            self._x_text(p, QRectF(tx, y + rh * 0.5, cw - tx + cx - rh * 0.3, rh * 0.4), st, 0.021, QColor(col))
+        else:
+            bw, bh = h * 0.13, rh * 0.55
+            bx = rect.right() - rh * 0.2 - 2 * bw - h * 0.012
+            self._x_text(p, QRectF(tx, y + rh * 0.08, bx - tx - rh * 0.2, rh * 0.45), r["name"], 0.028, QColor(245, 245, 252), True)
+            self._x_text(p, QRectF(tx, y + rh * 0.5, bx - tx - rh * 0.2, rh * 0.4), "Wants to be your friend", 0.021, QColor(170, 170, 200))
+            for j, t in enumerate(("Accept", "Decline")):
+                br = QRectF(bx + j * (bw + h * 0.012), y + (rh - bh) / 2, bw, bh)
+                self._x_pill(p, br, t, acc, sel=(sel and fr["btn"] == j), primary=(j == 0), size=0.02)
+                self._xhits.append((br.intersected(QRectF(0, top, w, bot - top)), ("btn", i, j)))
+    p.restore()
+
+
+@_bpm("_paint_chat")
+def _bpx_paint_chat(self, p, w, h, acc):
+    fr = self._fr
+    row = next((r for r in fr["rows"] if r["uid"] == fr["chat"]), None)
+    cx, cw = w * 0.2, w * 0.6
+    if row is not None:
+        ad = h * 0.075
+        self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
+        st, col = _friend_status(row["d"])
+        self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
+        self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
+    top = h * 0.24
+    bot = h * 0.42 if self._kb is not None else h * 0.78
+    p.save()
+    p.setClipRect(QRectF(cx - h * 0.01, top, cw + h * 0.02, bot - top))
+    msgs = fr["msgs"]
+    if not msgs:
+        self._x_msg(p, QRectF(cx, top, cw, bot - top), "Loading messages..." if fr["loading"] else "No messages yet. Press A to say hi!")
+    f = self._font(h * 0.024)
+    p.setFont(f)
+    fm = QFontMetrics(f)
+    maxw, padx, pady = cw * 0.72, h * 0.018, h * 0.012
+    y, idx = bot, len(msgs) - 1 - fr["moff"]
+    while idx >= 0 and y > top:
+        mg = msgs[idx]
+        idx -= 1
+        text = str(mg.get("text") or "") or ("[attachment]" if mg.get("att") else "")
+        if not text.strip():
+            continue
+        br = fm.boundingRect(QRect(0, 0, int(maxw - 2 * padx), 10000), int(Qt.TextFlag.TextWordWrap), text)
+        bw, bh = min(maxw, br.width() + 2 * padx), br.height() + 2 * pady
+        y -= bh
+        mine = mg.get("from") == fr["me"]
+        bx = cx + cw - bw if mine else cx
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc if mine else QColor(255, 255, 255, 36))
+        p.drawRoundedRect(QRectF(bx, y, bw, bh), h * 0.02, h * 0.02)
+        p.setPen(QColor(_on_accent()) if mine else QColor(235, 235, 245))
+        p.drawText(QRectF(bx + padx, y + pady, bw - 2 * padx, br.height()),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap), text)
+        y -= h * 0.01
+    p.restore()
+    bh, bw = h * 0.065, h * 0.22
+    for j, t in enumerate(("Sending..." if fr["sending"] else "Message", "Back")):
+        r = QRectF(cx + j * (bw + h * 0.014), h * 0.81, bw, bh)
+        self._x_pill(p, r, t, acc, sel=(self._zone == "content" and fr["cbtn"] == j), primary=(j == 0))
+        self._xhits.append((r, ("cbtn", j)))
+
+
+# ---------------------------------------------------------------- Downloads tab
+@_bpm("_dl_infos")
+def _bpx_dl_infos(self):
+    out = []
+    dp = getattr(self._app, "downloads_page", None)
+    if dp is not None:
+        try:
+            lay = dp.container_layout
+            for i in range(lay.count()):
+                wdg = lay.itemAt(i).widget()
+                if not isinstance(wdg, DownloadCard):
+                    continue
+                try:
+                    pb = wdg.progress_bar
+                    mx = pb.maximum()
+                    cpath = getattr(wdg, "cover_path", "") or ""
+                    cpm = None
+                    if not (cpath and os.path.exists(cpath)):
+                        try:
+                            cpm = wdg.cover.pixmap()
+                            cpm = cpm if cpm is not None and not cpm.isNull() else None
+                        except Exception:
+                            cpm = None
+                    out.append({"cover": cpath, "cover_pm": cpm,
+                                "title": wdg.title, "status": wdg.status_label.text(),
+                                "pct": None if mx == 0 else int(pb.value() * 100 / max(1, mx)),
+                                "info": wdg.info_label.text(), "state": getattr(wdg, "state", "active"),
+                                "btns": [(b.text(), b.click) for b in (wdg.pause_btn, wdg.action_btn, wdg.clear_btn)
+                                         if not b.isHidden()]})
+                except RuntimeError:
+                    pass
+        except RuntimeError:
+            pass
+    wp = getattr(self._app, "workshop_page", None)
+    if wp is not None:
+        names = {"queued": ("Queued", "Remove"), "downloading": ("Downloading", "Cancel"), "failed": ("Failed", "Retry"),
+                 "cancelled": ("Cancelled", "Retry"), "done": ("Installed", None)}
+        for e in list(wp.queue):
+            st = e.get("status", "")
+            stxt, btn = names.get(st, (str(st).title(), None))
+            pct = e.get("pct")
+            pct = pct if isinstance(pct, (int, float)) else None
+            try:
+                hdr = _BPX_HDR % int(e.get("appid"))
+            except (TypeError, ValueError):
+                hdr = ""
+            out.append({"hdr": hdr,
+                        "title": "%s  (Workshop - %s)" % (e.get("title", "?"), e.get("game", "")),
+                        "status": stxt + (" %d%%" % pct if st == "downloading" and pct is not None else ""),
+                        "pct": 100 if st == "done" else (0 if st == "queued" else pct),
+                        "info": e.get("msg") or e.get("line") or "",
+                        "state": "active" if st in ("queued", "downloading") else ("done" if st == "done" else "failed"),
+                        "btns": [(btn, lambda e=e: wp._queue_action(e))] if btn else []})
+    return out
+
+
+@_bpm("_dl_ensure")
+def _bpx_dl_ensure(self):
+    h = self.height()
+    pitch = h * 0.135
+    n = max(1, len(self._dl_infos()))
+    i = max(0, min(n - 1, self._dl["sel"]))
+    self._x_ensure(i * pitch, (i + 1) * pitch, h * 0.86 - h * 0.19)
+
+
+@_bpm("_dl_act")
+def _bpx_dl_act(self, name):
+    dl = self._dl
+    infos = self._dl_infos()
+    n = len(infos)
+    dl["sel"] = max(0, min(max(0, n - 1), dl["sel"]))
+    if name == "back":
+        self._switch_tab(0)
+    elif name == "up":
+        if dl["sel"] <= 0:
+            _bpx_top(self)
+        else:
+            dl["sel"] -= 1
+            dl["btn"] = 0
+            self._dl_ensure()
+    elif name == "down":
+        if dl["sel"] < n - 1:
+            dl["sel"] += 1
+            dl["btn"] = 0
+            self._dl_ensure()
+    elif name in ("left", "right") and n:
+        dl["btn"] = max(0, min(len(infos[dl["sel"]]["btns"]) - 1, dl["btn"] + (1 if name == "right" else -1)))
+    elif name == "accept" and n:
+        btns = infos[dl["sel"]]["btns"]
+        if btns:
+            btns[max(0, min(len(btns) - 1, dl["btn"]))][1]()
+    elif name == "alt":
+        for obj in (getattr(self._app, "downloads_page", None), getattr(self._app, "workshop_page", None)):
+            try:
+                if obj is not None:
+                    (obj.clear_finished)()
+            except Exception:
+                pass
+        self._say("Cleared finished downloads", 1800)
+
+
+@_bpm("_paint_downloads")
+def _bpx_paint_downloads(self, p, w, h, m, acc):
+    dl = self._dl
+    infos = self._dl_infos()
+    n = len(infos)
+    dl["sel"] = max(0, min(max(0, n - 1), dl["sel"]))
+    cx, cw = w * 0.14, w * 0.72
+    nact = sum(1 for i in infos if i["state"] == "active")
+    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Downloads" + ("   %d active" % nact if nact else ""),
+                 0.028, QColor(235, 235, 245), True)
+    top, bot, rh, pitch = h * 0.19, h * 0.86, h * 0.12, h * 0.135
+    if not n:
+        self._x_msg(p, QRectF(0, top, w, bot - top), "No active or recent downloads")
+        return
+    focus = self._zone == "content"
+    p.save()
+    p.setClipRect(QRectF(0, top - h * 0.01, w, bot - top + h * 0.02))
+    pad = rh * 0.16
+    for i, it in enumerate(infos):
+        y = top + i * pitch - self._xscroll
+        if y + rh < top - h * 0.01 or y > bot:
+            continue
+        rect = QRectF(cx, y, cw, rh)
+        sel = focus and i == dl["sel"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 48 if sel else 22))
+        p.drawRoundedRect(rect, rh * 0.14, rh * 0.14)
+        if sel:
+            self._x_ring(p, rect, rh * 0.14)
+        self._xhits.append((rect.intersected(QRectF(0, top, w, bot - top)), ("drow", i)))
+        # game cover on the left
+        cvh = rh - 2 * pad
+        cvr = QRectF(cx + pad, y + pad, cvh * 0.68, cvh)
+        if it.get("hdr"):
+            cpm = self._ws_pix(it["hdr"])
+        elif it.get("cover"):
+            cpm = self._dl_cover(it["cover"])
+        else:
+            cpm = it.get("cover_pm")
+        _bpe_draw_cover(p, cvr, cpm, rh * 0.09)
+        lx = cvr.right() + pad
+        bw, bh, gap = h * 0.125, rh * 0.38, h * 0.01
+        btns = it["btns"]
+        bx = rect.right() - pad - len(btns) * (bw + gap) + gap
+        for j, (label, _cb) in enumerate(btns):
+            br = QRectF(bx + j * (bw + gap), y + (rh - bh) / 2, bw, bh)
+            self._x_pill(p, br, label, acc, sel=(sel and dl["btn"] == j), size=0.019)
+            self._xhits.append((br.intersected(QRectF(0, top, w, bot - top)), ("dbtn", i, j)))
+        tw = (bx if btns else rect.right() - pad) - lx - pad
+        col = QColor(GREEN) if it["state"] == "done" else QColor(RED) if it["state"] == "failed" else QColor(200, 200, 220)
+        sw = min(tw * 0.4, h * 0.3)
+        self._x_text(p, QRectF(lx, y + rh * 0.08, tw - sw - pad, rh * 0.3), it["title"], 0.025, QColor(245, 245, 252), True)
+        self._x_text(p, QRectF(lx + tw - sw, y + rh * 0.08, sw, rh * 0.3), it["status"], 0.02, col, False,
+                     int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+        track = QRectF(lx, y + rh * 0.47, tw, rh * 0.11)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 36))
+        p.drawRoundedRect(track, track.height() / 2, track.height() / 2)
+        if it["pct"] is None:
+            p.setBrush(QColor(acc.red(), acc.green(), acc.blue(), 90))
+            p.drawRoundedRect(track, track.height() / 2, track.height() / 2)
+        elif it["pct"] > 0:
+            fw = max(track.height(), track.width() * min(100, it["pct"]) / 100.0)
+            p.setBrush(QColor(GREEN) if it["state"] == "done" else acc)
+            p.drawRoundedRect(QRectF(track.left(), track.top(), fw, track.height()), track.height() / 2, track.height() / 2)
+        self._x_text(p, QRectF(lx, y + rh * 0.64, tw, rh * 0.27), it["info"], 0.0185, QColor(150, 150, 175))
+    p.restore()
+
+
+# ---------------------------------------------------------------- Workshop tab
+_BPX_HDR = "https://cdn.cloudflare.steamstatic.com/steam/apps/%d/header.jpg"
+
+
+@_bpm("_x_grid")
+def _bpx_grid(self, aspect, th_frac=0.2):
+    w, h = self.width(), self.height()
+    m, gap = w * 0.05, h * 0.022
+    th = h * th_frac
+    tw = th * aspect
+    cols = max(1, int((w - 2 * m + gap) // (tw + gap)))
+    x0 = (w - (cols * tw + (cols - 1) * gap)) / 2
+    return gap, tw, th, cols, x0, h * 0.2, h * 0.86
+
+
+@_bpm("_x_grid_paint")
+def _bpx_grid_paint(self, p, w, h, acc, n, sel, aspect, draw, th_frac=0.2):
+    gap, tw, th, cols, x0, top, bot = self._x_grid(aspect, th_frac)
+    pitch, pad = th + gap, h * 0.012
+    clip = QRectF(0, top, w, bot - top)
+    p.save()
+    p.setClipRect(clip)
+    first = max(0, int(self._xscroll // pitch) - 1) * cols
+    last = min(n, (int((self._xscroll + bot - top) // pitch) + 2) * cols)
+    focus = self._zone == "content"
+    for i in range(first, last):
+        row, col = divmod(i, cols)
+        r = QRectF(x0 + col * (tw + gap), top + pad + row * pitch - self._xscroll, tw, th)
+        if r.bottom() < top or r.top() > bot:
+            continue
+        vis = r.intersected(clip)
+        if not vis.isEmpty():
+            self._xhits.append((vis, ("tile", i)))
+        s = focus and i == sel
+        if s:
+            self._x_ring(p, r, tw * 0.05)
+        draw(r, i, s)
+    p.restore()
+
+
+@_bpm("_x_tile")
+def _bpx_tile(self, p, r, pm, title, sub, acc, badge=None):
+    h = self.height()
+    rad = r.width() * 0.05
+    path = QPainterPath()
+    path.addRoundedRect(r, rad, rad)
+    p.save()
+    p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+    if pm is not None and not pm.isNull():
+        sr = pm.rect()
+        sc = max(r.width() / sr.width(), r.height() / sr.height())
+        vw, vh = r.width() / sc, r.height() / sc
+        p.drawPixmap(r, pm, QRectF((sr.width() - vw) / 2, (sr.height() - vh) / 2, vw, vh))
+    else:
+        p.fillRect(r, QColor(255, 255, 255, 20))
+    g = QLinearGradient(0, r.top() + r.height() * 0.45, 0, r.bottom())
+    g.setColorAt(0, QColor(0, 0, 0, 0))
+    g.setColorAt(1, QColor(0, 0, 0, 225))
+    p.fillRect(r, QBrush(g))
+    p.restore()
+    pad = h * 0.012
+    self._x_text(p, QRectF(r.left() + pad, r.bottom() - h * 0.072, r.width() - 2 * pad, h * 0.036), title, 0.0215, QColor(245, 245, 252), True)
+    if sub:
+        self._x_text(p, QRectF(r.left() + pad, r.bottom() - h * 0.038, r.width() - 2 * pad, h * 0.03), sub, 0.0165, QColor(185, 185, 205))
+    if badge:
+        bf = self._font(h * 0.0155, True)
+        p.setFont(bf)
+        b = QRectF(r.left() + h * 0.008, r.top() + h * 0.008, QFontMetrics(bf).horizontalAdvance(badge) + h * 0.026, h * 0.028)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc)
+        p.drawRoundedRect(b, h * 0.014, h * 0.014)
+        p.setPen(QColor(_on_accent()))
+        p.drawText(b, int(Qt.AlignmentFlag.AlignCenter), badge)
+
+
+@_bpm("_ws_pix")
+def _bpx_ws_pix(self, url):
+    wk = self._wk
+    pm = wk["pix"].get(url)
+    if pm is None and url and url not in wk["asked"]:
+        wk["asked"].add(url)
+        wp = getattr(self._app, "workshop_page", None)
+        if wp is not None:
+            wp.img.request(url, lambda pm_, u=url: self._ws_img_ready(u, pm_))
+    return pm
+
+
+@_bpm("_ws_img_ready")
+def _bpx_ws_img_ready(self, url, pm):
+    self._wk["pix"][url] = pm
+    QTimer.singleShot(0, self.update)
+
+
+@_bpm("_ws_enter")
+def _bpx_ws_enter(self):
+    wk = self._wk
+    if wk["mode"] == "games":
+        try:
+            wk["all"] = list(_ws_installed_games())
+            wk["err"] = ""
+        except Exception as ex:
+            wk["all"], wk["err"] = [], str(ex)
+        self._ws_count_games()
+        self._ws_filter_games()
+    self._ws_ensure()
+    if wk["mode"] == "items" and not wk["items"] and not wk["loading"]:
+        self._ws_fetch(1)
+
+
+@_bpm("_ws_count_games")
+def _bpx_ws_count_games(self):
+    """Look up how many Workshop items each installed game has (shared cache with the main Workshop tab)."""
+    wk = self._wk
+    wk.setdefault("failed", set())
+    wk.setdefault("counting", set())
+    for g in wk.get("all", []):
+        aid = g["appid"]
+        if aid in _WS_MOD_COUNTS or aid in wk["counting"] or aid in wk["failed"]:
+            continue
+        wk["counting"].add(aid)
+        w_ = WorkshopCountWorker(aid, self)
+        w_.done.connect(self._ws_counted)
+        wk["workers"].append(w_)
+        w_.finished.connect(lambda x=w_: wk["workers"].remove(x) if x in wk["workers"] else None)
+        w_.start()
+
+
+@_bpm("_ws_counted")
+def _bpx_ws_counted(self, appid, count):
+    wk = self._wk
+    wk["counting"].discard(appid)
+    if count >= 0:
+        _WS_MOD_COUNTS[appid] = count
+    else:
+        wk["failed"].add(appid)           # lookup failed: keep the game listed rather than hide it
+    if wk["mode"] == "games":
+        self._ws_filter_games()
+    self.update()
+
+
+@_bpm("_ws_filter_games")
+def _bpx_ws_filter_games(self):
+    wk = self._wk
+    allg = wk.get("all", [])
+    cur = wk["games"][wk["gsel"]]["appid"] if wk["games"] and 0 <= wk["gsel"] < len(wk["games"]) else None
+    keep = []
+    for g in allg:
+        cnt = _WS_MOD_COUNTS.get(g["appid"])
+        if (cnt is not None and cnt > 0) or (cnt is None and g["appid"] in wk.get("failed", ())):
+            keep.append(g)
+    wk["games"] = keep
+    wk["gsel"] = next((i for i, g in enumerate(keep) if g["appid"] == cur), 0)
+    if keep or not allg:
+        wk["err"] = ""
+    elif any(g["appid"] in wk.get("counting", ()) for g in allg):
+        wk["err"] = "Checking which games have Workshop mods..."
+    else:
+        wk["err"] = "None of your installed games have Workshop mods."
+
+
+@_bpm("_ws_ensure")
+def _bpx_ws_ensure(self):
+    wk = self._wk
+    games = wk["mode"] == "games"
+    gap, tw, th, cols, x0, top, bot = self._x_grid(2.14 if games else 1.6, 0.2 if games else 0.2)
+    row = (wk["gsel"] if games else wk["sel"]) // cols
+    pitch = th + gap
+    self._x_ensure(row * pitch, row * pitch + pitch + self.height() * 0.024, bot - top)
+
+
+@_bpm("_ws_open_game")
+def _bpx_ws_open_game(self, g):
+    wk = self._wk
+    wk.update(mode="items", appid=int(g["appid"]), title=g["title"], query="", sort=0)
+    self._ws_reset_items()
+    self._ws_fetch(1)
+
+
+def _bpx_ws_reset_items(self):
+    wk = self._wk
+    wk.update(items=[], seen=set(), sel=0, more=False, err="")
+    wk["token"] += 1
+    self._x_reset_scroll()
+
+
+_BigPicture._ws_reset_items = _bpx_ws_reset_items
+
+
+@_bpm("_ws_fetch")
+def _bpx_ws_fetch(self, page):
+    wk = self._wk
+    wk["token"] += 1
+    wk["page"], wk["loading"], wk["err"] = page, True, ""
+    wkr = WorkshopFetchWorker(wk["token"], wk["appid"], wk["query"], WS_SORTS[wk["sort"]][1], page, self)
+    wkr.done.connect(self._ws_fetched)
+    wk["workers"].append(wkr)
+    wkr.finished.connect(lambda w_=wkr: wk["workers"].remove(w_) if w_ in wk["workers"] else None)
+    wkr.start()
+    self.update()
+
+
+@_bpm("_ws_fetched")
+def _bpx_ws_fetched(self, token, items, err):
+    wk = self._wk
+    if token != wk["token"]:
+        return
+    wk["loading"] = False
+    if err:
+        wk["err"] = err
+    else:
+        new = [it for it in items if it["id"] not in wk["seen"]]
+        for it in new:
+            wk["seen"].add(it["id"])
+            wk["items"].append(it)
+        wk["more"] = len(items) >= 9 and bool(new)
+    self.update()
+
+
+@_bpm("_ws_search")
+def _bpx_ws_search(self, text):
+    self._wk["query"] = (text or "").strip()
+    self._ws_reset_items()
+    self._ws_fetch(1)
+
+
+@_bpm("_ws_install")
+def _bpx_ws_install(self, it):
+    wk = self._wk
+    wp = getattr(self._app, "workshop_page", None)
+    if wp is None:
+        return
+    try:
+        if wp._ws_have(wk["appid"], it["id"]):
+            self._say("Already installed", 2000)
+        elif wp.enqueue(it, wk["appid"], wk["title"]):
+            self._say("Queued: %s  (see the Downloads tab)" % it["title"], 3000)
+        else:
+            self._say("Already in the queue", 2000)
+    except Exception as ex:
+        self._say("Couldn't queue it: %s" % ex, 4000)
+
+
+def _bpx_grid_nav(sel, n, cols, name):
+    """New selection index for a grid move, -1 when 'up' leaves the top row."""
+    if name == "left":
+        return max(0, sel - 1)
+    if name == "right":
+        return min(n - 1, sel + 1)
+    if name == "down":
+        if sel + cols < n:
+            return sel + cols
+        return n - 1 if sel // cols < (n - 1) // cols else sel
+    if name == "up":
+        return sel - cols if sel >= cols else -1
+    return sel
+
+
+@_bpm("_ws_act")
+def _bpx_ws_act(self, name):
+    wk = self._wk
+    games = wk["mode"] == "games"
+    lst, key = (wk["games"], "gsel") if games else (wk["items"], "sel")
+    n = len(lst)
+    cols = self._x_grid(2.14 if games else 1.6)[3]
+    if name == "back":
+        if games:
+            self._switch_tab(0)
+        else:
+            wk["mode"] = "games"
+            self._x_reset_scroll()
+            self._ws_ensure()
+        return
+    if name in ("left", "right", "up", "down"):
+        if not n:
+            if name == "up":
+                _bpx_top(self)
+            return
+        new = _bpx_grid_nav(wk[key], n, cols, name)
+        if new < 0:
+            _bpx_top(self)
+            return
+        wk[key] = new
+        self._ws_ensure()
+        if not games and wk["more"] and not wk["loading"] and new // cols >= (n - 1) // cols - 1:
+            self._ws_fetch(wk["page"] + 1)
+    elif name == "accept":
+        if games and n:
+            self._ws_open_game(lst[wk[key]])
+        elif not games and n:
+            self._ws_install(lst[wk[key]])
+        elif not games and wk["err"]:
+            self._ws_fetch(1)
+    elif not games and name == "alt":
+        self._kb_open("Search the Workshop - %s" % wk["title"], wk["query"], None, self._ws_search, 80)
+    elif not games and name == "x":
+        wk["sort"] = (wk["sort"] + 1) % len(WS_SORTS)
+        self._ws_reset_items()
+        self._ws_fetch(1)
+        self._say("Sorted by: %s" % WS_SORTS[wk["sort"]][0], 2000)
+
+
+@_bpm("_paint_workshop")
+def _bpx_paint_ws(self, p, w, h, m, acc):
+    wk = self._wk
+    wp = getattr(self._app, "workshop_page", None)
+    top, bot = h * 0.2, h * 0.86
+    area = QRectF(0, top, w, bot - top)
+    if wp is None:
+        self._x_msg(p, area, "Workshop isn't available")
+        return
+    if wk["mode"] == "games":
+        self._x_text(p, QRectF(m, h * 0.125, w - 2 * m, h * 0.05), "Steam Workshop   -   choose a game", 0.028,
+                     QColor(235, 235, 245), True)
+        games = wk["games"]
+        if not games:
+            self._x_msg(p, area, wk["err"] or "No installed Steam games found. Add a game to your library first.")
+            return
+
+        def draw_game(r, i, s):
+            g = games[i]
+            try:
+                url = _BPX_HDR % int(g["appid"])
+            except (TypeError, ValueError):
+                url = ""
+            cnt = _WS_MOD_COUNTS.get(g["appid"])
+            self._x_tile(p, r, self._ws_pix(url), g["title"], ("%s%s items" % (format(cnt, ","), "+" if g["appid"] in _WS_COUNT_APPROX else "")) if cnt else "", acc)
+        self._x_grid_paint(p, w, h, acc, len(games), wk["gsel"], 2.14, draw_game)
+        return
+    # items of one game: small toolbar (mouse friendly) + grid of previews
+    y, bh, gap = h * 0.128, h * 0.046, h * 0.012
+    focus = self._zone == "content"
+    sort_lbl = "Sort: %s" % WS_SORTS[wk["sort"]][0]
+    q_lbl = "Search: %s" % wk["query"] if wk["query"] else "Search"
+    bws = (h * 0.16, h * 0.3, h * 0.3)
+    x = m
+    for t, bw, tag in (("< Games", bws[0], "wback"), (sort_lbl, bws[1], "wsort"), (q_lbl, bws[2], "wsearch")):
+        r = QRectF(x, y, bw, bh)
+        self._x_pill(p, r, QFontMetrics(self._font(h * 0.019, True)).elidedText(t, Qt.TextElideMode.ElideRight, int(bw - h * 0.03)),
+                     acc, size=0.019)
+        self._xhits.append((r, (tag,)))
+        x += bw + gap
+    self._x_text(p, QRectF(x + gap, y, w - x - m, bh), wk["title"], 0.026, QColor(235, 235, 245), True)
+    items = wk["items"]
+    if not items:
+        if wk["loading"]:
+            self._paint_loading(p, w, h, area, "Loading Workshop...")
+        else:
+            self._x_msg(p, area, ("Couldn't load the Workshop: %s" % wk["err"]) if wk["err"] else "No Workshop items found")
+        return
+
+    def draw_item(r, i, s):
+        it = items[i]
+        badge = None
+        try:
+            if wp._ws_have(wk["appid"], it["id"]):
+                badge = "INSTALLED"
+            else:
+                q = next((e for e in wp.queue if e["id"] == it["id"] and e["appid"] == wk["appid"]
+                          and e["status"] in ("queued", "downloading")), None)
+                if q is not None:
+                    badge = "QUEUED" if q["status"] == "queued" else "DOWNLOADING"
+        except Exception:
+            pass
+        by = ("by " + it["author"]) if it.get("author") else ""
+        self._x_tile(p, r, self._ws_pix(it.get("preview", "")), it.get("title", "?"), by, acc, badge)
+    self._x_grid_paint(p, w, h, acc, len(items), wk["sel"], 1.6, draw_item, 0.2)
+    if wk["loading"]:
+        p.setFont(self._font(h * 0.018))
+        p.setPen(QColor(170, 170, 195))
+        p.drawText(QRectF(0, bot - h * 0.035, w, h * 0.03), int(Qt.AlignmentFlag.AlignCenter), "Loading more...")
+    elif wk["err"]:
+        p.setFont(self._font(h * 0.018))
+        p.setPen(QColor(230, 170, 170))
+        p.drawText(QRectF(0, bot - h * 0.035, w, h * 0.03), int(Qt.AlignmentFlag.AlignCenter), wk["err"])
+
+
+# ================================================================ Big Picture: X options sidebar, in-BP download server picker,
+# Fan Games tab and Garry's Mod Addons tab. Tabs: Library, Store, Friends, Downloads, Workshop, Fan Games, (GMod Addons).
+_bpy_o = {n: getattr(_BigPicture, n) for n in (
+    "__init__", "enter", "leave", "_act", "keyPressEvent", "mousePressEvent", "wheelEvent", "_launch", "_switch_tab",
+    "_tab_labels", "_x_enter", "_x_act", "_x_tag", "_x_hint", "_paint_extra", "paintEvent")}
+
+
+def _bpy_active_bp():
+    try:
+        for w in QApplication.topLevelWidgets():
+            bp = getattr(w, "_big_picture", None)
+            if bp is not None and bp._active and not bp._asleep and bp.isVisible():
+                return bp
+    except Exception:
+        pass
+    return None
+
+
+@_bpm("__init__")
+def _bpy_init(self, app):
+    _bpy_o["__init__"](self, app)
+    self._ov = None                       # open overlay: X sidebar ("side") or download-server picker ("pick")
+    self._pick_q = []
+    self._gm_root = None
+    self._ovtimer = QTimer(self)
+    self._ovtimer.setInterval(250)
+    self._ovtimer.timeout.connect(self.update)
+    self._fg = {"list": [], "sel": 0, "tag": "", "query": "", "pix": {}, "asked": set(), "tags": [""]}
+    self._gm = {"sel": 0, "btn": 0, "query": "", "confirm": None}
+    self._fgl = FanCoverLoader()
+    self._fgl.loaded.connect(self._fg_cover)
+    QApplication.instance().aboutToQuit.connect(self._fgl.shutdown)
+
+
+@_bpm("enter")
+def _bpy_enter(self):
+    try:
+        self._gm_root = find_gmod_root()
+    except Exception:
+        self._gm_root = None
+    _bpy_o["enter"](self)
+
+
+@_bpm("leave")
+def _bpy_leave(self, show_main=True):
+    pend = [self._ov] if self._ov is not None and self._ov["kind"] == "pick" else []
+    pend += [{"box": b, "ev": e} for _t, b, e in self._pick_q]
+    self._pick_q = []
+    self._ov = None
+    self._ovtimer.stop()
+    for o in pend:                        # a download waiting for a server pick is cancelled
+        o["ev"].set()
+    self._fg["pix"].clear()
+    self._fg["asked"].clear()
+    try:
+        self._fgl.cancel_pending()
+    except Exception:
+        pass
+    _bpy_o["leave"](self, show_main)
+
+
+@_bpm("_switch_tab")
+def _bpy_switch_tab(self, t):
+    global _BP_NTABS
+    _BP_NTABS = len(self._tab_labels())
+    _bpy_o["_switch_tab"](self, t)
+
+
+@_bpm("_tab_labels")
+def _bpy_tab_labels(self):
+    return tuple(_bpy_o["_tab_labels"](self)) + ("Fan Games",) + (("GMod Addons",) if self._gm_root else ())
+
+
+# ---------------------------------------------------------------- downloads stay inside Big Picture
+@_bpm("_launch")
+def _bpy_launch(self):
+    if not self._items:
+        return
+    it = self._items[self._sel]
+    btn = it["btn"]
+    try:
+        label = btn.text().strip().lower() if btn is not None else ""
+        usable = btn is not None and btn.isEnabled()
+    except RuntimeError:
+        label, usable = "", False
+    if not usable or label in ("play", "launch", "open"):
+        _bpy_o["_launch"](self)
+        return
+    before = len(self._dl_infos())
+    self._lib_dirty = True
+    btn.click()                           # same button the launcher uses; Big Picture stays open
+    if self._active and len(self._dl_infos()) > before:
+        self._switch_tab(3)
+        self._say("Downloading %s" % it["title"], 3500)
+    self.update()
+
+
+def _bpy_asker_show(title, box, ev):
+    bp = _bpy_active_bp()
+    if bp is None:
+        _ServerAsker._show(_PW_ASKER, title, box, ev)       # normal popup when Big Picture isn't open
+    else:
+        bp._pick_open(title, box, ev)
+
+
+try:
+    _PW_ASKER.request.disconnect()
+except Exception:
+    pass
+_PW_ASKER.request.connect(_bpy_asker_show)
+
+
+def _bpy_probe(states, title, sid):
+    try:
+        states[sid] = _pw_probe_server(title, sid)
+    except Exception:
+        states[sid] = "error"
+
+
+@_bpm("_pick_open")
+def _bpy_pick_open(self, title, box, ev):
+    if self._ov is not None and self._ov["kind"] == "pick":
+        self._pick_q.append((title, box, ev))
+        return
+    sids = list(PW_SERVER_NAMES.keys())
+    states = {s: "checking" for s in sids}
+    self._ov = {"kind": "pick", "title": title, "box": box, "ev": ev, "sids": sids, "states": states, "sel": 0, "rects": []}
+    for s in sids:
+        threading.Thread(target=_bpy_probe, args=(states, title, s), daemon=True).start()
+    self._ovtimer.start()
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+@_bpm("_pick_done")
+def _bpy_pick_done(self, sid):
+    ov = self._ov
+    self._ov = None
+    if ov is not None and ov["kind"] == "pick":
+        ov["box"]["v"] = sid
+        ov["ev"].set()
+    if self._pick_q:
+        self._pick_open(*self._pick_q.pop(0))
+    else:
+        self._ovtimer.stop()
+    self.update()
+
+
+# ---------------------------------------------------------------- X sidebar (the launcher's 3-dot menu)
+def _bpy_menu_entries(menu):
+    try:
+        menu.aboutToShow.emit()           # some menus fill themselves in lazily
+    except Exception:
+        pass
+    out = []
+    for a in menu.actions():
+        try:
+            if a.isSeparator() or not a.isVisible():
+                continue
+            txt = a.text().replace("&", "").strip()
+            if not txt:
+                continue
+            try:
+                sub = a.menu()
+            except Exception:
+                sub = None
+            out.append({"text": txt, "enabled": a.isEnabled(), "act": a, "sub": sub,
+                        "checked": a.isChecked() if a.isCheckable() else None})
+        except RuntimeError:
+            continue
+    return out
+
+
+@_bpm("_side_open")
+def _bpy_side_open(self):
+    if not self._items or not (0 <= self._sel < len(self._items)):
+        return
+    it = self._items[self._sel]
+    try:
+        more = it["card"].findChild(QPushButton, "MoreButton")
+        menu = more.menu() if more is not None else None
+    except RuntimeError:
+        menu = None
+    ents = _bpy_menu_entries(menu) if menu is not None else []
+    if not ents:
+        self._say("No options for this game", 2000)
+        self.update()
+        return
+    sel = next((i for i, e in enumerate(ents) if e["enabled"]), 0)
+    self._ov = {"kind": "side", "title": it["title"], "stack": [("Options", ents)], "sel": sel, "scroll": 0, "rects": []}
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+@_bpm("_side_run")
+def _bpy_side_run(self, a):
+    try:
+        a.trigger()
+    except Exception as ex:
+        self._say("Couldn't run that: %s" % ex, 3000)
+    self._lib_dirty = True
+    QTimer.singleShot(700, self._side_after)
+
+
+@_bpm("_side_after")
+def _bpy_side_after(self):
+    if self._active and not self._asleep and self._tab == 0 and self._ov is None and self._detail is None and self._kb is None:
+        self._refresh()
+    self.update()
+
+
+@_bpm("_ov_act")
+def _bpy_ov_act(self, name):
+    ov = self._ov
+    if ov is None:
+        return
+    if name == "start":
+        name = "accept"
+    if ov["kind"] == "side":
+        title, ents = ov["stack"][-1]
+        n = len(ents)
+        if name in ("up", "down"):
+            d = -1 if name == "up" else 1
+            j = ov["sel"] + d
+            while 0 <= j < n and not ents[j]["enabled"]:
+                j += d
+            if 0 <= j < n:
+                ov["sel"] = j
+        elif name == "accept" and n:
+            e = ents[ov["sel"]]
+            if not e["enabled"]:
+                return
+            if e["sub"] is not None:
+                sub = _bpy_menu_entries(e["sub"])
+                if sub:
+                    ov["stack"].append((e["text"], sub))
+                    ov["sel"], ov["scroll"] = next((i for i, x in enumerate(sub) if x["enabled"]), 0), 0
+                return
+            a = e["act"]
+            self._ov = None
+            QTimer.singleShot(60, lambda a=a: self._side_run(a))
+        elif name in ("back", "x"):
+            if len(ov["stack"]) > 1:
+                ov["stack"].pop()
+                ov["sel"], ov["scroll"] = 0, 0
+            else:
+                self._ov = None
+    else:
+        n = len(ov["sids"]) + 1                       # servers + Cancel
+        if name in ("up", "down"):
+            ov["sel"] = max(0, min(n - 1, ov["sel"] + (-1 if name == "up" else 1)))
+        elif name == "accept":
+            if ov["sel"] >= len(ov["sids"]):
+                self._pick_done("")
+            else:
+                sid = ov["sids"][ov["sel"]]
+                if ov["states"].get(sid) != "404":
+                    self._pick_done(sid)
+        elif name == "back":
+            self._pick_done("")
+    self.update()
+
+
+@_bpm("_ov_click")
+def _bpy_ov_click(self, tag):
+    ov = self._ov
+    ov["sel"] = tag[1]
+    self._ov_act("accept")
+
+
+@_bpm("_act")
+def _bpy_act(self, name):
+    if not self._from_key:
+        self._pad_last = True
+    if self._ov is not None:
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self._ov_act(name)
+        return
+    if name == "x" and self._tab == 0 and self._detail is None and self._kb is None:
+        self._side_open()
+        return
+    _bpy_o["_act"](self, name)
+
+
+@_bpm("keyPressEvent")
+def _bpy_key(self, e):
+    k, K = e.key(), Qt.Key
+    if self._ov is not None:
+        self._pad_last = False
+        name = {K.Key_Up: "up", K.Key_Down: "down", K.Key_Left: "up", K.Key_Right: "down", K.Key_Return: "accept",
+                K.Key_Enter: "accept", K.Key_Space: "accept", K.Key_Escape: "back", K.Key_Backspace: "back",
+                K.Key_F11: "back", K.Key_X: "x"}.get(k)
+        if self._ov["kind"] in ("view", "files") and k in (K.Key_Left, K.Key_Right):
+            name = "left" if k == K.Key_Left else "right"
+        if name:
+            self._ov_act(name)
+        return
+    if (k == K.Key_X and self._tab == 0 and self._detail is None and self._kb is None
+            and not (e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier))):
+        self._pad_last = False
+        self._side_open()
+        return
+    _bpy_o["keyPressEvent"](self, e)
+
+
+@_bpm("mousePressEvent")
+def _bpy_mouse(self, e):
+    if self._ov is not None:
+        pt = e.position()
+        for r, tag in self._ov["rects"]:
+            if r.contains(pt):
+                self._ov_click(tag)
+                return
+        if self._ov["kind"] in ("side", "view"):
+            self._ov_act("back")
+        return
+    _bpy_o["mousePressEvent"](self, e)
+
+
+@_bpm("wheelEvent")
+def _bpy_wheel(self, e):
+    if self._ov is not None:
+        self._ov_act("up" if e.angleDelta().y() > 0 else "down")
+        return
+    _bpy_o["wheelEvent"](self, e)
+
+
+@_bpm("paintEvent")
+def _bpy_paint(self, e):
+    _bpy_o["paintEvent"](self, e)
+    if self._ov is None:
+        return
+    p = QPainter(self)
+    p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+    try:
+        self._paint_ov(p, self.width(), self.height(), QApplication.palette().color(QPalette.ColorRole.Highlight))
+    finally:
+        p.end()
+
+
+@_bpm("_paint_ov")
+def _bpy_paint_ov(self, p, w, h, acc):
+    ov = self._ov
+    ov["rects"] = []
+    al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    if ov["kind"] == "side":
+        px, pad = w * 0.64, h * 0.03
+        p.fillRect(QRectF(0, 0, px, h), QColor(0, 0, 0, 150))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(14, 14, 26, 250))
+        p.drawRect(QRectF(px, 0, w - px, h))
+        p.setBrush(acc)
+        p.drawRect(QRectF(px, 0, max(2.0, h * 0.003), h))
+        title, ents = ov["stack"][-1]
+        self._x_text(p, QRectF(px + pad, h * 0.04, w - px - 2 * pad, h * 0.05), ov["title"], 0.032, QColor(245, 245, 252), True)
+        self._x_text(p, QRectF(px + pad, h * 0.095, w - px - 2 * pad, h * 0.04), title, 0.021, QColor(170, 170, 200))
+        top, bot, rh, pitch = h * 0.16, h * 0.9, h * 0.068, h * 0.076
+        vis = max(1, int((bot - top) // pitch))
+        sel = ov["sel"]
+        if sel < ov["scroll"]:
+            ov["scroll"] = sel
+        if sel >= ov["scroll"] + vis:
+            ov["scroll"] = sel - vis + 1
+        clip = QRectF(px, top - h * 0.01, w - px, bot - top + h * 0.02)
+        p.save()
+        p.setClipRect(clip)
+        for n in range(ov["scroll"], min(len(ents), ov["scroll"] + vis + 1)):
+            e = ents[n]
+            r = QRectF(px + pad, top + (n - ov["scroll"]) * pitch, w - px - 2 * pad, rh)
+            s = n == sel
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(acc if s else QColor(255, 255, 255, 22))
+            p.drawRoundedRect(r, rh * 0.25, rh * 0.25)
+            label = ("[x] " if e["checked"] else "[ ] " if e["checked"] is not None else "") + e["text"]
+            col = QColor(_on_accent()) if s else (QColor(235, 235, 245) if e["enabled"] else QColor(110, 110, 130))
+            self._x_text(p, QRectF(r.left() + pad * 0.7, r.top(), r.width() - pad * 1.9, rh), label, 0.024, col, s)
+            if e["sub"] is not None:
+                self._x_text(p, QRectF(r.left(), r.top(), r.width() - pad * 0.7, rh), ">", 0.026, col, True, al_r)
+            ov["rects"].append((r.intersected(clip), ("row", n)))
+        p.restore()
+        p.setFont(self._font(h * 0.0185))
+        p.setPen(QColor(150, 150, 175))
+        p.drawText(QRectF(px + pad, h * 0.935, w - px - 2 * pad, h * 0.035),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "Up / Down  Move      A  Select      B / X  Close")
+        return
+    # download server picker
+    bw, bh = w * 0.46, h * 0.62
+    bx, by, pad = (w - bw) / 2, (h - bh) / 2, h * 0.03
+    p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 175))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(14, 14, 26, 250))
+    p.drawRoundedRect(QRectF(bx, by, bw, bh), h * 0.025, h * 0.025)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.025, bw - 2 * pad, h * 0.05), "Choose download server", 0.032, QColor(245, 245, 252), True)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.078, bw - 2 * pad, h * 0.04), "Where do you want to download %s from?" % ov["title"],
+                 0.021, QColor(170, 170, 200))
+    y, rh = by + h * 0.14, h * 0.1
+    names = {"ok": "available", "404": "Not found (404)", "checking": "checking..."}
+    for i, sid in enumerate(ov["sids"]):
+        name, desc = PW_SERVER_NAMES[sid]
+        st = ov["states"].get(sid, "checking")
+        r = QRectF(bx + pad, y + i * (rh + h * 0.012), bw - 2 * pad, rh)
+        s = i == ov["sel"]
+        dead = st == "404"
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc if s and not dead else QColor(255, 255, 255, 22))
+        p.drawRoundedRect(r, rh * 0.2, rh * 0.2)
+        col = QColor(110, 110, 130) if dead else (QColor(_on_accent()) if s else QColor(240, 240, 250))
+        self._x_text(p, QRectF(r.left() + pad * 0.7, r.top() + rh * 0.08, r.width() - pad * 1.4, rh * 0.46), name, 0.026, col, True)
+        self._x_text(p, QRectF(r.left() + pad * 0.7, r.top() + rh * 0.52, r.width() - pad * 1.4, rh * 0.38),
+                     "%s  -  %s" % (desc, names.get(st, "couldn't check")), 0.0185, col)
+        ov["rects"].append((r, ("srv", i)))
+    r = QRectF(bx + pad, y + len(ov["sids"]) * (rh + h * 0.012), bw - 2 * pad, h * 0.065)
+    self._x_pill(p, r, "Cancel", acc, sel=(ov["sel"] == len(ov["sids"])))
+    ov["rects"].append((r, ("cancel", len(ov["sids"]))))
+
+
+# ---------------------------------------------------------------- Fan Games tab
+@_bpm("_x_enter")
+def _bpy_x_enter(self, t):
+    _bpy_o["_x_enter"](self, t)
+    if t == 5:
+        self._fg_enter()
+    elif t == 6:
+        self._gm_enter()
+
+
+@_bpm("_x_act")
+def _bpy_x_act(self, name):
+    if self._tab == 5:
+        self._fg_act(name)
+    elif self._tab == 6:
+        self._gm_act(name)
+    else:
+        _bpy_o["_x_act"](self, name)
+        return
+    self.update()
+
+
+@_bpm("_x_hint")
+def _bpy_hint(self):
+    if self._tab == 5:
+        return "Arrows  Browse      A  Add to library      Y  Search      X  Category      LB / RB  Switch tab      B  Library"
+    if self._tab == 6:
+        return "Up / Down  Select      Left / Right  Button      A  Press      Y  Search      X  Enable / disable all      LB / RB  Switch tab      B  Library"
+    return _bpy_o["_x_hint"](self)
+
+
+@_bpm("_paint_extra")
+def _bpy_paint_extra(self, p, w, h, m, acc, k):
+    if self._tab < 5:
+        _bpy_o["_paint_extra"](self, p, w, h, m, acc, k)
+        return
+    self._xhits = []
+    p.setOpacity(k)
+    if self._tab == 5:
+        self._paint_fan(p, w, h, m, acc)
+    else:
+        self._paint_gm(p, w, h, m, acc)
+    p.setOpacity(1.0)
+
+
+@_bpm("_x_tag")
+def _bpy_x_tag(self, tag):
+    k = tag[0]
+    if self._tab == 5:
+        fg = self._fg
+        if k == "tile":
+            if fg["sel"] == tag[1]:
+                self._fg_act("accept")
+            else:
+                fg["sel"] = tag[1]
+                self._fg_ensure()
+        elif k == "fgtag":
+            self._fg_act("x")
+        elif k == "fgsearch":
+            self._fg_act("alt")
+        self.update()
+        return
+    if self._tab == 6:
+        gm = self._gm
+        if k == "grow":
+            gm["sel"], gm["btn"] = tag[1], 0
+        elif k == "gbtn":
+            gm["sel"], gm["btn"] = tag[1], tag[2]
+            self._gm_act("accept")
+        elif k == "gall":
+            self._gm_all(tag[1])
+        elif k == "gsearch":
+            self._gm_act("alt")
+        self.update()
+        return
+    _bpy_o["_x_tag"](self, tag)
+
+
+@_bpm("_fg_cover")
+def _bpy_fg_cover(self, gid, path):
+    pm = QPixmap()
+    if path:
+        q = QPixmap(path)
+        if not q.isNull():
+            pm = q.scaledToWidth(480, Qt.TransformationMode.SmoothTransformation) if q.width() > 480 else q
+    self._fg["pix"][gid] = pm
+    QTimer.singleShot(0, self.update)
+
+
+@_bpm("_fg_rebuild")
+def _bpy_fg_rebuild(self):
+    fg = self._fg
+    games = load_fan_games()
+    q = fg["query"].lower()
+    cur = fg["list"][fg["sel"]][0] if fg["list"] and 0 <= fg["sel"] < len(fg["list"]) else None
+    fg["list"] = [g for g in games if q in g[1].lower() and (not fg["tag"] or fg["tag"] in g[3])]
+    fg["sel"] = next((i for i, g in enumerate(fg["list"]) if g[0] == cur), 0)
+    tags = set()
+    for g in games:
+        tags |= set(g[3])
+    fg["tags"] = [""] + [t for t in _FAN_TAG_NAMES if t in tags] + sorted(t for t in tags if t not in _FAN_TAG_NAMES)
+
+
+@_bpm("_fg_enter")
+def _bpy_fg_enter(self):
+    self._fg_rebuild()
+    self._fg_ensure()
+
+
+@_bpm("_fg_ensure")
+def _bpy_fg_ensure(self):
+    gap, tw, th, cols, x0, top, bot = self._x_grid(1.6)
+    pitch = th + gap
+    row = self._fg["sel"] // cols
+    self._x_ensure(row * pitch, row * pitch + pitch + self.height() * 0.024, bot - top)
+
+
+@_bpm("_fg_search")
+def _bpy_fg_search(self, text):
+    self._fg["query"] = (text or "").strip()
+    self._fg_rebuild()
+    self._x_reset_scroll()
+
+
+@_bpm("_fg_act")
+def _bpy_fg_act(self, name):
+    fg = self._fg
+    lst = fg["list"]
+    n = len(lst)
+    fg["sel"] = max(0, min(max(0, n - 1), fg["sel"]))
+    if name == "back":
+        self._switch_tab(0)
+    elif name in ("left", "right", "up", "down"):
+        if not n:
+            if name == "up":
+                _bpx_top(self)
+            return
+        new = _bpx_grid_nav(fg["sel"], n, self._x_grid(1.6)[3], name)
+        if new < 0:
+            _bpx_top(self)
+            return
+        fg["sel"] = new
+        self._fg_ensure()
+    elif name == "accept" and n:
+        gid, title, link, _tags = lst[fg["sel"]]
+        lib = getattr(self._app, "fan_lib_cards", None) or {}
+        if gid in lib:                                   # already added: jump to it in the Library
+            card = lib[gid]
+            self._switch_tab(0)
+            if self._lib_dirty:
+                self._refresh()
+            for i, li in enumerate(self._items):
+                if li["card"] is card:
+                    self._sel, self._pos = i, float(i)
+                    self._cache.clear()
+                    self._sync_bg(animate=False)
+                    break
+            return
+        cover = os.path.join(get_fan_cover_dir(), "%s.img" % gid)
+        try:
+            self._app._fan_add(gid, title, cover if os.path.exists(cover) else "")
+            self._lib_dirty = True
+            self._say("Added %s to your library" % title, 3000)
+        except Exception as ex:
+            self._say("Couldn't add game: %s" % ex, 4000)
+    elif name == "alt":
+        self._kb_open("Search Fan Games", fg["query"], None, self._fg_search, 80)
+    elif name == "x":
+        tags = fg["tags"]
+        fg["tag"] = tags[(tags.index(fg["tag"]) + 1) % len(tags)] if fg["tag"] in tags else ""
+        self._fg_rebuild()
+        self._x_reset_scroll()
+        self._say("Category: %s" % (_FAN_TAG_NAMES.get(fg["tag"], fg["tag"].title()) if fg["tag"] else "All"), 2000)
+
+
+@_bpm("_paint_fan")
+def _bpy_paint_fan(self, p, w, h, m, acc):
+    fg = self._fg
+    top, bot = h * 0.2, h * 0.86
+    area = QRectF(0, top, w, bot - top)
+    y, bh, gap = h * 0.128, h * 0.046, h * 0.012
+    fm = QFontMetrics(self._font(h * 0.019, True))
+    tag_lbl = "Category: %s" % (_FAN_TAG_NAMES.get(fg["tag"], fg["tag"].title()) if fg["tag"] else "All")
+    q_lbl = ("Search: " + fg["query"]) if fg["query"] else "Search"
+    x = m
+    for t, bw, tag in ((tag_lbl, h * 0.34, "fgtag"), (q_lbl, h * 0.34, "fgsearch")):
+        r = QRectF(x, y, bw, bh)
+        self._x_pill(p, r, fm.elidedText(t, Qt.TextElideMode.ElideRight, int(bw - h * 0.03)), acc, size=0.019)
+        self._xhits.append((r, (tag,)))
+        x += bw + gap
+    lst = fg["list"]
+    self._x_text(p, QRectF(x + gap, y, w - x - m, bh), "Fan Games   %d" % len(lst), 0.026, QColor(235, 235, 245), True)
+    if not lst:
+        self._x_msg(p, area, "No fan games match" if load_fan_games() else "No fan_games.csv found next to main.py")
+        return
+    lib = getattr(self._app, "fan_lib_cards", None) or {}
+
+    def draw(r, i, s):
+        gid, title, link, tags = lst[i]
+        pm = fg["pix"].get(gid)
+        if pm is None and gid not in fg["asked"]:
+            fg["asked"].add(gid)
+            self._fgl.request(gid, link, title)
+        sub = ", ".join(_FAN_TAG_NAMES.get(t, t.title()) for t in sorted(tags))
+        self._x_tile(p, r, pm, title, sub, acc, "IN LIBRARY" if gid in lib else None)
+    self._x_grid_paint(p, w, h, acc, len(lst), fg["sel"], 1.6, draw)
+
+
+# ---------------------------------------------------------------- Garry's Mod Addons tab
+def _bpy_gm_page(self):
+    return getattr(self._app, "gmod_page", None) if self._gm_root else None
+
+
+@_bpm("_gm_rows")
+def _bpy_gm_rows(self):
+    gp = _bpy_gm_page(self)
+    if gp is None:
+        return []
+    q = self._gm["query"].lower()
+    return [r for r in gp.rows if q in r["name"].lower()]
+
+
+@_bpm("_gm_enter")
+def _bpy_gm_enter(self):
+    gp = _bpy_gm_page(self)
+    if gp is not None:
+        try:
+            gp.set_root(self._gm_root)
+            gp.refresh_addons()
+        except Exception as ex:
+            self._say("Couldn't read addons: %s" % ex, 3000)
+    self._gm.update(sel=0, btn=0, confirm=None)
+
+
+@_bpm("_gm_ensure")
+def _bpy_gm_ensure(self):
+    h = self.height()
+    pitch = h * 0.097
+    i = self._gm["sel"]
+    self._x_ensure(i * pitch, (i + 1) * pitch, h * 0.86 - h * 0.2)
+
+
+@_bpm("_gm_set")
+def _bpy_gm_set(self, r, enable):
+    gp = _bpy_gm_page(self)
+    if gp is None or r["btn"].isChecked() == enable:
+        return True
+    try:
+        gp._move(r, enable)
+    except Exception as ex:
+        self._say("Couldn't move addon: %s" % ex, 4000)
+        return False
+    b = r["btn"]
+    b.blockSignals(True)
+    b.setChecked(enable)
+    b.setText("Enabled" if enable else "Disabled")
+    b.blockSignals(False)
+    return True
+
+
+@_bpm("_gm_all")
+def _bpy_gm_all(self, enable):
+    rows = self._gm_rows()
+    done = sum(1 for r in rows if r["btn"].isChecked() != enable and self._gm_set(r, enable))
+    self._say("%s %d addon%s" % ("Enabled" if enable else "Disabled", done, "" if done == 1 else "s"), 2500)
+
+
+@_bpm("_gm_delete")
+def _bpy_gm_delete(self, r):
+    gp = _bpy_gm_page(self)
+    if gp is None:
+        return
+    base = gp.addons_dir()
+    path = os.path.join(base if r["btn"].isChecked() else os.path.join(base, "disabled"), r["real"])
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception as ex:
+        self._say("Couldn't delete addon: %s" % ex, 4000)
+        return
+    name = r["name"]
+    gp.refresh_addons()
+    self._say("Deleted %s" % name, 2500)
+
+
+@_bpm("_gm_search")
+def _bpy_gm_search(self, text):
+    self._gm.update(query=(text or "").strip(), sel=0, confirm=None)
+    self._x_reset_scroll()
+
+
+@_bpm("_gm_act")
+def _bpy_gm_act(self, name):
+    gm = self._gm
+    rows = self._gm_rows()
+    n = len(rows)
+    gm["sel"] = max(0, min(max(0, n - 1), gm["sel"]))
+    if name == "back":
+        self._switch_tab(0)
+    elif name == "up":
+        gm["confirm"] = None
+        if gm["sel"] <= 0:
+            _bpx_top(self)
+        else:
+            gm["sel"] -= 1
+            gm["btn"] = 0
+            self._gm_ensure()
+    elif name == "down":
+        gm["confirm"] = None
+        if gm["sel"] < n - 1:
+            gm["sel"] += 1
+            gm["btn"] = 0
+            self._gm_ensure()
+    elif name in ("left", "right"):
+        gm["confirm"] = None
+        gm["btn"] = 1 if name == "right" else 0
+    elif name == "accept" and n:
+        r = rows[gm["sel"]]
+        if gm["btn"] == 0:
+            self._gm_set(r, not r["btn"].isChecked())
+        elif gm["confirm"] == r["name"]:
+            gm["confirm"] = None
+            self._gm_delete(r)
+        else:
+            gm["confirm"] = r["name"]
+            self._say("Press A again to delete \"%s\"" % r["name"], 3000)
+    elif name == "alt":
+        self._kb_open("Search addons", gm["query"], None, self._gm_search, 80)
+    elif name == "x" and n:
+        self._gm_all(any(not r["btn"].isChecked() for r in rows))
+
+
+@_bpm("_paint_gm")
+def _bpy_paint_gm(self, p, w, h, m, acc):
+    gm = self._gm
+    top, bot = h * 0.2, h * 0.86
+    area = QRectF(0, top, w, bot - top)
+    gp = _bpy_gm_page(self)
+    if gp is None:
+        self._x_msg(p, area, "Garry's Mod isn't installed")
+        return
+    rows = self._gm_rows()
+    y, bh, gap = h * 0.128, h * 0.046, h * 0.012
+    fm = QFontMetrics(self._font(h * 0.019, True))
+    q_lbl = ("Search: " + gm["query"]) if gm["query"] else "Search"
+    x = m
+    for t, bw, tag in (("Enable all", h * 0.2, ("gall", True)), ("Disable all", h * 0.2, ("gall", False)),
+                       (q_lbl, h * 0.34, ("gsearch",))):
+        r = QRectF(x, y, bw, bh)
+        self._x_pill(p, r, fm.elidedText(t, Qt.TextElideMode.ElideRight, int(bw - h * 0.03)), acc, size=0.019)
+        self._xhits.append((r, tag))
+        x += bw + gap
+    en = sum(1 for r in gp.rows if r["btn"].isChecked())
+    self._x_text(p, QRectF(x + gap, y, w - x - m, bh), "Addons   %d installed, %d enabled" % (len(gp.rows), en), 0.026,
+                 QColor(235, 235, 245), True)
+    if not rows:
+        self._x_msg(p, area, "No addons found" if not gp.rows else "No addons match your search")
+        return
+    cx, cw, rh, pitch = w * 0.14, w * 0.72, h * 0.085, h * 0.097
+    focus = self._zone == "content"
+    p.save()
+    p.setClipRect(QRectF(0, top - h * 0.01, w, bot - top + h * 0.02))
+    for i, r in enumerate(rows):
+        yy = top + i * pitch - self._xscroll
+        if yy + rh < top - h * 0.01 or yy > bot:
+            continue
+        rect = QRectF(cx, yy, cw, rh)
+        sel = focus and i == gm["sel"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 48 if sel else 22))
+        p.drawRoundedRect(rect, rh * 0.2, rh * 0.2)
+        if sel:
+            self._x_ring(p, rect, rh * 0.2)
+        vis = QRectF(0, top, w, bot - top)
+        self._xhits.append((rect.intersected(vis), ("grow", i)))
+        pad, bw2, bh2 = rh * 0.2, h * 0.15, rh * 0.55
+        delr = QRectF(rect.right() - pad - bw2, yy + (rh - bh2) / 2, bw2, bh2)
+        togr = QRectF(delr.left() - h * 0.012 - bw2, delr.top(), bw2, bh2)
+        on = r["btn"].isChecked()
+        self._x_pill(p, togr, "Enabled" if on else "Disabled", acc, sel=(sel and gm["btn"] == 0), primary=on, size=0.02)
+        self._x_pill(p, delr, "Confirm?" if gm["confirm"] == r["name"] else "Delete", acc, sel=(sel and gm["btn"] == 1), size=0.02)
+        self._xhits.append((togr.intersected(vis), ("gbtn", i, 0)))
+        self._xhits.append((delr.intersected(vis), ("gbtn", i, 1)))
+        self._x_text(p, QRectF(cx + pad, yy, togr.left() - cx - 2 * pad, rh), r["name"], 0.026,
+                     QColor(245, 245, 252) if on else QColor(160, 160, 180), True)
+    p.restore()
+
+
+# ================================================================ Big Picture chat: game invites + attachments
+class _BPMediaBus(QObject):
+    ready = pyqtSignal(str, str, str)       # attachment id (or "inv:<link>"), file path, error
+
+
+_bpz_o = {n: getattr(_BigPicture, n) for n in (
+    "__init__", "leave", "_fr_act", "_x_tag", "_x_hint", "_x_tick", "_ov_act", "_paint_ov")}
+
+
+@_bpm("__init__")
+def _bpz_init(self, app):
+    _bpz_o["__init__"](self, app)
+    self._fr.update(cfocus="btns", media={}, mreq=set(), cov={}, want=None, seen=None)
+    self._mb = _BPMediaBus()
+    self._mb.ready.connect(self._fr_media_ready)
+
+
+@_bpm("leave")
+def _bpz_leave(self, show_main=True):
+    fr = self._fr
+    fr["media"].clear()
+    fr["cov"].clear()
+    fr["want"] = None
+    fr["cfocus"] = "btns"
+    _bpz_o["leave"](self, show_main)
+
+
+# ---------------------------------------------------------------- media (thumbnails, invite covers)
+@_bpm("_fr_media_req")
+def _bpz_media_req(self, att, force=False):
+    fr = self._fr
+    aid, other = str(att.get("id", "")), fr["chat"]
+    if not aid or not other or aid in fr["mreq"] or (aid in fr["media"] and not force):
+        return
+    fr["mreq"].add(aid)
+    bus = self._mb
+
+    def work():
+        try:
+            path, err = cloud_fetch_media(other, att), ""
+        except Exception as e:
+            path, err = "", (str(e) or "Couldn't load this attachment.")
+        try:
+            bus.ready.emit(aid, path, err)
+        except RuntimeError:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+
+
+@_bpm("_fr_media_ready")
+def _bpz_media_ready(self, aid, path, err):
+    fr = self._fr
+    fr["mreq"].discard(aid)
+    if aid.startswith("inv:"):
+        pm = QPixmap(path) if path else QPixmap()
+        fr["cov"][aid[4:]] = pm.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation) if not pm.isNull() else QPixmap()
+    else:
+        pm = QPixmap()
+        if path:
+            q = QPixmap(path)
+            if not q.isNull():
+                pm = q.scaledToHeight(540, Qt.TransformationMode.SmoothTransformation) if q.height() > 540 else q
+        fr["media"][aid] = pm
+        want = fr["want"]
+        if want and want[0] == aid:
+            fr["want"] = None
+            if err or not path:
+                self._say("Couldn't open it: %s" % (err or "not available"), 4000)
+            else:
+                self._att_show(want[1], want[2], path)
+    self.update()
+
+
+@_bpm("_att_open")
+def _bpz_att_open(self, atts, i):
+    att = atts[i]
+    path = _att_cache_path(att)
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        self._att_show(atts, i, path)
+        return
+    self._fr["want"] = (str(att.get("id", "")), atts, i)
+    self._fr_media_req(att, force=True)
+    self._say("Downloading...", 3000)
+
+
+@_bpm("_att_show")
+def _bpz_att_show(self, atts, i, path):
+    att = atts[i]
+    if att.get("k") in ("img", "gif"):
+        imgs = [a for a in atts if a.get("k") in ("img", "gif")]
+        j = next((n for n, a in enumerate(imgs) if a is att), 0)
+        self._ov = {"kind": "view", "atts": imgs, "i": j, "pm": QPixmap(path), "rects": []}
+        self.setCursor(Qt.CursorShape.BlankCursor)
+    else:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self._say("Opened in your default app", 2500)
+    self.update()
+
+
+@_bpm("_att_step")
+def _bpz_att_step(self, ov, d):
+    imgs = ov["atts"]
+    if len(imgs) < 2:
+        return
+    j = (ov["i"] + d) % len(imgs)
+    path = _att_cache_path(imgs[j])
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        ov["i"], ov["pm"] = j, QPixmap(path)
+    else:
+        self._fr["want"] = (str(imgs[j].get("id", "")), imgs, j)
+        self._fr_media_req(imgs[j], force=True)
+        self._say("Downloading...", 3000)
+
+
+def _bpz_cover(self, inv, sender):
+    fr = self._fr
+    link = inv["link"]
+    pm = fr["cov"].get(link)
+    if pm is not None:
+        return pm
+    path = ""
+    try:
+        path = invite_cover_path(inv, sender)
+    except Exception:
+        pass
+    if path:
+        q = QPixmap(path)
+        pm = q.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation) if not q.isNull() else QPixmap()
+        fr["cov"][link] = pm
+        return pm
+    key = "inv:" + link
+    if not (inv.get("appid") or (sender and inv.get("key"))):
+        fr["cov"][link] = QPixmap()
+        return fr["cov"][link]
+    if key not in fr["mreq"]:
+        fr["mreq"].add(key)
+        bus = self._mb
+
+        def work():
+            try:
+                pth = _fetch_invite_cover(inv, sender) or ""
+            except Exception:
+                pth = ""
+            try:
+                bus.ready.emit(key, pth, "")
+            except RuntimeError:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+    return None
+
+
+# ---------------------------------------------------------------- chat drawing
+@_bpm("_chat_parts")
+def _bpz_parts(self, mg, iw, fm):
+    fr, h, parts = self._fr, self.height(), []
+    text = str(mg.get("text") or "")
+    inv = parse_invite(text)
+    if inv:
+        parts.append({"t": "inv", "inv": inv, "w": min(iw, h * 0.5), "h": h * 0.11, "from": mg.get("from")})
+        return parts
+    if text.strip():
+        br = fm.boundingRect(QRect(0, 0, int(iw), 10000), int(Qt.TextFlag.TextWordWrap), text)
+        parts.append({"t": "txt", "text": text, "w": br.width(), "h": br.height()})
+    atts = [a for a in (mg.get("att") if isinstance(mg.get("att"), list) else []) if isinstance(a, dict)]
+    for a in atts[:CHAT_MAX_ATTACH]:
+        k, aid = a.get("k"), str(a.get("id", ""))
+        if k in ("img", "gif"):
+            pm = fr["media"].get(aid)
+            if pm is None:
+                self._fr_media_req(a)
+            if pm is not None and not pm.isNull():
+                s = min(iw / pm.width(), h * 0.22 / pm.height(), 1.0)
+                parts.append({"t": "img", "pm": pm, "w": pm.width() * s, "h": pm.height() * s})
+            else:
+                parts.append({"t": "ph", "label": "Loading image..." if pm is None else "Image unavailable",
+                              "w": min(iw, h * 0.3), "h": h * 0.06})
+        else:
+            parts.append({"t": "file", "label": "[%s] %s" % ("Video" if k == "vid" else "File", str(a.get("n") or "attachment")),
+                          "w": min(iw, h * 0.45), "h": h * 0.05})
+    return parts
+
+
+@_bpm("_paint_chat")
+def _bpz_paint_chat(self, p, w, h, acc):
+    fr = self._fr
+    row = next((r for r in fr["rows"] if r["uid"] == fr["chat"]), None)
+    cx, cw = w * 0.2, w * 0.6
+    if row is not None:
+        ad = h * 0.075
+        self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
+        st, col = _friend_status(row["d"])
+        self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
+        self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
+    top = h * 0.24
+    bot = h * 0.42 if self._kb is not None else h * 0.78
+    clip = QRectF(cx - h * 0.01, top, cw + h * 0.02, bot - top)
+    p.save()
+    p.setClipRect(clip)
+    msgs = fr["msgs"]
+    if not msgs:
+        self._x_msg(p, QRectF(cx, top, cw, bot - top), "Loading messages..." if fr["loading"] else "No messages yet. Press A to say hi!")
+    f = self._font(h * 0.024)
+    p.setFont(f)
+    fm = QFontMetrics(f)
+    maxw, padx, pady, gap = cw * 0.72, h * 0.018, h * 0.012, h * 0.01
+    inner = cw * 0.72 - 2 * padx
+    y, idx, first = bot, len(msgs) - 1 - fr["moff"], True
+    focus = self._zone == "content" and fr["cfocus"] == "msgs"
+    al_c = int(Qt.AlignmentFlag.AlignCenter)
+    while idx >= 0 and y > top:
+        mg, i = msgs[idx], idx
+        idx -= 1
+        parts = self._chat_parts(mg, inner, fm)
+        if not parts:
+            continue
+        bh = sum(pt["h"] for pt in parts) + gap * 0.6 * (len(parts) - 1) + 2 * pady
+        bw = min(maxw, max(pt["w"] for pt in parts) + 2 * padx)
+        y -= bh
+        mine = mg.get("from") == fr["me"]
+        bx = cx + cw - bw if mine else cx
+        rect = QRectF(bx, y, bw, bh)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc if mine else QColor(255, 255, 255, 36))
+        p.drawRoundedRect(rect, h * 0.02, h * 0.02)
+        if first and focus:
+            self._x_ring(p, rect, h * 0.02)
+        self._xhits.append((rect.intersected(clip), ("cmsg", i)))
+        ink = QColor(_on_accent()) if mine else QColor(235, 235, 245)
+        yy = y + pady
+        for pt in parts:
+            r = QRectF(bx + padx, yy, pt["w"], pt["h"])
+            t = pt["t"]
+            if t == "txt":
+                p.setFont(f)
+                p.setPen(ink)
+                p.drawText(QRectF(r.left(), r.top(), bw - 2 * padx, r.height()),
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap), pt["text"])
+            elif t == "img":
+                path = QPainterPath()
+                path.addRoundedRect(r, h * 0.01, h * 0.01)
+                p.save()
+                p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+                p.drawPixmap(r, pt["pm"], QRectF(pt["pm"].rect()))
+                p.restore()
+            elif t in ("ph", "file"):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 70))
+                p.drawRoundedRect(r, r.height() / 2 if t == "file" else h * 0.01, r.height() / 2 if t == "file" else h * 0.01)
+                self._x_text(p, r.adjusted(h * 0.014, 0, -h * 0.014, 0), pt["label"], 0.02, ink, False,
+                             al_c if t == "ph" else None)
+            else:                                                   # game invite card
+                inv = pt["inv"]
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 80))
+                p.drawRoundedRect(r, h * 0.014, h * 0.014)
+                ch = r.height() * 0.84
+                cr = QRectF(r.left() + r.height() * 0.08, r.top() + (r.height() - ch) / 2, ch * 0.75, ch)
+                cov = _bpz_cover(self, inv, pt["from"])
+                if cov is not None and not cov.isNull():
+                    cp = QPainterPath()
+                    cp.addRoundedRect(cr, h * 0.008, h * 0.008)
+                    p.save()
+                    p.setClipPath(cp, Qt.ClipOperation.IntersectClip)
+                    sc = max(cr.width() / cov.width(), cr.height() / cov.height())
+                    vw, vh = cr.width() / sc, cr.height() / sc
+                    p.drawPixmap(cr, cov, QRectF((cov.width() - vw) / 2, (cov.height() - vh) / 2, vw, vh))
+                    p.restore()
+                else:
+                    p.setBrush(QColor(255, 255, 255, 30))
+                    p.drawRoundedRect(cr, h * 0.008, h * 0.008)
+                tx = cr.right() + h * 0.014
+                tw = r.right() - tx - h * 0.012
+                self._x_text(p, QRectF(tx, r.top() + r.height() * 0.08, tw, r.height() * 0.26),
+                             "Game invite" + (" (sent)" if mine else ""), 0.0165, ink)
+                self._x_text(p, QRectF(tx, r.top() + r.height() * 0.32, tw, r.height() * 0.3), inv["game"] or "Steam game", 0.024, ink, True)
+                self._x_text(p, QRectF(tx, r.top() + r.height() * 0.66, tw, r.height() * 0.26),
+                             "A  Join" if (first and focus and not mine) else ("Press A to join" if not mine else ""), 0.0175, ink)
+            yy += pt["h"] + gap * 0.6
+        y -= gap
+        first = False
+    p.restore()
+    labels = ("Sending..." if fr["sending"] else "Message", "Invite to game", "Send file", "Back")
+    gb = h * 0.014
+    bw = min(h * 0.22, (cw - 3 * gb) / 4)
+    for j, t in enumerate(labels):
+        r = QRectF(cx + j * (bw + gb), h * 0.81, bw, h * 0.065)
+        self._x_pill(p, r, t, acc, sel=(self._zone == "content" and fr["cfocus"] == "btns" and fr["cbtn"] == j),
+                     primary=(j == 0), size=0.019)
+        self._xhits.append((r, ("cbtn", j)))
+
+
+# ---------------------------------------------------------------- chat input
+@_bpm("_fr_act")
+def _bpz_fr_act(self, name):
+    fr = self._fr
+    if not fr["chat"]:
+        _bpz_o["_fr_act"](self, name)
+        if fr["chat"]:                                   # a chat was just opened
+            fr["cfocus"], fr["seen"] = "btns", None
+        return
+    uid, msgs = fr["chat"], fr["msgs"]
+    if name == "back":
+        if fr["cfocus"] == "msgs":
+            fr["cfocus"] = "btns"
+        else:
+            fr["chat"] = None
+    elif name == "alt":
+        self._fr_compose(uid)
+    elif name == "x":
+        self._files_open(uid)
+    elif fr["cfocus"] == "msgs":
+        if name == "up":
+            fr["moff"] = min(max(0, len(msgs) - 1), fr["moff"] + 1)
+        elif name == "down":
+            if fr["moff"] > 0:
+                fr["moff"] -= 1
+            else:
+                fr["cfocus"] = "btns"
+        elif name == "accept" and msgs:
+            self._fr_msg_open(max(0, min(len(msgs) - 1, len(msgs) - 1 - fr["moff"])))
+    else:
+        if name in ("left", "right"):
+            fr["cbtn"] = max(0, min(3, fr["cbtn"] + (1 if name == "right" else -1)))
+        elif name == "up" and msgs:
+            fr["cfocus"] = "msgs"
+        elif name == "accept":
+            b = fr["cbtn"]
+            if b == 0:
+                self._fr_compose(uid)
+            elif b == 1:
+                self._fr_invite(uid)
+            elif b == 2:
+                self._files_open(uid)
+            else:
+                fr["chat"] = None
+
+
+@_bpm("_fr_msg_open")
+def _bpz_msg_open(self, i):
+    fr = self._fr
+    mg = fr["msgs"][i]
+    inv = parse_invite(str(mg.get("text") or ""))
+    if inv:
+        if mg.get("from") == fr["me"]:
+            self._say("That's the invite you sent", 2500)
+        else:
+            self._say("Joining %s..." % (inv["game"] or "game"), 6000)
+            try:
+                accept_invite(inv["link"], inv["game"])
+            except Exception as ex:
+                self._say("Couldn't join: %s" % ex, 4000)
+        return
+    atts = [a for a in (mg.get("att") if isinstance(mg.get("att"), list) else []) if isinstance(a, dict)]
+    if atts:
+        self._att_open(atts, 0)
+    else:
+        self._say("Nothing to open on this message", 2000)
+
+
+@_bpm("_x_tag")
+def _bpz_x_tag(self, tag):
+    fr = self._fr
+    if self._tab == 2 and fr["chat"]:
+        if tag[0] == "cmsg":
+            fr["cfocus"], fr["moff"] = "msgs", len(fr["msgs"]) - 1 - tag[1]
+            self._fr_act("accept")
+            self.update()
+            return
+        if tag[0] == "cbtn":
+            fr["cfocus"] = "btns"
+    _bpz_o["_x_tag"](self, tag)
+
+
+@_bpm("_x_hint")
+def _bpz_hint(self):
+    fr = self._fr
+    if self._tab == 2 and fr["chat"]:
+        if fr["cfocus"] == "msgs":
+            return "Up / Down  Messages      A  Open / Join      Y  Message      X  Send file      B  Buttons"
+        return "Up  Messages      Left / Right  Choose      A  Select      Y  Message      X  Send file      B  Back"
+    return _bpz_o["_x_hint"](self)
+
+
+@_bpm("_x_tick")
+def _bpz_tick(self):
+    _bpz_o["_x_tick"](self)
+    fr = self._fr
+    if self._tab == 2 and fr["chat"] and not fr["loading"]:
+        msgs = fr["msgs"]
+        last = msgs[-1] if msgs else None
+        key = (fr["chat"], len(msgs), last.get("_key") if last else None)
+        if fr["seen"] != key:
+            if (fr["seen"] and fr["seen"][0] == fr["chat"] and last and last.get("from") != fr["me"]
+                    and parse_invite(str(last.get("text") or ""))):
+                self._say("New game invite!", 4000)
+            fr["seen"] = key
+
+
+# ---------------------------------------------------------------- sending: messages, files, invites
+@_bpm("_fr_send_raw")
+def _bpz_send_raw(self, uid, fn, ok):
+    fp = getattr(self._app, "friends_page", None)
+    fr = self._fr
+    if fp is None or fr["sending"]:
+        return
+    fr["sending"] = True
+    self.update()
+
+    def done(res, err):
+        try:
+            fr["sending"] = False
+            if err:
+                self._say("Couldn't send: %s" % err, 4000)
+            else:
+                self._say(ok, 2200)
+                fr["moff"] = 0
+                if fr["chat"] == uid:
+                    self._fr_load_chat(uid, quiet=True)
+            self.update()
+        except RuntimeError:
+            pass
+    fp._run(fn, done)
+
+
+@_bpm("_fr_send_file")
+def _bpz_send_file(self, uid, path):
+    self._say("Sending %s..." % os.path.basename(path), 20000)
+    self._fr_send_raw(uid, lambda: cloud_send_message(uid, "", [prepare_attachment(path)]), "File sent")
+
+
+@_bpm("_fr_send_invite")
+def _bpz_send_invite(self, uid, game, link, appid):
+    text = make_invite_text(game, link, appid)
+    self._fr_send_raw(uid, lambda: cloud_send_message(uid, text), "Invite sent")
+
+
+@_bpm("_fr_invite")
+def _bpz_invite(self, uid):
+    fp = getattr(self._app, "friends_page", None)
+    fr = self._fr
+    if fp is None or fr["sending"]:
+        return
+    clip = normalize_steam_join(QApplication.clipboard().text())     # a link you just copied from the game
+    fr["sending"] = True
+    self._say("Finding your game and join link...", 20000)
+    self.update()
+
+    def done(info, err):
+        try:
+            fr["sending"] = False
+            info = info or {}
+            game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "") or clip
+            self._say("")
+            if game and link:
+                self._fr_send_invite(uid, game, link, appid)
+            else:
+                self._fr_invite_ask(uid, game, appid, link)
+            self.update()
+        except RuntimeError:
+            pass
+    fp._run(detect_invite_info, done, key="bp-invite")
+
+
+@_bpm("_fr_invite_ask")
+def _bpz_invite_ask(self, uid, game, appid, link):
+    if not link:
+        self._say("No join link found. Type one (steam://... or ip:port)", 5000)
+        self._kb_open("Join link or ip:port", "", None, lambda t: self._fr_invite_link(uid, game, appid, t), 120)
+    elif not game:
+        self._kb_open("Game name", "", None, lambda t: self._fr_invite_name(uid, link, appid, t), 60)
+    else:
+        self._fr_send_invite(uid, game, link, appid)
+
+
+@_bpm("_fr_invite_link")
+def _bpz_invite_link(self, uid, game, appid, text):
+    link = normalize_steam_join(text)
+    if not link:
+        self._say("That isn't a valid join link", 3000)
+        return
+    self._fr_invite_ask(uid, game, appid, link)
+
+
+@_bpm("_fr_invite_name")
+def _bpz_invite_name(self, uid, link, appid, text):
+    game = (text or "").strip()[:60]
+    if not game:
+        return
+    try:
+        appid = appid or _steam_appid_for_title(game)
+    except Exception:
+        pass
+    self._fr_send_invite(uid, game, link, appid)
+
+
+# ---------------------------------------------------------------- in-Big-Picture file browser (images / videos)
+def _bpz_ls(path):
+    if path is None:                                  # Windows drive list
+        return [{"label": d + ":\\", "path": d + ":\\", "dir": True} for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                if os.path.exists(d + ":\\")]
+    parent = os.path.dirname(path.rstrip("\\/")) or path
+    if parent == path or parent.rstrip("\\/") == path.rstrip("\\/"):
+        parent = None if sys.platform.startswith("win") else path
+    ents = [{"label": ".. (up)", "path": parent, "dir": True}]
+    dirs, files = [], []
+    try:
+        for e in os.scandir(path):
+            if e.name.startswith("."):
+                continue
+            try:
+                if e.is_dir():
+                    dirs.append(e)
+                elif os.path.splitext(e.name)[1].lower() in CHAT_IMAGE_EXTS + CHAT_VIDEO_EXTS:
+                    files.append(e)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    dirs.sort(key=lambda e: e.name.lower())
+    files.sort(key=lambda e: -e.stat().st_mtime if os.path.exists(e.path) else 0)
+    ents += [{"label": e.name, "path": e.path, "dir": True} for e in dirs[:300]]
+    for e in files[:300]:
+        try:
+            sz = e.stat().st_size
+        except OSError:
+            sz = 0
+        ents.append({"label": e.name, "path": e.path, "dir": False, "size": sz})
+    return ents
+
+
+@_bpm("_files_open")
+def _bpz_files_open(self, uid):
+    home = os.path.expanduser("~")
+    start = next((d for d in (os.path.join(home, "Pictures", "Screenshots"), os.path.join(home, "Pictures"),
+                              os.path.join(home, "Videos"), os.path.join(home, "Downloads"), home) if os.path.isdir(d)), home)
+    name = next((r["name"] for r in self._fr["rows"] if r["uid"] == uid), "friend")
+    ents = _bpz_ls(start)
+    self._ov = {"kind": "files", "uid": uid, "name": name, "dir": start, "ents": ents,
+                "sel": 1 if len(ents) > 1 else 0, "scroll": 0, "rects": []}
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+def _bpz_files_cd(ov, path):
+    ov["dir"] = path
+    ov["ents"] = _bpz_ls(path)
+    ov["sel"], ov["scroll"] = (1 if len(ov["ents"]) > 1 else 0), 0
+
+
+@_bpm("_ov_act")
+def _bpz_ov_act(self, name):
+    ov = self._ov
+    if ov is None or ov["kind"] not in ("view", "files"):
+        _bpz_o["_ov_act"](self, name)
+        return
+    if name == "start":
+        name = "accept"
+    if ov["kind"] == "view":
+        if name in ("back", "accept", "x", "alt"):
+            self._ov = None
+        elif name in ("left", "right"):
+            self._att_step(ov, -1 if name == "left" else 1)
+    else:
+        ents, n = ov["ents"], len(ov["ents"])
+        if name == "back":
+            self._ov = None
+        elif name in ("up", "down") and n:
+            ov["sel"] = max(0, min(n - 1, ov["sel"] + (-1 if name == "up" else 1)))
+        elif name == "left" and n:
+            _bpz_files_cd(ov, ents[0]["path"])
+        elif name in ("accept", "right") and n:
+            e = ents[ov["sel"]]
+            if e["dir"]:
+                _bpz_files_cd(ov, e["path"])
+            elif name == "accept":
+                uid, path = ov["uid"], e["path"]
+                self._ov = None
+                self._fr_send_file(uid, path)
+    self.update()
+
+
+@_bpm("_paint_ov")
+def _bpz_paint_ov(self, p, w, h, acc):
+    ov = self._ov
+    if ov["kind"] not in ("view", "files"):
+        _bpz_o["_paint_ov"](self, p, w, h, acc)
+        return
+    ov["rects"] = []
+    al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    p.setPen(Qt.PenStyle.NoPen)
+    if ov["kind"] == "view":
+        p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 238))
+        pm = ov["pm"]
+        area = QRectF(w * 0.05, h * 0.09, w * 0.9, h * 0.8)
+        if not pm.isNull():
+            s = min(area.width() / pm.width(), area.height() / pm.height())
+            rw, rh = pm.width() * s, pm.height() * s
+            p.drawPixmap(QRectF(area.center().x() - rw / 2, area.center().y() - rh / 2, rw, rh), pm, QRectF(pm.rect()))
+        else:
+            self._x_msg(p, area, "Couldn't show this image")
+        att = ov["atts"][ov["i"]]
+        self._x_text(p, QRectF(w * 0.05, h * 0.03, w * 0.7, h * 0.05), str(att.get("n") or "Image"), 0.026, QColor(235, 235, 245), True)
+        self._x_text(p, QRectF(w * 0.75, h * 0.03, w * 0.2, h * 0.05), "%d / %d" % (ov["i"] + 1, len(ov["atts"])), 0.022,
+                     QColor(170, 170, 200), False, al_r)
+        p.setFont(self._font(h * 0.0185))
+        p.setPen(QColor(150, 150, 175))
+        p.drawText(QRectF(w * 0.05, h * 0.93, w * 0.9, h * 0.035), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   "Left / Right  Previous / Next      A / B  Close")
+        return
+    bw, bh = w * 0.6, h * 0.84
+    bx, by, pad = (w - bw) / 2, (h - bh) / 2, h * 0.03
+    p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 175))
+    p.setBrush(QColor(14, 14, 26, 250))
+    p.drawRoundedRect(QRectF(bx, by, bw, bh), h * 0.025, h * 0.025)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.02, bw - 2 * pad, h * 0.05), "Send a file to %s" % ov["name"], 0.03, QColor(245, 245, 252), True)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.07, bw - 2 * pad, h * 0.035), ov["dir"] or "This PC", 0.0185, QColor(170, 170, 200))
+    top, bot, rh, pitch = by + h * 0.12, by + bh - h * 0.06, h * 0.058, h * 0.065
+    ents = ov["ents"]
+    vis = max(1, int((bot - top) // pitch))
+    if ov["sel"] < ov["scroll"]:
+        ov["scroll"] = ov["sel"]
+    if ov["sel"] >= ov["scroll"] + vis:
+        ov["scroll"] = ov["sel"] - vis + 1
+    clip = QRectF(bx, top - h * 0.005, bw, bot - top + h * 0.01)
+    p.save()
+    p.setClipRect(clip)
+    for n in range(ov["scroll"], min(len(ents), ov["scroll"] + vis + 1)):
+        e = ents[n]
+        r = QRectF(bx + pad, top + (n - ov["scroll"]) * pitch, bw - 2 * pad, rh)
+        s = n == ov["sel"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc if s else QColor(255, 255, 255, 22))
+        p.drawRoundedRect(r, rh * 0.25, rh * 0.25)
+        col = QColor(_on_accent()) if s else QColor(235, 235, 245)
+        self._x_text(p, QRectF(r.left() + pad * 0.6, r.top(), r.width() * 0.75, rh), ("[DIR] " if e["dir"] and n else "") + e["label"], 0.022, col, s)
+        if not e["dir"]:
+            self._x_text(p, QRectF(r.left(), r.top(), r.width() - pad * 0.6, rh), _fmt_size(e.get("size", 0)), 0.0185, col, False, al_r)
+        ov["rects"].append((r.intersected(clip), ("row", n)))
+    p.restore()
+    if len(ents) <= 1:
+        self._x_msg(p, QRectF(bx, top, bw, bh * 0.5), "No images or videos in this folder")
+    p.setFont(self._font(h * 0.0185))
+    p.setPen(QColor(150, 150, 175))
+    p.drawText(QRectF(bx + pad, by + bh - h * 0.05, bw - 2 * pad, h * 0.035), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+               "Up / Down  Move      A  Open / Send      Left  Parent folder      B  Close")
+
+
 def _bp_open(self):
     bp = getattr(self, "_big_picture", None)
     if bp is None:
@@ -41240,6 +44658,940 @@ def _bp_init(self, *a, **k):
 
 
 AdaptiveApp.__init__ = _bp_init
+
+
+# ================================================================ Big Picture: embedded windows, settings cog, download covers
+# Every dialog the launcher opens with exec() / QMessageBox.xxx() / QInputDialog.getXxx() while Big Picture is on screen is
+# shown INSIDE Big Picture (dimmed backdrop + panel) instead of as a separate window, so the X sidebar options (Launch Options,
+# Switch Compatibility Tool, Uninstall confirmations, ...) and the new Settings cog stay in Big Picture. The controller moves
+# focus around the panel (D-pad), A presses / opens, B closes. Text fields open Big Picture's on-screen keyboard with A.
+# Native OS file/folder pickers (QFileDialog.getXxx) and external programs (Winetricks, browsers) can't be embedded.
+from PyQt6.QtCore import QEventLoop, QPoint
+from PyQt6.QtGui import QPainterPath, QTransform, QKeyEvent
+from PyQt6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QAbstractSlider, QAbstractItemView, QTextEdit,
+                             QPlainTextEdit, QInputDialog, QColorDialog, QTabBar, QGridLayout, QFrame, QLabel)
+
+
+def _bpe_draw_cog(p, r, col):
+    c, R = r.center(), min(r.width(), r.height()) / 2.0
+    path = QPainterPath()
+    path.addEllipse(c, R * 0.64, R * 0.64)
+    for i in range(8):
+        tooth = QPainterPath()
+        tooth.addRoundedRect(QRectF(-R * 0.18, -R, R * 0.36, R * 0.45), R * 0.07, R * 0.07)
+        t = QTransform()
+        t.translate(c.x(), c.y())
+        t.rotate(i * 45)
+        path = path.united(t.map(tooth))
+    hole = QPainterPath()
+    hole.addEllipse(c, R * 0.28, R * 0.28)
+    path = path.subtracted(hole)
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.drawPath(path)
+    p.restore()
+
+
+def _bpe_draw_cover(p, r, pm, radius):
+    p.save()
+    clip = QPainterPath()
+    clip.addRoundedRect(r, radius, radius)
+    p.setClipPath(clip)
+    if pm is None or pm.isNull():
+        p.fillRect(r, QColor(255, 255, 255, 30))
+    else:
+        s = pm.size().scaled(r.size().toSize(), Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        tgt = QRectF(r.center().x() - s.width() / 2.0, r.center().y() - s.height() / 2.0, s.width(), s.height())
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawPixmap(tgt, pm, QRectF(pm.rect()))
+    p.restore()
+
+
+# remember each download card's cover file (the Downloads tab in Big Picture shows it)
+_bpe_dc_init = DownloadCard.__init__
+
+
+def _bpe_dc_init2(self, title, download_url, expected_size=0, cover_path="", *a, **k):
+    self.cover_path = cover_path or ""
+    _bpe_dc_init(self, title, download_url, expected_size, cover_path, *a, **k)
+
+
+DownloadCard.__init__ = _bpe_dc_init2
+
+class _BPEmbHost(QWidget):
+    """Full-size dimmed layer that holds one embedded window."""
+    def __init__(self, bp):
+        super().__init__(bp)
+        self.setObjectName("BPEmbHost")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("#BPEmbHost { background: rgba(0, 0, 0, 190); }")
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, e):
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        e.accept()
+
+    def wheelEvent(self, e):
+        e.accept()
+
+
+_bpe_o = {n: getattr(_BigPicture, n) for n in (
+    "__init__", "leave", "_act", "keyPressEvent", "mousePressEvent", "wheelEvent", "resizeEvent", "_kb_close", "_kb_submit",
+    "_paint_extra", "_x_hint", "paintEvent")}
+
+
+@_bpm("__init__")
+def _bpe_init(self, app):
+    self._embs = []                       # open embedded windows (last = on top)
+    self._st = None                       # native Settings menu state
+    self._hsel = None                     # header item picked by the controller: None | "cog" | "exit"
+    self._barsel = 0                      # toolbar pill picked by the controller (zone "bar")
+    self._cog_rect = QRectF()
+    self._dl_pm = {}
+    _bpe_o["__init__"](self, app)
+
+
+@_bpm("_dl_cover")
+def _bpe_dl_cover(self, path):
+    pm = self._dl_pm.get(path)
+    if pm is None:
+        pm = QPixmap(path)
+        self._dl_pm[path] = pm
+    return pm
+
+
+def _bpe_scale_font(widget, h):
+    f = widget.font()
+    sc = max(1.0, min(1.5, h / 900.0))
+    if f.pointSizeF() > 0:
+        f.setPointSizeF(f.pointSizeF() * sc)
+        widget.setFont(f)
+
+
+@_bpm("_emb_open")
+def _bpe_emb_open(self, widget, title, kind, frac=None, on_close=None):
+    """Put `widget` into a panel on top of Big Picture. Returns the entry dict."""
+    W, H = max(400, self.width()), max(300, self.height())
+    host = _BPEmbHost(self)
+    host.setGeometry(0, 0, self.width(), self.height())
+    acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+    panel = QFrame(host)
+    panel.setObjectName("BPEmbPanel")
+    panel.setStyleSheet("#BPEmbPanel { background: rgb(14, 14, 26); border: 2px solid %s; border-radius: 18px; }" % acc.name())
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(14, 12, 14, 10)
+    lay.setSpacing(8)
+    ent = {"kind": kind, "host": host, "panel": panel, "w": widget, "close": None, "on_close": on_close}
+    head = QHBoxLayout()
+    tl = QLabel(title or "")
+    tl.setStyleSheet("font-weight: bold; color: rgb(245,245,252); background: transparent;")
+    _bpe_scale_font(tl, H * 1.15)
+    head.addWidget(tl, 1)
+    if kind == "settings":
+        cb = QPushButton("Close")
+        cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb.clicked.connect(lambda _c=False, e=ent: e["close"]())
+        head.addWidget(cb)
+    lay.addLayout(head)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    lay.addWidget(scroll, 1)
+    hint = QLabel("D-pad / arrows  Move      A / Enter  Select      B / Esc  Back")
+    hint.setStyleSheet("color: rgb(150,150,175); background: transparent;")
+    lay.addWidget(hint)
+    ent["scroll"] = scroll
+    ent["title"] = tl
+    widget.setParent(None)
+    widget.move(0, 0)
+    scroll.setWidget(widget)
+    _bpe_scale_font(panel, H)
+    widget.adjustSize()
+    want = widget.sizeHint().expandedTo(widget.minimumSizeHint())
+    if frac:
+        pw, ph = int(W * frac[0]), int(H * frac[1])
+    else:
+        pw = min(int(W * 0.92), max(380, want.width() + 60))
+        ph = min(int(H * 0.92), want.height() + 130)
+    panel.setFixedSize(pw, ph)
+    g = QGridLayout(host)
+    g.setContentsMargins(0, 0, 0, 0)
+    g.addWidget(panel, 0, 0, Qt.AlignmentFlag.AlignCenter)
+    self._embs.append(ent)
+    host.show()
+    host.raise_()
+    widget.show()
+    self.setCursor(Qt.CursorShape.ArrowCursor)
+    QTimer.singleShot(0, lambda e=ent: self._emb_focus_first(e))
+    self.update()
+    return ent
+
+
+@_bpm("_emb_focus_first")
+def _bpe_focus_first(self, ent):
+    try:
+        w = ent["w"]
+        fw = w.focusWidget()
+        if fw is not None and fw.isVisible() and fw.isEnabled():
+            fw.setFocus()
+            return
+        for b in w.findChildren(QPushButton):
+            if b.isDefault() and b.isEnabled() and b.isVisible():
+                b.setFocus()
+                return
+        for c in w.findChildren(QWidget):
+            if c.isVisible() and c.isEnabled() and _bpe_focusable(c):
+                c.setFocus()
+                return
+        w.setFocus()
+    except RuntimeError:
+        pass
+
+
+def _bpe_focusable(c):
+    try:
+        if c.focusPolicy().value not in (1, 11, 15):
+            return False
+        par = c.parentWidget()
+        if isinstance(par, (QAbstractSpinBox, QComboBox)):
+            return False
+        return True
+    except RuntimeError:
+        return False
+
+
+@_bpm("_emb_close_ent")
+def _bpe_close_ent(self, ent):
+    if ent not in self._embs:
+        return
+    self._embs.remove(ent)
+    w = ent["w"]
+    try:
+        ent["scroll"].takeWidget()
+    except RuntimeError:
+        pass
+    try:
+        w.hide()
+        if ent.get("on_close"):
+            ent["on_close"]()
+    except RuntimeError:
+        pass
+    try:
+        ent["host"].hide()
+        ent["host"].setParent(None)
+        ent["host"].deleteLater()
+    except RuntimeError:
+        pass
+    if self._embs:
+        self._emb_focus_first(self._embs[-1])
+    else:
+        self.setFocus()
+    self.update()
+
+
+@_bpm("_emb_run")
+def _bpe_run(self, dlg):
+    """Blocking replacement for QDialog.exec(): the dialog lives inside Big Picture until it is closed."""
+    orig_parent, orig_flags = dlg.parentWidget(), dlg.windowFlags()
+    loop = QEventLoop()
+    ent = self._emb_open(dlg, dlg.windowTitle(), "dialog",
+                         on_close=lambda: dlg.setParent(orig_parent, orig_flags))
+    ent["loop"] = loop
+    ent["close"] = dlg.reject
+    dlg.finished.connect(loop.quit)
+    loop.exec()
+    try:
+        dlg.finished.disconnect(loop.quit)
+    except Exception:
+        pass
+    self._emb_close_ent(ent)
+    return dlg.result()
+
+
+_bpe_qdialog_exec = QDialog.exec
+
+
+def _bpe_exec(self, *a):
+    bp = _bpy_active_bp()
+    if bp is None or self.isVisible() or self is None or isinstance(self, QFileDialog):
+        return _bpe_qdialog_exec(self, *a)
+    try:
+        return bp._emb_run(self)
+    except RuntimeError:
+        return _bpe_qdialog_exec(self, *a)
+
+
+QDialog.exec = _bpe_exec
+
+
+def _bpe_mb_static(icon, default_buttons, orig):
+    def f(parent, title, text, buttons=default_buttons, defaultButton=QMessageBox.StandardButton.NoButton, *a, **k):
+        if _bpy_active_bp() is None:
+            return orig(parent, title, text, buttons, defaultButton)
+        box = QMessageBox(icon, title, text, buttons, parent)
+        if defaultButton != QMessageBox.StandardButton.NoButton:
+            box.setDefaultButton(defaultButton)
+        return QMessageBox.StandardButton(box.exec())
+    return staticmethod(f)
+
+
+_SB = QMessageBox.StandardButton
+QMessageBox.information = _bpe_mb_static(QMessageBox.Icon.Information, _SB.Ok, QMessageBox.information)
+QMessageBox.warning = _bpe_mb_static(QMessageBox.Icon.Warning, _SB.Ok, QMessageBox.warning)
+QMessageBox.critical = _bpe_mb_static(QMessageBox.Icon.Critical, _SB.Ok, QMessageBox.critical)
+QMessageBox.question = _bpe_mb_static(QMessageBox.Icon.Question, _SB.Yes | _SB.No, QMessageBox.question)
+
+_bpe_qi = {n: getattr(QInputDialog, n) for n in ("getText", "getInt", "getItem", "getMultiLineText")}
+
+
+def _bpe_input(kind):
+    orig = _bpe_qi[kind]
+
+    def f(parent, title, label, *a, **k):
+        if _bpy_active_bp() is None:
+            return orig(parent, title, label, *a, **k)
+        try:
+            d = QInputDialog(parent)
+            d.setWindowTitle(title)
+            d.setLabelText(label)
+            if kind == "getText":
+                echo = a[0] if len(a) > 0 else k.get("echo", QLineEdit.EchoMode.Normal)
+                d.setTextEchoMode(echo)
+                d.setTextValue(a[1] if len(a) > 1 else k.get("text", ""))
+            elif kind == "getMultiLineText":
+                d.setOption(QInputDialog.InputDialogOption.UsePlainTextEditForTextInput, True)
+                d.setTextValue(a[0] if len(a) > 0 else k.get("text", ""))
+            elif kind == "getInt":
+                d.setInputMode(QInputDialog.InputMode.IntInput)
+                d.setIntRange(a[1] if len(a) > 1 else k.get("minValue", -2147483647), a[2] if len(a) > 2 else k.get("maxValue", 2147483647))
+                d.setIntStep(a[3] if len(a) > 3 else k.get("step", 1))
+                d.setIntValue(a[0] if len(a) > 0 else k.get("value", 0))
+            else:
+                items = list(a[0] if len(a) > 0 else k.get("items", []))
+                d.setComboBoxItems(items)
+                cur = a[1] if len(a) > 1 else k.get("current", 0)
+                if isinstance(cur, int) and 0 <= cur < len(items):
+                    d.setTextValue(items[cur])
+                d.setComboBoxEditable(a[2] if len(a) > 2 else k.get("editable", True))
+        except Exception:
+            return orig(parent, title, label, *a, **k)
+        ok = bool(d.exec())
+        if kind == "getInt":
+            return d.intValue(), ok
+        return d.textValue(), ok
+    return staticmethod(f)
+
+
+for _n in _bpe_qi:
+    setattr(QInputDialog, _n, _bpe_input(_n))
+
+_bpe_getcolor = QColorDialog.getColor
+
+
+def _bpe_get_color(initial=None, parent=None, title="", options=None):
+    if _bpy_active_bp() is None:
+        args = [x for x in (initial, parent, title, options) if x is not None]
+        return _bpe_getcolor(*args)
+    d = QColorDialog(initial if initial is not None else QColor(Qt.GlobalColor.white), parent)
+    if title:
+        d.setWindowTitle(title)
+    if options is not None:
+        d.setOptions(options)
+    return d.currentColor() if d.exec() else QColor()
+
+
+QColorDialog.getColor = staticmethod(_bpe_get_color)
+
+
+# ---------------------------------------------------------------- controller / keyboard navigation inside an embedded window
+def _bpe_key(widget, key):
+    for t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+        QApplication.sendEvent(widget, QKeyEvent(t, key, Qt.KeyboardModifier.NoModifier))
+
+
+def _bpe_scroll_to(w):
+    par = w.parentWidget()
+    while par is not None:
+        if isinstance(par, QScrollArea):
+            try:
+                par.ensureWidgetVisible(w, 40, 90)
+            except Exception:
+                pass
+            break
+        par = par.parentWidget()
+
+
+@_bpm("_emb_move")
+def _bpe_move(self, name):
+    ent = self._embs[-1]
+    root = ent["panel"]
+    cands = [c for c in root.findChildren(QWidget) if c.isVisible() and c.isEnabled() and _bpe_focusable(c)]
+    if not cands:
+        return
+    cur = QApplication.focusWidget()
+
+    def ctr(c):
+        r = c.rect()
+        pt = c.mapTo(root, QPoint(r.width() // 2, r.height() // 2))
+        return pt.x(), pt.y()
+    if cur not in cands:
+        cands.sort(key=lambda c: (ctr(c)[1], ctr(c)[0]))
+        tgt = cands[0]
+    else:
+        cx, cy = ctr(cur)
+        best, bs = None, None
+        for c in cands:
+            if c is cur:
+                continue
+            x, y = ctr(c)
+            dx, dy = x - cx, y - cy
+            if name == "down" and dy > 2:
+                sc = dy + 3 * abs(dx)
+            elif name == "up" and dy < -2:
+                sc = -dy + 3 * abs(dx)
+            elif name == "right" and dx > 2:
+                sc = dx + 3 * abs(dy)
+            elif name == "left" and dx < -2:
+                sc = -dx + 3 * abs(dy)
+            else:
+                continue
+            if bs is None or sc < bs:
+                best, bs = c, sc
+        if best is None:
+            if name in ("up", "down"):                      # nothing further: scroll the area instead
+                par = cur.parentWidget()
+                while par is not None and not isinstance(par, QScrollArea):
+                    par = par.parentWidget()
+                if par is not None:
+                    sb = par.verticalScrollBar()
+                    sb.setValue(sb.value() + (120 if name == "down" else -120))
+            return
+        tgt = best
+    tgt.setFocus()
+    _bpe_scroll_to(tgt)
+
+
+@_bpm("_emb_text")
+def _bpe_text(self, w):
+    if isinstance(w, QLineEdit):
+        if w.isReadOnly():
+            return
+        text, setter = w.text(), w.setText
+    else:
+        text, setter = w.toPlainText(), w.setPlainText
+    title = (w.placeholderText() if isinstance(w, QLineEdit) else "") or "Type text"
+    for e in self._embs:
+        e["host"].hide()
+
+    def done(t, w=w, setter=setter):
+        setter(t)
+        QTimer.singleShot(0, lambda: w.setFocus())
+    self._kb_open(title, text, None, done, 500)
+
+
+@_bpm("_emb_show_hosts")
+def _bpe_show_hosts(self):
+    if self._kb is None:
+        for e in self._embs:
+            e["host"].show()
+            e["host"].raise_()
+
+
+@_bpm("_emb_act")
+def _bpe_emb_act(self, name):
+    pop = QApplication.activePopupWidget()
+    if pop is not None:                                      # an open drop-down list
+        k = {"up": Qt.Key.Key_Up, "down": Qt.Key.Key_Down, "left": Qt.Key.Key_Up, "right": Qt.Key.Key_Down,
+             "accept": Qt.Key.Key_Return, "start": Qt.Key.Key_Return, "back": Qt.Key.Key_Escape}.get(name)
+        if k is not None:
+            _bpe_key(pop, k)
+        return
+    ent = self._embs[-1]
+    if name == "back":
+        ent["close"]()
+        return
+    cur = QApplication.focusWidget()
+    inside = cur is not None and ent["panel"].isAncestorOf(cur)
+    if name in ("accept", "start"):
+        if not inside:
+            self._emb_focus_first(ent)
+            return
+        if isinstance(cur, QAbstractButton):
+            cur.click()
+        elif isinstance(cur, QComboBox):
+            cur.showPopup()
+        elif isinstance(cur, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            self._emb_text(cur)
+        elif isinstance(cur, QAbstractSpinBox):
+            pass
+        else:
+            _bpe_key(cur, Qt.Key.Key_Return)
+        return
+    if name in ("up", "down", "left", "right"):
+        if inside and name in ("left", "right") and isinstance(cur, (QAbstractSlider, QAbstractSpinBox, QTabBar)):
+            _bpe_key(cur, Qt.Key.Key_Left if name == "left" else Qt.Key.Key_Right)
+            return
+        if inside and name in ("up", "down") and isinstance(cur, QAbstractItemView):
+            before = cur.currentIndex()
+            _bpe_key(cur, Qt.Key.Key_Up if name == "up" else Qt.Key.Key_Down)
+            if cur.currentIndex() != before:
+                return
+        if inside and name in ("up", "down") and isinstance(cur, QAbstractSpinBox):
+            _bpe_key(cur, Qt.Key.Key_Up if name == "up" else Qt.Key.Key_Down)
+            return
+        self._emb_move(name)
+
+
+@_bpm("_act")
+def _bpe_act(self, name):
+    if self._embs and self._kb is None:
+        if not self._from_key:
+            self._pad_last = True
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._emb_act(name)
+        return
+    if self._st is not None and self._kb is None:
+        if not self._from_key:
+            self._pad_last = True
+        self._st_act(name)
+        return
+    if self._zone != "tabs":
+        self._hsel = None
+    plain = (self._kb is None and not self._embs and self._st is None and self._ov is None and self._detail is None)
+    if not plain:
+        _bpe_o["_act"](self, name)
+        return
+    if not self._from_key:
+        self._pad_last = True
+    if name == "start":                                     # Start button = Settings
+        self._settings_open()
+        return
+    if self._zone == "tabs":                                # header: tabs ... cog wheel, Exit
+        hs = self._hsel
+        if hs:
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            if name == "left":
+                self._hsel = "cog" if hs == "exit" else None
+            elif name == "right":
+                self._hsel = "exit" if hs == "cog" else hs
+            elif name in ("accept", "start"):
+                if hs == "cog":
+                    self._settings_open()
+                else:
+                    self.leave(True)
+                    return
+            elif name in ("down", "back", "prev", "next", "alt", "x"):
+                self._hsel = None
+                _bpe_o["_act"](self, name)
+                return
+            self.update()
+            return
+        if name == "right" and self._tab == len(self._tab_labels()) - 1:
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            self._hsel = "cog"
+            self.update()
+            return
+    if self._tab >= 2:
+        if self._zone == "bar":                             # toolbar pills (Category / Search / Sort / ...) of the tab
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            items = self._bar_items()
+            if not items:
+                self._zone = "content"
+            else:
+                self._barsel = max(0, min(len(items) - 1, self._barsel))
+                if name == "left":
+                    self._barsel = max(0, self._barsel - 1)
+                elif name == "right":
+                    self._barsel = min(len(items) - 1, self._barsel + 1)
+                elif name == "up":
+                    self._zone = "tabs"
+                elif name == "down":
+                    self._zone = "content"
+                elif name in ("accept", "start"):
+                    tag = items[self._barsel][1]
+                    if tag[0] == "wback":
+                        self._zone = "content"
+                    try:
+                        self._x_tag(tag)
+                    except (IndexError, KeyError):
+                        pass
+                elif name in ("prev", "next"):
+                    self._switch_tab(self._tab + (1 if name == "next" else -1))
+                    self._zone = "content"
+                elif name == "back":
+                    self._zone = "content"
+            self.update()
+            return
+        was = self._zone
+        _bpe_o["_act"](self, name)
+        if name == "up" and was == "content" and self._zone == "tabs" and self._bar_items():
+            self._zone, self._barsel = "bar", 0             # from the top of the grid go to the toolbar first
+            self.update()
+        return
+    _bpe_o["_act"](self, name)
+
+
+_BPE_BAR_TAGS = ("fgtag", "fgsearch", "wback", "wsort", "wsearch", "gall", "gsearch")
+
+
+@_bpm("_bar_items")
+def _bpe_bar_items(self):
+    items = [(r, t) for r, t in getattr(self, "_xhits", []) if t and t[0] in _BPE_BAR_TAGS]
+    items.sort(key=lambda it: it[0].left())
+    return items
+
+
+@_bpm("_paint_extra")
+def _bpe_paint_extra(self, p, w, h, m, acc, k):
+    _bpe_o["_paint_extra"](self, p, w, h, m, acc, k)
+    if self._tab >= 2 and self._zone == "bar":
+        items = self._bar_items()
+        if items:
+            r = items[max(0, min(len(items) - 1, self._barsel))][0]
+            self._x_ring(p, r, r.height() / 2)
+
+
+@_bpm("_x_hint")
+def _bpe_hint(self):
+    if self._zone == "bar":
+        return "Left / Right  Choose      A  Press      Up  Tabs      Down  Back to the list      LB / RB  Switch tab"
+    if self._zone == "tabs" and self._hsel:
+        return "Left / Right  Choose      A  Open      Down  Content"
+    return _bpe_o["_x_hint"](self)
+
+
+@_bpm("keyPressEvent")
+def _bpe_keypress(self, e):
+    k, K = e.key(), Qt.Key
+    if self._embs and self._kb is None:
+        name = {K.Key_Escape: "back", K.Key_Up: "up", K.Key_Down: "down", K.Key_Left: "left", K.Key_Right: "right"}.get(k)
+        if name:
+            self._emb_act(name)
+        e.accept()
+        return
+    if self._st is not None and self._kb is None:
+        self._pad_last = False
+        name = {K.Key_Up: "up", K.Key_Down: "down", K.Key_Left: "left", K.Key_Right: "right", K.Key_Return: "accept",
+                K.Key_Enter: "accept", K.Key_Space: "accept", K.Key_Escape: "back", K.Key_Backspace: "back",
+                K.Key_F11: "back"}.get(k)
+        if name:
+            self._st_act(name)
+        e.accept()
+        return
+    if (k == K.Key_Comma and (e.modifiers() & Qt.KeyboardModifier.ControlModifier) and self._kb is None
+            and self._ov is None and self._detail is None):
+        self._settings_open()
+        return
+    _bpe_o["keyPressEvent"](self, e)
+
+
+@_bpm("mousePressEvent")
+def _bpe_mouse(self, e):
+    if self._embs and self._kb is None:
+        return
+    if self._st is not None and self._kb is None:
+        pt = e.position()
+        for r, tag in reversed(self._st["rects"]):
+            if r.contains(pt):
+                self._st_click(tag)
+                return
+        self._st_close()
+        return
+    if (self._kb is None and self._ov is None and self._detail is None and self._cog_rect.contains(e.position())):
+        self._settings_open()
+        return
+    _bpe_o["mousePressEvent"](self, e)
+
+
+@_bpm("wheelEvent")
+def _bpe_wheel(self, e):
+    if self._embs:
+        return
+    if self._st is not None and self._kb is None:
+        self._st_act("up" if e.angleDelta().y() > 0 else "down")
+        return
+    _bpe_o["wheelEvent"](self, e)
+
+
+@_bpm("resizeEvent")
+def _bpe_resize(self, e):
+    _bpe_o["resizeEvent"](self, e)
+    for ent in getattr(self, "_embs", ()):
+        try:
+            ent["host"].setGeometry(0, 0, self.width(), self.height())
+        except RuntimeError:
+            pass
+
+
+@_bpm("_kb_close")
+def _bpe_kb_close(self):
+    _bpe_o["_kb_close"](self)
+    self._emb_show_hosts()
+
+
+@_bpm("_kb_submit")
+def _bpe_kb_submit(self):
+    _bpe_o["_kb_submit"](self)
+    self._emb_show_hosts()
+
+
+@_bpm("leave")
+def _bpe_leave(self, show_main=True):
+    self._st = None
+    for ent in list(reversed(self._embs)):                  # close everything that is embedded before leaving
+        try:
+            ent["close"]()
+        except Exception:
+            pass
+    for ent in list(self._embs):
+        self._emb_close_ent(ent)
+    _bpe_o["leave"](self, show_main)
+
+
+# ---------------------------------------------------------------- Settings: a native Big Picture menu (cog wheel in the header,
+# Start button, Ctrl+,). The rows are read from the launcher's Settings page, so every setting that page has is here and
+# changing one here changes the real setting (the controls of the real page are driven, nothing is duplicated).
+def _bpe_hidden(w, stop):
+    while w is not None and w is not stop:
+        if w.isHidden():
+            return True
+        w = w.parentWidget()
+    return False
+
+
+def _bpe_st_scan(sp):
+    """[{'title', 'desc', 'ctrls': [widgets]}] in page order."""
+    rows, cur, cur_panel = [], None, None
+
+    def panel_of(w):
+        par = w.parentWidget()
+        while par is not None:
+            if par.objectName() == "Panel":
+                return par
+            par = par.parentWidget()
+        return None
+    try:
+        kids = sp._content.findChildren(QWidget)
+    except Exception:
+        kids = sp.findChildren(QWidget)
+    for c in kids:
+        try:
+            if isinstance(c, QLabel):
+                if c.objectName() == "RowTitle" and c.text().strip():
+                    cur = {"title": c.text().strip(), "desc": "", "ctrls": []}
+                    cur_panel = panel_of(c)
+                    rows.append(cur)
+                elif c.objectName() == "RowDesc" and cur is not None and not cur["desc"] and not cur["ctrls"] \
+                        and panel_of(c) is cur_panel:
+                    cur["desc"] = c.text().strip()
+                continue
+            if cur is None or _bpe_hidden(c, sp._content):
+                continue
+            if isinstance(c.parentWidget(), (QAbstractSpinBox, QComboBox)):
+                continue
+            if isinstance(c, (QComboBox, QAbstractButton, QLineEdit)) and panel_of(c) is cur_panel:
+                cur["ctrls"].append(c)
+        except RuntimeError:
+            continue
+    return [r for r in rows if r["ctrls"]]
+
+
+def _bpe_ctl_text(c):
+    try:
+        if isinstance(c, QComboBox):
+            return c.currentText() or "-"
+        if isinstance(c, QLineEdit):
+            t = c.text()
+            if c.echoMode() != QLineEdit.EchoMode.Normal and t:
+                return "*" * min(12, len(t))
+            return t or c.placeholderText() or "Edit"
+        t = c.text().replace("&", "").strip()
+        if not t:
+            t = ("On" if c.isChecked() else "Off") if c.isCheckable() else "..."
+        return t
+    except RuntimeError:
+        return "?"
+
+
+@_bpm("_settings_open")
+def _bpe_settings_open(self):
+    if self._embs or self._st is not None or self._kb is not None or self._detail is not None or self._ov is not None:
+        return
+    sp = getattr(self._app, "settings_page", None)
+    rows = _bpe_st_scan(sp) if sp is not None else []
+    if not rows:
+        self._say("Settings aren't available", 2500)
+        self.update()
+        return
+    self._st = {"rows": rows, "sel": 0, "btn": 0, "scroll": 0, "rects": []}
+    self.update()
+
+
+@_bpm("_st_close")
+def _bpe_st_close(self):
+    self._st = None
+    self.update()
+
+
+@_bpm("_st_press")
+def _bpe_st_press(self, c):
+    try:
+        if not c.isEnabled():
+            return
+        if isinstance(c, QComboBox):
+            n = c.count()
+            if n:
+                c.setCurrentIndex((c.currentIndex() + 1) % n)
+        elif isinstance(c, QAbstractButton):
+            c.click()
+        elif isinstance(c, QLineEdit):
+            if c.isReadOnly():
+                return
+            title = c.placeholderText() or "Type text"
+
+            def done(t, c=c):
+                c.setText(t)
+                try:
+                    c.editingFinished.emit()
+                except Exception:
+                    pass
+                try:
+                    c.returnPressed.emit()
+                except Exception:
+                    pass
+            self._kb_open(title, c.text(), None, done, 500)
+    except RuntimeError:
+        pass
+    self.update()
+
+
+@_bpm("_st_click")
+def _bpe_st_click(self, tag):
+    st = self._st
+    if tag[0] == "close":
+        self._st_close()
+    elif tag[0] == "row":
+        st["sel"], st["btn"] = tag[1], 0
+    elif tag[0] == "pill":
+        st["sel"], st["btn"] = tag[1], tag[2]
+        self._st_press(st["rows"][tag[1]]["ctrls"][tag[2]])
+    self.update()
+
+
+@_bpm("_st_act")
+def _bpe_st_act(self, name):
+    st = self._st
+    if st is None:
+        return
+    if name == "start":
+        name = "accept"
+    rows = st["rows"]
+    row = rows[st["sel"]]
+    ctrls = row["ctrls"]
+    if name in ("back", "x"):
+        self._st_close()
+        return
+    if name in ("up", "down"):
+        st["sel"] = max(0, min(len(rows) - 1, st["sel"] + (-1 if name == "up" else 1)))
+        st["btn"] = 0
+    elif name in ("left", "right"):
+        d = -1 if name == "left" else 1
+        if len(ctrls) == 1 and isinstance(ctrls[0], QComboBox):      # a single drop-down: Left / Right change its value
+            c = ctrls[0]
+            if c.count() and c.isEnabled():
+                c.setCurrentIndex(max(0, min(c.count() - 1, c.currentIndex() + d)))
+        else:
+            st["btn"] = max(0, min(len(ctrls) - 1, st["btn"] + d))
+    elif name == "accept":
+        self._st_press(ctrls[max(0, min(len(ctrls) - 1, st["btn"]))])
+    self.update()
+
+
+@_bpm("paintEvent")
+def _bpe_paint(self, e):
+    _bpe_o["paintEvent"](self, e)
+    if self._st is None or self._kb is not None:
+        return
+    p = QPainter(self)
+    p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+    try:
+        self._paint_st(p, self.width(), self.height(), QApplication.palette().color(QPalette.ColorRole.Highlight))
+    finally:
+        p.end()
+
+
+@_bpm("_paint_st")
+def _bpe_paint_st(self, p, w, h, acc):
+    st = self._st
+    st["rects"] = []
+    rows = st["rows"]
+    p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 205))
+    cx, cw = w * 0.14, w * 0.72
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(14, 14, 26, 252))
+    p.drawRoundedRect(QRectF(cx - h * 0.035, h * 0.04, cw + h * 0.07, h * 0.92), h * 0.025, h * 0.025)
+    self._x_text(p, QRectF(cx, h * 0.06, cw * 0.6, h * 0.07), "Settings", 0.038, QColor(245, 245, 252), True)
+    cr = QRectF(cx + cw - h * 0.16, h * 0.072, h * 0.16, h * 0.05)
+    self._x_pill(p, cr, "Close", acc, size=0.02)
+    st["rects"].append((cr, ("close",)))
+    top, bot, pitch, rh = h * 0.16, h * 0.9, h * 0.1, h * 0.088
+    vis = max(1, int((bot - top) // pitch))
+    sel = max(0, min(len(rows) - 1, st["sel"]))
+    if sel < st["scroll"]:
+        st["scroll"] = sel
+    if sel >= st["scroll"] + vis:
+        st["scroll"] = sel - vis + 1
+    clip = QRectF(cx - h * 0.02, top - h * 0.01, cw + h * 0.04, bot - top + h * 0.02)
+    p.save()
+    p.setClipRect(clip)
+    for n in range(st["scroll"], min(len(rows), st["scroll"] + vis + 1)):
+        row = rows[n]
+        r = QRectF(cx, top + (n - st["scroll"]) * pitch, cw, rh)
+        s = n == sel
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 48 if s else 22))
+        p.drawRoundedRect(r, rh * 0.18, rh * 0.18)
+        if s:
+            self._x_ring(p, r, rh * 0.18)
+        st["rects"].append((r.intersected(clip), ("row", n)))
+        # controls on the right
+        ctrls = row["ctrls"][:4]
+        pf = QFontMetrics(self._font(h * 0.02, True))
+        pb, gap = rh * 0.62, h * 0.01
+        widths = []
+        for c in ctrls:
+            t = _bpe_ctl_text(c)
+            widths.append(max(h * 0.15, min(h * 0.34, pf.horizontalAdvance(t) + h * 0.07)))
+        x = r.right() - rh * 0.2 - (sum(widths) + gap * (len(widths) - 1))
+        single_combo = len(ctrls) == 1 and isinstance(ctrls[0], QComboBox)
+        for j, c in enumerate(ctrls):
+            pr = QRectF(x, r.top() + (rh - pb) / 2, widths[j], pb)
+            x += widths[j] + gap
+            txt = _bpe_ctl_text(c)
+            if single_combo and s:
+                txt = "<  %s  >" % txt
+            txt = pf.elidedText(txt, Qt.TextElideMode.ElideRight, int(widths[j] - h * 0.03))
+            try:
+                on = isinstance(c, QAbstractButton) and c.isCheckable() and c.isChecked()
+            except RuntimeError:
+                on = False
+            self._x_pill(p, pr, txt, acc, sel=(s and (j == st["btn"] or single_combo)), primary=on, size=0.02)
+            st["rects"].append((pr.intersected(clip), ("pill", n, j)))
+        tw = x - gap - (r.left() + rh * 0.3)
+        left_w = r.right() - rh * 0.2 - (sum(widths) + gap * (len(widths) - 1)) - (r.left() + rh * 0.3) - rh * 0.2
+        self._x_text(p, QRectF(r.left() + rh * 0.3, r.top() + rh * 0.08, left_w, rh * 0.46), row["title"], 0.0245, QColor(245, 245, 252), True)
+        if row["desc"]:
+            self._x_text(p, QRectF(r.left() + rh * 0.3, r.top() + rh * 0.52, left_w, rh * 0.38), row["desc"], 0.0165, QColor(150, 150, 175))
+    p.restore()
+    p.setFont(self._font(h * 0.0185))
+    p.setPen(QColor(150, 150, 175))
+    p.drawText(QRectF(cx, h * 0.915, cw, h * 0.035), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+               "Up / Down  Move      Left / Right  Change      A  Select      B  Close")
 
 
 # ================================================================ Admin panel + bans
@@ -41870,490 +46222,624 @@ AdaptiveApp.__init__ = _adm_init
 
 
 
-# ================================================================ Halloween update: classic Home page
-# The old launcher's home screen (welcome line, big cover columns with a "Manage" button, "Other Stuff" button).
-# It sits in front of the Library and drives the exact same actions as the Library cards, so nothing is lost:
-# every button here clicks / triggers the matching Library card button or menu action.
-from PyQt6.QtCore import (QPropertyAnimation as _HmAnim, QSequentialAnimationGroup as _HmSeq,
-                          QPoint as _HmPoint, QTimer as _HmTimer, Qt as _HmQt, QSize as _HmSize)
-from PyQt6.QtWidgets import (QGraphicsOpacityEffect as _HmOpacity, QMenu as _HmMenu, QScrollArea as _HmScroll,
-                             QFrame as _HmFrame, QDialog as _HmDialog, QWidget as _HmWidget,
-                             QVBoxLayout as _HmV, QHBoxLayout as _HmH, QLabel as _HmLabel,
-                             QPushButton as _HmButton)
+# ================================================================ Settings: grouped sections + Big Picture auto-launch
+# 1) The Settings page (regular AND Big Picture) is sorted into sections: Appearance, Big Picture & Controller, Startup & Updates,
+#    Library & Downloads, Compatibility, Online & Integrations. Big Picture reads the real page, so it gets the same sections.
+# 2) New settings: "Launch Big Picture on startup" and "Big Picture when a controller connects".
+_NCZ_SET_CATS = [
+    ("Appearance", ("dark mode", "accent color", "interface style")),
+    ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
+    ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut")),
+    ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
+    ("Compatibility", ("direct3d", "xwayland", "renderer")),
+    ("Online & Integrations", ("discord", "ncz link", "overlay", "sync profile", "friend", "account")),
+]
 
-_HOME_DEDICATED = ("Edit Current Save", "Edit Current Settings", "Save Data", "Sync Data", "Uninstall")
 
-def _home_source(app, gid):
-    """(primary button, menu) of the Library card for a game, looked up fresh every time."""
-    btn = {"ae": getattr(app, "btn_ae_action", None), "ncz2": getattr(app, "btn_ncz2_action", None)}.get(gid)
-    card = btn.parentWidget() if btn is not None else None
-    more = card.findChild(_HmButton, "MoreButton") if card is not None else None
-    return btn, (more.menu() if more is not None else None)
+def _ncz_cat_index(title):
+    t = (title or "").lower()
+    for i, (_n, keys) in enumerate(_NCZ_SET_CATS):
+        if any(k in t for k in keys):
+            return i
+    return len(_NCZ_SET_CATS)
 
-def _home_toggle(manage_btn, actions_frame, back_btn):
-    """The old Manage / back animation: Manage slides up and fades, the action buttons appear."""
-    def forward():
-        manage_btn.setEnabled(False)
-        opacity = _HmOpacity(manage_btn)
-        manage_btn.setGraphicsEffect(opacity)
-        slide = _HmAnim(manage_btn, b"pos")
-        slide.setDuration(220)
-        slide.setStartValue(_HmPoint(0, 0))
-        slide.setEndValue(_HmPoint(0, -15))
-        fade = _HmAnim(opacity, b"opacity")
-        fade.setDuration(180)
-        fade.setStartValue(1.0)
-        fade.setEndValue(0.0)
-        manage_btn._group = _HmSeq()
-        manage_btn._group.addAnimation(slide)
-        manage_btn._group.addAnimation(fade)
-        def complete():
-            manage_btn.hide()
-            actions_frame.show()
-            back_btn.show()
-        manage_btn._group.finished.connect(complete)
-        manage_btn._group.start()
 
-    def reverse():
-        back_btn.hide()
-        actions_frame.hide()
-        manage_btn.show()
-        opacity = _HmOpacity(manage_btn)
-        manage_btn.setGraphicsEffect(opacity)
-        slide = _HmAnim(manage_btn, b"pos")
-        slide.setDuration(220)
-        slide.setStartValue(_HmPoint(0, -15))
-        slide.setEndValue(_HmPoint(0, 0))
-        fade = _HmAnim(opacity, b"opacity")
-        fade.setDuration(180)
-        fade.setStartValue(0.0)
-        fade.setEndValue(1.0)
-        manage_btn._reverse_group = _HmSeq()
-        manage_btn._reverse_group.addAnimation(slide)
-        manage_btn._reverse_group.addAnimation(fade)
-        def complete_return():
-            manage_btn.setEnabled(True)
-            manage_btn.setGraphicsEffect(None)
-        manage_btn._reverse_group.finished.connect(complete_return)
-        manage_btn._reverse_group.start()
+def _ncz_cat_name(i):
+    return _NCZ_SET_CATS[i][0] if i < len(_NCZ_SET_CATS) else "Other"
 
-    manage_btn.clicked.connect(forward)
-    back_btn.clicked.connect(reverse)
 
-def _home_column(app, title_html, image, gid, syncers):
-    """One game: cover on the left; title, (status) and the Manage button on the right (same sizes as before)."""
-    column = _HmV()
-    column.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-    row = _HmH()
-    row.setSpacing(15)
-    row.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-
-    cover = _HmLabel()
-    cover.setFixedSize(120, 180)
-    pix = app.get_rounded_pixmap(image, 120, 180, 12) if os.path.exists(image) else None
-    if pix:
-        cover.setPixmap(pix)
-    else:
-        cover.setText("[ Missing\\nCover ]")
-        cover.setAlignment(_HmQt.AlignmentFlag.AlignCenter)
-        cover.setStyleSheet("border: 1px dashed gray; border-radius: 12px; color: gray;")
-
-    details = _HmV()
-    details.setContentsMargins(0, 0, 0, 0)
-    details.setAlignment(_HmQt.AlignmentFlag.AlignTop)
-    head = _HmH()
-    head.setContentsMargins(0, 0, 0, 0)
-    title = _HmLabel(title_html)
-    tf = title.font()
-    tf.setPointSize(11)
-    tf.setBold(True)
-    title.setFont(tf)
-    title.setWordWrap(True)
-    simple = gid in ("nczfront", "chess")
-    title.setFixedSize(130, 30 if simple else 75)
-    head.addWidget(title)
-    back = _HmButton("\\u2715")
-    back.setFixedSize(22, 22)
-    back.setCursor(_HmQt.CursorShape.PointingHandCursor)
-    back.setStyleSheet("QPushButton { border: none; border-radius: 11px; background-color: transparent;"
-                       " font-weight: bold; color: gray; }"
-                       "QPushButton:hover { background-color: rgba(128,128,128,0.25); color: red; }")
-    back.hide()
-    head.addWidget(back, alignment=_HmQt.AlignmentFlag.AlignTop)
-    details.addLayout(head)
-
-    if gid == "nczfront":
-        status = _HmLabel("Checking...")
-        sf = status.font()
-        sf.setBold(True)
-        status.setFont(sf)
-        details.addWidget(status)
-        def sync_status(s=status):
-            src = app.card_status.get("nczfront")
-            if src is not None:
-                s.setText(src.text().replace("\\u25CF", "").strip())
-                s.setStyleSheet(src.styleSheet() + " font-weight: bold;")
-        syncers.append(sync_status)
-    details.addSpacing(8)
-
-    box = _HmWidget()
-    box.setFixedSize(160, 40 if simple else 272)
-    manage = _HmButton("Manage", box)
-    manage.setFixedWidth(100)
-    manage.move(0, 0)
-    frame = _HmWidget(box)
-    frame.hide()
-    lay = _HmV(frame)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(4)
-
-    def add(btn):
-        btn.setFixedWidth(150)
-        lay.addWidget(btn)
-        return btn
-
-    if gid == "nczfront":
-        add(_HmButton("Play")).clicked.connect(lambda _c=False: app.open_nczfront())
-        add(_HmButton("Refresh")).clicked.connect(lambda _c=False: app.check_nczfront_status())
-    elif gid == "chess":
-        add(_HmButton("Play")).clicked.connect(lambda _c=False: app.open_chess())
-    else:
-        def act(text):
-            _b, menu = _home_source(app, gid)
-            for a in (menu.actions() if menu is not None else []):
-                if a.text() == text:
-                    return a
-            return None
-        def trigger(text):
-            a = act(text)
-            if a is not None and a.isEnabled():
-                a.trigger()
-        b_action = add(_HmButton("Install"))
-        b_update = add(_HmButton("Update"))
-        b_uninstall = add(_HmButton("Uninstall"))
-        b_save = add(_HmButton("Edit Current Save"))
-        b_settings = add(_HmButton("Edit Current Settings"))
-        b_csave = add(_HmButton("Save Data"))
-        b_csync = add(_HmButton("Sync Data"))
-        b_more = add(_HmButton("More..."))
-        b_update.hide()
-        b_csave.setToolTip("Upload this device's save and settings to your account")
-        b_csync.setToolTip("Download your account's save and settings to this device")
-        b_action.clicked.connect(lambda _c=False: (lambda s: s[0] is not None and s[0].click())(_home_source(app, gid)))
-        b_update.clicked.connect(lambda _c=False: (lambda u: u is not None and u.click())(app.update_buttons.get(gid)))
-        for btn, text in ((b_uninstall, "Uninstall"), (b_save, "Edit Current Save"),
-                          (b_settings, "Edit Current Settings"), (b_csave, "Save Data"), (b_csync, "Sync Data")):
-            btn.clicked.connect(lambda _c=False, t=text: trigger(t))
-
-        more_menu = _HmMenu(b_more)
-        more_menu.setToolTipsVisible(True)
-        b_more.setMenu(more_menu)
-        def fill_more():
-            for a in more_menu.actions():
-                more_menu.removeAction(a)
-            _b, src = _home_source(app, gid)
-            last_sep = True
-            for a in (src.actions() if src is not None else []):
-                if a.isSeparator():
-                    if not last_sep:
-                        more_menu.addSeparator()
-                        last_sep = True
-                elif a.text() not in _HOME_DEDICATED:
-                    more_menu.addAction(a)
-                    last_sep = False
-        more_menu.aboutToShow.connect(fill_more)
-
-        def sync_game():
-            src, _m = _home_source(app, gid)
-            if src is not None:
-                b_action.setText(src.text())
-                b_action.setEnabled(src.isEnabled())
-            for btn, text in ((b_uninstall, "Uninstall"), (b_save, "Edit Current Save"),
-                              (b_settings, "Edit Current Settings"), (b_csave, "Save Data"),
-                              (b_csync, "Sync Data")):
-                a = act(text)
-                if a is not None:
-                    btn.setEnabled(a.isEnabled())
-                    if btn is b_uninstall:
-                        btn.setVisible(a.isEnabled())
-            upd = app.update_buttons.get(gid)
-            show = upd is not None and not upd.isHidden()
-            b_update.setVisible(show)
-            if upd is not None:
-                b_update.setEnabled(upd.isEnabled())
-        syncers.append(sync_game)
-
-    _home_toggle(manage, frame, back)
-    details.addWidget(box)
-    row.addWidget(cover, 0, _HmQt.AlignmentFlag.AlignTop)
-    row.addLayout(details)
-    column.addLayout(row)
-    column.addStretch()
-    return column
-
-class _HomeOtherStuff(_HmDialog):
-    """"Other Stuff": a button for every page of the launcher (Account, Library, Store, Settings, ...)."""
-    def __init__(self, app):
-        super().__init__(app)
-        self.setWindowTitle("Other Stuff")
-        self.setModal(True)
-        lay = _HmV(self)
-        lay.setContentsMargins(20, 20, 20, 20)
-        lay.setSpacing(10)
-        n = 0
-        for b in app.nav_group.buttons():
-            if b is getattr(app, "_home_nav_btn", None) or b.isHidden():
-                continue
-            name = b.toolTip() or b.text().title()
-            if not name:
-                name = "Account"
-            if name == "Credits":
-                continue                 # credits live at the bottom of Settings now
-            btn = _HmButton(name)
-            btn.setFixedHeight(32)
-            btn.clicked.connect(lambda _c=False, x=b: (self.accept(), x.click()))
-            lay.addWidget(btn)
-            n += 1
-        self.setFixedWidth(220)
-        self.setFixedHeight(40 + 42 * max(n, 1))
-
-def _home_build(app):
-    page = _HmWidget()
-    page.setObjectName("Content")
-    outer = _HmV(page)
-    outer.setContentsMargins(0, 0, 0, 0)
-    scroll = _HmScroll()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(_HmFrame.Shape.NoFrame)
-    outer.addWidget(scroll)
-    body = _HmWidget()
-    body.setObjectName("GridContainer")
-    scroll.setWidget(body)
-    main = _HmV(body)
-    main.setContentsMargins(30, 25, 30, 25)
-    main.addSpacing(15)
-
-    welcome = _HmLabel("Welcome to NCZ Games Launcher! Please select a game to get started.")
-    wf = welcome.font()
-    wf.setPointSize(12)
-    wf.setBold(True)
-    welcome.setFont(wf)
-    welcome.setAlignment(_HmQt.AlignmentFlag.AlignCenter)
-    main.addWidget(welcome)
-    main.addSpacing(25)
-
-    syncers = []
-    def centered(layouts, spacing):
-        row = _HmH()
-        row.setSpacing(spacing)
-        row.addStretch()
-        for l in layouts:
-            row.addLayout(l)
-        row.addStretch()
-        return row
-
-    top = centered([_home_column(app, "Five Nights<br>at NCZ AE<br>", asset_path("fnanczaecover.png"), "ae", syncers),
-                    _home_column(app, "Five Nights<br>at NCZ<br>2", asset_path("fnancz2cover.png"), "ncz2", syncers)], 40)
-    main.addLayout(top)
-    main.addSpacing(20)
-    bottom = centered([_home_column(app, "NCZFront", asset_path("nczfront-cover.png"), "nczfront", syncers),
-                       _home_column(app, "NCZ Chess", asset_path("nczchess.png"), "chess", syncers)], 40)
-    main.addLayout(bottom)
-    main.addStretch()
-
-    main.addSpacing(10)
-
-    def tick():
-        if page.isVisible():
-            for fn in syncers:
-                try:
-                    fn()
-                except RuntimeError:
-                    pass
-    page._home_timer = _HmTimer(page)
-    page._home_timer.setInterval(400)
-    page._home_timer.timeout.connect(tick)
-    page._home_timer.start()
-    tick()
-    return page
-
-_home_prev_init = AdaptiveApp.__init__
-
-def _home_init(self, *a, **k):
-    _home_prev_init(self, *a, **k)
+def _ncz_block_title(w):
     try:
-        self.home_page = _home_build(self)
-        self.pages.addWidget(self.home_page)
-        btn = self.make_nav_button("Home", checkable=True)
-        btn.setToolTip("Home")
-        btn.setFixedHeight(44)
-        btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        btn.setIconSize(QSize(18, 18))
-        self.nav_group.addButton(btn, self.pages.indexOf(self.home_page))
-        self._home_nav_btn = btn
-        try:
-            _set_tab_icon(btn, "library")
-        except Exception:
-            pass
-        center = getattr(self, "_nav_center_layout", None)
-        if center is not None:
-            center.insertWidget(0, btn)
-        else:
-            lib = self.nav_group.button(0)
-            lay = lib.parent().layout()
-            lay.insertWidget(lay.indexOf(lib), btn)
-        btn.setChecked(True)
-        self.pages.setCurrentWidget(self.home_page)
-        try:
-            self._nav_center_filter.place()
-        except Exception:
-            pass
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-AdaptiveApp.__init__ = _home_init
+        if isinstance(w, QLabel) and w.objectName() == "RowTitle":
+            return w.text().strip()
+        for c in w.findChildren(QLabel):
+            if c.objectName() == "RowTitle" and c.text().strip():
+                return c.text().strip()
+    except RuntimeError:
+        pass
+    return None
 
 
+def _ncz_section_header(sp, name):
+    hdrs = sp.__dict__.setdefault("_ncz_hdrs", {})
+    h = hdrs.get(name)
+    if h is None:
+        h = QLabel(name.upper(), sp._content)
+        h.setObjectName("NczSectionTitle")
+        h.setStyleSheet("QLabel#NczSectionTitle { color: palette(highlight); font-size: 12px; font-weight: 700;"
+                        " padding: 4px 4px 0px 4px; background: transparent; }")
+        hdrs[name] = h
+    return h
 
-# ================================================================ Halloween update: classic look (from the old launcher)
-# Old grey/blue Fusion palette, native title bar, no nav bar. Home is the launcher; every other page is reached
-# through "Other Stuff" and has a "< Home" bar to come back.
-def _classic_palette(dark):
-    C, R, G = QColor, QPalette.ColorRole, QPalette.ColorGroup
-    p = QPalette()
-    if dark:
-        vals = {R.Window: C(45, 45, 45), R.WindowText: C(230, 230, 230), R.Base: C(32, 32, 32),
-                R.AlternateBase: C(45, 45, 45), R.ToolTipBase: C(45, 45, 45), R.ToolTipText: C(230, 230, 230),
-                R.Text: C(230, 230, 230), R.Button: C(58, 58, 58), R.ButtonText: C(230, 230, 230),
-                R.BrightText: C(255, 80, 80), R.Link: C(42, 130, 218), R.Highlight: C(42, 130, 218),
-                R.HighlightedText: C(255, 255, 255), R.PlaceholderText: C(140, 140, 140)}
-        dis = C(130, 130, 130)
-    else:
-        vals = {R.Window: C(240, 240, 240), R.WindowText: C(20, 20, 20), R.Base: C(255, 255, 255),
-                R.AlternateBase: C(245, 245, 245), R.ToolTipBase: C(255, 255, 255), R.ToolTipText: C(20, 20, 20),
-                R.Text: C(20, 20, 20), R.Button: C(240, 240, 240), R.ButtonText: C(20, 20, 20),
-                R.BrightText: C(200, 0, 0), R.Link: C(0, 100, 200), R.Highlight: C(42, 130, 218),
-                R.HighlightedText: C(255, 255, 255), R.PlaceholderText: C(120, 120, 120)}
-        dis = C(140, 140, 140)
-    for role, col in vals.items():
-        p.setColor(role, col)
-    for role in (R.Text, R.ButtonText, R.WindowText):
-        p.setColor(G.Disabled, role, dis)
-    return p
 
-_CLASSIC_QSS = """
-QLabel#PageTitle { font-size: 22px; font-weight: bold; }
-QLabel#PageCount { color: gray; font-size: 13px; padding-left: 12px; padding-bottom: 3px; }
-QLabel#EmptyState { color: gray; font-size: 14px; padding: 40px; }
-QLabel#RowTitle { font-size: 13px; font-weight: 600; }
-QLabel#RowDesc { color: gray; font-size: 12px; }
-QFrame#Panel, QFrame#AccountCard { border: 1px solid rgba(128,128,128,0.35); border-radius: 10px; }
-QFrame#GameCard { border: 1px solid transparent; border-radius: 12px; }
-QFrame#GameCard:hover { border: 1px solid palette(highlight); }
-QLabel#CardTitle { font-weight: bold; padding-left: 2px; }
-QLabel#CardStatus, QLabel#CardPlaytime { color: gray; font-size: 12px; padding-left: 2px; }
-QLabel#CoverPlaceholder { border: 1px dashed gray; border-radius: 8px; color: gray; }
-QPushButton#Primary { background: palette(highlight); color: white; font-weight: bold; border: none; border-radius: 4px; padding: 6px 14px; }
-QPushButton#Primary:hover { background: #4a9ae8; }
-QPushButton#Primary:pressed { background: #2a6fb8; }
-QPushButton#Primary:disabled { background: rgba(128,128,128,0.3); color: gray; }
-QPushButton#MoreButton { padding: 0; }
-QPushButton#MoreButton::menu-indicator { image: none; width: 0px; }
-QLabel#Avatar { background: palette(highlight); color: white; border-radius: 18px; font-weight: bold; }
-QLabel#AvatarLarge { background: palette(highlight); color: white; border-radius: 40px; font-size: 32px; font-weight: bold; }
-QFrame#AvatarRing { background: transparent; border: 2px solid palette(highlight); border-radius: 48px; }
-QPushButton#LogoutButton { color: #e5484d; border: 1px solid rgba(229,72,77,0.55); }
-QLabel#SyncAvatar { background: palette(highlight); color: white; border-radius: 28px; font-size: 22px; font-weight: bold; }
-QFrame#SyncCard { border: 1px solid rgba(128,128,128,0.35); border-radius: 12px; }
-QFrame#SyncCard:hover, QFrame#SyncCard[selected="true"] { border: 1px solid palette(highlight); }
-QLabel#SyncName { font-size: 14px; font-weight: 600; }
-QMessageBox QPushButton { min-width: 80px; }
-QFrame#SideRail { border-right: 1px solid rgba(128,128,128,0.35); }
-QPushButton#NavButton { background: transparent; border: none; border-left: 3px solid transparent; border-radius: 0; text-align: left; padding: 0px 16px; font-size: 12px; font-weight: bold; }
-QPushButton#NavButton:hover { background: rgba(128,128,128,0.18); }
-QPushButton#NavButton:checked { background: rgba(42,130,218,0.28); border-left: 3px solid palette(highlight); }
-"""
-
-def apply_dark_mode(mode):
-    app = QApplication.instance()
-    if app is None:
+def _ncz_organize(sp):
+    """Sort the settings panels into sections (idempotent; cheap when nothing changed)."""
+    lay = getattr(sp, "_content_layout", None)
+    if lay is None:
         return
-    app.setStyle("Fusion")
-    use_dark = mode == "on" or (mode == "system" and system_prefers_dark())
+    hdrs = sp.__dict__.setdefault("_ncz_hdrs", {})
+    hset = set(hdrs.values())
+    widgets = [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() is not None]
+    head, blocks, tail = [], [], []
+    for w in widgets:
+        if w in hset:
+            continue
+        if w.objectName() == "PageTitle":
+            head.append(w)
+            continue
+        t = _ncz_block_title(w)
+        if t is None:
+            tail.append(w)
+        else:
+            blocks.append((_ncz_cat_index(t), w))
+    blocks.sort(key=lambda b: b[0])                      # stable: keeps the original order inside a section
+    desired, groups = list(head), {}
+    last = None
+    for ci, w in blocks:
+        if ci != last:
+            last = ci
+            desired.append(_ncz_section_header(sp, _ncz_cat_name(ci)))
+        groups.setdefault(ci, []).append(w)
+        desired.append(w)
+    desired += tail
+    if desired != widgets:
+        while lay.count():
+            lay.takeAt(0)
+        for w in desired:
+            if w in head:
+                lay.addWidget(w)
+                lay.addSpacing(18)
+            elif w in hset or w.objectName() == "NczSectionTitle":
+                lay.addSpacing(10)
+                lay.addWidget(w)
+                lay.addSpacing(4)
+            else:
+                lay.addWidget(w)
+                lay.addSpacing(12)
+        lay.addStretch(1)
+    for ci, ws in groups.items():                        # hide a section title when every panel under it is hidden
+        _ncz_section_header(sp, _ncz_cat_name(ci)).setVisible(any(not w.isHidden() for w in ws))
+
+
+# ---- the two new settings
+_NCZ_PAD = {"timer": None, "had": None, "app": None}
+
+
+def _ncz_pad_present():
     try:
-        import overlay as _overlay_mod
-        _overlay_mod.set_light(not use_dark)
+        if sys.platform.startswith("win"):
+            import ctypes
+            try:
+                dll = ctypes.windll.xinput1_4
+            except Exception:
+                dll = ctypes.windll.xinput1_3
+            buf = ctypes.create_string_buffer(16)
+            return any(dll.XInputGetState(i, buf) == 0 for i in range(4))
+        if sys.platform.startswith("linux"):
+            import glob
+            return bool(glob.glob("/dev/input/js*"))
     except Exception:
         pass
-    app.setPalette(_classic_palette(use_dark))
-    app.setStyleSheet(_CLASSIC_QSS)             # Fusion look; only page layout / card rules are kept
-    theme = THEMES["dark" if use_dark else "light"]
-    _theme_state["nav_text"] = theme["nav_text"]
-    _theme_state["nav_active"] = theme["nav_active"]
-    for listener in list(_theme_listeners):
-        try:
-            listener()
-        except Exception:
-            pass
+    return False
 
-_classic_prev_init = AdaptiveApp.__init__
 
-def _classic_init(self, *a, **k):
-    _classic_prev_init(self, *a, **k)
+def _ncz_pad_tick():
+    now = _ncz_pad_present()
+    had, _NCZ_PAD["had"] = _NCZ_PAD["had"], now
+    app = _NCZ_PAD["app"]
+    if now and had is False and app is not None:         # a controller just showed up
+        bp = getattr(app, "_big_picture", None)
+        if bp is None or not getattr(bp, "_active", False):
+            app.open_big_picture()
+
+
+def _ncz_pad_apply():
+    """Polls for controllers only while the setting is on (nothing runs when it's off)."""
+    on = bool(load_launcher_settings().get("bp_on_controller", True))
+    t = _NCZ_PAD["timer"]
+    if t is None:
+        t = _NCZ_PAD["timer"] = QTimer(QApplication.instance())
+        t.timeout.connect(_ncz_pad_tick)
+    if on and not t.isActive():
+        _NCZ_PAD["had"] = _ncz_pad_present()
+        t.start(2000)
+    elif not on:
+        t.stop()
+
+
+_NCZ_BP_SPECS = (("Launch Big Picture on startup", "Open Big Picture mode automatically whenever the launcher starts",
+                  "bp_on_startup", None),
+                 ("Big Picture when a controller connects", "Switch to Big Picture as soon as a controller is plugged in or turned on",
+                  "bp_on_controller", _ncz_pad_apply))
+_NCZ_SND_SPECS = (("Overlay notification sound", "Play a short chime when a friend notification pops up",
+                   "overlay_sound", None),)
+
+
+def _ncz_add_bp_settings(sp):
+    if getattr(sp, "_ncz_bp_panel", None) is not None:
+        return
+    _ncz_make_panel(sp, _NCZ_BP_SPECS, "_ncz_bp_panel")
+    _ncz_make_panel(sp, _NCZ_SND_SPECS, "_ncz_snd_panel")
+
+
+def _ncz_make_panel(sp, specs, attr):
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    for n, (title, desc, key, cb) in enumerate(specs):
+        if n:
+            pl.addSpacing(10)
+        row, col = QHBoxLayout(), QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setObjectName("RowTitle")
+        d = QLabel(desc)
+        d.setObjectName("RowDesc")
+        d.setWordWrap(True)
+        col.addWidget(t)
+        col.addWidget(d)
+        b = QPushButton()
+        b.setCheckable(True)
+        b.setFixedWidth(160)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        on = bool(load_launcher_settings().get(key, key in ("bp_on_controller", "overlay_sound")))
+        b.setChecked(on)
+        b.setText("On" if on else "Off")
+
+        def toggled(_c=False, b=b, key=key, cb=cb):
+            v = b.isChecked()
+            b.setText("On" if v else "Off")
+            s = load_launcher_settings()
+            s[key] = v
+            save_launcher_settings(s)
+            if cb:
+                cb()
+        b.clicked.connect(toggled)
+        row.addLayout(col, 1)
+        row.addWidget(b)
+        pl.addLayout(row)
+    sp._content_layout.addWidget(panel)
+    setattr(sp, attr, panel)
+
+
+_ncz_show_o = SettingsPage.showEvent
+
+
+def _ncz_settings_show(self, e):
+    _ncz_show_o(self, e)
     try:
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)     # back to the normal title bar
-        self.setMinimumSize(QSize(800, 640))
-        self.resize(900, 760)
-        self.center_on_screen()
-        top = self.findChild(QFrame, "Sidebar")
-        if top is not None:
-            top.hide()                                                   # the old top bar; its buttons move to the rail
-        rv = getattr(self, "_nav_center_layout", None)
-        proxies = []
-        if rv is not None:
-            for gid_, label in ((6, "Downloads"), (1, "Settings"), (3, "Account")):
-                orig = self.nav_group.button(gid_)
-                if orig is None:
-                    continue
-                pb = QPushButton(label.upper())
-                pb.setObjectName("NavButton")
-                pb.setCheckable(True)
-                pb.setFixedHeight(44)
-                pb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-                pb.setCursor(Qt.CursorShape.PointingHandCursor)
-                pb.clicked.connect(lambda _c=False, o=orig: o.click())
-                rv.insertWidget(rv.count(), pb)                          # below the stretch: bottom of the rail
-                proxies.append((pb, orig))
-            def mirror(*_a):
-                for pb, orig in proxies:
-                    pb.setChecked(orig.isChecked())
-            self.nav_group.buttonToggled.connect(mirror)
-            mirror()
-        def refit(_i=0):                      # Library measures its width only once it is really on screen
-            if self.pages.currentWidget() is self.pages.widget(0):
-                for ms in (0, 120):
-                    QTimer.singleShot(ms, lambda: self.apply_filter(self.search_edit.text()))
-        self.pages.currentChanged.connect(refit)
-        self.setWindowTitle("NCZ Games Launcher")
+        _ncz_organize(self)                              # picks up panels other features added after startup
     except Exception:
         import traceback
         traceback.print_exc()
 
-AdaptiveApp.__init__ = _classic_init
+
+SettingsPage.showEvent = _ncz_settings_show
+
+_ncz_prev_init = AdaptiveApp.__init__
+
+
+def _ncz_init(self, *a, **k):
+    _ncz_prev_init(self, *a, **k)
+    try:
+        _NCZ_PAD["app"] = self
+        sp = self.settings_page
+        _ncz_add_bp_settings(sp)
+        _ncz_organize(sp)
+        _ncz_pad_apply()
+        if load_launcher_settings().get("bp_on_startup", False) and "--bigpicture" not in sys.argv:
+            QTimer.singleShot(900, self.open_big_picture)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+AdaptiveApp.__init__ = _ncz_init
+
+
+# ---- Big Picture settings menu: same sections (section titles are rows that can't be selected)
+_ncz_scan_o = _bpe_st_scan
+
+
+def _ncz_scan(sp):
+    rows = _ncz_scan_o(sp)
+    try:
+        rows = [r for r in rows if r.get("ctrls")]       # drop hidden / non-interactive rows
+        for r in rows:
+            r["_cat"] = _ncz_cat_index(r["title"])
+        rows.sort(key=lambda r: r["_cat"])
+        out, last = [], None
+        for r in rows:
+            if r["_cat"] != last:
+                last = r["_cat"]
+                out.append({"title": _ncz_cat_name(last), "desc": "", "ctrls": [], "header": True})
+            out.append(r)
+        return out
+    except Exception:
+        return rows
+
+
+_bpe_st_scan = _ncz_scan
+_ncz_o = {n: getattr(_BigPicture, n) for n in ("_settings_open", "_st_act", "_st_click", "_paint_st")}
+
+
+def _ncz_bp_settings_open(self):
+    _ncz_o["_settings_open"](self)
+    st = self._st
+    if st and st["rows"] and st["rows"][0].get("header"):
+        st["sel"] = 1 if len(st["rows"]) > 1 else 0
+        st["scroll"] = 0
+
+
+def _ncz_bp_st_act(self, name):
+    st = self._st
+    if st is None:
+        return
+    rows = st["rows"]
+    if name in ("up", "down"):
+        d = -1 if name == "up" else 1
+        i = st["sel"] + d
+        while 0 <= i < len(rows) and rows[i].get("header"):
+            i += d
+        if 0 <= i < len(rows):
+            st["sel"], st["btn"] = i, 0
+            if i > 0 and rows[i - 1].get("header") and st["scroll"] >= i:
+                st["scroll"] = i - 1                      # keep the section title in view above the first row
+        self.update()
+        return
+    if name in ("accept", "start") and (rows[st["sel"]].get("header") or not rows[st["sel"]]["ctrls"]):
+        return
+    _ncz_o["_st_act"](self, name)
+
+
+def _ncz_bp_st_click(self, tag):
+    st = self._st
+    if st is not None and tag[0] in ("row", "pill") and st["rows"][tag[1]].get("header"):
+        return
+    _ncz_o["_st_click"](self, tag)
+
+
+def _ncz_bp_paint_st(self, p, w, h, acc):
+    _ncz_o["_paint_st"](self, p, w, h, acc)
+    st = self._st
+    if not st:
+        return
+    for r, tag in st.get("rects", []):                    # repaint section rows as plain titles instead of cards
+        if tag[0] == "row" and st["rows"][tag[1]].get("header"):
+            p.fillRect(r.adjusted(-1, -1, 1, 1), QColor(14, 14, 26, 255))
+            self._x_text(p, QRectF(r.left() + h * 0.01, r.top() + r.height() * 0.38, r.width(), r.height() * 0.6),
+                         st["rows"][tag[1]]["title"].upper(), 0.02, acc, True)
+
+
+_BigPicture._settings_open = _ncz_bp_settings_open
+_BigPicture._st_act = _ncz_bp_st_act
+_BigPicture._st_click = _ncz_bp_st_click
+_BigPicture._paint_st = _ncz_bp_paint_st
 
 
 
 
-# NCZ Chess puts its own look on the whole launcher while it is open and calls _ui_apply_sunset() to take it off again.
-# Inside chess that is fine; everywhere else the classic look is what should come back.
-_classic_prev_sunset = _ui_apply_sunset
-
-def _ui_apply_sunset():
-    if _ch_orig.get("on"):                      # chess is on screen: keep its look
-        _classic_prev_sunset()
+def _ncz_dominant_pixmap(pix):
+    """2x2 pixmap filled with the most repeated colour of `pix` (colours bucketed so near-identical shades count together;
+    near-black / near-white pixels are ignored so cover borders don't win)."""
+    img = pix.toImage().scaled(48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
+    buckets = {}
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            r, g, b = c.red(), c.green(), c.blue()
+            if c.alpha() < 128 or max(r, g, b) < 28 or min(r, g, b) > 235:
+                continue
+            k = (r >> 5, g >> 5, b >> 5)
+            e = buckets.setdefault(k, [0, 0, 0, 0])
+            e[0] += 1
+            e[1] += r
+            e[2] += g
+            e[3] += b
+    if buckets:
+        n, r, g, b = max(buckets.values(), key=lambda e: e[0])
+        col = QColor(r // n, g // n, b // n)
     else:
-        apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
+        col = QColor(20, 20, 32)
+    out = QPixmap(2, 2)
+    out.fill(col)
+    return out
+
+
+# ================================================================ Overlay toast chime
+# A short two-note chime (synthesized once into the settings folder, nothing to download) plays whenever an overlay toast
+# (friend playing / invite / chess challenge / messages) is shown. Settings -> "Overlay notification sound" turns it off.
+_NCZ_CHIME = {"fx": None, "broken": False, "last": 0.0}
+
+
+def _ncz_chime_path():
+    path = os.path.join(os.path.dirname(get_launcher_settings_path()), "overlay_chime.wav")
+    if not os.path.exists(path):
+        rate, buf = 22050, []
+        for start, freq, dur in ((0.0, 880.0, 0.22), (0.11, 1318.5, 0.34)):
+            for n in range(int(dur * rate)):
+                t = n / rate
+                v = (_math.sin(2 * _math.pi * freq * t) * 0.8 + _math.sin(4 * _math.pi * freq * t) * 0.15) \
+                    * _math.exp(-t * 9.0) * min(1.0, t * 400.0) * 0.35
+                i = int(start * rate) + n
+                while len(buf) <= i:
+                    buf.append(0.0)
+                buf[i] += v
+        with _wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(b"".join(_struct.pack("<h", int(max(-1.0, min(1.0, v)) * 32767)) for v in buf))
+    return path
+
+
+def _ncz_chime():
+    if _NCZ_CHIME["broken"] or not load_launcher_settings().get("overlay_sound", True):
+        return
+    now = time.time()
+    if now - _NCZ_CHIME["last"] < 0.4:                    # several toasts at once: one chime
+        return
+    _NCZ_CHIME["last"] = now
+    try:
+        fx = _NCZ_CHIME["fx"]
+        if fx is None:
+            from PyQt6.QtMultimedia import QSoundEffect
+            fx = QSoundEffect()
+            fx.setSource(QUrl.fromLocalFile(_ncz_chime_path()))
+            fx.setVolume(0.6)
+            _NCZ_CHIME["fx"] = fx
+        fx.play()
+    except Exception:
+        _NCZ_CHIME["broken"] = True                       # no QtMultimedia / audio device: stay silent
+
+
+def _ncz_wrap_overlay():
+    ov = globals().get("_overlay")
+    if ov is None:
+        return
+    for name in ("notify_playing", "notify_invite", "notify_chess_invite"):
+        orig = getattr(ov, name, None)
+        if orig is None or getattr(orig, "_ncz_chime", False):
+            continue
+
+        def wrapped(*a, _o=orig, **k):
+            r = _o(*a, **k)
+            _ncz_chime()
+            return r
+        wrapped._ncz_chime = True
+        try:
+            setattr(ov, name, wrapped)
+        except Exception:
+            pass
+
+
+_ncz_wrap_overlay()
+
+
+# ================================================================ NCZ Chess inside Big Picture
+# While Big Picture is open, "Play" on the NCZ Chess card (or accepting a chess challenge) shows the chess page in a panel on
+# top of Big Picture instead of switching the hidden main window. B / the page's Library button closes the panel; the page goes
+# back into the launcher's page stack and keeps its game running.
+_ncz_chess_open_o = AdaptiveApp.open_chess
+
+
+def _ncz_open_chess_bp(self):
+    bp = getattr(self, "_big_picture", None)
+    if bp is None or not getattr(bp, "_active", False):
+        return _ncz_chess_open_o(self)
+    ent = getattr(bp, "_ncz_chess_ent", None)
+    if ent is not None and ent in bp._embs:
+        return                                              # already open
+    page = self.__dict__.get("chess_page")
+    if page is None:
+        page = NczChessPage()
+        self.chess_page = page
+        self.pages.addWidget(page)
+        page.back_requested.connect(self._leave_web_page)
+        self.pages.currentChanged.connect(lambda _i, p=page: _ch_sync_launcher_look(p))
+    try:
+        page.back_requested.disconnect(self._leave_web_page)   # inside Big Picture "back" closes the panel instead
+    except Exception:
+        pass
+    holder = {}
+
+    def close_panel(_c=False):
+        if holder.get("ent") is not None:
+            bp._emb_close_ent(holder["ent"])
+
+    def restore():
+        try:
+            page.back_requested.disconnect(close_panel)
+        except Exception:
+            pass
+        try:
+            page.back_requested.connect(self._leave_web_page)
+            self.pages.addWidget(page)                       # back into the launcher's page stack
+        except Exception:
+            pass
+        bp._ncz_chess_ent = None
+
+    page.back_requested.connect(close_panel)
+    ent = bp._emb_open(page, "NCZ Chess", "chess", frac=(0.96, 0.94), on_close=restore)
+    ent["close"] = close_panel
+    holder["ent"] = bp._ncz_chess_ent = ent
+    try:
+        _ch_sync_launcher_look(page)
+    except Exception:
+        pass
+    try:
+        bp._say("", 1)                                       # clear the "Launching NCZ Chess..." toast
+    except Exception:
+        pass
+
+
+AdaptiveApp.open_chess = _ncz_open_chess_bp
+
+
+# ================================================================ NCZ logo (assets/icon.png) in more places
+# Regular launcher: a small round logo next to every page title (follows the accent recolor).
+# Big Picture: logo next to "NCZ" in the header, a faint watermark behind every tab, and one on the Settings menu.
+_NCZ_LOGO_CACHE = {}
+
+
+def _ncz_logo_pm(px):
+    """Round logo pixmap, px device pixels wide (cached until icon.png changes). None if unavailable."""
+    try:
+        path = asset_path("icon.png")
+        key = (px, path, os.path.getmtime(path))
+    except Exception:
+        return None
+    pm = _NCZ_LOGO_CACHE.get(key)
+    if pm is None:
+        try:
+            pm = CreditsPage.circular_pixmap(path, px)
+        except Exception:
+            pm = None
+        if pm is not None and not pm.isNull():
+            for k in [k for k in _NCZ_LOGO_CACHE if k[0] == px]:
+                _NCZ_LOGO_CACHE.pop(k, None)
+            _NCZ_LOGO_CACHE[key] = pm
+        else:
+            pm = None
+    return pm
+
+
+def _ncz_set_title_logo(lbl):
+    pm = _ncz_logo_pm(56)
+    lbl.setVisible(pm is not None)
+    if pm is not None:
+        pm = QPixmap(pm)
+        pm.setDevicePixelRatio(2.0)
+        lbl.setPixmap(pm)
+
+
+def _ncz_add_title_logos(win):
+    logos = win.__dict__.setdefault("_ncz_title_logos", [])
+    done = {id(x[1]) for x in logos}
+    for title in win.findChildren(QLabel):
+        try:
+            if title.objectName() != "PageTitle" or id(title) in done:
+                continue
+            par = title.parentWidget()
+            lay = par.layout() if par is not None else None
+            idx = lay.indexOf(title) if lay is not None else -1
+            if idx < 0 or not isinstance(lay, (QVBoxLayout, QHBoxLayout)):
+                continue
+            lay.removeWidget(title)
+            row = QWidget(par)
+            row.setStyleSheet("background: transparent;")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(10)
+            logo = QLabel()
+            logo.setFixedSize(28, 28)
+            _ncz_set_title_logo(logo)
+            rl.addWidget(logo)
+            rl.addWidget(title)
+            rl.addStretch(1)
+            lay.insertWidget(idx, row)
+            logos.append((logo, title))
+        except Exception:
+            pass
+
+
+_ncz_logo_prev_init = AdaptiveApp.__init__
+
+
+def _ncz_logo_init(self, *a, **k):
+    _ncz_logo_prev_init(self, *a, **k)
+    try:
+        _ncz_add_title_logos(self)
+        QTimer.singleShot(3000, lambda: _ncz_add_title_logos(self))     # pages that are built a little later
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+AdaptiveApp.__init__ = _ncz_logo_init
+_ncz_logo_prev_reload = AdaptiveApp.reload_brand_logo
+
+
+def _ncz_logo_reload(self):
+    _ncz_logo_prev_reload(self)
+    for logo, _t in self.__dict__.get("_ncz_title_logos", []):
+        try:
+            _ncz_set_title_logo(logo)
+        except RuntimeError:
+            pass
+
+
+AdaptiveApp.reload_brand_logo = _ncz_logo_reload
+
+_ncz_logo_hdr_o = _BigPicture._paint_header
+
+
+def _ncz_logo_bp_header(self, p, w, h, m, acc):
+    _ncz_logo_hdr_o(self, p, w, h, m, acc)
+    try:                                                   # icon only, rounded square, where the "NCZ" text used to be
+        path = asset_path("icon.png")
+        key = (path, os.path.getmtime(path))
+        pm = _NCZ_LOGO_CACHE.get(("sq",) + key)
+        if pm is None:
+            pm = QPixmap(path)
+            if not pm.isNull():
+                side = min(pm.width(), pm.height())
+                pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+                for k in [k for k in _NCZ_LOGO_CACHE if k[0] == "sq"]:
+                    _NCZ_LOGO_CACHE.pop(k, None)
+                _NCZ_LOGO_CACHE[("sq",) + key] = pm
+        if pm is not None and not pm.isNull():
+            s = h * 0.062
+            r = QRectF(m, h * 0.035 + (h * 0.07 - s) / 2, s, s)
+            path_ = QPainterPath()
+            path_.addRoundedRect(r, s * 0.24, s * 0.24)
+            p.save()
+            p.setClipPath(path_)
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            p.restore()
+    except Exception:
+        pass
+
+
+_BigPicture._paint_header = _ncz_logo_bp_header
+_ncz_logo_st_o = _BigPicture._paint_st
+
+
+def _ncz_logo_bp_st(self, p, w, h, acc):
+    _ncz_logo_st_o(self, p, w, h, acc)
+    try:
+        pm = _ncz_logo_pm(128)
+        if pm is not None and self._st is not None:
+            s = h * 0.05
+            adv = QFontMetrics(self._font(h * 0.038, True)).horizontalAdvance("Settings")
+            p.drawPixmap(QRectF(w * 0.14 + adv + h * 0.015, h * 0.06 + (h * 0.07 - s) / 2, s, s), pm, QRectF(pm.rect()))
+    except Exception:
+        pass
+
+
+_BigPicture._paint_st = _ncz_logo_bp_st
+
 
 
 if __name__ == "__main__":
