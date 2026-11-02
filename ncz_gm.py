@@ -7,6 +7,7 @@ the right place.
 
     ncz-gm help
 """
+import getpass
 import importlib.util
 import json
 import os
@@ -17,7 +18,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 CLI_NAME = "ncz-gm"
 IS_WIN = sys.platform.startswith("win")
@@ -31,6 +34,7 @@ NCZ Games Launcher - command line
 usage: ncz-gm <command> [arguments]
 
 commands:
+  login <email> [password]                sign in (every command except `demo` needs you to be signed in)
   workshop <mod id>                       download a Steam Workshop mod (an item link works too)
   download <game id> [path] [server]      download a Steam game (Steam app id); no path = your Settings install
                                           folder, no server = it asks. server: 1 = SteamRIP, 2 = FitGirl, 3 = AnkerGames
@@ -41,6 +45,7 @@ commands:
   gmod-extract <path>                     extract Garry's Mod addons (a .gma / .bin file or a folder of them)
   update                                  update the launcher
   demo                                    delete account.json and open demo.py (back to the sign-in window)
+                                          (works without being signed in)
   help                                    list all commands
 
 extra:
@@ -733,6 +738,147 @@ def resolve_game(query):
     return query, None            # not in the lists we can read: let the launcher try the name as typed
 
 
+# ============================================================================================== sign-in
+# Same Firebase project the launcher and demo.py use. Read from main.py when it's next to us so there's one source of truth.
+_FB_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
+_FB_DB = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
+_LOGIN_ERRORS = {
+    "INVALID_LOGIN_CREDENTIALS": "Wrong email or password.",
+    "INVALID_PASSWORD": "Wrong email or password.",
+    "EMAIL_NOT_FOUND": "Wrong email or password.",
+    "INVALID_EMAIL": "That doesn't look like a valid email address.",
+    "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts. Please wait a bit and try again.",
+    "USER_DISABLED": "This account has been disabled.",
+}
+
+
+def _firebase_config():
+    key, db = _FB_KEY, _FB_DB
+    mp = main_py()
+    if mp:
+        try:
+            with open(mp, encoding="utf-8", errors="replace") as f:
+                head = f.read(400000)
+            k = re.search(r'^FIREBASE_API_KEY\s*=\s*"([^"]+)"', head, re.M)
+            d = re.search(r'^FIREBASE_DB_URL\s*=\s*"([^"]+)"', head, re.M)
+            key, db = (k.group(1) if k else key), (d.group(1) if d else db)
+        except OSError:
+            pass
+    return key, db.rstrip("/")
+
+
+def _account_file():
+    return os.path.join(settings_dir(), "account.json")
+
+
+def _ban_flag_file():
+    return os.path.join(settings_dir(), "launcher_ban.json")
+
+
+def is_logged_in():
+    """Same test the launcher uses: account.json holds a refresh token and a uid (and the account isn't banned)."""
+    if os.path.exists(_ban_flag_file()):
+        return False
+    try:
+        with open(_account_file(), encoding="utf-8") as f:
+            acct = json.load(f)
+        return isinstance(acct, dict) and bool(acct.get("refresh_token")) and bool(acct.get("uid"))
+    except Exception:
+        return False
+
+
+def _fb_json(url, payload=None, method=None):
+    headers = {"User-Agent": "NCZ-Games-Launcher"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8", "replace"))["error"]["message"]
+        except Exception:
+            msg = ""
+        code = str(msg).split(" : ")[0].strip()
+        raise RuntimeError(_LOGIN_ERRORS.get(code) or f"Sign-in failed ({code or 'HTTP %s' % e.code}).")
+    except (urllib.error.URLError, OSError):
+        raise RuntimeError("Couldn't reach the cloud. Check your internet connection.")
+    return json.loads(body) if body.strip() else None
+
+
+def _discord_banned():
+    """Best effort, same check demo.py does on sign-in: a banned Discord id blocks it. Needs demo.py + PyQt6 + pypresence;
+    when any of those is missing (or Discord is closed) it lets the sign-in through, exactly like demo.py does."""
+    demo = os.path.join(os.path.dirname(main_py() or HERE), "demo.py")
+    if not os.path.isfile(demo):
+        return None
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        spec = importlib.util.spec_from_file_location("ncz_demo_check", demo)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        res = mod.discord_check(False)
+        if res.get("status") == "banned":
+            mod.write_ban_flag(res.get("user_id"))
+            return res.get("user_id")
+    except BaseException:
+        pass
+    return None
+
+
+def cmd_login(args):
+    if not 1 <= len(args) <= 2:
+        err("usage: ncz-gm login <email> [password]")
+        return 2
+    email = args[0].strip()
+    if "@" not in email:
+        err("That doesn't look like a valid email address.")
+        return 2
+    if os.path.exists(_ban_flag_file()):
+        err("This device can't sign in.")
+        return 1
+    if len(args) == 2:
+        password = args[1]
+    else:                                  # leaving it off keeps it out of your shell history
+        try:
+            password = getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt):
+            say()
+            return 130
+    if not password:
+        err("No password given.")
+        return 2
+    key, db = _firebase_config()
+    say(paint("\u27f3", "accent") + " Signing in...")
+    res = _fb_json("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key="
+                   + urllib.parse.quote(key, safe=""),
+                   {"email": email, "password": password, "returnSecureToken": True})
+    uid, token = res["localId"], res["idToken"]
+    profile = _fb_json(f"{db}/users/{urllib.parse.quote(uid, safe='')}/profile.json?auth={urllib.parse.quote(token, safe='')}")
+    if profile is None:
+        err("This account isn't set up yet. Sign in once in the launcher window to finish creating it.")
+        return 1
+    banned = _discord_banned()
+    if banned:
+        err("This device can't sign in.")
+        return 1
+    acct = {"email": res.get("email", email), "uid": uid, "refresh_token": res["refreshToken"]}
+    path = _account_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(acct, f)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    say(paint("\u2714 Signed in as", "ok") + " " + paint(acct["email"], "bold"))
+    return 0
+
+
 # ============================================================================================== commands
 def cmd_open(args):
     if not args:
@@ -1086,7 +1232,7 @@ def cmd_help(_args):
 
 
 COMMANDS = {
-    "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
+    "login": cmd_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
     "update": cmd_update, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
@@ -1103,9 +1249,13 @@ def main(argv=None, launcher=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not os.environ.get("NCZ_GM_NO_INSTALL") and (not argv or argv[0].lower() not in ("install", "uninstall")):
         install_path(quiet=True)           # first run: add the command to PATH (a no-op once it's there)
+    name = argv[0].lower() if argv else ""
+    if name not in ("login", "demo") and not is_logged_in():          # only `login` and `demo` work signed out
+        err("You're not signed in. Sign in first:  ncz-gm login <email> [password]")
+        return 1
     if not argv:
         return cmd_help([])
-    cmd = COMMANDS.get(argv[0].lower())
+    cmd = COMMANDS.get(name)
     if cmd is None:
         err(f"unknown command: {argv[0]}\n")
         say(_style_help(HELP))
