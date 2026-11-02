@@ -38,16 +38,14 @@ commands:
   google-login                            sign in with Google (opens your browser)
   github-login                            sign in with GitHub (opens your browser)
   workshop <mod id>                       download a Steam Workshop mod (an item link works too)
-  download <game id> [path] [server]      download a Steam game (Steam app id); no path = your Settings install
-                                          folder, no server = it asks. server: 1 = SteamRIP, 2 = FitGirl, 3 = AnkerGames
+  download <game id> [path] [server]      download a Steam game by its app id (no path = your Settings install folder)
   big-pic                                 open Big Picture mode
   open                                    open the launcher
   open <game name>                        open (launch) a game from your library
   shiftq                                  open the Shift+Q overlay menu
   gmod-extract <path>                     extract Garry's Mod addons (a .gma / .bin file or a folder of them)
   update                                  update the launcher
-  demo                                    delete account.json and open demo.py (back to the sign-in window)
-                                          (works without being signed in)
+  demo                                    delete account.json and open demo.py (works while signed out)
   help                                    list all commands
 
 extra:
@@ -55,6 +53,7 @@ extra:
 
 options:
   workshop      --login <steam name>      Steam account for games whose Workshop needs one (default: the launcher's)
+  download      server: 1, 2 or 3         1 = SteamRIP, 2 = FitGirl, 3 = AnkerGames (no server = it asks)
   gmod-extract  --to <addons folder>      where to extract (default: garrysmod/addons of your Garry's Mod)
 """
 
@@ -1294,8 +1293,13 @@ def cmd_uninstall(_args):
     return uninstall_path()
 
 
+def print_help():
+    for line in _style_help(HELP).splitlines():
+        say(line)
+
+
 def cmd_help(_args):
-    say(_style_help(HELP))
+    print_help()
     return 0
 
 
@@ -1329,7 +1333,7 @@ def main(argv=None, launcher=None):
     cmd = COMMANDS.get(name)
     if cmd is None:
         err(f"unknown command: {argv[0]}\n")
-        say(_style_help(HELP))
+        print_help()
         return 2
     try:
         return cmd(argv[1:]) or 0
