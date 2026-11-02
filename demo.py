@@ -11,7 +11,7 @@ Flow
   * Create Account -> the same Discord check runs BEFORE the account is created.
   * Discord check -> pypresence reads which Discord user is logged in locally and compares the id with
                 BANNED_DISCORD_IDS. Banned: message, webhook alert, closes after 3 s, no sign-in on later starts.
-  * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py and assets/ from
+  * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py, ncz_gm.py and assets/ from
                 GitHub into this folder ("Downloading Launcher..."), then starts main.py.
 
 The session is saved in the same account.json the launcher itself uses, so main.py opens already signed in.
@@ -40,7 +40,7 @@ import http.server
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
-                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption)
+                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption, QImage)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect)
 
 # ------------------------------------------------------------------------------------------------ config
@@ -66,13 +66,16 @@ REQUIRE_DISCORD_FOR_NEW_ACCOUNTS = True
 # next login counts as "already in the database".
 WRITE_PROFILE_FOR_NEW_ACCOUNTS = True
 BAN_CLOSE_DELAY_MS = 16
-VERSION_TEXT = "v12.4.0"
+VERSION_TEXT = "v12.5.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
 GITHUB_REPO = "justmm33/FNaNCZ-AE-Releases"
 GITHUB_BRANCH = "main"
 LAUNCHER_FILES = ("main.py", "overlay.py", "controller_input.py", "controller_bridge.py","fan_games.csv","gamejolt_scraper.py")
+# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. When it is
+# missing locally it is fetched on every start, even with Automatic Updates off.
+OPTIONAL_FILES = ("ncz_gm.py",)
 ASSETS_PREFIX = "assets/"
 KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it already exists (locally built)
 TREE_URL = "https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
@@ -109,6 +112,90 @@ def settings_dir():
         return os.path.join(base, "NCZ_Games_Launcher")
     return os.path.expanduser("~/.config/NCZ_Games_Launcher")
 
+
+def _read_theme_choice():
+    """(theme, accent) from the launcher's settings: theme is new / sunset / classic / legacy (default new)."""
+    try:
+        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    c = d.get("ui_theme_choice")
+    acc = d.get("accent_color")
+    return (c if c in ("sunset", "classic", "legacy") else "new"), (acc if isinstance(acc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", acc) else "#a666ff")
+
+THEME_NAME, _THEME_ACCENT = _read_theme_choice()
+
+def _make_theme(name, accent_hex):
+    """Colours of the sign-in / download window for each launcher theme."""
+    if name == "sunset":
+        acc = QColor("#ff7a2f")
+        return dict(bg=[(0.0, (15, 8, 38)), (0.45, (26, 13, 60)), (0.70, (54, 22, 92)), (0.88, (96, 38, 120)), (1.0, (140, 58, 130))],
+                    mist=(190, 120, 255), halo=(255, 140, 70), btn=(QColor("#ff8f45"), QColor("#f0501e")), btn_text=QColor(255, 255, 255),
+                    bar0=QColor("#ff8f45"), bar1=QColor("#f0501e"), glow=(255, 122, 47))
+    if name == "legacy":
+        acc = QColor("#12e87c")
+        return dict(bg=[(0.0, (0, 0, 0)), (0.45, (10, 16, 13)), (0.70, (18, 40, 30)), (0.88, (24, 92, 62)), (1.0, (30, 140, 92))],
+                    mist=(120, 255, 190), halo=(60, 240, 150), btn=(acc, acc), btn_text=QColor(255, 255, 255),
+                    bar0=QColor("#0cc466"), bar1=QColor("#3cf296"), glow=(18, 232, 124))
+    if name == "classic":
+        acc = QColor(accent_hex)
+        r, g, b = acc.red(), acc.green(), acc.blue()
+        dark = lambda f: (int(r * f), int(g * f), int(b * f))
+        return dict(bg=[(0.0, (0, 0, 0)), (0.45, (13, 13, 15)), (0.70, dark(0.28)), (0.88, dark(0.55)), (1.0, dark(0.82))],
+                    mist=(r, g, b), halo=(r, g, b), btn=(acc, acc), btn_text=QColor(255, 255, 255),
+                    bar0=acc.darker(125), bar1=acc.lighter(120), glow=(r, g, b))
+    return dict(bg=[(0.0, (0, 0, 0)), (0.45, (8, 8, 8)), (0.70, (40, 40, 40)), (0.88, (95, 95, 95)), (1.0, (138, 138, 138))],
+                mist=(255, 255, 255), halo=(255, 255, 255), btn=(QColor(255, 255, 255), QColor(255, 255, 255)), btn_text=QColor(28, 28, 28),
+                bar0=QColor(120, 120, 120), bar1=QColor(255, 255, 255), glow=(255, 255, 255))
+
+THEME = _make_theme(THEME_NAME, _THEME_ACCENT)
+
+def _hue_shift_icon(src, hue, sat_scale, size=512):
+    """Icon with the N and the glow moved to `hue`; white outline, stars and black sky stay."""
+    img = QImage(src)
+    if img.isNull():
+        return None
+    if max(img.width(), img.height()) > size:
+        img = img.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            if c.alpha() and not (c.saturationF() < 0.22 and c.valueF() > 0.82):
+                c.setHsvF(hue, min(1.0, c.saturationF() * sat_scale), c.valueF(), c.alphaF())
+                img.setPixelColor(x, y, c)
+    return img
+
+def theme_icon_path():
+    """The icon of the active theme (same files the launcher uses). '' if none is available yet."""
+    try:
+        if THEME_NAME == "sunset":
+            f = os.path.join(ASSETS_DIR, "icon-ss.png")
+            return f if os.path.isfile(f) else ""
+        if THEME_NAME == "classic":
+            custom = os.path.join(settings_dir(), "icon_accent.png")      # made by the launcher when the accent was changed
+            if os.path.isfile(custom):
+                return custom
+            f = os.path.join(ASSETS_DIR, "icon-cl.png")
+            return f if os.path.isfile(f) else ""
+        if THEME_NAME == "legacy":
+            src = os.path.join(ASSETS_DIR, "icon-cl.png")
+            if not os.path.isfile(src):
+                return ""
+            dest = os.path.join(settings_dir(), f"icon_legacy_v3_{os.path.getsize(src)}.png")
+            if not os.path.isfile(dest):                                   # the launcher makes it too; same recipe
+                img = _hue_shift_icon(src, QColor("#12e87c").hueF(), 1.3)
+                if img is None:
+                    return ""
+                os.makedirs(settings_dir(), exist_ok=True)
+                img.save(dest, "PNG")
+            return dest
+    except Exception:
+        pass
+    return ""
 
 def ban_flag_path():
     return os.path.join(settings_dir(), "launcher_ban.json")
@@ -650,7 +737,7 @@ def list_launcher_files():
     if missing:
         raise CloudError("Not found in the GitHub repo: " + ", ".join(missing))
     return [(p, int(e.get("size", 0)), e.get("sha", "")) for p, e in sorted(blobs.items())
-            if p in LAUNCHER_FILES or p.startswith(ASSETS_PREFIX)]
+            if p in LAUNCHER_FILES or p in OPTIONAL_FILES or p.startswith(ASSETS_PREFIX)]
 
 
 def git_blob_sha(path):
@@ -665,18 +752,33 @@ def git_blob_sha(path):
         return None
 
 
-def list_asset_updates(timeout=8):
+def auto_update_on():
+    """The launcher's 'Automatic Updates' switch (launcher.json, key auto_update). On when it isn't saved yet,
+    same as the launcher's own default."""
+    try:
+        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+            v = json.load(f).get("auto_update", True)
+        return v if isinstance(v, bool) else True
+    except Exception:
+        return True
+
+
+def list_asset_updates(timeout=8, include_scripts=False):
     """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
-    different from the local copy. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
     try:
         with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         out = []
         for e in data.get("tree", []):
             path = e.get("path", "")
-            if e.get("type") != "blob" or not path.startswith(ASSETS_PREFIX):
+            if e.get("type") != "blob":
                 continue
             dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
+            missing_optional = path in OPTIONAL_FILES and not os.path.exists(dest)
+            if not (path.startswith(ASSETS_PREFIX) or missing_optional
+                    or (include_scripts and (path in LAUNCHER_FILES or path in OPTIONAL_FILES))):
+                continue
             if not dest.startswith(INSTALL_DIR + os.sep):
                 continue
             size, sha = int(e.get("size", 0)), e.get("sha", "")
@@ -763,7 +865,7 @@ def install_launcher(progress, is_cancelled, entries=None):
         if exists and (path in KEEP_LOCAL_ASSETS or (sha and git_blob_sha(dest) == sha)):
             bump(size)
             continue
-        if exists and path in LAUNCHER_FILES and not os.path.exists(dest + ".bak"):
+        if exists and (path in LAUNCHER_FILES or path in OPTIONAL_FILES) and not os.path.exists(dest + ".bak"):
             try:
                 shutil.copy2(dest, dest + ".bak")
             except OSError:
@@ -842,7 +944,7 @@ class LinkButton(QPushButton):
 
 
 class PrimaryButton(QPushButton):
-    """Plain white pill. Looks the same in every state (no hover, press or disabled change)."""
+    """Pill in the theme's button colour. Looks the same in every state (no hover, press or disabled change)."""
 
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
@@ -855,8 +957,11 @@ class PrimaryButton(QPushButton):
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(r, r.height() / 2, r.height() / 2)
-        p.fillPath(path, QColor(255, 255, 255))
-        p.setPen(QColor(28, 28, 28))
+        bg = QLinearGradient(0, r.top(), 0, r.bottom())
+        bg.setColorAt(0, THEME["btn"][0])
+        bg.setColorAt(1, THEME["btn"][1])
+        p.fillPath(path, QBrush(bg))
+        p.setPen(THEME["btn_text"])
         p.setFont(self.font())
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
         p.end()
@@ -1010,13 +1115,13 @@ class ProgressBar(QWidget):
         if fw:
             fr = QRectF(0, 0, fw, bh)
             glow = QRadialGradient(QPointF(fw, bh / 2), bh * 3.2)
-            glow.setColorAt(0, QColor(255, 255, 255, 90))
-            glow.setColorAt(1, QColor(255, 255, 255, 0))
+            glow.setColorAt(0, QColor(*THEME["glow"], 90))
+            glow.setColorAt(1, QColor(*THEME["glow"], 0))
             p.setBrush(QBrush(glow))
             p.drawEllipse(QPointF(fw, bh / 2), bh * 3.2, bh * 3.2)
             g = QLinearGradient(0, 0, fw, 0)
-            g.setColorAt(0, QColor(120, 120, 120))
-            g.setColorAt(1, QColor(255, 255, 255))
+            g.setColorAt(0, THEME["bar0"])
+            g.setColorAt(1, THEME["bar1"])
             p.setBrush(QBrush(g))
             p.drawRoundedRect(fr, rad, rad)
             p.save()
@@ -1092,7 +1197,7 @@ def load_fonts():
 
 
 def load_logo():
-    path = os.path.join(ASSETS_DIR, "icon.png")
+    path = theme_icon_path() or os.path.join(ASSETS_DIR, "icon.png")
     pm = QPixmap(path) if os.path.isfile(path) else QPixmap()
     if pm.isNull():
         pm = QPixmap()
@@ -1508,11 +1613,8 @@ class LoginWindow(QWidget):
         pm.setDevicePixelRatio(dpr)
         p = QPainter(pm)
         g = QLinearGradient(0, 0, 0, h)
-        g.setColorAt(0.00, QColor(0, 0, 0))
-        g.setColorAt(0.45, QColor(8, 8, 8))
-        g.setColorAt(0.70, QColor(40, 40, 40))
-        g.setColorAt(0.88, QColor(95, 95, 95))
-        g.setColorAt(1.00, QColor(138, 138, 138))
+        for pos, col in THEME["bg"]:
+            g.setColorAt(pos, QColor(*col))
         p.fillRect(QRectF(0, 0, w, h), QBrush(g))
         r = QRadialGradient(QPointF(w * 0.5, h * 0.80), w * 0.46)       # darker middle, lighter lower corners
         r.setColorAt(0.0, QColor(0, 0, 0, 135))
@@ -1538,8 +1640,8 @@ class LoginWindow(QWidget):
         p.drawPixmap(0, 0, self._bg_cache)
 
         # slow drifting mist near the bottom
-        _glow(p, w * (0.22 + 0.06 * math.sin(t * 0.13)), h * 1.0, w * 0.42, h * 0.34, (255, 255, 255), 30)
-        _glow(p, w * (0.78 + 0.06 * math.cos(t * 0.11)), h * 1.0, w * 0.42, h * 0.34, (255, 255, 255), 30)
+        _glow(p, w * (0.22 + 0.06 * math.sin(t * 0.13)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
+        _glow(p, w * (0.78 + 0.06 * math.cos(t * 0.11)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
 
         # stars (parallax with the mouse, twinkling, fading out towards the bottom)
         p.setPen(Qt.PenStyle.NoPen)
@@ -1571,7 +1673,7 @@ class LoginWindow(QWidget):
 
         # soft light that follows the cursor
         if self.rect().contains(self._spot.toPoint()):
-            _glow(p, self._spot.x(), self._spot.y(), 360 * s, 360 * s, (255, 255, 255), 17)
+            _glow(p, self._spot.x(), self._spot.y(), 360 * s, 360 * s, THEME["halo"], 17)
 
         ox, oy = self._origin()
         # logo: halo + floating rounded icon
@@ -1582,7 +1684,7 @@ class LoginWindow(QWidget):
             cx, cy = ox + 982 * s, oy + (232 + 130) * s + bob + (1 - e) * 22 * s
             p.save()
             p.setOpacity(e)
-            _glow(p, cx, cy, 330 * s, 330 * s, (255, 255, 255), 34 + 12 * math.sin(t * 1.6))
+            _glow(p, cx, cy, 330 * s, 330 * s, THEME["halo"], 34 + 12 * math.sin(t * 1.6))
             rect = QRectF(cx - size / 2, cy - size / 2, size, size)
             path = QPainterPath()
             if self.state in ("downloading", "launching") and not self._ncz_logo.isNull():
@@ -1614,7 +1716,7 @@ class LoginWindow(QWidget):
             g = self.btn_primary.geometry()
             hv = self._hover[self.btn_primary]
             _glow(p, g.center().x(), g.center().y() + 4 * s, g.width() * 0.62, g.height() * 1.7,
-                  (255, 255, 255), 30)
+                  THEME["halo"], 30)
         for field, amt in self._focus.items():
             if field.isVisible() and amt > 0.01:
                 g = field.geometry()
@@ -2021,7 +2123,9 @@ def main():
     # signed in and installed: skip the window completely and open the launcher
     changed = []
     if not is_flagged_banned() and load_account() and install_complete():
-        changed = list_asset_updates()                # silent: new or modified files in assets/ (empty when offline)
+        # silent: new or modified files in assets/, plus main.py and the other scripts when Automatic Updates is on
+        # (empty when offline)
+        changed = list_asset_updates(include_scripts=auto_update_on())
         if not changed:
             try:
                 launch_launcher()
@@ -2043,7 +2147,7 @@ _old_init = LoginWindow.__init__
 def _new_init(self):
     _old_init(self)
     self.setWindowTitle("NCZ Games Launcher Registration")
-    self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "icon.png")))
+    self.setWindowIcon(QIcon(theme_icon_path() or os.path.join(ASSETS_DIR, "icon.png")))
 LoginWindow.__init__ = _new_init
 
 
