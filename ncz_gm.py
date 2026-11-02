@@ -43,6 +43,7 @@ commands:
   open                                    open the launcher
   open <game name>                        open (launch) a game from your library
   shiftq                                  open the Shift+Q overlay menu
+  change-theme <theme>                    switch the launcher's theme: new, sunset, classic or legacy
   gmod-extract <path>                     extract Garry's Mod addons (a .gma / .bin file or a folder of them)
   update                                  update the launcher
   demo                                    delete account.json and open demo.py (works while signed out)
@@ -66,15 +67,39 @@ DEFAULT_ACCENT = "#a666ff"
 _COLOR = None
 
 
-def _accent_hex():
-    """The launcher's accent colour (Settings > Accent Color), read straight from launcher.json."""
+# The colour each launcher theme uses (Sunset = orange, New = grey, ...). Classic has no fixed colour: it uses the one
+# picked in Settings (accent_color in launcher.json).
+THEME_ACCENTS = {"sunset": "#ff7a2f", "new": "#9e9e9e", "legacy": "#12e87c", "kablooey": "#4a6fc0", "mm33": "#c98420"}
+
+
+def _read_launcher_json():
     try:
         with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
-            c = json.load(f).get("accent_color")
-        if isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c):
-            return c.lower()
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+def _theme_key(cfg=None):
+    """The launcher's active theme: new / sunset / classic / legacy or an account theme such as mm33."""
+    cfg = _read_launcher_json() if cfg is None else cfg
+    if cfg.get("ui_theme") in THEME_ACCENTS:
+        return cfg["ui_theme"]
+    choice = cfg.get("ui_theme_choice")
+    return choice if choice in ("sunset", "classic", "legacy") else "new"
+
+
+def _accent_hex():
+    """The launcher's accent colour: the active theme's (Sunset orange, New grey, ...), or - on Classic - the one picked
+    in Settings > Accent Color. Read straight from launcher.json."""
+    cfg = _read_launcher_json()
+    key = _theme_key(cfg)
+    if key in THEME_ACCENTS:
+        return THEME_ACCENTS[key]
+    c = cfg.get("accent_color")
+    if isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+        return c.lower()
     return DEFAULT_ACCENT
 
 
@@ -946,6 +971,72 @@ def cmd_github_login(args):
     return _social_login("github", "GitHub")
 
 
+THEME_LABELS = {"new": "New", "sunset": "Sunset", "classic": "Classic", "legacy": "Legacy"}
+
+
+def _theme_options():
+    """({key: label}, locked key or '', module or None). Account themes (and the lock on them) come from main.py."""
+    options, locked, mod = dict(THEME_LABELS), "", None
+    try:
+        mod = load_launcher()
+        locked = mod._locked_theme_key()
+        for k in mod._allowed_theme_keys():
+            options[k] = mod._ACCOUNT_THEMES[k].get("label", k)
+    except Exception:
+        mod = None                 # no PyQt6 / main.py: only the plain themes, no account themes
+    return options, locked, mod
+
+
+def _write_launcher_json(updates):
+    """Changes just these keys in launcher.json (everything else the launcher saved stays as it is)."""
+    path = os.path.join(settings_dir(), "launcher.json")
+    data = _read_launcher_json()
+    data.update(updates)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, path)
+
+
+def cmd_change_theme(args):
+    options, locked, mod = _theme_options()
+    current = _theme_key()
+    if locked:
+        err(f"Your account's theme is fixed ({options.get(locked, locked)}); it can't be changed.")
+        return 1
+    if not args:
+        say(paint("Current theme:", "light") + " " + paint(options.get(current, current), "bold"))
+        say("Available: " + ", ".join(paint(k, "accent") for k in options))
+        say(paint("usage: ncz-gm change-theme <theme>", "dim"))
+        return 0
+    want = _norm(" ".join(args))
+    key = next((k for k, lab in options.items() if want in (_norm(k), _norm(lab), _norm(lab.split(" (")[0]))), None)
+    if key is None:
+        err(f"\"{' '.join(args)}\" isn't a theme you can use. Available: " + ", ".join(options))
+        return 2
+    if key == current:
+        say(paint("\u2714", "ok") + f" Already on the {paint(options[key], 'bold')} theme.")
+        return 0
+    account = key not in THEME_LABELS                       # same three settings the Settings > Theme box saves
+    _write_launcher_json({"ui_style": "new",
+                          "ui_theme_choice": key if key in ("sunset", "classic", "legacy") else "new",
+                          "ui_theme": key if account else ""})
+    if mod is not None:                                     # swap the desktop shortcut's icon to the new theme's, like Settings does
+        try:
+            existing = mod._ncz_launcher_shortcut_files()
+            if existing:
+                mod._ncz_recreate_launcher_shortcut(existing, key, False)
+        except Exception:
+            pass
+    say(paint("\u2714 Theme set to", "ok") + " " + paint(options[key], "bold") + "  " + paint("\u25a0\u25a0\u25a0", "accent"))
+    if launcher_running():
+        say("Restart the launcher to apply it.")
+    else:
+        say("It applies the next time the launcher opens.")
+    return 0
+
+
 # ============================================================================================== commands
 def cmd_open(args):
     if not args:
@@ -1304,7 +1395,7 @@ def cmd_help(_args):
 
 
 COMMANDS = {
-    "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
+    "change-theme": cmd_change_theme, "theme": cmd_change_theme, "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
     "update": cmd_update, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
