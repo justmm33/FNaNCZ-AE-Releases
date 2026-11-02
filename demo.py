@@ -73,8 +73,8 @@ HANDLE_TEXT = "@jsmm33"
 GITHUB_REPO = "justmm33/FNaNCZ-AE-Releases"
 GITHUB_BRANCH = "main"
 LAUNCHER_FILES = ("main.py", "overlay.py", "controller_input.py", "controller_bridge.py","fan_games.csv","gamejolt_scraper.py")
-# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. When it is
-# missing locally it is fetched on every start, even with Automatic Updates off.
+# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. On every start
+# it is compared with GitHub and re-downloaded when it is missing or different, even with Automatic Updates off.
 OPTIONAL_FILES = ("ncz_gm.py",)
 ASSETS_PREFIX = "assets/"
 KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it already exists (locally built)
@@ -683,9 +683,9 @@ def discord_check(strict=True):
     return {"status": "ok", "user_id": user_id, "message": ""}
 
 from pathlib import Path
-def send_ban_webhook(user_id):
+def send_ban_webhook(user_id, action="make an account in"):
     body = json.dumps({
-        "content": f"<@{user_id}> has tried to make an account in the NCZ Games Launcher, E-mail: {user_email}.",
+        "content": f"<@{user_id}> has tried to {action} the NCZ Games Launcher, E-mail: {user_email}.",
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
     req = urllib.request.Request(WEBHOOK_URL, data=body, method="POST",
@@ -764,8 +764,8 @@ def auto_update_on():
 
 
 def list_asset_updates(timeout=8, include_scripts=False):
-    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
-    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder, plus ncz_gm.py,
+    that are new or different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
     try:
         with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -775,9 +775,10 @@ def list_asset_updates(timeout=8, include_scripts=False):
             if e.get("type") != "blob":
                 continue
             dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
-            missing_optional = path in OPTIONAL_FILES and not os.path.exists(dest)
-            if not (path.startswith(ASSETS_PREFIX) or missing_optional
-                    or (include_scripts and (path in LAUNCHER_FILES or path in OPTIONAL_FILES))):
+            # ncz_gm.py is always compared with GitHub (even with Automatic Updates off): it is downloaded when it is
+            # missing locally or its git sha differs from the repo's copy.
+            if not (path.startswith(ASSETS_PREFIX) or path in OPTIONAL_FILES
+                    or (include_scripts and path in LAUNCHER_FILES)):
                 continue
             if not dest.startswith(INSTALL_DIR + os.sep):
                 continue
