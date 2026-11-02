@@ -35,6 +35,8 @@ usage: ncz-gm <command> [arguments]
 
 commands:
   login <email> [password]                sign in (every command except `demo` needs you to be signed in)
+  google-login                            sign in with Google (opens your browser)
+  github-login                            sign in with GitHub (opens your browser)
   workshop <mod id>                       download a Steam Workshop mod (an item link works too)
   download <game id> [path] [server]      download a Steam game (Steam app id); no path = your Settings install
                                           folder, no server = it asks. server: 1 = SteamRIP, 2 = FitGirl, 3 = AnkerGames
@@ -809,17 +811,34 @@ def _fb_json(url, payload=None, method=None):
     return json.loads(body) if body.strip() else None
 
 
-def _discord_banned():
-    """Best effort, same check demo.py does on sign-in: a banned Discord id blocks it. Needs demo.py + PyQt6 + pypresence;
-    when any of those is missing (or Discord is closed) it lets the sign-in through, exactly like demo.py does."""
+_DEMO = None
+
+
+def _load_demo():
+    """demo.py as a module (next to main.py): it holds the sign-in code - Google / GitHub client ids, the browser
+    redirect server and the Discord ban check - so the CLI uses exactly the same one."""
+    global _DEMO
+    if _DEMO is not None:
+        return _DEMO
     demo = os.path.join(os.path.dirname(main_py() or HERE), "demo.py")
     if not os.path.isfile(demo):
-        return None
+        raise RuntimeError("demo.py wasn't found next to main.py (the browser sign-in lives there).")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")           # it imports PyQt6 but never opens a window here
     try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        spec = importlib.util.spec_from_file_location("ncz_demo_check", demo)
+        spec = importlib.util.spec_from_file_location("ncz_demo_signin", demo)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+    except ImportError:
+        raise RuntimeError("PyQt6 isn't installed for this Python (pip install PyQt6) - sign-in needs it.")
+    _DEMO = mod
+    return mod
+
+
+def _discord_banned():
+    """Best effort, same check demo.py does on sign-in: a banned Discord id blocks it. When demo.py / PyQt6 /
+    pypresence is missing (or Discord is closed) it lets the sign-in through, exactly like demo.py does."""
+    try:
+        mod = _load_demo()
         res = mod.discord_check(False)
         if res.get("status") == "banned":
             mod.write_ban_flag(res.get("user_id"))
@@ -827,6 +846,24 @@ def _discord_banned():
     except BaseException:
         pass
     return None
+
+
+def _profile_exists(uid, token):
+    _key, db = _firebase_config()
+    return _fb_json(f"{db}/users/{urllib.parse.quote(uid, safe='')}/profile.json"
+                    f"?auth={urllib.parse.quote(token, safe='')}") is not None
+
+
+def _save_account(acct):
+    path = _account_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(acct, f)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def cmd_login(args):
@@ -857,8 +894,7 @@ def cmd_login(args):
                    + urllib.parse.quote(key, safe=""),
                    {"email": email, "password": password, "returnSecureToken": True})
     uid, token = res["localId"], res["idToken"]
-    profile = _fb_json(f"{db}/users/{urllib.parse.quote(uid, safe='')}/profile.json?auth={urllib.parse.quote(token, safe='')}")
-    if profile is None:
+    if not _profile_exists(uid, token):
         err("This account isn't set up yet. Sign in once in the launcher window to finish creating it.")
         return 1
     banned = _discord_banned()
@@ -866,17 +902,49 @@ def cmd_login(args):
         err("This device can't sign in.")
         return 1
     acct = {"email": res.get("email", email), "uid": uid, "refresh_token": res["refreshToken"]}
-    path = _account_file()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(acct, f)
-    try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+    _save_account(acct)
     say(paint("\u2714 Signed in as", "ok") + " " + paint(acct["email"], "bold"))
     return 0
+
+
+def _social_login(name, label):
+    import threading
+    if os.path.exists(_ban_flag_file()):
+        err("This device can't sign in.")
+        return 1
+    mod = _load_demo()
+    if _discord_banned():                                  # same gate as the window: a banned Discord id can't sign in
+        err("This device can't sign in.")
+        return 1
+    say(paint("\u25b6", "accent") + f" Opening your browser to sign in with {paint(label, 'bold')}...")
+    say(paint("  Finish signing in there; this waits up to 3 minutes. Ctrl+C cancels.", "dim"))
+    try:
+        res = mod.social_sign_in(name, threading.Event())
+        exists = mod.db_profile_exists(res["uid"], res["token"])
+    except mod.CloudError as e:
+        err(str(e))
+        return 1
+    if not exists:
+        err("This account isn't set up yet. Sign in once in the launcher window to finish creating it.")
+        return 1
+    acct = res["account"]
+    _save_account(acct)
+    say(paint("\u2714 Signed in as", "ok") + " " + paint(acct.get("email") or f"{label} account", "bold"))
+    return 0
+
+
+def cmd_google_login(args):
+    if args:
+        err("usage: ncz-gm google-login")
+        return 2
+    return _social_login("google", "Google")
+
+
+def cmd_github_login(args):
+    if args:
+        err("usage: ncz-gm github-login")
+        return 2
+    return _social_login("github", "GitHub")
 
 
 # ============================================================================================== commands
@@ -1232,11 +1300,14 @@ def cmd_help(_args):
 
 
 COMMANDS = {
-    "login": cmd_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
+    "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
     "update": cmd_update, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
 }
+
+
+SIGNED_OUT_OK = ("login", "google-login", "github-login", "demo")
 
 
 def main(argv=None, launcher=None):
@@ -1250,8 +1321,8 @@ def main(argv=None, launcher=None):
     if not os.environ.get("NCZ_GM_NO_INSTALL") and (not argv or argv[0].lower() not in ("install", "uninstall")):
         install_path(quiet=True)           # first run: add the command to PATH (a no-op once it's there)
     name = argv[0].lower() if argv else ""
-    if name not in ("login", "demo") and not is_logged_in():          # only `login` and `demo` work signed out
-        err("You're not signed in. Sign in first:  ncz-gm login <email> [password]")
+    if name not in SIGNED_OUT_OK and not is_logged_in():              # only the sign-in commands and `demo` work signed out
+        err("You're not signed in. Sign in first:  ncz-gm login <email> [password]   (or google-login / github-login)")
         return 1
     if not argv:
         return cmd_help([])
