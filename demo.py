@@ -31,6 +31,7 @@ import shutil
 import hashlib
 import threading
 import subprocess
+import zipfile
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -831,6 +832,118 @@ def _download_to(url, dest, on_bytes, is_cancelled):
     raise last_err or CloudError("Download failed.")
 
 
+# ------------------------------------------------------------------------------------------------ FFmpeg (Windows only)
+# NCZ Link streams the PC screen as H.264 through FFmpeg (main.py looks for ffmpeg.exe in its own folder first). Windows has no
+# FFmpeg out of the box, so it is downloaded once into INSTALL_DIR (next to main.py). Only ffmpeg.exe is kept. Never downloaded on
+# Linux (the package manager has it) and a failure here never blocks the launcher: NCZ Link just falls back to its JPEG stream.
+FFMPEG_EXE = os.path.join(INSTALL_DIR, "ffmpeg.exe")
+FFMPEG_FAILED_MARKER = os.path.join(INSTALL_DIR, ".ncz_ffmpeg_failed")
+FFMPEG_RETRY_S = 24 * 3600                      # after a failed download, don't try again for a day
+FFMPEG_SOURCES = (                              # (zip, checksum file): the first one that works wins
+    ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256"),
+    ("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"),
+)
+
+
+def ffmpeg_needed():
+    if not sys.platform.startswith("win") or os.path.isfile(FFMPEG_EXE):
+        return False
+    try:
+        if time.time() - os.path.getmtime(FFMPEG_FAILED_MARKER) < FFMPEG_RETRY_S:
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def _ffmpeg_sha_from(text, name):
+    for line in text.splitlines():
+        parts = line.replace("*", " ").split()
+        if parts and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]) and (len(parts) == 1 or parts[-1].endswith(name)):
+            return parts[0].lower()
+    return None
+
+
+def _ffmpeg_verify(path):
+    r = subprocess.run([path, "-hide_banner", "-version"], capture_output=True, timeout=15,
+                       creationflags=0x08000000 if sys.platform.startswith("win") else 0)
+    return r.returncode == 0
+
+
+def _ffmpeg_fetch(zip_url, sum_url, progress, is_cancelled):
+    tmp_zip = os.path.join(INSTALL_DIR, "ffmpeg_download.zip.part")
+    tmp_exe = FFMPEG_EXE + ".part"
+    try:
+        want = None
+        try:                                                    # the checksum is a nice-to-have: skip the check if it can't be read
+            req = urllib.request.Request(sum_url, headers={"User-Agent": "NCZ-Games-Launcher"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                want = _ffmpeg_sha_from(r.read(200000).decode("utf-8", "replace"), zip_url.rsplit("/", 1)[-1])
+        except Exception:
+            pass
+        req = urllib.request.Request(zip_url, headers={"User-Agent": "NCZ-Games-Launcher"})
+        h, done = hashlib.sha256(), 0
+        with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_zip, "wb") as f:
+            total = int(resp.headers.get("Content-Length") or 0) or 110 * 1048576
+            while True:
+                if is_cancelled():
+                    raise CloudError("Cancelled.")
+                chunk = resp.read(128 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                progress(min(0.99, done / total), f"FFmpeg (video encoder)   {done / 1048576:.1f} / {total / 1048576:.0f} MB")
+        if want and h.hexdigest() != want:
+            raise OSError("checksum mismatch")
+        progress(0.99, "FFmpeg (video encoder)   unpacking...")
+        with zipfile.ZipFile(tmp_zip) as z:
+            member = next((n for n in z.namelist() if n.replace("\\", "/").lower().endswith("/bin/ffmpeg.exe")
+                           or n.lower() == "ffmpeg.exe"), None)
+            if not member:
+                raise OSError("ffmpeg.exe not found in the download")
+            with z.open(member) as src, open(tmp_exe, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+        if not _ffmpeg_verify(tmp_exe):
+            raise OSError("the downloaded ffmpeg.exe doesn't run")
+        os.replace(tmp_exe, FFMPEG_EXE)
+    finally:
+        for p in (tmp_zip, tmp_exe):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def install_ffmpeg(progress, is_cancelled):
+    """Windows: puts ffmpeg.exe next to main.py if it isn't there. Never raises (except a user cancel)."""
+    if not ffmpeg_needed():
+        return
+    for zip_url, sum_url in FFMPEG_SOURCES:
+        try:
+            progress(0.0, "FFmpeg (video encoder)   connecting...")
+            _ffmpeg_fetch(zip_url, sum_url, progress, is_cancelled)
+            try:
+                os.remove(FFMPEG_FAILED_MARKER)
+            except OSError:
+                pass
+            return
+        except CloudError:
+            if is_cancelled():
+                raise
+        except Exception:
+            if is_cancelled():
+                raise CloudError("Cancelled.")
+    try:                                                        # every source failed: remember, so the next starts aren't delayed
+        with open(FFMPEG_FAILED_MARKER, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    except OSError:
+        pass
+
+
 def install_launcher(progress, is_cancelled, entries=None):
     """Downloads the launcher into INSTALL_DIR. progress(fraction, text). Files that are already identical are
     skipped; replaced scripts keep a one-time .bak copy of what was there before.
@@ -874,6 +987,7 @@ def install_launcher(progress, is_cancelled, entries=None):
         _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
                      dest, bump, is_cancelled)
     emit(force=True)
+    install_ffmpeg(progress, is_cancelled)                  # Windows only, never fails the install
     if full:
         with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -2123,11 +2237,14 @@ class LoginWindow(QWidget):
 def main():
     # signed in and installed: skip the window completely and open the launcher
     changed = []
+    ff_only = False
     if not is_flagged_banned() and load_account() and install_complete():
         # silent: new or modified files in assets/, plus main.py and the other scripts when Automatic Updates is on
         # (empty when offline)
         changed = list_asset_updates(include_scripts=auto_update_on())
-        if not changed:
+        if not changed and ffmpeg_needed():
+            ff_only = True                            # nothing else to update, but NCZ Link's video encoder is missing (Windows)
+        elif not changed:
             try:
                 launch_launcher()
                 return
@@ -2141,7 +2258,7 @@ def main():
     if is_flagged_banned():                           # banned earlier: no sign-in, just the message and close
         QTimer.singleShot(0, lambda: win.ban(None, notify=False))
     elif load_account():                              # signed in but the launcher isn't downloaded (yet), or assets changed
-        QTimer.singleShot(0, lambda: win.start_download(changed or None))
+        QTimer.singleShot(0, lambda: win.start_download([] if ff_only else (changed or None)))
     sys.exit(app.exec())
 
 _old_init = LoginWindow.__init__
