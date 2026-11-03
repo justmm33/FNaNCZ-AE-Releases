@@ -2739,20 +2739,9 @@ def register_cli():
                 script = os.path.expanduser("~/.local/share/NCZ_Games_Launcher/ncz_gm.py")
             if not os.path.isfile(script):                # not installed there: use the copy next to main.py
                 script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncz_gm.py")
-            if not os.path.isfile(script) and not sys.platform.startswith("win"):   # last resort: the launcher's own folder / bundle
-                for d in (SCRIPT_DIR, _bundled_dir()):
-                    cand = os.path.join(d, "ncz_gm.py")
-                    if os.path.isfile(cand):
-                        script = cand
-                        break
             if not os.path.isfile(script):
                 return
-            if sys.platform.startswith("win"):
-                py = shutil.which("py") or shutil.which("python3") or shutil.which("python")
-            else:                            # Linux/macOS: no `py` launcher; python3 first, then whatever interpreter runs the launcher
-                py = shutil.which("python3") or shutil.which("python") or shutil.which("py")
-                if not py and sys.executable and os.path.isfile(sys.executable):
-                    py = sys.executable
+            py = shutil.which("py") or shutil.which("python3") or shutil.which("python")
             if not py and re.match(r"^pythonw?[\d.]*(\.exe)?$", os.path.basename(sys.executable), re.I):
                 py = sys.executable          # never a launcher stub exe: running it with a script would start another launcher
             if not py:
@@ -29672,63 +29661,6 @@ def _bridge_pin():
         save_launcher_settings(s)
     return pin
 
-class _BridgeFeed(QObject):
-    """Phone controller state -> Big Picture, hopped from the bridge thread to the GUI thread."""
-    state = pyqtSignal(int, int, int, bool)
-
-_bridge_feed = None
-
-def _bridge_feed_gui(mask, dx, dy, live):
-    try:
-        win = getattr(QApplication.instance(), "_ncz_main_window", None)
-        bp = getattr(win, "_big_picture", None)
-        if bp is not None and getattr(bp, "_active", False):
-            bp._input.feed_bridge(mask, dx, dy, live)
-    except Exception:
-        pass
-
-def _bridge_hook_obj(br):
-    """Wrap the bridge's virtual pad so every state change is ALSO sent straight to Big Picture (no controller_bridge.py edit)."""
-    global _bridge_feed
-    if _bridge_feed is None:
-        _bridge_feed = _BridgeFeed()
-        _bridge_feed.state.connect(_bridge_feed_gui)
-    og = br._get_pad
-
-    def get_pad():
-        pad = og()
-        if not getattr(pad, "_ncz_hooked", False):
-            pad._ncz_hooked = True
-            o_up, o_close = pad.update, pad.close
-            last = [None]
-
-            def ax(v):
-                return 1 if v > .5 else -1 if v < -.5 else 0
-
-            def up(mask, axes, lt, rt):
-                o_up(mask, axes, lt, rt)
-                try:
-                    a = (list(axes) + [0, 0, 0, 0])[:4]
-                    dx = 1 if mask >> 15 & 1 else -1 if mask >> 14 & 1 else ax(a[0])
-                    dy = 1 if mask >> 13 & 1 else -1 if mask >> 12 & 1 else ax(a[1])
-                    key = (mask & 0xF23F, dx, dy)
-                    if key != last[0]:
-                        last[0] = key
-                        _bridge_feed.state.emit(int(mask), dx, dy, True)
-                except Exception:
-                    pass
-
-            def close():
-                o_close()
-                last[0] = None
-                try:
-                    _bridge_feed.state.emit(0, 0, 0, False)
-                except Exception:
-                    pass
-            pad.update, pad.close = up, close
-        return pad
-    br._get_pad = get_pad
-
 def _bridge_set_running(on):
     global _bridge_obj
     try:
@@ -29737,7 +29669,6 @@ def _bridge_set_running(on):
         return False
     if _bridge_obj is None:
         _bridge_obj = ControllerBridge(_bridge_pin)
-        _bridge_hook_obj(_bridge_obj)
     if on:
         _bridge_obj.start()
     else:
@@ -33779,13 +33710,12 @@ def _lk_ws_session(ws, q):
             return max(lo, min(hi, int((q.get(k) or [d])[0])))
         except Exception:
             return d
-    cfg = {"w": qi("w", 1280, 320, 2560), "q": qi("q", 60, 25, 90), "fps": qi("fps", 30, 5, 60), "br": qi("br", 10000, 1000, 50000),
-           "h264": (q.get("v") or [""])[0] == "h264"}
+    cfg = {"w": qi("w", 1280, 320, 1920), "q": qi("q", 60, 25, 90), "fps": qi("fps", 30, 5, 60)}
     with _lk["lock"]:
         _lk["gen"] += 1                                            # a newer stream replaces this one
         gen = _lk["gen"]
     st = {"inflight": 0, "sent": {}, "rtt": 0.05, "ack_t": time.time(), "lock": threading.Lock()}
-    threading.Thread(target=_lk_ws_video_auto, args=(ws, st, cfg, gen), daemon=True).start()
+    threading.Thread(target=_lk_ws_video, args=(ws, st, cfg, gen), daemon=True).start()
     try:
         while ws.alive and _lk["gen"] == gen and _lk["server"] is not None:
             op, p = ws.recv()
@@ -33819,452 +33749,15 @@ def _lk_ws_session(ws, q):
             if "p" in m:
                 ws.text({"pong": m["p"]})
             if "cfg" in m and isinstance(m["cfg"], dict):
-                old = (cfg["w"], cfg["fps"], cfg["br"])
-                for k, lo, hi in (("w", 320, 2560), ("q", 25, 90), ("fps", 5, 60), ("br", 1000, 50000)):
+                for k, lo, hi in (("w", 320, 1920), ("q", 25, 90), ("fps", 5, 60)):
                     try:
                         cfg[k] = max(lo, min(hi, int(m["cfg"].get(k, cfg[k]))))
                     except Exception:
                         pass
-                if cfg.get("h264") and old != (cfg["w"], cfg["fps"], cfg["br"]):
-                    st["restart"] = True                       # the encoder is restarted with the new size / fps / bitrate
     except Exception:
         pass
     finally:
         ws.alive = False
-
-
-# ---- v3: real video. The PC encodes the screen as H.264 (GPU encoder through FFmpeg: NVENC / AMF / Quick Sync / VAAPI, x264 as a
-# last resort) and the phone decodes it with its hardware decoder (WebCodecs). A JPEG per frame (v2) is 5-10x bigger and every frame
-# is encoded in Python; this is one encoder process on the GPU and tiny delta frames.  If FFmpeg, a usable encoder or the phone's
-# decoder is missing, the session silently stays on the JPEG stream above.  Settings (ncz_link.json): "ffmpeg": "<path>",
-# "video": "mjpeg" (force the old stream), "encoder": "nvenc" | "amf" | "qsv" | "vaapi" | "x264" (force one).
-_LK_FF = {"path": None, "done": False, "encs": None, "filters": None}
-_LK_ENC_ORDER = ("nvenc", "amf", "qsv", "vaapi", "x264")
-_LK_ENC_NAME = {"nvenc": "h264_nvenc", "amf": "h264_amf", "qsv": "h264_qsv", "vaapi": "h264_vaapi", "x264": "libx264"}
-_LK_FF_HINT = ("Hardware video needs FFmpeg on the PC (Windows: run  winget install Gyan.FFmpeg  or put ffmpeg.exe next to "
-               "main.py). Using the slower JPEG stream for now.")
-
-
-def _lk_ffmpeg():
-    """Path of a working ffmpeg, or None (looked up once)."""
-    if _LK_FF["done"]:
-        return _LK_FF["path"]
-    _LK_FF["done"] = True
-    exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
-    cands = [str(_lk_load().get("ffmpeg") or "")]
-    try:
-        here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-        cands += [os.path.join(here, exe), os.path.join(here, "ffmpeg", "bin", exe)]
-    except Exception:
-        pass
-    try:
-        cands.append(os.path.join(os.path.dirname(get_launcher_settings_path()), exe))
-    except Exception:
-        pass
-    cands.append(shutil.which("ffmpeg") or "")
-    try:
-        import imageio_ffmpeg
-        cands.append(imageio_ffmpeg.get_ffmpeg_exe())
-    except Exception:
-        pass
-    for c in cands:
-        if c and os.path.isfile(c):
-            try:
-                r = subprocess.run([c, "-hide_banner", "-version"], capture_output=True, timeout=8,
-                                   creationflags=0x08000000 if sys.platform.startswith("win") else 0)
-                if r.returncode == 0:
-                    _LK_FF["path"] = c
-                    break
-            except Exception:
-                continue
-    return _LK_FF["path"]
-
-
-def _lk_ff_list(ff, what):
-    try:
-        r = subprocess.run([ff, "-hide_banner", what], capture_output=True, timeout=10,
-                           creationflags=0x08000000 if sys.platform.startswith("win") else 0)
-        return r.stdout.decode("utf-8", "replace")
-    except Exception:
-        return ""
-
-
-def _lk_encoders(ff):
-    """Encoders this FFmpeg build has, best first (listed != usable: the first start of each one is the real test)."""
-    if _LK_FF["encs"] is None:
-        txt = _lk_ff_list(ff, "-encoders")
-        _LK_FF["encs"] = [k for k in _LK_ENC_ORDER if _LK_ENC_NAME[k] in txt
-                          and not (k == "vaapi" and not sys.platform.startswith("linux"))
-                          and not (k == "amf" and not sys.platform.startswith("win"))]
-    forced = str(_lk_load().get("encoder") or "").lower()
-    encs = list(_LK_FF["encs"])
-    if forced in encs:
-        encs = [forced]
-    return encs
-
-
-def _lk_cap_modes(ff):
-    if sys.platform.startswith("win"):
-        if _LK_FF["filters"] is None:
-            _LK_FF["filters"] = _lk_ff_list(ff, "-filters")
-        return (["ddagrab"] if "ddagrab" in _LK_FF["filters"] else []) + ["gdigrab"]
-    if sys.platform.startswith("linux") and not _lk_wayland():
-        return ["x11grab"]
-    return []
-
-
-def _lk_screen_rect():
-    """(x, y, w, h) of the primary screen in real pixels."""
-    def f():
-        s = _LkGuiApp.primaryScreen()
-        g, r = s.geometry(), s.devicePixelRatio()
-        return int(g.x() * r), int(g.y() * r), int(g.width() * r) & ~1, int(g.height() * r) & ~1
-    return _lk_gui(f)
-
-
-def _lk_ff_cmd(ff, cap, enc, cfg, rect, kbps):
-    """The FFmpeg command line: capture -> scale -> low-latency encode -> raw H.264 on stdout."""
-    x, y, sw, sh = rect
-    fps = int(cfg["fps"])
-    w = max(320, min(int(cfg["w"]), sw)) & ~1
-    cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin"]
-    scale = "scale=%d:-2:flags=fast_bilinear" % w
-    if cap == "gdigrab":
-        cmd += ["-fflags", "nobuffer", "-probesize", "32", "-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "0",
-                "-offset_x", str(x), "-offset_y", str(y), "-video_size", "%dx%d" % (sw, sh), "-i", "desktop"]
-        vf = scale + ",format=yuv420p"
-    elif cap == "ddagrab":
-        cmd += ["-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=%d:draw_mouse=0" % fps]
-        vf = "hwdownload,format=bgra," + scale + ",format=yuv420p"
-    elif cap == "x11grab":
-        cmd += ["-fflags", "nobuffer", "-probesize", "32", "-f", "x11grab", "-framerate", str(fps), "-draw_mouse", "0",
-                "-video_size", "%dx%d" % (sw, sh), "-i", "%s+%d,%d" % (os.environ.get("DISPLAY") or ":0", x, y)]
-        vf = scale + ",format=yuv420p"
-    elif cap == "test":                                             # moving test picture (used by the self-test only)
-        cmd += ["-re", "-f", "lavfi", "-i", "testsrc2=size=%dx%d:rate=%d" % (sw, sh, fps)]
-        vf = scale + ",format=yuv420p"
-    else:
-        raise ValueError(cap)
-    gop = max(10, fps // 2)                                         # a fresh keyframe twice a second: a lost frame heals fast
-    buf = max(100, int(kbps / max(1, fps) * 2))                     # ~2 frames of buffer: no queueing inside the encoder
-    rate = ["-b:v", "%dk" % kbps, "-maxrate", "%dk" % kbps, "-bufsize", "%dk" % buf]
-    if enc == "nvenc":
-        out = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "cbr", "-zerolatency", "1", "-delay", "0",
-               "-bf", "0", "-g", str(gop), "-forced-idr", "1", "-profile:v", "high"] + rate
-    elif enc == "amf":
-        out = ["-c:v", "h264_amf", "-usage", "ultralowlatency", "-quality", "speed", "-rc", "cbr", "-bf", "0", "-g", str(gop)] + rate
-    elif enc == "qsv":
-        out = ["-c:v", "h264_qsv", "-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0", "-bf", "0", "-g", str(gop)] + rate
-    elif enc == "vaapi":
-        dev = os.environ.get("NCZ_VAAPI_DEVICE") or "/dev/dri/renderD128"
-        cmd = cmd[:5] + ["-vaapi_device", dev] + cmd[5:]
-        vf = vf.replace("format=yuv420p", "format=nv12,hwupload")
-        out = ["-c:v", "h264_vaapi", "-bf", "0", "-g", str(gop)] + rate
-    else:
-        out = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-bf", "0", "-g", str(gop),
-               "-x264-params", "repeat-headers=1:sliced-threads=0"] + rate
-    return cmd + ["-vf", vf, "-an", "-sn"] + out + ["-flags", "low_delay", "-f", "h264", "-bsf:v", "dump_extra=freq=keyframe",
-                                                       "-flush_packets", "1", "pipe:1"]
-
-
-class _LkProc:
-    """One FFmpeg process. stdout is read on its own thread; bursts() glues the pieces of one frame back together."""
-
-    def __init__(self, cmd):
-        self.q = _lk_queue.Queue()
-        self.err = []
-        self.eof = False
-        self.p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                                  creationflags=0x08000000 if sys.platform.startswith("win") else 0)
-        threading.Thread(target=self._out, daemon=True).start()
-        threading.Thread(target=self._errs, daemon=True).start()
-
-    def _out(self):
-        try:
-            fd = self.p.stdout.fileno()
-            while True:
-                d = os.read(fd, 1 << 18)
-                if not d:
-                    break
-                self.q.put(d)
-        except Exception:
-            pass
-        self.q.put(None)
-
-    def _errs(self):
-        try:
-            for line in iter(self.p.stderr.readline, b""):
-                self.err.append(line.decode("utf-8", "replace").strip())
-                del self.err[:-12]
-        except Exception:
-            pass
-
-    def burst(self, first_timeout):
-        """Bytes of one burst (a frame, or a few if we were slow); b'' = nothing yet; None = FFmpeg ended."""
-        if self.eof:
-            return None
-        try:
-            d = self.q.get(timeout=first_timeout)
-        except _lk_queue.Empty:
-            return b""
-        if d is None:
-            self.eof = True
-            return None
-        out = bytearray(d)
-        while True:                                                 # FFmpeg writes a frame in a few quick writes: wait 2.5 ms for more
-            try:
-                d = self.q.get(timeout=0.0025)
-            except _lk_queue.Empty:
-                break
-            if d is None:
-                self.eof = True
-                break
-            out += d
-        return bytes(out)
-
-    def tail(self):
-        return " | ".join(self.err[-3:])[:300]
-
-    def kill(self):
-        try:
-            self.p.kill()
-        except Exception:
-            pass
-        try:
-            self.p.wait(timeout=2)
-        except Exception:
-            pass
-
-
-def _lk_split_aus(b):
-    """Annex-B bytes -> ([(access_unit_bytes, is_keyframe)], sps_header_bytes | None). The last unit is taken as complete."""
-    pos, i = [], b.find(b"\x00\x00\x01")
-    while i >= 0:
-        pos.append(i)
-        i = b.find(b"\x00\x00\x01", i + 3)
-    aus, cur, seen, key, sps = [], None, False, False, None
-    for i in pos:
-        h = i + 3
-        if h >= len(b):
-            break
-        t = b[h] & 31
-        st = i - 1 if i > 0 and b[i - 1] == 0 else i
-        if cur is None:
-            cur = st
-        if seen and (t in (6, 7, 8, 9) or (t in (1, 5) and h + 1 < len(b) and b[h + 1] & 0x80)):
-            aus.append((bytes(b[cur:st]), key))                     # a new picture starts here
-            cur, seen, key = st, False, False
-        if t in (1, 5):
-            seen = True
-        if t == 5:
-            key = True
-        if t == 7 and sps is None and h + 3 < len(b):
-            sps = bytes(b[h:h + 4])
-    if cur is not None:
-        aus.append((bytes(b[cur:]), key))
-    return aus, sps
-
-
-def _lk_codec(sps):
-    return "avc1.%02x%02x%02x" % (sps[1], sps[2], sps[3])
-
-
-def _lk_h264_open(ws, cfg, rect, kbps):
-    """Starts the first (capture, encoder) pair that really produces video. -> (proc, first_burst, enc_name) or None."""
-    ff = _lk_ffmpeg()
-    combos = []
-    if _lk.get("vsel"):
-        combos.append(_lk["vsel"])
-    caps, encs = _lk_cap_modes(ff), _lk_encoders(ff)
-    combos += [(c, e) for e in encs for c in caps if (c, e) != _lk.get("vsel")]
-    last = ""
-    for cap, enc in combos:
-        if not (ws.alive and _lk["server"] is not None):
-            return None
-        pr = None
-        try:
-            pr = _LkProc(_lk_ff_cmd(ff, cap, enc, cfg, rect, kbps))
-            deadline = time.time() + 6.0
-            while time.time() < deadline:
-                b = pr.burst(0.25)
-                if b is None:
-                    break
-                if b:
-                    aus, sps = _lk_split_aus(b)
-                    if sps:
-                        _lk["vsel"] = (cap, enc)
-                        print(f"NCZ Link: video {cap} + {enc} OK")
-                        return pr, b, enc
-        except Exception as e:
-            last = repr(e)
-        last = (pr.tail() if pr else "") or last
-        print(f"NCZ Link: video {cap} + {enc} failed: {last}")
-        if pr:
-            pr.kill()
-        if _lk.get("vsel") == (cap, enc):
-            _lk["vsel"] = None
-    ws.text({"vfail": "no usable hardware encoder" + ((" (" + last[:90] + ")") if last else "")})
-    return None
-
-
-def _lk_h264_cursor(ws, gen, stop):
-    """The PC's pointer travels on its own channel (the phone draws it), so it is smooth and never encoded into the video."""
-    cap = None
-    try:
-        cap = _lk_make_cap()
-    except Exception:
-        return
-    last = None
-    try:
-        while not stop.is_set() and ws.alive and _lk["gen"] == gen:
-            try:
-                c = cap.cursor()
-            except Exception:
-                c = None
-            if c and (last is None or abs(c[0] - last[0]) > 1e-4 or abs(c[1] - last[1]) > 1e-4):
-                last = c
-                ws.text({"c": [round(c[0], 4), round(c[1], 4)]})
-            time.sleep(0.016)
-    finally:
-        try:
-            cap.close()
-        except Exception:
-            pass
-
-
-def _lk_h264_video(ws, st, cfg, gen):
-    """True = the session is over. False = H.264 isn't possible here, use the JPEG stream."""
-    def live():
-        return ws.alive and _lk["gen"] == gen and _lk["server"] is not None
-    if not (sys.platform.startswith("win") or (sys.platform.startswith("linux") and not _lk_wayland())):
-        return False
-    if _lk_load().get("video") == "mjpeg":
-        return False
-    if not _lk_ffmpeg():
-        ws.text({"vfail": _LK_FF_HINT})
-        return False
-    try:
-        ws.h.connection.setsockopt(_lk_socket.IPPROTO_TCP, _lk_socket.TCP_NODELAY, 1)
-    except Exception:
-        pass
-    try:
-        rect = _lk_screen_rect()
-    except Exception as e:
-        print(f"NCZ Link: no screen size ({e!r})")
-        return False
-    _lk["sz"] = (rect[2], rect[3])
-    ws.text({"sz": [rect[2], rect[3]]})
-    stop = threading.Event()
-    threading.Thread(target=_lk_h264_cursor, args=(ws, gen, stop), daemon=True).start()
-    kbps_max = int(cfg["br"])
-    kbps, fid, starts = kbps_max, 0, 0
-    last_codec, last_change, good, bad = None, 0.0, 0, 0
-    try:
-        while live():
-            opened = _lk_h264_open(ws, cfg, rect, kbps)
-            if opened is None:
-                return not live()
-            pr, first, enc = opened
-            starts += 1
-            if starts == 1:
-                ws.text({"venc": enc})
-            need_key, ctl, ended = True, time.time(), None
-            pending = first
-            try:
-                while live():
-                    if st.get("restart"):
-                        st["restart"] = False
-                        kbps_max = int(cfg["br"])
-                        kbps = kbps_max
-                        ended = "restart"
-                        break
-                    if pending is not None:
-                        b, pending = pending, None
-                    else:
-                        b = pr.burst(0.05)
-                    if b is None:
-                        ended = "dead"
-                        break
-                    if not b:
-                        if pr.p.poll() is not None:
-                            ended = "dead"
-                            break
-                        continue
-                    if not (b[:3] == b"\x00\x00\x01" or b[:4] == b"\x00\x00\x00\x01"):
-                        need_key = True                              # a frame was cut in the middle: wait for the next keyframe
-                        continue
-                    aus, sps = _lk_split_aus(b)
-                    if sps:
-                        codec = _lk_codec(sps)
-                        if codec != last_codec:
-                            last_codec = codec
-                            ws.text({"v": "h264", "codec": codec})
-                    now = time.time()
-                    for au, key in aus:
-                        if key:
-                            need_key = False
-                        if need_key:
-                            continue
-                        if st["inflight"] >= 5 and not key:          # the phone / Wi-Fi is behind: drop, resume at the next keyframe
-                            need_key = True
-                            if now - st["ack_t"] > 3.0:
-                                with st["lock"]:
-                                    st["inflight"] = 0
-                                    st["sent"].clear()
-                            continue
-                        fid = (fid + 1) & 0x7FFFFFFF
-                        with st["lock"]:
-                            st["sent"][fid] = time.time()
-                            st["inflight"] += 1
-                        if not ws.send(2, b"\x02" + _lk_struct.pack(">IB", fid, 1 if key else 0) + au):
-                            ended = "gone"
-                            break
-                    if ended:
-                        break
-                    if now - ctl >= 1.0:                             # bitrate follows the Wi-Fi (a restart costs ~half a second)
-                        ctl = now
-                        rtt = st["rtt"]
-                        if rtt > 0.15:
-                            bad, good = bad + 1, 0
-                        elif rtt < 0.04:
-                            good, bad = good + 1, 0
-                        else:
-                            good = bad = 0
-                        if bad >= 3 and kbps > 2500 and now - last_change > 6:
-                            kbps, bad, last_change, ended = max(2000, int(kbps * 0.7)), 0, now, "restart"
-                            break
-                        if good >= 12 and kbps < kbps_max and now - last_change > 6:
-                            kbps, good, last_change, ended = min(kbps_max, int(kbps * 1.2)), 0, now, "restart"
-                            break
-            finally:
-                pr.kill()
-            if ended == "dead":
-                if starts >= 4:
-                    ws.text({"vfail": "the video encoder keeps stopping"})
-                    return not live()
-                _lk["vsel"] = None
-                time.sleep(0.3)
-            elif ended == "gone":
-                break
-        return True
-    finally:
-        stop.set()
-
-
-def _lk_ws_video_auto(ws, st, cfg, gen):
-    if cfg.get("h264"):
-        try:
-            done = _lk_h264_video(ws, st, cfg, gen)
-        except Exception as e:
-            print(f"NCZ Link: H.264 stopped ({e!r}), JPEG fallback")
-            done = False
-        if done or not (ws.alive and _lk["gen"] == gen):
-            ws.alive = False if done else ws.alive
-            return
-        with st["lock"]:
-            st["inflight"] = 0
-            st["sent"].clear()
-    _lk_ws_video(ws, st, cfg, gen)
 
 
 # ---- the HTTP side
@@ -34282,27 +33775,6 @@ def _lk_token_ok(tok):
         return False
     toks = _lk_load().get("tokens", {})
     return any(_lk_hmac.compare_digest(tok, t) for t in toks)
-
-def _lk_open_bp_gui():
-    """GUI thread: opens NCZ Big Picture (unless it is already open). Returns True when it is open."""
-    win = _lk_win()
-    if win is None or not hasattr(win, "open_big_picture"):
-        return False
-    bp = getattr(win, "_big_picture", None)
-    if bp is not None and getattr(bp, "_active", False):
-        return True
-    win.open_big_picture()
-    return True
-
-def _lk_on_connect():
-    """A phone connected (the first thing it does after pairing / signing in): open Big Picture on this PC so the phone lands on
-    the controller-friendly screen. Turn it off with  "big_picture": false  in ncz_link.json."""
-    if _lk_load().get("big_picture") is False:
-        return {"ok": True, "bp": False}
-    try:
-        return {"ok": True, "bp": bool(_lk_gui(_lk_open_bp_gui, timeout=10.0))}
-    except Exception as e:
-        return {"ok": True, "bp": False, "msg": str(e)[:120]}
 
 class _LkHandler(_lk_http.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -34366,8 +33838,6 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
                                                  _LkGuiApp.primaryScreen().geometry().height()))
                 return self._json(200, {"ok": True, "games": games, "playing": _now_playing["name"] or "",
                                         "sw": _lk["sz"][0], "sh": _lk["sz"][1]})
-            if path == "/api/connect" and method == "POST":          # the phone just connected: open Big Picture first thing
-                return self._json(200, _lk_on_connect())
             if path == "/api/launch" and method == "POST":
                 ok, msg = _lk_gui(lambda g=str(self._body().get("game", ""))[:160]: _lk_launch_gui(g))
                 return self._json(200, {"ok": ok, "msg": msg})
@@ -41168,54 +40638,22 @@ class _BPInput(QObject):
         self._scan.timeout.connect(self._open_js)
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._poll_xinput)
-        self._sd = {}                # held direction per source (js device / xinput / phone bridge): they are merged
-        self._xi_prevs = {}          # XInput: previous buttons per slot (0-3)
-        self._js = {}                # Linux: every open /dev/input/js* -> [fd, notifier, axes]
-        self._lastbtn = {}           # button name -> time, so the same press seen by two sources only counts once
-        self._bridge_on = False      # a phone is feeding the Input Bridge right now
-        self._br_prev = 0
 
     def start(self):
         if sys.platform.startswith("win"):
             self._poll.start(1000)
         elif sys.platform.startswith("linux"):
             self._open_js()
+            if self._fd is None:
+                self._scan.start(2000)
 
     def stop(self):
         for t in (self._rep, self._scan, self._poll):
             t.stop()
         self._close_js()
         self._axes.clear()
-        self._sd.clear()
-        self._xi_prevs.clear()
         self._dir = (0, 0)
         self._xi_prev = 0
-        self._br_prev = 0
-
-    # one press seen by two sources (e.g. the phone bridge AND the virtual XInput pad it creates) must count once
-    def _emit_btn(self, name):
-        now = time.monotonic()
-        if now - self._lastbtn.get(name, 0.0) < 0.06:
-            return
-        self._lastbtn[name] = now
-        self.action.emit(name)
-
-    def _set_src_dir(self, src, d):
-        self._sd[src] = d
-        dx = next((v[0] for v in self._sd.values() if v[0]), 0)
-        dy = next((v[1] for v in self._sd.values() if v[1]), 0)
-        self._set_dir((dx, dy))
-
-    def feed_bridge(self, mask, dx, dy, live):
-        """Input Bridge: the phone's controller state arrives here directly, so Big Picture works even when the OS never
-        shows the virtual pad in the slot / device Big Picture happens to read."""
-        self._bridge_on = bool(live)
-        new = mask & ~self._br_prev
-        self._br_prev = mask if live else 0
-        for bit, name in ((0, "accept"), (1, "back"), (2, "x"), (3, "alt"), (4, "prev"), (5, "next"), (9, "start")):
-            if new >> bit & 1:
-                self._emit_btn(name)
-        self._set_src_dir("bridge", (dx, dy) if live else (0, 0))
 
     # held direction: fires once, then repeats
     def _set_dir(self, d):
@@ -41239,50 +40677,45 @@ class _BPInput(QObject):
         self._rep.setInterval(110)
         self._emit_dir()
 
-    # ---- Linux joystick API (every js device, and it keeps looking: a virtual pad can appear after Big Picture opened)
+    # ---- Linux joystick API
     def _open_js(self):
         import glob
         for p in sorted(glob.glob("/dev/input/js*")):
-            if p in self._js:
-                continue
             try:
                 fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
             except OSError:
                 continue
-            sn = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
-            sn.activated.connect(lambda *_a, _p=p: self._read_js(_p))
-            self._js[p] = [fd, sn, {}]
-            self._fd = next(iter(self._js.values()))[0]
-        if not self._scan.isActive():
-            self._scan.start(2000)
+            self._fd = fd
+            self._sn = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
+            self._sn.activated.connect(self._read_js)
+            self._scan.stop()
+            return
 
-    def _close_js(self, path=None):
-        for p in ([path] if path else list(self._js)):
-            ent = self._js.pop(p, None)
-            if ent is None:
-                continue
-            ent[1].setEnabled(False)
-            ent[1].deleteLater()
+    def _close_js(self):
+        if self._sn is not None:
+            self._sn.setEnabled(False)
+            self._sn.deleteLater()
+            self._sn = None
+        if self._fd is not None:
             try:
-                os.close(ent[0])
+                os.close(self._fd)
             except OSError:
                 pass
-            self._set_src_dir("js:" + p, (0, 0))
-        self._fd = next(iter(self._js.values()))[0] if self._js else None
+            self._fd = None
 
-    def _read_js(self, path):
+    def _read_js(self, *_):
         import struct
-        ent = self._js.get(path)
-        while ent is not None:
-            fd, _sn, axes = ent
+        while self._fd is not None:
             try:
-                data = os.read(fd, 128)
+                data = os.read(self._fd, 128)
             except BlockingIOError:
                 return
             except OSError:
                 data = b""
-            if not data:                                   # pad unplugged: forget it, the scan timer finds it again
-                self._close_js(path)
+            if not data:                                   # pad unplugged: look for it again
+                self._close_js()
+                self._set_dir((0, 0))
+                self._scan.start(2000)
                 return
             for off in range(0, len(data) - 7, 8):
                 _t, val, typ, num = struct.unpack_from("<IhBB", data, off)
@@ -41291,15 +40724,15 @@ class _BPInput(QObject):
                 if typ == 1 and val == 1:                  # button down (Xbox layout: A B X Y LB RB back start)
                     name = {0: "accept", 1: "back", 2: "x", 3: "alt", 4: "prev", 5: "next", 7: "start"}.get(num)
                     if name:
-                        self._emit_btn(name)
+                        self.action.emit(name)
                 elif typ == 2:                             # axis: 0/1 left stick, 6/7 d-pad
-                    sg = (val > 16000) - (val < -16000)
+                    s = (val > 16000) - (val < -16000)
                     if num in (0, 6):
-                        axes["x%d" % num] = sg
+                        self._axes["x%d" % num] = s
                     elif num in (1, 7):
-                        axes["y%d" % num] = sg
-                    self._set_src_dir("js:" + path, (axes.get("x6", 0) or axes.get("x0", 0),
-                                                     axes.get("y7", 0) or axes.get("y1", 0)))
+                        self._axes["y%d" % num] = s
+                    self._set_dir((self._axes.get("x6", 0) or self._axes.get("x0", 0),
+                                   self._axes.get("y7", 0) or self._axes.get("y1", 0)))
 
     # ---- Windows XInput
     def _poll_xinput(self):
@@ -41322,29 +40755,23 @@ class _BPInput(QObject):
                 self._poll.stop()
                 return
         dll, S = self._xi
-        any_pad, new, dx, dy = False, 0, 0, 0
-        for slot in range(4):                              # a virtual pad (ViGEm) takes the first FREE slot, not always 0
-            st = S()
-            if dll.XInputGetState(slot, ctypes.byref(st)) != 0:
-                self._xi_prevs[slot] = 0
-                continue
-            any_pad = True
-            b, g = st.pad.wButtons, st.pad
-            new |= b & ~self._xi_prevs.get(slot, 0)
-            self._xi_prevs[slot] = b
-            dx = dx or (1 if b & 8 else -1 if b & 4 else 0) or (1 if g.lx > 16000 else -1 if g.lx < -16000 else 0)
-            dy = dy or (1 if b & 2 else -1 if b & 1 else 0) or (-1 if g.ly > 16000 else 1 if g.ly < -16000 else 0)
-        if not any_pad:                                    # no pad: check once a second
+        st = S()
+        if dll.XInputGetState(0, ctypes.byref(st)) != 0:   # no pad: check once a second
             if self._poll.interval() != 1000:
                 self._poll.setInterval(1000)
-            self._set_src_dir("xi", (0, 0))
+            self._xi_prev = 0
+            self._set_dir((0, 0))
             return
         if self._poll.interval() != 16:
             self._poll.setInterval(16)
+        b, g = st.pad.wButtons, st.pad
+        new, self._xi_prev = b & ~self._xi_prev, b
         for mask, name in ((0x1000, "accept"), (0x2000, "back"), (0x0100, "prev"), (0x0200, "next"), (0x0010, "start"), (0x8000, "alt"), (0x4000, "x")):
             if new & mask:
-                self._emit_btn(name)
-        self._set_src_dir("xi", (dx, dy))
+                self.action.emit(name)
+        dx = (1 if b & 8 else -1 if b & 4 else 0) or (1 if g.lx > 16000 else -1 if g.lx < -16000 else 0)
+        dy = (1 if b & 2 else -1 if b & 1 else 0) or (-1 if g.ly > 16000 else 1 if g.ly < -16000 else 0)
+        self._set_dir((dx, dy))
 
 
 class _BPBridge(QObject):
@@ -42805,8 +42232,6 @@ _bpx_o = {n: getattr(_BigPicture, n) for n in ("__init__", "enter", "leave", "_s
 
 def _bpx_connected(self):
     """True while a game controller is plugged in (Linux js device open / Windows XInput pad answering)."""
-    if self._bridge_on:
-        return True
     if sys.platform.startswith("win"):
         return self._xi is not None and self._poll.interval() == 16
     return self._fd is not None
@@ -50728,6 +50153,504 @@ def _ncz_refresh_launcher_shortcut(theme_key=None, only_if_changed=False):
         return
     threading.Thread(target=_ncz_recreate_launcher_shortcut, args=(existing, theme_key, only_if_changed),
                      daemon=True).start()
+
+
+# ================================================================ Settings: install missing dependencies
+# Same package list as bootstrap_win.py. One button checks what's missing and pip-installs it into the Python
+# that's running the launcher (the private embeddable Python on Windows), plus Chromium for Playwright.
+# Packages installed while the launcher is open are picked up after a restart.
+import importlib as _dep_importlib
+import importlib.util as _dep_iu
+import glob as _dep_glob
+from PyQt6.QtWidgets import QPlainTextEdit as _DepLogBox
+
+_DEP_CORE = [("PyQt6", "PyQt6"), ("psutil", "psutil"), ("rarfile", "rarfile"),
+             ("playwright", "playwright"), ("pywin32", "win32api")]
+_DEP_OPTIONAL = [("pypresence", "pypresence"), ("libtorrent", "libtorrent"), ("pynput", "pynput"),
+                 ("nudenet", "nudenet"), ("vgamepad", "vgamepad"),
+                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets")]
+_DEP_WIN_ONLY = {"pywin32", "vgamepad"}
+
+def _dep_have(module):
+    try:
+        return _dep_iu.find_spec(module) is not None
+    except Exception:
+        return False
+
+def _dep_applicable(pairs):
+    win = sys.platform.startswith("win")
+    return [(p, m) for p, m in pairs if win or p not in _DEP_WIN_ONLY]
+
+def _dep_python():
+    exe = sys.executable
+    d, n = os.path.split(exe)
+    if n.lower() == "pythonw.exe" and os.path.exists(os.path.join(d, "python.exe")):
+        return os.path.join(d, "python.exe")      # pythonw has no stdout to read pip's output from
+    return exe
+
+def _dep_env():
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")}
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+def _dep_chromium_present():
+    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not base:
+        if sys.platform.startswith("win"):
+            base = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ms-playwright")
+        elif sys.platform == "darwin":
+            base = os.path.expanduser("~/Library/Caches/ms-playwright")
+        else:
+            base = os.path.expanduser("~/.cache/ms-playwright")
+    return bool(_dep_glob.glob(os.path.join(base, "chromium-*")))
+
+def _dep_missing():
+    """(missing core pip names, missing optional pip names, chromium missing?)"""
+    core = [p for p, m in _dep_applicable(_DEP_CORE) if not _dep_have(m)]
+    opt = [p for p, m in _dep_applicable(_DEP_OPTIONAL) if not _dep_have(m)]
+    chromium = _dep_have("playwright") and not _dep_chromium_present()
+    return core, opt, chromium
+
+_FFMPEG_URLS = ["https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+                "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"]
+
+def _dep_ffmpeg_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "NCZ_Games_Launcher", "ffmpeg")
+
+def _dep_add_to_path(folder):
+    """Adds folder to this process's PATH and permanently to the user's PATH (no admin needed)."""
+    cur = os.environ.get("PATH", "")
+    if folder.lower() not in [x.strip().lower() for x in cur.split(os.pathsep)]:
+        os.environ["PATH"] = folder + os.pathsep + cur
+    if not sys.platform.startswith("win"):
+        return
+    import winreg, ctypes
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+        try:
+            old, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            old, kind = "", winreg.REG_EXPAND_SZ
+        parts = [x for x in old.split(";") if x.strip()]
+        if folder.lower() not in [x.strip().lower().rstrip("\\") for x in parts]:
+            parts.append(folder)
+            winreg.SetValueEx(key, "Path", 0, kind if kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ)
+                              else winreg.REG_EXPAND_SZ, ";".join(parts))
+    try:      # tell Explorer / new terminals the environment changed
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+    except Exception:
+        pass
+
+def _dep_ffmpeg_missing():
+    return sys.platform.startswith("win") and shutil.which("ffmpeg") is None
+
+# if ffmpeg was installed by the launcher earlier, make sure this run can see it
+try:
+    if sys.platform.startswith("win") and os.path.exists(os.path.join(_dep_ffmpeg_dir(), "ffmpeg.exe")):
+        _dep_add_to_path(_dep_ffmpeg_dir())
+except Exception:
+    pass
+
+class _DepPanel(QFrame):
+    _line = pyqtSignal(str)
+    _finished = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Panel")
+        self._busy = False
+        pl = QVBoxLayout(self)
+        pl.setContentsMargins(22, 18, 22, 18)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel("Dependencies")
+        name.setObjectName("RowTitle")
+        desc = QLabel("Installs any Python packages the launcher needs that are missing (PyQt6, psutil, rarfile, "
+                      "playwright + Chromium, pypresence, libtorrent...). Needs internet. "
+                      "Restart the launcher afterwards so new packages get picked up.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        self.status = QLabel()
+        self.status.setObjectName("RowDesc")
+        self.status.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(desc)
+        text.addWidget(self.status)
+        self.btn = QPushButton("Install missing dependencies")
+        self.btn.clicked.connect(self.start_install)
+        row.addLayout(text, 1)
+        row.addWidget(self.btn)
+        pl.addLayout(row)
+        self.log = _DepLogBox()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(150)
+        self.log.hide()
+        pl.addWidget(self.log)
+        self._line.connect(self._on_line)
+        self._finished.connect(self._on_finished)
+        self.refresh()
+
+    def refresh(self):
+        core, opt, chromium = _dep_missing()
+        miss = core + opt + (["Chromium"] if chromium else []) + (["ffmpeg"] if _dep_ffmpeg_missing() else [])
+        if miss:
+            self.status.setText("Missing: " + ", ".join(miss))
+        else:
+            self.status.setText("Everything is installed.")
+        self.btn.setEnabled(bool(miss) and not self._busy)
+
+    def _on_line(self, s):
+        self.log.appendPlainText(s)
+
+    def _on_finished(self, summary):
+        self._busy = False
+        self.log.appendPlainText(summary)
+        _dep_importlib.invalidate_caches()
+        self.refresh()
+        self.btn.setText("Install missing dependencies")
+
+    def start_install(self):
+        if self._busy:
+            return
+        self._busy = True
+        self.btn.setEnabled(False)
+        self.btn.setText("Installing...")
+        self.log.clear()
+        self.log.show()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def _run(self, cmd):
+        self._line.emit("> " + " ".join(os.path.basename(c) if i == 0 else c for i, c in enumerate(cmd)))
+        flags = 0x08000000 if sys.platform.startswith("win") else 0
+        p = subprocess.Popen(cmd, env=_dep_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=flags)
+        for line in p.stdout:
+            line = line.rstrip()
+            if line:
+                self._line.emit(line)
+        return p.wait() == 0
+
+    def _install_ffmpeg(self):
+        dest = _dep_ffmpeg_dir()
+        os.makedirs(dest, exist_ok=True)
+        zp = os.path.join(dest, "ffmpeg.zip")
+        last_err = None
+        for url in _FFMPEG_URLS:
+            try:
+                self._line.emit("Downloading ffmpeg (~80 MB)...")
+                req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
+                with urllib.request.urlopen(req, timeout=30) as r, open(zp, "wb") as f:
+                    shutil.copyfileobj(r, f)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if last_err:
+            raise last_err
+        with zipfile.ZipFile(zp) as z:
+            for n in z.namelist():
+                base = os.path.basename(n).lower()
+                if base in ("ffmpeg.exe", "ffprobe.exe") and "/bin/" in n.replace("\\", "/"):
+                    with z.open(n) as src, open(os.path.join(dest, base), "wb") as out:
+                        shutil.copyfileobj(src, out)
+        os.remove(zp)
+        if not os.path.exists(os.path.join(dest, "ffmpeg.exe")):
+            raise RuntimeError("ffmpeg.exe not found in the download")
+        _dep_add_to_path(dest)
+        self._line.emit("ffmpeg installed and added to PATH: " + dest)
+
+    def _work(self):
+        failed = []
+        try:
+            core, opt, chromium = _dep_missing()
+            py = _dep_python()
+            pip = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location"]
+            if (core or opt) and not (_dep_have("setuptools") and _dep_have("wheel")):
+                self._run(pip + ["--upgrade", "setuptools", "wheel"])
+            if core:
+                if not self._run(pip + ["--only-binary=:all:", *core]):
+                    for p in core:                    # one bad package shouldn't block the rest
+                        if not self._run(pip + ["--only-binary=:all:", p]):
+                            failed.append(p)
+            for p in opt:
+                if not (self._run(pip + ["--only-binary=:all:", p]) or
+                        self._run(pip + ["--no-build-isolation", p])):
+                    failed.append(p)
+            _dep_importlib.invalidate_caches()
+            if _dep_have("playwright") and not _dep_chromium_present():
+                self._line.emit("Downloading Chromium (~150 MB)...")
+                if not self._run([py, "-m", "playwright", "install", "chromium"]):
+                    failed.append("Chromium")
+            if _dep_ffmpeg_missing():
+                try:
+                    self._install_ffmpeg()
+                except Exception as e:
+                    self._line.emit(f"ffmpeg failed: {e}")
+                    failed.append("ffmpeg")
+            summary = "Done. Restart the launcher to use the new packages."
+            if failed:
+                summary = "Done, but couldn't install: " + ", ".join(failed) + "."
+        except Exception as e:
+            summary = f"Install failed: {e}"
+        self._finished.emit(summary)
+
+_dep_prev_settings_init = SettingsPage.__init__
+
+def _dep_settings_init(self, *a, **k):
+    _dep_prev_settings_init(self, *a, **k)
+    try:
+        layout = self.layout()
+        panel = _DepPanel()
+        idx = max(layout.count() - 1, 0)
+        layout.insertSpacing(idx, 12)
+        layout.insertWidget(idx + 1, panel)
+    except Exception:
+        pass
+
+SettingsPage.__init__ = _dep_settings_init
+
+
+# ================================================================ Settings: game shortcuts open through the launcher or launch directly
+# Default (on) is how it worked before: desktop shortcuts for library games open the launcher, which starts the game.
+# Turned off: the launcher never rewrites your desktop shortcuts, new game shortcuts start the game's exe directly,
+# and "Restore original shortcuts" puts back the ones it already changed (the originals it saved, or a direct one).
+def get_shortcuts_via_launcher():
+    try:
+        return bool(load_launcher_settings().get("shortcuts_via_launcher", True))
+    except Exception:
+        return True
+
+def set_shortcuts_via_launcher(on):
+    try:
+        st = load_launcher_settings()
+        st["shortcuts_via_launcher"] = bool(on)
+        save_launcher_settings(st)
+    except Exception:
+        pass
+
+def _sc_args_text(a):
+    if not a:
+        return ""
+    return subprocess.list2cmdline([str(x) for x in a]) if isinstance(a, (list, tuple)) else str(a)
+
+def _sc_can_direct(exe, compat_tool=""):
+    """Windows: any exe. Linux: only native games (a Windows exe needs Wine/Proton, which the launcher sets up)."""
+    if not exe or not os.path.exists(exe):
+        return False
+    if sys.platform.startswith("win"):
+        return True
+    return not compat_tool and not exe.lower().endswith(".exe")
+
+def _sc_write_direct(path, title, exe, args="", workdir=""):
+    """Writes a shortcut at `path` that starts the game's exe itself. Raises on failure."""
+    workdir = workdir or os.path.dirname(exe)
+    if sys.platform.startswith("win"):
+        q = _ps_quote
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(path)});"
+              f"$s.TargetPath={q(exe)};$s.Arguments={q(args)};$s.WorkingDirectory={q(workdir)};"
+              f"$s.IconLocation={q(exe + ',0')};$s.Description={q(title)};$s.Save()")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       check=True, capture_output=True, timeout=30, creationflags=0x08000000)
+        return
+    icon = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if ln.startswith("Icon="):
+                    icon = ln.strip()
+    except OSError:
+        pass
+    if not icon:
+        p = _exe_icon_png(exe, sanitize_folder_name(title) or "Game")
+        icon = f"Icon={p}" if p else ""
+    argv = [exe] + (shlex.split(args) if args else [])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("[Desktop Entry]\nType=Application\n"
+                f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={workdir}\n"
+                + (icon + "\n" if icon else "") + "Terminal=false\nCategories=Game;\n")
+    os.chmod(path, 0o755)
+
+def _sc_launcher_title(path):
+    """Game title if this desktop file opens the launcher for a game (`--launch-game <title>`), else ''."""
+    low = path.lower()
+    try:
+        if low.endswith(".lnk") and sys.platform.startswith("win"):
+            r = _desk_parse_lnk(path)
+            if r and "--launch-game" in (r[1] or ""):
+                t = r[1].split()
+                return urllib.parse.unquote(t[t.index("--launch-game") + 1].strip('"'))
+        elif low.endswith(".desktop") and not sys.platform.startswith("win"):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            m = re.search(r'--launch-game"?\s+"?([^"\s]+)', txt)
+            if m:
+                return urllib.parse.unquote(m.group(1).replace("%%", "%"))
+    except Exception:
+        pass
+    return ""
+
+def _sc_restore_all():
+    """Desktop shortcuts that open the launcher -> back to what they were. Returns (restored, left)."""
+    keep_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
+    added = _ncz_autoadd_load().get("added", {})
+    custom = {_norm_title(g.get("title", "")): g for g in load_custom_games()}
+    done = left = 0
+    for d in _desktop_dirs():
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.isfile(p) or os.path.islink(p):
+                continue
+            title = _sc_launcher_title(p)
+            if not title:
+                continue
+            ext = ".lnk" if p.lower().endswith(".lnk") else ".desktop"
+            gid = added.get(_norm_title(title))
+            orig = os.path.join(keep_dir, f"{gid}.orig{ext}") if gid else ""
+            try:
+                if orig and os.path.isfile(orig):
+                    shutil.copyfile(orig, p)                  # the shortcut exactly as it was
+                    done += 1
+                    continue
+                g = custom.get(_norm_title(title))
+                if g and _sc_can_direct(g.get("exe_path", ""), g.get("compat_tool", "")):
+                    _sc_write_direct(p, title, g["exe_path"], _sc_args_text(g.get("launch_args")),
+                                     g.get("workdir", ""))
+                    done += 1
+                    continue
+            except Exception:
+                pass
+            left += 1
+    return done, left
+
+# --- keep the launcher from rewriting shortcuts while the option is off
+_sc_prev_reroute = _ncz_reroute_shortcut
+
+def _ncz_reroute_shortcut(c, gid):
+    if not get_shortcuts_via_launcher():
+        return False
+    return _sc_prev_reroute(c, gid)
+
+_sc_prev_migrate = _ncz_migrate_old_shortcuts
+
+def _ncz_migrate_old_shortcuts(window):
+    if not get_shortcuts_via_launcher():
+        return                                    # not marked done, so it still runs if the option is turned back on
+    return _sc_prev_migrate(window)
+
+# --- new game shortcuts
+_sc_prev_create = create_game_shortcut
+
+def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", launch_args=None):
+    if get_shortcuts_via_launcher() or not _sc_can_direct(exe, compat_tool):
+        return _sc_prev_create(app, title, exe, compat_tool, fallback_icon, launch_args)
+    from PyQt6.QtCore import QStandardPaths
+    desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation) or os.path.expanduser("~/Desktop")
+    try:
+        os.makedirs(desktop, exist_ok=True)
+        target = os.path.join(desktop, (sanitize_folder_name(title) or "Game") +
+                              (".lnk" if sys.platform.startswith("win") else ".desktop"))
+        _sc_write_direct(target, title, exe, _sc_args_text(launch_args))
+        if not sys.platform.startswith("win"):
+            try:
+                subprocess.run(["gio", "set", target, "metadata::trusted", "true"], capture_output=True, timeout=5)
+            except Exception:
+                pass
+        QMessageBox.information(app, "Desktop Shortcut", f"Shortcut created (launches the game directly):\n{target}")
+    except Exception as e:
+        QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
+
+class _ScPanel(QFrame):
+    _restored = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Panel")
+        pl = QVBoxLayout(self)
+        pl.setContentsMargins(22, 18, 22, 18)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel("Game shortcuts")
+        name.setObjectName("RowTitle")
+        desc = QLabel("Choose what your desktop shortcuts for games do. \"Through the launcher\" opens the launcher and "
+                      "it starts the game (applies Proton/Wine, launch options, cloud saves). \"Directly\" never touches "
+                      "your existing shortcuts and new ones start the game's exe on their own. On Linux, Windows games "
+                      "that need Wine/Proton still go through the launcher.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        self.status = QLabel()
+        self.status.setObjectName("RowDesc")
+        self.status.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(desc)
+        text.addWidget(self.status)
+        self.combo = QComboBox()
+        self.combo.setFixedWidth(240)
+        self.combo.addItem("Through the launcher", True)
+        self.combo.addItem("Launch the game directly", False)
+        self.combo.setCurrentIndex(0 if get_shortcuts_via_launcher() else 1)
+        self.combo.currentIndexChanged.connect(self._changed)
+        self.restore = QPushButton("Restore original shortcuts")
+        self.restore.clicked.connect(self._restore_clicked)
+        btns = QVBoxLayout()
+        btns.addWidget(self.combo)
+        btns.addWidget(self.restore)
+        row.addLayout(text, 1)
+        row.addLayout(btns)
+        pl.addLayout(row)
+        self._restored.connect(self._on_restored)
+
+    def _changed(self, _i):
+        via = bool(self.combo.currentData())
+        set_shortcuts_via_launcher(via)
+        if not via:
+            ans = QMessageBox.question(self, "Game shortcuts",
+                                       "Also put back the desktop shortcuts the launcher already changed?",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ans == QMessageBox.StandardButton.Yes:
+                self._restore_clicked()
+
+    def _restore_clicked(self):
+        self.restore.setEnabled(False)
+        self.status.setText("Restoring shortcuts...")
+        def work():
+            try:
+                d, l = _sc_restore_all()
+            except Exception:
+                d, l = 0, -1
+            self._restored.emit(d, l)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_restored(self, done, left):
+        self.restore.setEnabled(True)
+        if left < 0:
+            self.status.setText("Couldn't restore the shortcuts.")
+        elif done == 0 and left == 0:
+            self.status.setText("No shortcuts needed restoring.")
+        else:
+            self.status.setText(f"Restored {done} shortcut(s)." +
+                                (f" {left} couldn't be restored (delete and re-create those from the game's menu)."
+                                 if left else ""))
+
+_sc_prev_settings_init = SettingsPage.__init__
+
+def _sc_settings_init(self, *a, **k):
+    _sc_prev_settings_init(self, *a, **k)
+    try:
+        layout = self.layout()
+        panel = _ScPanel()
+        idx = max(layout.count() - 1, 0)
+        layout.insertSpacing(idx, 12)
+        layout.insertWidget(idx + 1, panel)
+    except Exception:
+        pass
+
+SettingsPage.__init__ = _sc_settings_init
 
 
 if __name__ == "__main__":
