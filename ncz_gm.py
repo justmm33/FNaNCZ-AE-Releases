@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 CLI_NAME = "ncz-gm"
 IS_WIN = sys.platform.startswith("win")
@@ -46,6 +47,16 @@ commands:
   change-theme <theme>                    switch the launcher's theme: new, sunset, classic or legacy
   gmod-extract <path>                     extract Garry's Mod addons (a .gma / .bin file or a folder of them)
   update                                  update the launcher
+  account                                 show which account is signed in
+  logout                                  sign out (closes the launcher first)
+  list [filter]                           list the games in your library (a filter only shows matching names)
+  auto-update [on|off]                    show or change the launcher's Automatic Updates switch
+  status                                  launcher, account, theme and update overview
+  folder [launcher]                       open the settings folder (or the launcher's own folder)
+  config [get|set|unset] [key] [value]    list / read / change / remove a launcher.json setting
+  backup [file]                           save your settings (launcher.json etc., not your sign-in) to a zip
+  quit                                    close the launcher
+  restart                                 close the launcher and open it again
   demo                                    delete account.json and open demo.py (works while signed out)
   help                                    list all commands
 
@@ -987,11 +998,13 @@ def _theme_options():
     return options, locked, mod
 
 
-def _write_launcher_json(updates):
+def _write_launcher_json(updates, remove=()):
     """Changes just these keys in launcher.json (everything else the launcher saved stays as it is)."""
     path = os.path.join(settings_dir(), "launcher.json")
     data = _read_launcher_json()
     data.update(updates)
+    for k in remove:
+        data.pop(k, None)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1375,6 +1388,254 @@ def cmd_demo(_args):
     return 0
 
 
+def _quit_launcher(timeout=10.0):
+    """Asks a running launcher to close and waits for it. True when none is running afterwards."""
+    if not launcher_running():
+        return True
+    send_to_launcher(b"quit")
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.25)
+        if not launcher_running():
+            return True
+    return False
+
+
+def cmd_account(_args):
+    if not is_logged_in():
+        say(paint("!", "warn") + " Not signed in.  " + paint("ncz-gm login <email> [password]", "dim"))
+        return 1
+    try:
+        with open(_account_file(), encoding="utf-8") as f:
+            email = str(json.load(f).get("email") or "")
+    except Exception:
+        email = ""
+    say(paint("\u2714 Signed in as", "ok") + " " + paint(email or "your account", "bold"))
+    return 0
+
+
+def cmd_logout(args):
+    if args:
+        err("usage: ncz-gm logout")
+        return 2
+    path = _account_file()
+    if not os.path.exists(path):
+        say("Already signed out.")
+        return 0
+    if not _quit_launcher():                    # a running launcher would write account.json again
+        err("Couldn't close the launcher - close it yourself and run this again.")
+        return 1
+    try:
+        os.remove(path)
+    except OSError as e:
+        err(f"Couldn't delete {path}: {e}")
+        return 1
+    say(paint("\u2714 Signed out.", "ok"))
+    return 0
+
+
+def cmd_list(args):
+    titles = _known_titles()
+    if args:
+        want = _norm(" ".join(args))
+        titles = [t for t in titles if want in _norm(t)]
+        if not titles:
+            err(f"No game in your library matches \"{' '.join(args)}\".")
+            return 1
+        say(paint(f"{len(titles)} {'game matches' if len(titles) == 1 else 'games match'} \"{' '.join(args)}\"", "light"))
+    else:
+        say(paint(f"{len(titles)} {'game' if len(titles) == 1 else 'games'} in your library", "light"))
+    for i, t in enumerate(titles, 1):
+        say(f"  {paint(str(i).rjust(3), 'dim')}  {t}")
+    return 0
+
+
+def cmd_auto_update(args):
+    cur = _read_launcher_json().get("auto_update", True)
+    cur = cur if isinstance(cur, bool) else True
+    if not args:
+        say(paint("Automatic Updates:", "light") + " " + paint("on" if cur else "off", "ok" if cur else "warn"))
+        say(paint("usage: ncz-gm auto-update <on|off>", "dim"))
+        return 0
+    word = " ".join(args).strip().lower()
+    if word in ("on", "true", "yes", "1"):
+        want = True
+    elif word in ("off", "false", "no", "0"):
+        want = False
+    else:
+        err("usage: ncz-gm auto-update <on|off>")
+        return 2
+    if want == cur:
+        say(paint("\u2714", "ok") + f" Automatic Updates are already {'on' if cur else 'off'}.")
+        return 0
+    _write_launcher_json({"auto_update": want})
+    say(paint("\u2714 Automatic Updates", "ok") + f" {'on' if want else 'off'}.")
+    if launcher_running():
+        say("Restart the launcher to apply it.")
+    return 0
+
+
+def cmd_status(_args):
+    cfg = _read_launcher_json()
+    auto = cfg.get("auto_update", True)
+    auto = auto if isinstance(auto, bool) else True
+    key = _theme_key(cfg)
+    email = ""
+    if is_logged_in():
+        try:
+            with open(_account_file(), encoding="utf-8") as f:
+                email = str(json.load(f).get("email") or "")
+        except Exception:
+            pass
+    running = launcher_running()
+    mp = main_py()
+    rows = [
+        ("Launcher", paint("running", "ok") if running else paint("not running", "dim")),
+        ("Account", paint(email or "signed in", "bold") if is_logged_in() else paint("not signed in", "warn")),
+        ("Theme", THEME_LABELS.get(key, key)),
+        ("Automatic Updates", paint("on", "ok") if auto else paint("off", "warn")),
+        ("Library", f"{len(_known_titles())} games"),
+        ("Settings folder", settings_dir()),
+        ("main.py", mp or paint("not found", "bad")),
+    ]
+    for label, value in rows:
+        say(f"  {paint(label.ljust(18), 'light')} {value}")
+    return 0
+
+
+def _open_path(path):
+    """Opens a folder in the file manager. False when this system has no way to do it."""
+    try:
+        if IS_WIN:
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            opener = shutil.which("xdg-open")
+            if not opener:
+                return False
+            subprocess.Popen([opener, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def cmd_folder(args):
+    if args and [a.lower() for a in args] != ["launcher"]:
+        err("usage: ncz-gm folder [launcher]")
+        return 2
+    if args:
+        mp = main_py()
+        if not mp:
+            err("main.py not found next to ncz_gm.py (set NCZ_MAIN to its path)")
+            return 1
+        path = os.path.dirname(mp)
+    else:
+        path = settings_dir()
+    if not os.path.isdir(path):
+        err(f"{path} doesn't exist yet.")
+        return 1
+    if _open_path(path):
+        say(paint("\u2714 Opened", "ok") + f" {path}")
+    else:
+        say(path)
+    return 0
+
+
+def _mask_setting(key, text):
+    return "(hidden)" if re.search(r"key|token|secret|pass", key, re.I) else text
+
+
+def cmd_config(args):
+    cfg = _read_launcher_json()
+    sub = args[0].lower() if args else "list"
+    if sub == "list" and len(args) <= 1:
+        if not cfg:
+            say("No settings saved yet.")
+            return 0
+        for k in sorted(cfg):
+            v = json.dumps(cfg[k], ensure_ascii=False)
+            v = _mask_setting(k, v if len(v) <= 70 else v[:67] + "...")
+            say(f"  {paint(k.ljust(28), 'accent')} {v}")
+        return 0
+    if sub == "get" and len(args) == 2:
+        if args[1] not in cfg:
+            err(f"There is no setting called {args[1]}.")
+            return 1
+        say(json.dumps(cfg[args[1]], ensure_ascii=False, indent=2))
+        return 0
+    if sub == "set" and len(args) >= 3:
+        text = " ".join(args[2:])
+        try:
+            value = json.loads(text)             # true / 5 / [1,2] ... anything else is kept as text
+        except ValueError:
+            value = text
+        _write_launcher_json({args[1]: value})
+        say(paint("\u2714", "ok") + f" {args[1]} = {json.dumps(value, ensure_ascii=False)}")
+        if launcher_running():
+            say("Restart the launcher to apply it.")
+        return 0
+    if sub == "unset" and len(args) == 2:
+        if args[1] not in cfg:
+            say(f"{args[1]} isn't set.")
+            return 0
+        _write_launcher_json({}, remove=(args[1],))
+        say(paint("\u2714", "ok") + f" Removed {args[1]} (the launcher goes back to its default).")
+        if launcher_running():
+            say("Restart the launcher to apply it.")
+        return 0
+    err("usage: ncz-gm config [list] | get <key> | set <key> <value> | unset <key>")
+    return 2
+
+
+def cmd_backup(args):
+    if len(args) > 1:
+        err("usage: ncz-gm backup [file]")
+        return 2
+    sd = settings_dir()
+    skip = ("account.json", "launcher_ban.json")             # keep the sign-in out of the zip
+    files = [f for f in (sorted(os.listdir(sd)) if os.path.isdir(sd) else [])
+             if f.lower().endswith(".json") and f not in skip and os.path.isfile(os.path.join(sd, f))]
+    if not files:
+        err("Nothing to back up (no settings files found).")
+        return 1
+    name = time.strftime("ncz-gm-backup-%Y%m%d-%H%M%S.zip")
+    dest = os.path.abspath(os.path.expanduser(args[0])) if args else os.path.abspath(name)
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, name)
+    try:
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in files:
+                z.write(os.path.join(sd, f), f)
+    except OSError as e:
+        err(f"Couldn't write {dest}: {e}")
+        return 1
+    say(paint("\u2714 Backed up", "ok") + f" {len(files)} files to {dest}")
+    say(paint("  account.json is left out, so your sign-in isn't stored in the zip.", "dim"))
+    return 0
+
+
+def cmd_quit(_args):
+    if not launcher_running():
+        say("The launcher isn't running.")
+        return 0
+    if not _quit_launcher():
+        err("The launcher didn't close.")
+        return 1
+    say(paint("\u2714", "ok") + " Launcher closed.")
+    return 0
+
+
+def cmd_restart(_args):
+    if not _quit_launcher():
+        err("The launcher didn't close.")
+        return 1
+    start_launcher()
+    say(paint("\u25b6", "accent") + " Restarting the launcher...")
+    return 0
+
+
 def cmd_install(_args):
     install_path()
     return 0
@@ -1397,12 +1658,13 @@ def cmd_help(_args):
 COMMANDS = {
     "change-theme": cmd_change_theme, "theme": cmd_change_theme, "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
-    "update": cmd_update, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
+    "update": cmd_update, "account": cmd_account, "logout": cmd_logout, "list": cmd_list, "auto-update": cmd_auto_update,
+    "autoupdate": cmd_auto_update, "status": cmd_status, "folder": cmd_folder, "config": cmd_config, "backup": cmd_backup, "quit": cmd_quit, "restart": cmd_restart, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
 }
 
 
-SIGNED_OUT_OK = ("login", "google-login", "github-login", "demo")
+SIGNED_OUT_OK = ("login", "google-login", "github-login", "demo", "account", "logout", "status", "folder")
 
 
 def main(argv=None, launcher=None):
