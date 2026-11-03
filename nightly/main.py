@@ -1330,16 +1330,30 @@ def get_launch_command():
             exe = pythonw  # no console window
     return exe, [script], os.path.dirname(script)
 
-def prepare_shortcut_icon():
-    """Copies/converts assets/icon.png to a stable location the shortcut can point at. None if unavailable."""
-    src = asset_path("icon.png")
-    if not os.path.exists(src):
+def _shortcut_icon_name(src, ext):
+    """One file per theme icon, so Windows/the desktop can't keep showing a cached icon of another theme."""
+    stem = re.sub(r"[^A-Za-z0-9_-]", "", os.path.splitext(os.path.basename(src))[0]) or "icon"
+    try:
+        import hashlib
+        with open(src, "rb") as _f:
+            tag = "-" + hashlib.md5(_f.read()).hexdigest()[:8]      # changes whenever the icon's pixels change
+    except Exception:
+        tag = ""
+    return ("launcher" if ext == ".ico" else "launcher-icon") + ("" if stem == "icon" else "-" + stem) + tag + ext
+
+def _shortcut_marker():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "shortcut_icon.txt")
+
+def prepare_shortcut_icon(src=None):
+    """Copies/converts the current theme's icon (or `src`) to a stable location the shortcut can point at. None if unavailable."""
+    src = src or asset_path("icon.png")
+    if not src or not os.path.exists(src):
         return None
     folder = os.path.dirname(get_launcher_settings_path())
     os.makedirs(folder, exist_ok=True)
     try:
         if sys.platform.startswith("win"):
-            dest = os.path.join(folder, "launcher.ico")
+            dest = os.path.join(folder, _shortcut_icon_name(src, ".ico"))
             img = QImage(src)
             if img.isNull():
                 return None
@@ -1352,7 +1366,7 @@ def prepare_shortcut_icon():
             painter.drawImage((size - scaled.width()) // 2, (size - scaled.height()) // 2, scaled)
             painter.end()
             return dest if canvas.save(dest, "ICO") else None
-        dest = os.path.join(folder, "launcher-icon.png")
+        dest = os.path.join(folder, _shortcut_icon_name(src, ".png"))
         shutil.copyfile(src, dest)
         return dest
     except Exception:
@@ -1427,18 +1441,26 @@ def _create_linux_shortcut(target, args, workdir, icon):
             pass
     return path
 
-def create_desktop_shortcut():
-    """Creates (or refreshes) a desktop shortcut and returns its path. Raises RuntimeError with a readable message."""
+def create_desktop_shortcut(icon_src=None):
+    """Creates (or refreshes) a desktop shortcut and returns its path. Raises RuntimeError with a readable message.
+    icon_src: icon file to use instead of the running theme's (used when switching themes)."""
     target, args, workdir = get_launch_command()
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")     # the sign-in / installer script next to main.py
     if not os.environ.get("APPIMAGE") and not getattr(sys, "frozen", False) and os.path.isfile(demo):
         args, workdir = [demo], os.path.dirname(demo)      # the shortcut opens demo.py (it starts main.py once signed in)
-    icon = prepare_shortcut_icon()
+    icon = prepare_shortcut_icon(icon_src)
     if sys.platform.startswith("win"):
-        return _create_windows_shortcut(target, args, workdir, icon)
-    if sys.platform.startswith("linux"):
-        return _create_linux_shortcut(target, args, workdir, icon)
-    raise RuntimeError("Desktop shortcuts aren't supported on this platform yet.")
+        result = _create_windows_shortcut(target, args, workdir, icon)
+    elif sys.platform.startswith("linux"):
+        result = _create_linux_shortcut(target, args, workdir, icon)
+    else:
+        raise RuntimeError("Desktop shortcuts aren't supported on this platform yet.")
+    try:                                     # remember which icon the shortcut has, so a theme change can refresh it
+        with open(_shortcut_marker(), "w", encoding="utf-8") as f:
+            f.write(os.path.basename(icon or ""))
+    except Exception:
+        pass
+    return result
 
 THEMES = {
     # Black + red, flat and rounded (Epic Games feel) with Steam's top navigation bar.
@@ -1469,6 +1491,8 @@ _theme_listeners = []
 def _on_accent():
     """Text colour for things drawn on the accent colour (dark when the theme's accent is white)."""
     try:
+        if globals().get("_UI_STYLE_AT_START") == "classic":
+            return "#ffffff"
         return SUNSET_THEME.get("on_accent", "#ffffff")
     except NameError:
         return "#ffffff"
@@ -1677,6 +1701,23 @@ def set_accent(color):
     except Exception:
         pass
 
+def _hue_shift_icon(src, hue, sat_scale, size=256):
+    """The icon with every coloured pixel (the N and the glow) moved to `hue`; the white outline, stars and black sky stay.
+    sat_scale compensates for the target colour being more or less saturated than the original lavender."""
+    img = QImage(src)
+    if img.isNull():
+        return None
+    if max(img.width(), img.height()) > size:
+        img = img.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            if c.alpha() and not (c.saturationF() < 0.22 and c.valueF() > 0.82):      # skip white
+                c.setHsvF(hue, min(1.0, c.saturationF() * sat_scale), c.valueF(), c.alphaF())
+                img.setPixelColor(x, y, c)
+    return img
+
 def apply_accent_to_icon(color):
     """Recolors assets/icon.png to match the accent: the icon's background becomes exactly the chosen colour and
     the other shades move with it. The original is kept once as assets/icon_default.png and every recolor starts
@@ -1684,7 +1725,9 @@ def apply_accent_to_icon(color):
     import colorsys
     try:
         icon = accent_icon_path()
-        orig = os.path.join(ASSETS_DIR, "icon_default.png")      # the untouched original (older versions kept it here)
+        orig = os.path.join(ASSETS_DIR, "icon-cl.png")           # Classic's own icon is the base for recolouring
+        if not os.path.exists(orig):
+            orig = os.path.join(ASSETS_DIR, "icon_default.png")  # the untouched original (older versions kept it here)
         if not os.path.exists(orig):
             orig = os.path.join(ASSETS_DIR, "icon.png")
             if not os.path.exists(orig):
@@ -1696,53 +1739,9 @@ def apply_accent_to_icon(color):
             except FileNotFoundError:
                 pass
             return True
-        img = QImage(orig)
-        if img.isNull():
-            return False
-        if max(img.width(), img.height()) > 512:
-            img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        img = img.convertToFormat(QImage.Format.Format_ARGB32)
         target = QColor(color)
-        th, tl, ts = colorsys.rgb_to_hls(target.redF(), target.greenF(), target.blueF())
-        ptr = img.bits()
-        ptr.setsize(img.sizeInBytes())
-        data = bytearray(ptr)                                  # bytes are B, G, R, A
-        # the icon's background = its most common opaque colour (bucketed, then averaged)
-        buckets = {}
-        for i in range(0, len(data), 4):
-            if data[i + 3] < 200:
-                continue
-            k = (data[i] >> 3, data[i + 1] >> 3, data[i + 2] >> 3)
-            e = buckets.get(k)
-            if e is None:
-                buckets[k] = [1, data[i], data[i + 1], data[i + 2]]
-            else:
-                e[0] += 1; e[1] += data[i]; e[2] += data[i + 1]; e[3] += data[i + 2]
-        if buckets:
-            n, sb, sg, sr = max(buckets.values(), key=lambda e: e[0])
-            bh, bl, bs = colorsys.rgb_to_hls(sr / n / 255.0, sg / n / 255.0, sb / n / 255.0)
-        else:
-            stock = QColor("#a666ff")
-            bh, bl, bs = colorsys.rgb_to_hls(stock.redF(), stock.greenF(), stock.blueF())
-        shift = th - bh
-
-        def remap(v, b, t):            # piecewise linear: 0 -> 0, background value -> chosen value, 1 -> 1
-            if b <= 0.0 or b >= 1.0:
-                return v
-            return v * t / b if v <= b else t + (v - b) * (1.0 - t) / (1.0 - b)
-
-        cache = {}
-        for i in range(0, len(data), 4):
-            key = (data[i], data[i + 1], data[i + 2])
-            new = cache.get(key)
-            if new is None:
-                h, l, sat = colorsys.rgb_to_hls(key[2] / 255.0, key[1] / 255.0, key[0] / 255.0)
-                r, g, b = colorsys.hls_to_rgb((h + shift) % 1.0, min(1.0, max(0.0, remap(l, bl, tl))),
-                                              min(1.0, max(0.0, remap(sat, bs, ts))))
-                new = cache[key] = (round(b * 255), round(g * 255), round(r * 255))
-            data[i], data[i + 1], data[i + 2] = new
-        out = QImage(bytes(data), img.width(), img.height(), img.bytesPerLine(), QImage.Format.Format_ARGB32).copy()
-        return out.save(icon, "PNG")
+        out = _hue_shift_icon(orig, max(0.0, target.hueF()), target.saturationF() / 0.6)    # N + glow follow the accent
+        return bool(out is not None and out.save(icon, "PNG"))
     except Exception:
         return False
 
@@ -1941,6 +1940,7 @@ def stream_download(response, dest_path, emit_progress, is_cancelled=lambda: Fal
                 break
             f.write(buf)
             downloaded += len(buf)
+            _dl_throttle(len(buf))
             now = time.time()
             if now - last_emit >= 0.1:
                 last_emit = now
@@ -2086,6 +2086,7 @@ def resumable_download(w, get_link, pick_name, expected_total=0, first=None):
                             f.write(buf)
                         except OSError as de:
                             raise _DLFatal(f"Couldn't write the file: {de}")
+                        _dl_throttle(len(buf), w)
                         done += len(buf)
                         now = time.time()
                         if now - last_emit >= 0.1:
@@ -2724,6 +2725,34 @@ def apply_startup_setting():
     except Exception:
         pass
 
+def register_cli():
+    """Runs `py "<data folder>/NCZ_Games_Launcher/ncz_gm.py" install` on every launch, so the `ncz-gm` command stays on PATH.
+    Windows: %LOCALAPPDATA%\\NCZ_Games_Launcher\\ncz_gm.py   Linux: ~/.local/share/NCZ_Games_Launcher/ncz_gm.py"""
+    if _ncz_profile or getattr(sys, "frozen", False):     # a packaged exe would register itself (`exe --cli`), which is wrong here
+        return
+    def _run():
+        try:
+            if sys.platform.startswith("win"):
+                script = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
+                                      "NCZ_Games_Launcher", "ncz_gm.py")
+            else:
+                script = os.path.expanduser("~/.local/share/NCZ_Games_Launcher/ncz_gm.py")
+            if not os.path.isfile(script):                # not installed there: use the copy next to main.py
+                script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncz_gm.py")
+            if not os.path.isfile(script):
+                return
+            py = shutil.which("py") or shutil.which("python3") or shutil.which("python")
+            if not py and re.match(r"^pythonw?[\d.]*(\.exe)?$", os.path.basename(sys.executable), re.I):
+                py = sys.executable          # never a launcher stub exe: running it with a script would start another launcher
+            if not py:
+                return
+            kw = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}    # CREATE_NO_WINDOW
+            subprocess.run([py, script, "install"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60, **kw)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
 # ---------------------------------------------------------------- only one launcher at a time
 def _instance_name():
     user = re.sub(r"[^A-Za-z0-9]", "", os.environ.get("USERNAME") or os.environ.get("USER") or "user")
@@ -2884,19 +2913,40 @@ def _start_instance_server(app, window=None):
         woke = False
         quit_req = False
         friends_req = False
+        friends_cli = False              # `ncz-gm shiftq`: opens the panel even with no game running
+        bigpic_req = False
+        launch_reqs = []
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
             conn.waitForReadyRead(200)
             data = bytes(conn.readAll())
             woke = woke or data == b"show"
             quit_req = quit_req or data == b"quit"
-            friends_req = friends_req or data == b"friends"
+            friends_req = friends_req or data in (b"friends", b"friends:cli")
+            friends_cli = friends_cli or data == b"friends:cli"
+            bigpic_req = bigpic_req or data == b"bigpicture"       # `ncz-gm big-pic`
+            if data.startswith(b"launch:"):          # a game's desktop shortcut was opened while the launcher is running
+                launch_reqs.append(data[7:].decode("utf-8", "replace"))
             conn.disconnectFromServer()
+        for _title in launch_reqs:
+            if window is None:                   # still starting up: main() starts it once the library exists
+                app._ncz_pending_launches = list(getattr(app, "_ncz_pending_launches", [])) + [_title]
+            else:
+                _ncz_launch_requested(app, _title)
         if friends_req:                  # `main.py --friends` from a desktop keyboard shortcut
             fo = getattr(window, "_friends_overlay", None)
             if fo is not None:
                 fo._verbose = True
+                fo._force = friends_cli
                 fo.toggle_req.emit()
+        if bigpic_req:                   # `ncz-gm big-pic`
+            def _open_bp(tries=0):
+                w = app._ncz_main_window if getattr(app, "_ncz_main_window", None) is not None else window_arg
+                if w is not None and hasattr(w, "open_big_picture"):
+                    w.open_big_picture()
+                elif tries < 60:         # still starting up
+                    QTimer.singleShot(500, lambda: _open_bp(tries + 1))
+            _open_bp()
         if quit_req:                     # a newer launcher is replacing this one
             server.close()
             QApplication.quit()
@@ -3619,8 +3669,8 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
 
     def on_accent_pick(self):
-        if _UI_STYLE_AT_START == "new":
-            return                                   # the New theme has a fixed accent
+        if _SIDE_UI:
+            return                                   # Sunset / Legacy have a fixed accent
         from PyQt6.QtWidgets import QColorDialog
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
         chosen = QColorDialog.getColor(current, self, "Pick an accent color")
@@ -3628,7 +3678,7 @@ class SettingsPage(QWidget):
             self._set_accent_setting(chosen.name())
 
     def _set_accent_setting(self, color):
-        if _UI_STYLE_AT_START == "new":
+        if _SIDE_UI:
             return                                   # the accent is fixed by the theme
         settings = load_launcher_settings()
         settings["accent_color"] = color
@@ -3644,6 +3694,7 @@ class SettingsPage(QWidget):
             if hasattr(main_win, "reload_brand_logo"):
                 main_win.reload_brand_logo()         # top-left logo
             prepare_shortcut_icon()                  # refreshes launcher.ico used by shortcuts / the taskbar menu
+            _ncz_refresh_launcher_shortcut("classic")   # delete the old desktop shortcut, add one with the new icon
 
     def on_dark_mode_changed(self):
         mode = self.dark_mode_combo.currentData()
@@ -7483,6 +7534,9 @@ def ensure_terms_accepted():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
+        import ncz_gm
+        sys.exit(ncz_gm.main(sys.argv[2:], launcher=sys.modules[__name__]))
     import traceback
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
     _ban_check_startup()                 # banned (or still locked out after logging out): crash before anything opens
@@ -7509,12 +7563,17 @@ def main():
         except Exception:
             pass
         sys.exit(0)
+    _launch_title = _ncz_launch_arg()    # a game's desktop shortcut: `main.py --launch-game <title>`
+    if _launch_title and _ncz_send_launch(_launch_title):
+        sys.exit(0)                      # the launcher is already open: it starts the game, nothing else to do here
     got_lock = _acquire_instance_lock()
     if got_lock and _another_instance_running(wake=False):
         got_lock = False             # an older launcher (one that doesn't use the lock) is already running
     if not got_lock:
         if "--startup" in sys.argv:
             sys.exit(0)  # started at login while one is already up (or starting): leave it alone
+        if _launch_title and _ncz_send_launch(_launch_title, wait=6):
+            sys.exit(0)  # a launcher is still starting up: hand the game over to it
         if not _replace_running_instance():     # close the old one and carry on starting this one
             _another_instance_running(wake=True)
             sys.exit(0)  # it wouldn't go away: bring it to the front instead
@@ -7544,8 +7603,10 @@ def main():
 
     window = AdaptiveApp()
     app._ncz_main_window = window
+    _ncz_after_window_created(app, window, _launch_title)     # game from a desktop shortcut + desktop auto-add
     _acct_watch_start(window)
     apply_startup_setting()
+    register_cli()
     lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
     set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
@@ -13944,6 +14005,7 @@ class FriendsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.verticalScrollBar().setSingleStep(60)     # default step = about one DM row per wheel notch; this scrolls several
         holder = QWidget()
         self.rows_layout = QVBoxLayout(holder)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
@@ -15101,6 +15163,7 @@ def self_update_check():
 
 # files that update from the same repo + channel (stable / nightly) as main.py
 COMPANION_FILES = [  # (file name in the repo, local path, is it a python file?)
+    ("ncz_gm.py", lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncz_gm.py"), True),   # the `ncz-gm` CLI
     ("overlay.py", lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay.py"), True),
     ("controller_input.py", lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "controller_input.py"), True),
     ("overlay_hook.dll", lambda: asset_path("overlay_hook.dll"), False),
@@ -21923,8 +21986,8 @@ def _exe_icon_png(exe, name):
         return ""
 
 def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", launch_args=None):
-    import shlex
-    launch_args = list(launch_args or [])
+    """Desktop shortcut for one library game. It opens the launcher (or tells the running one) and the launcher starts
+    the game: `main.py --launch-game <title>`. The launcher applies the game's compatibility tool and launch options itself."""
     if not exe or not os.path.exists(exe):
         QMessageBox.warning(app, "Desktop Shortcut", "Couldn't find the game's executable. Is it installed?")
         return
@@ -21933,34 +21996,23 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
     os.makedirs(desktop, exist_ok=True)
     safe = sanitize_folder_name(title) or "Game"
     try:
+        argv, workdir = _ncz_game_launch_argv(title)
         if sys.platform.startswith("win"):
             q = lambda t: t.replace("'", "''")
             lnk = os.path.join(desktop, safe + ".lnk")
             ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');"
-                  f"$s.TargetPath='{q(exe)}';$s.WorkingDirectory='{q(os.path.dirname(exe))}';"
-                  + (f"$s.Arguments='{q(subprocess.list2cmdline(launch_args))}';" if launch_args else "")
-                  + f"$s.IconLocation='{q(exe)},0';$s.Save()")
+                  f"$s.TargetPath='{q(argv[0])}';$s.WorkingDirectory='{q(workdir)}';"
+                  f"$s.Arguments='{q(subprocess.list2cmdline(argv[1:]))}';"
+                  f"$s.IconLocation='{q(exe)},0';$s.Description='{q(title)}';$s.Save()")
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             target = lnk
         else:
-            argv, cwd, extra = _launch_spec(app, exe, compat_tool)
-            if extra:
-                os.makedirs(extra["STEAM_COMPAT_DATA_PATH"], exist_ok=True)
-            script_dir = os.path.expanduser("~/.local/share/game-launcher/shortcuts")
-            os.makedirs(script_dir, exist_ok=True)
-            script = os.path.join(script_dir, re.sub(r"[^A-Za-z0-9_-]+", "_", safe) + ".sh")
-            cmd = " ".join(shlex.quote(a) for a in argv + launch_args)
-            if extra:
-                cmd = "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in extra.items()) + " " + cmd
-            with open(script, "w", encoding="utf-8") as f:
-                f.write(f"#!/bin/sh\ncd {shlex.quote(cwd)} || exit 1\nexec {cmd}\n")
-            os.chmod(script, 0o755)
             icon = _exe_icon_png(exe, safe) or (fallback_icon if fallback_icon and os.path.exists(fallback_icon) else "")
             target = os.path.join(desktop, safe + ".desktop")
             with open(target, "w", encoding="utf-8") as f:
                 f.write("[Desktop Entry]\nType=Application\n"
-                        f"Name={title}\nExec=\"{script}\"\nPath={cwd}\n"
+                        f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={workdir}\n"
                         + (f"Icon={icon}\n" if icon else "") + "Terminal=false\nCategories=Game;\n")
             os.chmod(target, 0o755)
             try:  # GNOME: mark it trusted so it launches on double-click
@@ -23344,12 +23396,19 @@ def _restart_icon():
         icon.addPixmap(pm, mode)
     return icon
 
-def restart_launcher(window):
+def restart_launcher(window, use_demo=False):
     """Starts a fresh copy of the launcher and closes this one. The new copy takes over through the normal
-    'a newer launcher replaces the running one' path, so it waits for this process to let go of the instance lock."""
+    'a newer launcher replaces the running one' path, so it waits for this process to let go of the instance lock.
+    use_demo=True (the top-right restart button) starts demo.py instead of main.py when running from source."""
     frozen = getattr(sys, "frozen", False)
     args = [a for a in sys.argv[1:] if a not in ("--startup", "--friends")]   # --startup would make it bail out
+    if "--launch-game" in args:                                               # don't start the game again after a restart
+        _i = args.index("--launch-game")
+        del args[_i:_i + 2]
     cmd = [sys.executable] + args if frozen else [sys.executable, os.path.abspath(__file__)] + args
+    demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
+    if use_demo and not frozen and not os.environ.get("APPIMAGE") and os.path.isfile(demo):
+        cmd = [sys.executable, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
     env = dict(os.environ)
     if frozen:
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # a onefile build must unpack itself again
@@ -23460,7 +23519,7 @@ def _frameless_init(self):
         "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
         "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
         "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
-    restart_btn.clicked.connect(lambda: restart_launcher(self))
+    restart_btn.clicked.connect(lambda: restart_launcher(self, use_demo=True))
     restart_btn.setIcon(_restart_icon())
     _theme_listeners.append(lambda: restart_btn.setIcon(_restart_icon()))   # redraw when the theme changes
 
@@ -24747,6 +24806,7 @@ class _FriendsOverlay(QObject):
         self.toggle_req.connect(self.open, Qt.ConnectionType.QueuedConnection)
 
     _verbose = False      # True when asked via `main.py --friends`: then say why nothing opens
+    _force = False        # True when asked via `ncz-gm shiftq`: opens even if no launcher game is running
 
     def _refuse(self, why):
         _ov_log(f"friends panel not opened: {why}")
@@ -24756,12 +24816,13 @@ class _FriendsOverlay(QObject):
 
     def open(self):
         _ov_log("friends panel requested")
+        force, self._force = self._force, False
         if self.panel is not None and self.panel.isVisible():
             self.close()                 # Shift+Q again closes it
             return
         if get_overlay_mode() == "off":
             return self._refuse("the game overlay is set to Off in Settings")
-        if not (_now_playing["name"] or _running):
+        if not force and not (_now_playing["name"] or _running):
             return self._refuse("no game started from the launcher is running")   # only while a launcher game runs
         if load_account() is None:
             return self._refuse("you are not logged in")
@@ -29016,17 +29077,21 @@ def _active_theme_key():
     return ""
 
 def _ui_read_style():
+    """"new" = New (default), "sunset" = purple/orange, "classic" = original top-bar look with a free accent colour, "legacy" = side list + mint."""
     if _locked_theme_key():
-        return "new"                       # account themes ride on the new layout
-    return "new"                           # Classic was removed; an old saved "classic" is ignored
+        return "new"                       # account themes ride on the Sunset layout
+    choice = _raw_setting("ui_theme_choice")
+    return choice if choice in ("sunset", "classic", "legacy") else "new"
 
 _UI_STYLE_AT_START = _ui_read_style()
+_SIDE_UI = _UI_STYLE_AT_START in ("new", "sunset", "legacy")     # layouts with the left navigation list and a fixed accent
 
 _ui_prev_load_settings = load_launcher_settings
 def load_launcher_settings():
     s = _ui_prev_load_settings()          # the original drops unknown keys, so carry ui_style through it
     s["ui_style"] = _ui_read_style()
     s["ui_theme"] = _raw_setting("ui_theme") or ""
+    s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
     return s
 
 SUNSET_THEME = dict(      # the "New" theme: same colours as the sign-in window (black fading to grey, white accent)
@@ -29103,7 +29168,7 @@ def _ui_apply_sunset():
     try:
         import overlay as _overlay_mod
         _overlay_mod.set_light(False)
-        _overlay_mod.set_sunset(True)
+        _overlay_mod.set_sunset(_UI_STYLE_AT_START == "new")
         _overlay_mod.set_accent(theme["accent"])
     except Exception:
         pass
@@ -29234,7 +29299,110 @@ _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEM
                                    icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_kablooey.png",
                                               "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_kablooey.png?raw=true"])
 
-_ACTIVE_THEME_AT_START = _active_theme_key()
+# ---------------------------------------------------------------- Legacy theme (side list, mint green)
+_LEGACY_MINT = "#12e87c"
+_LEGACY_THEME = dict(SUNSET_THEME,
+    bg="#121214", sidebar="#151517", panel="#18181b", input="#0f0f11", border="#26262a", on_accent="#ffffff",
+    text="#f2f2f4", subtext="#9a9aa2", accent=_LEGACY_MINT, accent_hover="#3cf296", accent_press="#0cc466",
+    button="#222226", button_hover="#2c2c31", disabled_bg="#18181b", disabled_text="#55555c", handle="#34343a",
+    hover="#1c1c20", red=_LEGACY_MINT, red_hover="#3cf296", red_press="#0cc466", accent_fill="rgba(18,232,124,0.16)",
+    nav_text="#c9c9cf", nav_active="#ffffff", brand="#ffffff", sidebar_border="#232326",
+    nav_fill="rgba(255,255,255,0.05)", nav_fill_hover="rgba(255,255,255,0.09)")
+_LEGACY_EXTRA = """
+QFrame#SideRail { background: #151517; border-right: 1px solid #232326; }
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: #c9c9cf; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 30px; min-height: 48px; font-size: 14px; font-weight: normal;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.05); color: #ffffff; }
+QFrame#SideRail QPushButton#NavButton:checked { background: #212124; color: #ffffff; border: none; border-left: 3px solid #12e87c; }
+QPushButton#Primary { color: #ffffff; border-radius: 6px; font-weight: bold; }
+QPushButton#Primary:disabled { background: #2c2c31; color: #777777; }
+QLabel#Avatar, QLabel#AvatarLarge, QLabel#SyncAvatar { color: #ffffff; }
+QMenu::item:selected { color: #ffffff; }
+QPushButton#Danger:hover, QPushButton#Uninstall:hover { background: #12e87c; color: #ffffff; }
+QLineEdit, QTextEdit { selection-background-color: #12e87c; selection-color: #ffffff; }
+QComboBox QAbstractItemView { selection-background-color: #12e87c; selection-color: #ffffff; }
+"""
+
+# ---------------------------------------------------------------- Sunset theme (purple night sky, orange accent)
+_SS_THEME = dict(SUNSET_THEME,
+    bg="#150b30", sidebar="#0f0824", panel="#1e1142", input="#140a2e", border="#2e1a5c", on_accent="#ffffff",
+    text="#ffffff", subtext="#9d93bd", accent="#ff7a2f", accent_hover="#ff9650", accent_press="#e0561a",
+    button="#2a1857", button_hover="#382270", disabled_bg="#1a0f3a", disabled_text="#5f5585", handle="#43308a",
+    hover="#241350", red="#ff7a2f", red_hover="#ff9650", red_press="#e0561a", accent_fill="rgba(255,122,47,0.18)",
+    nav_text="#b6add4", nav_active="#ffffff", brand="#ffffff", sidebar_border="#241350",
+    nav_fill="rgba(255,255,255,0.06)", nav_fill_hover="rgba(255,255,255,0.12)")
+_SS_EXTRA = """
+QMainWindow, QWidget#Content, QWidget#GridContainer {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0f0826, stop:0.55 #1a0d3c, stop:1 #2c1148);
+}
+QWidget#GridContainer { background: transparent; }
+QFrame#Sidebar { background: #0f0824; border-bottom: 1px solid #241350; }
+QFrame#SideRail {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0d0620, stop:1 #1a0a35); border-right: 1px solid #241350;
+}
+QFrame#SideRail QPushButton#NavButton {
+    background: transparent; color: #b6add4; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}
+QFrame#SideRail QPushButton#NavButton:hover { background: rgba(255,255,255,0.07); color: #ffffff; }
+QFrame#SideRail QPushButton#NavButton:checked {
+    color: #ffffff; border: none; border-left: 3px solid #ff7a2f;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(255,122,47,0.38), stop:1 rgba(255,122,47,0));
+}
+QPushButton#Primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8f45, stop:1 #f0501e); border-radius: 8px; color: #ffffff; font-weight: bold;
+}
+QPushButton#Primary:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffa05c, stop:1 #ff6030); }
+QPushButton#Primary:pressed { background: #e0561a; }
+QPushButton#Primary:disabled { background: #2a1857; color: #6f64a0; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8f45, stop:1 #f0501e); border-radius: 3px;
+}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard { background: rgba(255,255,255,0.05); border: 1px solid rgba(130,90,230,0.35); }
+QFrame#GameCard { background: rgba(255,255,255,0.04); border: 1px solid rgba(130,90,230,0.30); border-radius: 14px; }
+QFrame#GameCard:hover { background: rgba(255,255,255,0.08); border: 1px solid #ff7a2f; }
+QFrame#ToolBar, QFrame#SidePanel { background: rgba(255,255,255,0.05); border: 1px solid rgba(130,90,230,0.35); border-radius: 16px; }
+QFrame#ToolBar QLabel, QFrame#SidePanel QLabel { background: transparent; border: none; }
+QFrame#ToolBar QLineEdit#Search { border-radius: 20px; background: rgba(255,255,255,0.07); }
+QLabel#PaneHeader { color: #9d93bd; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
+QPushButton#Danger:hover, QPushButton#Uninstall:hover { background: #ff7a2f; color: #ffffff; }
+QLineEdit, QTextEdit { selection-background-color: #ff7a2f; selection-color: #ffffff; }
+QComboBox QAbstractItemView { selection-background-color: #ff7a2f; selection-color: #ffffff; }
+"""
+
+def _legacy_icon_path():
+    """Classic icon (assets/icon-cl.png) with the N and the glow turned mint; white outline, stars and sky stay.
+    Generated once, cached in the config folder."""
+    src = os.path.join(ASSETS_DIR, "icon-cl.png")
+    if not os.path.isfile(src):
+        return ""
+    try:
+        dest = os.path.join(os.path.dirname(get_launcher_settings_path()), f"icon_legacy_v3_{os.path.getsize(src)}.png")
+        if os.path.isfile(dest):
+            return dest
+        img = _hue_shift_icon(src, QColor(_LEGACY_MINT).hueF(), 1.3, 512)
+        if img is None:
+            return ""
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        img.save(dest, "PNG")
+        return dest
+    except Exception:
+        return ""
+
+def _theme_icon_file(kind):
+    """Icon shown for a theme: new -> icon.png, sunset -> icon-ss.png, classic -> icon-cl.png, legacy -> mint version of classic."""
+    if kind == "legacy":
+        return _legacy_icon_path()
+    f = os.path.join(ASSETS_DIR, {"sunset": "icon-ss.png", "new": "icon.png"}.get(kind, "icon-cl.png"))
+    return f if os.path.isfile(f) else ""
+
+_ACTIVE_THEME_AT_START = _active_theme_key() if _UI_STYLE_AT_START == "new" else ""
+if _UI_STYLE_AT_START in ("legacy", "sunset"):
+    SUNSET_THEME, _SUNSET_EXTRA = (_LEGACY_THEME, _LEGACY_EXTRA) if _UI_STYLE_AT_START == "legacy" else (_SS_THEME, _SS_EXTRA)
+    SUNSET_ACCENT = SUNSET_THEME["accent"]
+    THEMES["dark"].update(SUNSET_THEME)
 if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the one an admin account picked
     _look = _ACCOUNT_THEMES[_ACTIVE_THEME_AT_START]
     SUNSET_THEME, _SUNSET_EXTRA = _look["theme"], _look["extra"]
@@ -29245,18 +29413,18 @@ if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the
 _ui_prev_set_accent = set_accent
 def set_accent(color):
     """The theme always uses its own accent (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
-    _ui_prev_set_accent(SUNSET_ACCENT if _UI_STYLE_AT_START == "new" else color)
+    _ui_prev_set_accent(SUNSET_ACCENT if _SIDE_UI else color)
 
 _ui_prev_apply_accent_to_icon = apply_accent_to_icon
 def apply_accent_to_icon(color):
-    if _UI_STYLE_AT_START == "new":
+    if _SIDE_UI:
         return False                                 # the theme icon is never recoloured
     return _ui_prev_apply_accent_to_icon(color)
 
 _ui_prev_apply_dark_mode = apply_dark_mode
 def apply_dark_mode(mode):
     _ui_prev_apply_dark_mode(mode)
-    if _UI_STYLE_AT_START == "new":
+    if _SIDE_UI:
         _ui_apply_sunset()                # the theme is always dark
 
 # Icons: the UI always uses assets/icon.png (or the active account theme's own icon).
@@ -29297,10 +29465,17 @@ def _ensure_theme_icon(entry):
 _ui_prev_asset_path = asset_path
 def asset_path(filename):
     if filename == "icon.png":
+        if _UI_STYLE_AT_START == "legacy":
+            return _legacy_icon_path() or os.path.join(ASSETS_DIR, "icon.png")
+        if _UI_STYLE_AT_START == "sunset":
+            return _theme_icon_file("sunset") or os.path.join(ASSETS_DIR, "icon.png")
         if _UI_STYLE_AT_START == "new":
             themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the active theme's own icon
             return themed or os.path.join(ASSETS_DIR, "icon.png")
         if not os.path.exists(accent_icon_path()):
+            cl = _theme_icon_file("classic")             # Classic: icon-cl.png until the accent colour is changed
+            if cl:
+                return cl
             old = os.path.join(ASSETS_DIR, "icon_default.png")
             if os.path.exists(old):
                 return old
@@ -29312,7 +29487,7 @@ def _ui_reload_brand_logo(self):
     pm = QPixmap(asset_path("icon.png"))
     if pm.isNull():
         return _ui_prev_reload_brand_logo(self)
-    side = int(min(pm.width(), pm.height()) * 0.58)
+    side = int(min(pm.width(), pm.height()) * (1.0 if _UI_STYLE_AT_START == "sunset" else 0.58))
     pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
     pm = pm.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
     out = QPixmap(64, 64)
@@ -29328,7 +29503,7 @@ def _ui_reload_brand_logo(self):
     self.brand_logo.setVisible(True)
     self.brand_logo.setPixmap(out)
 
-if _UI_STYLE_AT_START == "new":
+if _UI_STYLE_AT_START in ("new", "sunset"):
     AdaptiveApp.reload_brand_logo = _ui_reload_brand_logo
 
 class _UiRailLayout(QVBoxLayout):
@@ -29353,7 +29528,7 @@ def _ui_move_nav_to_rail(self):
     bl.setSpacing(0)
     rail = QFrame()
     rail.setObjectName("SideRail")
-    rail.setFixedWidth(208)
+    rail.setFixedWidth(236 if _UI_STYLE_AT_START == "legacy" else 208)
     rv = _UiRailLayout(rail)
     rv.setContentsMargins(0, 16, 0, 16)
     rv.setSpacing(2)
@@ -29365,7 +29540,7 @@ def _ui_move_nav_to_rail(self):
     for w in items:
         if isinstance(w, QPushButton):
             w.setFixedHeight(44)
-            w.setIconSize(QSize(18, 18))
+            w.setIconSize(QSize(1, 1) if _UI_STYLE_AT_START == "legacy" else QSize(18, 18))   # Legacy: text-only list
             rv.addWidget(w)
             prev = w
         elif prev is not None:                           # the red unread badge: sits on the right end of the Friends tab
@@ -29389,9 +29564,9 @@ def _ui_add_setting(self):
     row = QHBoxLayout()
     col = QVBoxLayout()
     col.setSpacing(2)
-    title = QLabel("Interface Style")
+    title = QLabel("Theme")
     title.setObjectName("RowTitle")
-    desc = QLabel("New: the default look with a side navigation bar. Needs a restart.")
+    desc = QLabel("New, Sunset, Classic (pick your own accent colour) or Legacy. Needs a restart.")
     desc.setObjectName("RowDesc")
     desc.setWordWrap(True)
     col.addWidget(title)
@@ -29401,7 +29576,10 @@ def _ui_add_setting(self):
     combo.addItem("New", "new")
     for key in _allowed_theme_keys():      # account themes this account may use (admin accounts get all of them)
         combo.addItem(_ACCOUNT_THEMES[key]["label"], key)
-    start_data = _active_theme_key() or _UI_STYLE_AT_START
+    combo.addItem("Sunset", "sunset")
+    combo.addItem("Classic", "classic")
+    combo.addItem("Legacy", "legacy")
+    start_data = _UI_STYLE_AT_START if _UI_STYLE_AT_START in ("sunset", "classic", "legacy") else (_active_theme_key() or "new")
     combo.setCurrentIndex(max(0, combo.findData(start_data)))
     if _custom_theme_locked():             # this account's theme is fixed
         key = _locked_theme_key()
@@ -29418,10 +29596,12 @@ def _ui_add_setting(self):
         d = combo.currentData()
         s = load_launcher_settings()
         s["ui_style"] = "new"
+        s["ui_theme_choice"] = d if d in ("sunset", "classic", "legacy") else "new"
         s["ui_theme"] = d if d in _ACCOUNT_THEMES else ""
         save_launcher_settings(s)
+        _ncz_refresh_launcher_shortcut(d)               # delete the old desktop shortcut, add one with the new theme's icon
         if d != start_data:
-            QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new interface style.")
+            QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new theme.")
     combo.currentIndexChanged.connect(changed)
     row.addLayout(col, 1)
     row.addWidget(combo)
@@ -29429,7 +29609,7 @@ def _ui_add_setting(self):
     lay.insertSpacing(1, 12)
     lay.insertSpacing(3, 12)
     sp.ui_style_combo = combo
-    if _UI_STYLE_AT_START == "new":
+    if _SIDE_UI:
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
         sp.accent_desc.setText("Locked to your custom theme." if _custom_theme_locked() else
@@ -29541,6 +29721,215 @@ def _ui_add_bridge_setting(self):
     if btn.isChecked():
         _bridge_set_running(True)
 
+# ---------------------------------------------------------------- theme picker (first launch)
+from PyQt6.QtGui import QLinearGradient as _QLG
+from PyQt6.QtCore import QRectF as _QRF
+from PyQt6.QtWidgets import QDialog as _QD, QButtonGroup as _QBG
+
+class _ThemePreview(QWidget):
+    """Small painted mock-up of a theme (no image files needed)."""
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.setFixedSize(190, 118)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        k = self.kind
+        p.setPen(Qt.PenStyle.NoPen)
+        if k == "sunset":
+            g = _QLG(0, 0, 0, h)
+            for pos, col in ((0, "#0f0826"), (0.55, "#1a0d3c"), (1, "#2c1148")):
+                g.setColorAt(pos, QColor(col))
+            p.fillRect(0, 0, w, h, g)
+            rail, card, btn, bar, hi = QColor("#0d0620"), QColor(255, 255, 255, 14), QColor("#ff7a2f"), QColor("#6a5aa0"), QColor("#ff7a2f")
+            left, top = 44, 0
+        elif k == "new":
+            g = _QLG(0, 0, 0, h)
+            for pos, col in ((0, "#000000"), (0.45, "#080808"), (0.7, "#282828"), (1, "#8a8a8a")):
+                g.setColorAt(pos, QColor(col))
+            p.fillRect(0, 0, w, h, g)
+            rail, card, btn, bar, hi = QColor("#050505"), QColor(255, 255, 255, 20), QColor("#fcfcfc"), QColor("#8a8a8a"), QColor("#ffffff")
+            left, top = 52, 0
+        elif k == "classic":
+            p.fillRect(0, 0, w, h, QColor("#0d0d0f"))
+            rail, card, btn, bar, hi = QColor("#050506"), QColor("#151518"), QColor("#a666ff"), QColor("#55555c"), QColor("#a666ff")
+            left, top = 0, 22
+        else:
+            p.fillRect(0, 0, w, h, QColor("#121214"))
+            rail, card, btn, bar, hi = QColor("#151517"), QColor("#18181b"), QColor("#12e87c"), QColor("#55555c"), QColor("#12e87c")
+            left, top = 56, 0
+        if k == "classic":
+            p.fillRect(0, 0, w, top, rail)
+            for i in range(5):
+                p.setBrush(bar)
+                p.drawRoundedRect(_QRF(14 + i * 34, 9, 24, 4), 2, 2)
+            p.setBrush(hi)
+            p.drawRect(_QRF(14 + 2 * 34, 19, 24, 3))
+        else:
+            p.fillRect(0, 0, left, h, rail)
+            for i in range(5):
+                p.setBrush(hi if i == 0 else bar)
+                p.drawRoundedRect(_QRF(10, 16 + i * 16, left - 20, 5), 2, 2)
+            if k == "legacy":
+                p.setBrush(hi)
+                p.drawRect(_QRF(0, 12, 3, 13))
+        n, gap = 3, 8
+        area_w, area_h = w - left, h - top
+        cw = (area_w - gap * (n + 1)) / n
+        for i in range(n):
+            x = left + gap + i * (cw + gap)
+            y = top + gap + 6
+            ch = area_h - 2 * gap - 6
+            p.setBrush(card)
+            p.drawRoundedRect(_QRF(x, y, cw, ch), 6, 6)
+            p.setBrush(QColor(255, 255, 255, 18))
+            p.drawRoundedRect(_QRF(x + 5, y + 5, cw - 10, ch - 34), 4, 4)
+            p.setBrush(btn)
+            p.drawRoundedRect(_QRF(x + 5, y + ch - 22, cw - 10, 14), 4, 4)
+        p.end()
+
+class _ThemePickDialog(_QD):
+    _INFO = (("new", "New", "Black-to-grey gradient, side navigation."),
+             ("sunset", "Sunset", "Purple night sky with an orange accent, side navigation."),
+             ("classic", "Classic", "Top navigation bar. Choose your own accent colour in Settings."),
+             ("legacy", "Legacy", "Simple side list with a mint green accent."))
+
+    def __init__(self, parent=None, current="new"):
+        super().__init__(parent)
+        self.setWindowTitle("Choose your theme")
+        self.setModal(True)
+        self.choice = current
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(14)
+        head = QLabel("Choose your theme")
+        head.setStyleSheet("font-size:20px; font-weight:bold;")
+        sub = QLabel("You can change it any time in Settings (a restart applies it).")
+        sub.setStyleSheet("color:#8d8d96;")
+        lay.addWidget(head)
+        lay.addWidget(sub)
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self._group = _QBG(self)
+        for key, name, desc in self._INFO:
+            b = QPushButton()
+            b.setCheckable(True)
+            b.setFixedSize(222, 270)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet("QPushButton{border:2px solid rgba(128,128,128,0.35); border-radius:12px; background:transparent;}"
+                            "QPushButton:hover{border:2px solid rgba(128,128,128,0.7);}"
+                            "QPushButton:checked{border:2px solid palette(link);}")
+            v = QVBoxLayout(b)
+            v.setContentsMargins(14, 12, 14, 12)
+            v.setSpacing(6)
+            top = QHBoxLayout()
+            icon = QLabel()
+            icon.setFixedSize(34, 34)
+            f = _theme_icon_file(key)
+            if f:
+                pm = QPixmap(f)
+                if not pm.isNull():
+                    icon.setPixmap(pm.scaled(34, 34, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            title = QLabel(name)
+            title.setStyleSheet("font-size:15px; font-weight:bold; background:transparent;")
+            top.addWidget(icon)
+            top.addWidget(title, 1)
+            v.addLayout(top)
+            v.addWidget(_ThemePreview(key), 0, Qt.AlignmentFlag.AlignHCenter)
+            d = QLabel(desc)
+            d.setWordWrap(True)
+            d.setStyleSheet("color:#8d8d96; font-size:11px; background:transparent;")
+            v.addWidget(d)
+            v.addStretch()
+            for child in (icon, title, d):
+                child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self._group.addButton(b)
+            b.setChecked(key == current)
+            b.clicked.connect(lambda _=False, k=key: setattr(self, "choice", k))
+            row.addWidget(b)
+        lay.addLayout(row)
+        go = QPushButton("Continue")
+        go.setObjectName("Primary")
+        go.setFixedHeight(38)
+        go.clicked.connect(self.accept)
+        lay.addWidget(go)
+
+def _ui_first_run_theme(win):
+    """First launch: choose a theme with previews. Closing the window keeps the default (New)."""
+    try:
+        if _raw_setting("ui_theme_choice"):
+            return
+        dlg = _ThemePickDialog(win if win.isVisible() else None, "new")
+        dlg.exec()
+        choice = dlg.choice if dlg.result() else "new"
+        s = load_launcher_settings()
+        s["ui_theme_choice"] = choice
+        save_launcher_settings(s)
+        running = _UI_STYLE_AT_START
+        if choice != running:
+            restart_launcher(win)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+def _ui_unify_friends_scroll(self):
+    """Friends page (every theme except New): the friend code, phone switches, Activity and Group chats stayed pinned while
+    only the friends list scrolled in a small box. Put the whole page in ONE scroll area instead."""
+    fp = self.friends_page
+    page = fp.stack.widget(0)
+    lay = page.layout()
+    holder = fp.rows_layout.parentWidget()
+    inner = holder.parentWidget() if holder is not None else None
+    while inner is not None and not isinstance(inner, QScrollArea):
+        inner = inner.parentWidget()
+    if inner is None or lay.indexOf(inner) < 0:
+        return
+    idx = lay.indexOf(inner)
+    inner.takeWidget()                                   # the rows holder leaves its own scroll box ...
+    lay.removeWidget(inner)
+    inner.hide()
+    inner.deleteLater()
+    lay.insertWidget(idx, holder)                        # ... and sits in the page like the other sections
+    outer_page = QWidget()
+    ol = QVBoxLayout(outer_page)
+    m = lay.contentsMargins()
+    ol.setContentsMargins(m.left(), m.top(), 12, m.bottom())
+    ol.setSpacing(lay.spacing() if lay.spacing() >= 0 else 6)
+    while lay.count():
+        item = lay.takeAt(0)
+        if item.widget() is not None:
+            ol.addWidget(item.widget())
+        elif item.layout() is not None:
+            ol.addLayout(item.layout())
+        else:
+            ol.addItem(item)
+    ol.addStretch()
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.Shape.NoFrame)
+    sa.setWidget(outer_page)
+    sa.verticalScrollBar().setSingleStep(60)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(sa)
+
+def _ui_refresh_shortcut_icon():
+    """If the user made a desktop shortcut earlier, re-point it at the current theme's icon (runs in the background)."""
+    try:
+        marker = _shortcut_marker()
+        if not os.path.isfile(marker):
+            return                           # no shortcut was created from here
+        icon = prepare_shortcut_icon()
+        with open(marker, encoding="utf-8") as f:
+            old = f.read().strip()
+        if icon and os.path.basename(icon) != old:
+            create_desktop_shortcut()
+    except Exception:
+        pass
+
 _ui_prev_init = AdaptiveApp.__init__
 def _ui_init(self):
     _ui_prev_init(self)
@@ -29557,11 +29946,19 @@ def _ui_init(self):
         _ui_add_bridge_setting(self)
     except Exception:
         traceback.print_exc()
-    if _UI_STYLE_AT_START == "new":
+    if _SIDE_UI:
         try:
             _ui_move_nav_to_rail(self)
         except Exception:
             traceback.print_exc()
+    _ncz_refresh_launcher_shortcut(only_if_changed=True)
+    if _UI_STYLE_AT_START != "new":
+        try:
+            _ui_unify_friends_scroll(self)
+        except Exception:
+            traceback.print_exc()
+    if not _raw_setting("ui_theme_choice") and not _custom_theme_locked():
+        QTimer.singleShot(700, lambda: _ui_first_run_theme(self))      # first launch: pick a theme
 AdaptiveApp.__init__ = _ui_init
 
 # ---------------------------------------------------------------- Sunset UI: layout touches + fade animations
@@ -36538,7 +36935,7 @@ def _ch_sync_launcher_look(page):
     """Put the chess look on the whole launcher while `page` is the page on screen, and take it off again when it isn't."""
     global SUNSET_THEME, _SUNSET_EXTRA
     try:
-        if globals().get("_UI_STYLE_AT_START") != "new":
+        if not globals().get("_SIDE_UI"):
             return
         pages = getattr(page.window(), "pages", None)
         th = _ch_cur_theme()
@@ -40408,6 +40805,39 @@ def _bp_app_details(appid):
             "dev": ", ".join(d.get("developers") or [])}
 
 
+_BP_LINUX_BOLD_TARGET = 500     # how heavy Big Picture "bold" text is on Linux (500 = Medium, 600 = SemiBold, 700 = Bold)
+_bp_bold_cache = {}
+
+def _bp_bold_weight(family):
+    """Linux only: the weight to use for Big Picture bold text, or None to leave Qt's normal bold alone (Windows).
+    Windows draws bold from the regular face with a light simulated bold, but on Linux Qt finds the font's real Bold
+    (or adds a much heavier fake one), so the same text looks far heavier. Here bold is the real face closest to
+    _BP_LINUX_BOLD_TARGET, so no fake embolden is ever added. Raise or lower the target to taste."""
+    if sys.platform.startswith("win"):
+        return None
+    if family in _bp_bold_cache:
+        return _bp_bold_cache[family]
+    result = None
+    try:
+        weights = []
+        for style in QFontDatabase.styles(family):
+            try:
+                w = int(QFontDatabase.weight(family, style))
+                w = min(range(100, 1000, 100), key=lambda v: abs(v - w))     # QFont.Weight only takes 100, 200 ... 900
+            except Exception:
+                continue
+            if w > 0 and w not in weights:
+                weights.append(w)
+        if weights:
+            result = min(weights, key=lambda w: (abs(w - _BP_LINUX_BOLD_TARGET), w))
+        else:
+            result = _BP_LINUX_BOLD_TARGET
+    except Exception:
+        result = None
+    _bp_bold_cache[family] = result
+    return result
+
+
 class _BigPicture(QWidget):
     LIB_TH = 0.36           # library tile height as a fraction of the window height
 
@@ -41157,7 +41587,11 @@ class _BigPicture(QWidget):
     def _font(self, px, bold=False):
         f = QFont(self.font())
         f.setPixelSize(max(9, int(px)))
-        f.setBold(bold)
+        w = _bp_bold_weight(f.family()) if bold else None
+        if w is not None:
+            f.setWeight(QFont.Weight(w))        # Linux: a real face, never Qt's heavy fake bold
+        else:
+            f.setBold(bold)
         return f
 
     def _make_tile(self, src, title, W, H, dpr):
@@ -41346,9 +41780,9 @@ class _BigPicture(QWidget):
         if self._kb is not None:
             hint = "Arrows  Move      A  Type      X  Delete      Y  Space      LB  Shift      RB  123      Start  Done      B  Close"
         elif self._detail is not None:
-            hint = "Left / Right  Choose      A / Enter  Select      B / Esc  Close"
+            hint = "Left / Right  Choose      A / Enter  Select      Y  Reviews      B / Esc  Close"
         elif self._tab == 0:
-            hint = "Left / Right  Browse      A / Enter  Launch      X  Game options      LB / RB  Switch tab      B / Esc  Exit"
+            hint = "Left / Right  Browse      A / Enter  Launch      X  Game options      Y  Library view      LB / RB  Switch tab      B / Esc  Exit"
         elif self._tab == 1:
             hint = "Arrows  Browse      A / Enter  Details      Y or type  Search      LB / RB  Switch tab      B / Esc  Back"
         else:
@@ -46916,6 +47350,2809 @@ def _ncz_logo_bp_st(self, p, w, h, acc):
 
 _BigPicture._paint_st = _ncz_logo_bp_st
 
+
+
+# ================================================================ library: favorites / hidden / recently played
+from PyQt6.QtWidgets import QCheckBox as _LbCheck, QSpinBox as _LbSpin, QDoubleSpinBox as _LbDSpin, QDialogButtonBox as _LbBtns
+
+def _lbmeta_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "library_meta.json")
+
+_lbmeta_cache = {"d": None}
+
+def lbmeta():
+    if _lbmeta_cache["d"] is None:
+        try:
+            with open(_lbmeta_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        d.setdefault("fav", []); d.setdefault("hidden", []); d.setdefault("last", {})
+        _lbmeta_cache["d"] = d
+    return _lbmeta_cache["d"]
+
+def lbmeta_save():
+    try:
+        os.makedirs(os.path.dirname(_lbmeta_path()), exist_ok=True)
+        with open(_lbmeta_path(), "w", encoding="utf-8") as f:
+            json.dump(lbmeta(), f)
+    except Exception:
+        pass
+
+def lb_toggle(kind, title):
+    lst = lbmeta()[kind]
+    if title in lst:
+        lst.remove(title)
+    else:
+        lst.append(title)
+    lbmeta_save()
+
+def lb_last(title):
+    return lbmeta()["last"].get(title.casefold(), 0)
+
+_lb_prev_track = _track_playing
+
+def _track_playing(name, proc, folder=None):     # remembers when each game was last launched
+    _lb_prev_track(name, proc, folder)
+    try:
+        now = int(time.time())
+        for n in {name, pretty_game_name(name)}:
+            lbmeta()["last"][str(n).casefold()] = now
+        lbmeta_save()
+    except Exception:
+        pass
+
+_LB_VIEWS = (("All games", "all"), ("Favorites", "fav"), ("Recently played", "recent"), ("Hidden", "hidden"))
+_lb_view = {"mode": "all"}
+
+def _lb_keep(title):
+    m, meta = _lb_view["mode"], lbmeta()
+    if m == "fav":
+        return title in meta["fav"]
+    if m == "hidden":
+        return title in meta["hidden"]
+    if m == "recent":
+        return lb_last(title) > 0 and title not in meta["hidden"]
+    return title not in meta["hidden"]
+
+def _lb_sorted(items):
+    if _lb_view["mode"] == "recent":
+        return sorted(items, key=lambda it: -lb_last(it[1]))
+    return items
+
+def _lb_decorate(self, card, title):
+    """Star badge, added once per card. Favorite / hide / screenshots live in the card's 3-dot menu (see _bpf_decorate)."""
+    if card.property("_lb_ready") is None:
+        card.setProperty("_lb_ready", True)
+        badge = QLabel("★", card)
+        badge.setStyleSheet("background: rgba(0,0,0,150); color: #ffc83d; border-radius: 10px; font-size: 14px;")
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedSize(20, 20)
+        badge.move(14, 14)
+        card._lb_badge = badge
+        card.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)      # no right-click menu: everything is in the ••• menu
+    card._lb_badge.setVisible(title in lbmeta()["fav"])
+    card._lb_badge.raise_()
+
+_lb_prev_apply_filter = AdaptiveApp.apply_filter
+
+def _lb_apply_filter(self, text=""):
+    fan = getattr(self, "fan_lib_list", None)
+    orig_main, orig_fan = list(self.cards), (list(fan) if fan is not None else None)
+    try:
+        for c, t in orig_main + (orig_fan or []):
+            _lb_decorate(self, c, t)
+        if _lb_view["mode"] != "all" or lbmeta()["hidden"]:
+            # filtered cards are simply left out of this layout pass; the real lists are restored below
+            self.cards[:] = _lb_sorted([it for it in orig_main if _lb_keep(it[1])])
+            if fan is not None:
+                fan[:] = _lb_sorted([it for it in orig_fan if _lb_keep(it[1])])
+        return _lb_prev_apply_filter(self, text)
+    finally:
+        self.cards[:] = orig_main
+        if fan is not None:
+            fan[:] = orig_fan
+        for c, t in orig_main + (orig_fan or []):
+            if not _lb_keep(t):
+                c.hide()
+
+AdaptiveApp.apply_filter = _lb_apply_filter
+
+_lb_prev_init = AdaptiveApp.__init__
+
+def _lb_init(self):
+    _lb_prev_init(self)
+    try:
+        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+        idx = header.indexOf(self.search_edit)
+        combo = QComboBox()
+        combo.setFixedHeight(36)
+        combo.setToolTip("Show favorites, recently played or hidden games. Use a game's ••• menu to favorite or hide it.")
+        for label, key in _LB_VIEWS:
+            combo.addItem(label, key)
+        def changed(_i):
+            _lb_view["mode"] = combo.currentData()
+            self.apply_filter(self.search_edit.text())
+        combo.currentIndexChanged.connect(changed)
+        header.insertWidget(idx, combo)
+        header.insertSpacing(idx + 1, 8)
+        self.lib_view_combo = combo
+        self.apply_filter(self.search_edit.text())
+    except Exception:
+        pass
+
+AdaptiveApp.__init__ = _lb_init
+
+# ================================================================ downloads: speed limit, schedule, pause all
+def _dl_limits_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "download_limits.json")
+
+_dl_lim = {"d": None, "t": 0.0, "next": 0.0, "lock": threading.Lock()}
+
+def dl_limits():
+    """{'mb_s': float (0 = unlimited), 'sched': bool, 'from': hour, 'to': hour}; re-read every few seconds."""
+    if _dl_lim["d"] is None or time.time() - _dl_lim["t"] > 3:
+        d = {"mb_s": 0.0, "sched": False, "from": 1, "to": 8}
+        try:
+            with open(_dl_limits_path(), encoding="utf-8") as f:
+                d.update(json.load(f))
+        except Exception:
+            pass
+        _dl_lim["d"], _dl_lim["t"] = d, time.time()
+    return _dl_lim["d"]
+
+def dl_limits_save(d):
+    try:
+        os.makedirs(os.path.dirname(_dl_limits_path()), exist_ok=True)
+        with open(_dl_limits_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+    _dl_lim["d"], _dl_lim["t"] = d, time.time()
+
+def _dl_in_window(d):
+    h, a, b = time.localtime().tm_hour, int(d["from"]), int(d["to"])
+    return True if a == b else (a <= h < b if a < b else (h >= a or h < b))
+
+def _dl_throttle(n, w=None):
+    """Called after every chunk: holds the download until the schedule window opens, then paces it to the speed limit."""
+    d = dl_limits()
+    if d.get("sched") and not _dl_in_window(d):
+        try:
+            w.status_update.emit(f"Waiting for the download window ({int(d['from']):02d}:00 to {int(d['to']):02d}:00)...")
+        except Exception:
+            pass
+        while not _dl_in_window(dl_limits()) and dl_limits().get("sched"):
+            if w is not None and _dl_cancelled(w):
+                return
+            time.sleep(1)
+    limit = float(d.get("mb_s") or 0) * 1048576
+    if limit > 0:
+        with _dl_lim["lock"]:                        # one shared budget for all running downloads
+            now = time.time()
+            start = max(_dl_lim["next"], now)
+            _dl_lim["next"] = start + n / limit
+            wait = start - now
+        if wait > 0:
+            time.sleep(min(wait, 3))
+
+class _DlLimitsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download limits")
+        d = dl_limits()
+        form = QFormLayout(self)
+        self.speed = _LbDSpin(); self.speed.setRange(0, 1000); self.speed.setDecimals(1); self.speed.setSuffix(" MB/s")
+        self.speed.setSpecialValueText("Unlimited"); self.speed.setValue(float(d["mb_s"]))
+        self.sched = _LbCheck("Only download between these hours"); self.sched.setChecked(bool(d["sched"]))
+        self.a = _LbSpin(); self.a.setRange(0, 23); self.a.setValue(int(d["from"])); self.a.setSuffix(":00")
+        self.b = _LbSpin(); self.b.setRange(0, 23); self.b.setValue(int(d["to"])); self.b.setSuffix(":00")
+        form.addRow("Speed limit", self.speed)
+        form.addRow(self.sched)
+        form.addRow("From", self.a)
+        form.addRow("Until", self.b)
+        bb = _LbBtns(_LbBtns.StandardButton.Save | _LbBtns.StandardButton.Cancel)
+        bb.accepted.connect(self._save); bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _save(self):
+        dl_limits_save({"mb_s": self.speed.value(), "sched": self.sched.isChecked(),
+                        "from": self.a.value(), "to": self.b.value()})
+        self.accept()
+
+def _dl_all_cards(page):
+    lay = page.container_layout
+    return [lay.itemAt(i).widget() for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), DownloadCard)]
+
+def _dl_pause_all(page, pause):
+    for c in _dl_all_cards(page):
+        if getattr(c, "state", "active") == "active" and hasattr(c.worker, "pause"):
+            if bool(getattr(c.worker, "_paused", False)) != pause:
+                c.toggle_pause()
+
+_dlp_prev_init = DownloadsPage.__init__
+
+def _dlp_init(self, parent=None):
+    _dlp_prev_init(self, parent)
+    try:
+        row = self.layout().itemAt(0).layout()
+        at = row.indexOf(self.clear_btn)
+        for label, fn in (("Limits", lambda: _DlLimitsDialog(self).exec()),
+                          ("Resume all", lambda: _dl_pause_all(self, False)),
+                          ("Pause all", lambda: _dl_pause_all(self, True))):
+            b = QPushButton(label)
+            b.setFixedHeight(32)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, f=fn: f())
+            row.insertWidget(at, b)
+    except Exception:
+        pass
+
+DownloadsPage.__init__ = _dlp_init
+
+
+# ================================================================ friends: activity feed
+def _act_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "friend_activity.json")
+
+def _act_load():
+    try:
+        with open(_act_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+def _act_add(items):
+    if not items:
+        return
+    data = (items + _act_load())[:60]
+    try:
+        with open(_act_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def _act_ago(ts):
+    s = max(0, int(time.time() - ts))
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if s >= n:
+            return f"{s // n}{u} ago"
+    return "just now"
+
+_act_prev_detect = FriendsPage._detect_events
+
+def _act_detect(self):
+    try:
+        now, new = int(time.time()), []
+        prev_lib = self.__dict__.setdefault("_act_lib", None)
+        prev_play = self.__dict__.setdefault("_act_play", {})
+        libs, plays = {}, {}
+        for uid, d in self.friends.items():
+            name = d.get("username") or "A friend"
+            lib = d.get("library")
+            lib = list(lib.values()) if isinstance(lib, dict) else (lib if isinstance(lib, list) else [])
+            libs[uid] = {pretty_game_name(t) for t in lib if isinstance(t, str)}
+            play = pretty_game_name(d["playing"]) if _friend_is_fresh(d) and isinstance(d.get("playing"), str) and d.get("playing") else ""
+            plays[uid] = play
+            if prev_lib is not None:
+                if play and play != prev_play.get(uid, ""):
+                    new.append({"t": now, "u": uid, "n": name, "x": f"started playing {play}"})
+                if uid in prev_lib:                       # a friend seen for the first time is only a baseline
+                    for g in sorted(libs[uid] - prev_lib[uid]):
+                        new.append({"t": now, "u": uid, "n": name, "x": f"added {g} to their library"})
+        self._act_lib, self._act_play = libs, plays
+        if new:
+            _act_add(new)
+            self._act_refresh()
+    except Exception:
+        pass
+    return _act_prev_detect(self)
+
+def _act_refresh(self):
+    box = self.__dict__.get("_act_box")
+    if box is None:
+        return
+    while box.count():
+        w = box.takeAt(0).widget()
+        if w is not None:
+            w.deleteLater()
+    items = _act_load()[:8]
+    if not items:
+        l = QLabel("Nothing yet. What your friends play and add shows up here while the launcher is open.")
+        l.setObjectName("RowDesc"); l.setWordWrap(True)
+        box.addWidget(l)
+    for it in items:
+        l = QLabel(f"<b>{html_lib.escape(str(it.get('n', '')))}</b> {html_lib.escape(str(it.get('x', '')))}"
+                   f" <span style='color:gray'>- {_act_ago(it.get('t', 0))}</span>")
+        l.setTextFormat(Qt.TextFormat.RichText); l.setWordWrap(True)
+        box.addWidget(l)
+
+FriendsPage._detect_events = _act_detect
+FriendsPage._act_refresh = _act_refresh
+
+_act_prev_init = FriendsPage.__init__
+
+def _act_init(self, parent=None):
+    _act_prev_init(self, parent)
+    try:
+        lay = self.req_box.parentWidget().layout()
+        panel = QFrame(); panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel); pl.setContentsMargins(22, 14, 22, 14); pl.setSpacing(6)
+        t = QLabel("Activity"); t.setObjectName("RowTitle")
+        pl.addWidget(t)
+        self._act_box = QVBoxLayout(); self._act_box.setSpacing(4)
+        pl.addLayout(self._act_box)
+        lay.insertWidget(lay.indexOf(self.req_box) + 2, panel)
+        self._act_refresh()
+    except Exception:
+        pass
+
+FriendsPage.__init__ = _act_init
+
+# ================================================================ screenshots: per-game gallery + share
+def _shots_for(game):
+    safe = re.sub(r'[\\/:*?"<>|]+', "", str(game)).strip().casefold()
+    try:
+        names = [n for n in os.listdir(_screenshots_dir()) if n.lower().endswith(".png")
+                 and n.casefold().startswith(safe + " - ")]
+    except Exception:
+        return []
+    return sorted((os.path.join(_screenshots_dir(), n) for n in names), key=os.path.getmtime, reverse=True)
+
+class _ShotGallery(QDialog):
+    def __init__(self, app, game):
+        super().__init__(app)
+        self.app = app
+        self.setWindowTitle(f"Screenshots: {game}")
+        self.resize(760, 520)
+        self.game = game
+        lay = QVBoxLayout(self)
+        self.hint = QLabel("Press F9 while a game is running to take a screenshot. Double-click one to open it.")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+        self.list = QListWidget()
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setIconSize(QSize(200, 112))
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setSpacing(8)
+        self.list.itemDoubleClicked.connect(lambda it: QDesktopServices.openUrl(QUrl.fromLocalFile(it.data(Qt.ItemDataRole.UserRole))))
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        for label, fn in (("Share with a friend", self.share), ("Delete", self.delete), ("Open folder", self.open_folder)):
+            b = QPushButton(label); b.clicked.connect(fn); row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        self.status = QLabel(""); lay.addWidget(self.status)
+        self._tasks = []
+        self.fill()
+
+    def fill(self):
+        self.list.clear()
+        for p in _shots_for(self.game):
+            pm = QPixmap(p)
+            it = QListWidgetItem(QIcon(pm.scaled(200, 112, Qt.AspectRatioMode.KeepAspectRatio,
+                                                 Qt.TransformationMode.SmoothTransformation)),
+                                 time.strftime("%d %b %H:%M", time.localtime(os.path.getmtime(p))))
+            it.setData(Qt.ItemDataRole.UserRole, p)
+            self.list.addItem(it)
+        self.hint.setVisible(self.list.count() == 0 or True)
+
+    def _paths(self):
+        return [i.data(Qt.ItemDataRole.UserRole) for i in self.list.selectedItems()]
+
+    def delete(self):
+        for p in self._paths():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self.fill()
+
+    def open_folder(self):
+        os.makedirs(_screenshots_dir(), exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(_screenshots_dir()))
+
+    def share(self):
+        paths = self._paths()[:4]
+        fp = getattr(self.app, "friends_page", None)
+        friends = {(d.get("username") or "Friend"): uid for uid, d in (fp.friends.items() if fp else [])}
+        if not paths or not friends:
+            self.status.setText("Select a screenshot first, and sign in with at least one friend added." if not paths
+                                else "You have no friends to share with yet.")
+            return
+        name, ok = QInputDialog.getItem(self, "Share", "Send to:", sorted(friends), 0, False)
+        if not ok:
+            return
+        self.status.setText("Sending...")
+        def send():
+            cloud_send_message(friends[name], f"Screenshot from {self.game}", [prepare_attachment(p) for p in paths])
+            return name
+        w = TaskWorker(send)
+        w.done.connect(lambda n: self.status.setText(f"Sent to {n}."))
+        w.failed.connect(lambda e: self.status.setText(e))
+        self._tasks.append(w)
+        w.start()
+
+# ================================================================ store: game reviews and ratings (Firebase: reviews/<appid>/<uid>)
+def cloud_get_reviews(appid):
+    token, _uid = get_id_token()
+    d = _http_json(_fdb(f"reviews/{appid}", token))
+    return [v for v in d.values() if isinstance(v, dict)] if isinstance(d, dict) else []
+
+def cloud_post_review(appid, rating, text):
+    token, uid = get_id_token()
+    pub = _http_json(_fdb(f"public/{uid}", token))
+    name = (pub.get("username") if isinstance(pub, dict) else "") or "Player"
+    _http_json(_fdb(f"reviews/{appid}/{uid}", token), "PUT",
+               {"r": int(rating), "t": text[:400], "n": name, "ts": {".sv": "timestamp"}, "u": uid})
+
+_rv_prev_init = StoreDetailPage.__init__
+
+def _rv_init(self, *a, **k):
+    _rv_prev_init(self, *a, **k)
+    if type(self) is not StoreDetailPage:
+        return
+    try:
+        lay = self.similar_wrap.parentWidget().layout()
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap); wl.setContentsMargins(0, 24, 0, 0); wl.setSpacing(8)
+        head = QLabel("Reviews"); head.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.rv_summary = QLabel("")
+        self.rv_list = QVBoxLayout(); self.rv_list.setSpacing(6)
+        form = QHBoxLayout()
+        self.rv_stars = QComboBox()
+        for n in (5, 4, 3, 2, 1):
+            self.rv_stars.addItem("★" * n + "☆" * (5 - n), n)
+        self.rv_text = QLineEdit(); self.rv_text.setPlaceholderText("Write a short review (optional)")
+        self.rv_text.setMaxLength(400)
+        self.rv_send = QPushButton("Post review"); self.rv_send.setObjectName("Primary")
+        self.rv_send.clicked.connect(self._rv_post)
+        form.addWidget(self.rv_stars); form.addWidget(self.rv_text, 1); form.addWidget(self.rv_send)
+        self.rv_status = QLabel("")
+        for w in (head, self.rv_summary):
+            wl.addWidget(w)
+        wl.addLayout(self.rv_list); wl.addLayout(form); wl.addWidget(self.rv_status)
+        lay.insertWidget(lay.indexOf(self.similar_wrap), wrap)
+        self._rv_tasks = []
+    except Exception:
+        pass
+
+def _rv_render(self, reviews):
+    while self.rv_list.count():
+        w = self.rv_list.takeAt(0).widget()
+        if w is not None:
+            w.deleteLater()
+    if not reviews:
+        self.rv_summary.setText("No reviews yet. Be the first.")
+        return
+    avg = sum(int(r.get("r", 0)) for r in reviews) / len(reviews)
+    self.rv_summary.setText(f"{avg:.1f} / 5 from {len(reviews)} review{'s' if len(reviews) != 1 else ''}")
+    for r in sorted(reviews, key=lambda r: -(r.get("ts") or 0))[:6]:
+        stars = "★" * max(0, min(5, int(r.get("r", 0))))
+        l = QLabel(f"<b>{html_lib.escape(str(r.get('n', 'Player')))}</b> {stars}<br>{html_lib.escape(str(r.get('t', '')))}")
+        l.setTextFormat(Qt.TextFormat.RichText); l.setWordWrap(True)
+        self.rv_list.addWidget(l)
+
+def _rv_load(self):
+    appid = getattr(self, "_appid", None)
+    if appid is None or not hasattr(self, "rv_list"):
+        return
+    if load_account() is None:
+        self.rv_summary.setText("Sign in to see and write reviews.")
+        return
+    w = TaskWorker(lambda a=appid: (a, cloud_get_reviews(a)))
+    w.done.connect(lambda res: _rv_render(self, res[1]) if res[0] == getattr(self, "_appid", None) else None)
+    w.failed.connect(lambda e: self.rv_summary.setText("Couldn't load reviews."))
+    self._rv_tasks.append(w)
+    w.start()
+
+def _rv_post(self):
+    appid = getattr(self, "_appid", None)
+    if appid is None or load_account() is None:
+        self.rv_status.setText("Sign in to post a review.")
+        return
+    stars, text = self.rv_stars.currentData(), self.rv_text.text().strip()
+    self.rv_status.setText("Posting...")
+    w = TaskWorker(lambda: cloud_post_review(appid, stars, text))
+    w.done.connect(lambda _r: (self.rv_status.setText("Review posted."), self.rv_text.clear(), _rv_load(self)))
+    w.failed.connect(lambda e: self.rv_status.setText(e))
+    self._rv_tasks.append(w)
+    w.start()
+
+StoreDetailPage._rv_post = _rv_post
+StoreDetailPage.__init__ = _rv_init
+_rv_prev_show = StoreDetailPage.show_game
+
+def _rv_show(self, appid, title, cover_path):
+    _rv_prev_show(self, appid, title, cover_path)
+    try:
+        if hasattr(self, "rv_list"):
+            self.rv_status.setText("")
+            _rv_load(self)
+    except Exception:
+        pass
+
+StoreDetailPage.show_game = _rv_show
+
+
+# ================================================================ F9 screenshots: fix black captures (Wayland / XWayland)
+def _shot_is_black(img):
+    try:
+        small = img.scaled(32, 18, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
+        for y in range(small.height()):
+            for x in range(small.width()):
+                c = small.pixelColor(x, y)
+                if c.red() > 12 or c.green() > 12 or c.blue() > 12:
+                    return False
+    except Exception:
+        return False
+    return True
+
+def _shot_take(self):
+    game = _now_playing.get("name") or next(iter(_running), None)
+    if not game:
+        return
+    try:
+        if _lk_wayland():
+            img = _lk_wl_frame()          # grim / spectacle / gnome-screenshot: Qt's own grab is black under XWayland
+        else:
+            pm = QApplication.primaryScreen().grabWindow(0)
+            if pm.isNull():
+                raise RuntimeError("empty grab")
+            img = pm.toImage()
+        if _shot_is_black(img):
+            _ov_log("screenshot came out black (exclusive fullscreen? try borderless / windowed mode)")
+            _show_screenshot_toast("Screenshot is black: try windowed or borderless mode")
+            return
+        folder = _screenshots_dir()
+        os.makedirs(folder, exist_ok=True)
+        safe = re.sub(r'[\\/:*?"<>|]+', "", str(game)).strip() or "Game"
+        path = os.path.join(folder, f"{safe} - {time.strftime('%Y-%m-%d %H-%M-%S')}.png")
+        if not img.save(path, "PNG"):
+            raise RuntimeError("couldn't write " + path)
+        _ov_log(f"screenshot saved: {path}")
+        _show_screenshot_toast("Screenshot taken")
+    except Exception as e:
+        _ov_log(f"screenshot failed: {e!r}")
+        _show_screenshot_toast("Screenshot failed: install grim, spectacle or gnome-screenshot" if _lk_wayland()
+                               else "Screenshot failed")
+
+_ScreenshotTaker.take = _shot_take
+
+
+# ================================================================ #14 recommendations ("because you played X")
+def compute_recommendations(sources=3, per=6):
+    lib = load_steam_library()
+    if not lib:
+        return []
+    secs = {}
+    for v in _pt_load()["games"].values():
+        if isinstance(v, dict) and isinstance(v.get("title"), str):
+            secs[v["title"].casefold()] = int(v.get("own", 0) or 0) + int(v.get("others", 0) or 0)
+    def played(g):
+        return secs.get(pretty_game_name(g["title"]).casefold(), secs.get(g["title"].casefold(), 0))
+    seen, out = {g["appid"] for g in lib}, []
+    for g in sorted(lib, key=lambda g: -played(g))[:sources]:
+        try:
+            sims = fetch_similar_games(g["appid"], fetch_app_tags(g["appid"]), 12)
+        except Exception:
+            continue
+        n = 0
+        for aid, title, base in sims:
+            if aid in seen:
+                continue
+            seen.add(aid)
+            out.append({"appid": aid, "title": title, "base": base, "because": g["title"]})
+            n += 1
+            if n >= per:
+                break
+    return out
+
+def _open_store_game_any(app, rec):
+    """Opens a game's Store page, in Big Picture when that is what's on screen."""
+    bp = _bpy_active_bp()
+    if bp is None:
+        app.open_store_game(rec["appid"], rec["title"], "")
+        return
+    it = bp._sbyid.get(rec["appid"]) or {"appid": rec["appid"], "title": rec["title"], "path": "", "nsfw": False, "done": False}
+    bp._sbyid.setdefault(rec["appid"], it)
+    try:
+        bp._loader.request(rec["appid"], rec["base"], rec["title"])
+    except Exception:
+        pass
+    if bp._tab != 1:
+        bp._switch_tab(1)
+    bp._detail, bp._detail_btn = {"item": it}, 0
+    bp._load_details(rec["appid"])
+    bp.update()
+
+# ================================================================ small dialogs used by Big Picture
+class _ActDialog(QDialog):
+    def __init__(self, app):
+        super().__init__(app)
+        self.setWindowTitle("Friend activity")
+        self.resize(520, 420)
+        lay = QVBoxLayout(self)
+        lst = QListWidget()
+        items = _act_load()[:40]
+        for it in items:
+            lst.addItem(f"{it.get('n', '')} {it.get('x', '')}  ({_act_ago(it.get('t', 0))})")
+        if not items:
+            lst.addItem("Nothing yet. Friend activity is collected while the launcher is open.")
+        lay.addWidget(lst)
+        c = QPushButton("Close"); c.clicked.connect(self.reject)
+        lay.addWidget(c)
+
+class _ReviewsDialog(QDialog):
+    def __init__(self, app, appid, title):
+        super().__init__(app)
+        self.appid = appid
+        self.setWindowTitle(f"Reviews: {title}")
+        self.resize(560, 480)
+        lay = QVBoxLayout(self)
+        self.summary = QLabel("Loading...")
+        lay.addWidget(self.summary)
+        self.list = QListWidget()
+        lay.addWidget(self.list, 1)
+        form = QHBoxLayout()
+        self.stars = QComboBox()
+        for n in (5, 4, 3, 2, 1):
+            self.stars.addItem("★" * n + "☆" * (5 - n), n)
+        self.text = QLineEdit(); self.text.setPlaceholderText("Write a short review (optional)"); self.text.setMaxLength(400)
+        post = QPushButton("Post"); post.setObjectName("Primary"); post.clicked.connect(self.post)
+        close = QPushButton("Close"); close.clicked.connect(self.reject)
+        for w in (self.stars, self.text, post, close):
+            form.addWidget(w, 1 if w is self.text else 0)
+        lay.addLayout(form)
+        self._tasks = []
+        self.load()
+
+    def _run(self, fn, ok):
+        w = TaskWorker(fn)
+        w.done.connect(ok)
+        w.failed.connect(lambda e: self.summary.setText(e))
+        self._tasks.append(w)
+        w.start()
+
+    def load(self):
+        if load_account() is None:
+            self.summary.setText("Sign in to see and write reviews.")
+            return
+        self._run(lambda: cloud_get_reviews(self.appid), self.render)
+
+    def render(self, reviews):
+        self.list.clear()
+        if not reviews:
+            self.summary.setText("No reviews yet. Be the first.")
+            return
+        avg = sum(int(r.get("r", 0)) for r in reviews) / len(reviews)
+        self.summary.setText(f"{avg:.1f} / 5 from {len(reviews)} review{'s' if len(reviews) != 1 else ''}")
+        for r in sorted(reviews, key=lambda r: -(r.get("ts") or 0))[:20]:
+            self.list.addItem(f"{r.get('n', 'Player')}  {'★' * max(0, min(5, int(r.get('r', 0))))}   {r.get('t', '')}")
+
+    def post(self):
+        if load_account() is None:
+            return
+        stars, text = self.stars.currentData(), self.text.text().strip()
+        self.summary.setText("Posting...")
+        self._run(lambda: cloud_post_review(self.appid, stars, text), lambda _r: (self.text.clear(), self.load()))
+
+# ================================================================ library cards: extra entries in the 3-dot menu (also what Big Picture's X menu shows)
+_bpf_prev_decorate = _lb_decorate
+
+def _bpf_decorate(self, card, title):
+    _bpf_prev_decorate(self, card, title)
+    if card.property("_lb_more") is not None:
+        return
+    card.setProperty("_lb_more", True)
+    try:
+        more = card.findChild(QPushButton, "MoreButton")
+        menu = more.menu() if more is not None else None
+        if menu is None:
+            return
+        from PyQt6.QtGui import QAction as _QAct
+        acts = menu.actions()
+        first = acts[0] if acts else None
+        fav, shots, hide = _QAct("Add to favorites", menu), _QAct("Screenshots...", menu), _QAct("Hide from library", menu)
+        for a in (fav, shots, hide):                       # favorite / screenshots / hide go first in the ••• menu
+            menu.insertAction(first, a)
+        if first is not None:
+            menu.insertSeparator(first)
+        menu.addSeparator()
+        upd = menu.addAction("Update game")
+        def refresh_texts():
+            fav.setText("Remove from favorites" if title in lbmeta()["fav"] else "Add to favorites")
+            hide.setText("Unhide game" if title in lbmeta()["hidden"] else "Hide from library")
+            shots.setText(f"Screenshots ({len(_shots_for(title))})...")
+            ub = next((b for b in card.findChildren(QPushButton) if b.text().strip() == "Update"), None)
+            upd.setVisible(ub is not None)
+        menu.aboutToShow.connect(refresh_texts)
+        def toggle(kind):
+            lb_toggle(kind, title)
+            self.apply_filter(self.search_edit.text())
+            bp = getattr(self, "_big_picture", None)
+            if bp is not None and bp._active:
+                bp._lib_dirty = True
+        fav.triggered.connect(lambda _c=False: toggle("fav"))
+        hide.triggered.connect(lambda _c=False: toggle("hidden"))
+        def open_shots():
+            bp = _bpy_active_bp()
+            if bp is not None:
+                bp._shots_open(title)                      # Big Picture has its own Screenshots tab
+            else:
+                _ShotGallery(self, title).exec()
+        shots.triggered.connect(lambda _c=False: open_shots())
+        def do_update():
+            ub = next((b for b in card.findChildren(QPushButton) if b.text().strip() == "Update"), None)
+            if ub is not None:
+                ub.click()
+        upd.triggered.connect(lambda _c=False: do_update())
+    except Exception:
+        pass
+
+_lb_decorate = _bpf_decorate
+
+# ================================================================ Big Picture
+_bpf_prev_refresh = _BigPicture._refresh
+
+def _bpf_refresh(self):
+    _bpf_prev_refresh(self)
+    try:
+        keep = self._items[self._sel]["card"] if self._items and self._sel < len(self._items) else None
+        items = [i for i in self._items if _lb_keep(i["title"])]
+        if _lb_view["mode"] == "recent":
+            items.sort(key=lambda i: -lb_last(i["title"]))
+        for i in items:
+            if any(b.text().strip() == "Update" for b in i["card"].findChildren(QPushButton)):
+                i["status"] = "Update available"
+        self._items = items
+        self._sel = next((n for n, i in enumerate(items) if i["card"] is keep), 0)
+        self._pos = float(self._sel)
+    except Exception:
+        pass
+
+_BigPicture._refresh = _bpf_refresh
+
+def _bpf_set_view(app, mode):
+    modes = [k for _l, k in _LB_VIEWS]
+    combo = getattr(app, "lib_view_combo", None)
+    if combo is not None:
+        combo.setCurrentIndex(modes.index(mode))          # its handler updates the mode and the launcher's library
+    else:
+        _lb_view["mode"] = mode
+
+_bpf_prev_act = _BigPicture._act
+
+def _bpf_act(self, name):
+    plain = (self._kb is None and not self._embs and self._st is None and self._ov is None and self._detail is None)
+    if plain and name == "alt" and self._tab == 0 and self._zone != "tabs":      # Y: next library view
+        modes = [k for _l, k in _LB_VIEWS]
+        nxt = modes[(modes.index(_lb_view["mode"]) + 1) % len(modes)]
+        _bpf_set_view(self._app, nxt)
+        self._refresh()
+        label = next(l for l, k in _LB_VIEWS if k == nxt)
+        self._say(f"Library: {label} ({len(self._items)})", 2200)
+        self.update()
+        return
+    _bpf_prev_act(self, name)
+
+_BigPicture._act = _bpf_act
+
+_bpf_prev_detail_act = _BigPicture._detail_act
+
+def _bpf_detail_act(self, name):
+    if name == "alt":                                                             # Y: reviews of this game
+        it = self._detail["item"]
+        QTimer.singleShot(0, lambda: _ReviewsDialog(self._app, it["appid"], it["title"]).exec())
+        return
+    _bpf_prev_detail_act(self, name)
+
+_BigPicture._detail_act = _bpf_detail_act
+
+_bpf_prev_settings = _BigPicture._settings_open
+
+def _bpf_settings_open(self):
+    _bpf_prev_settings(self)
+    st = self._st
+    if st is None or st.get("_bpf"):
+        return
+    st["_bpf"] = True
+    b = QPushButton("Limits...")                      # download speed limit and download window are real settings
+    b.clicked.connect(lambda _c=False: (self._st_close(), QTimer.singleShot(80, lambda: _DlLimitsDialog(self._app).exec())))
+    st["rows"].append({"title": "Download limits", "desc": "Speed limit and the hours downloads are allowed to run.", "ctrls": [b]})
+    self.update()
+
+_BigPicture._settings_open = _bpf_settings_open
+
+
+
+# ================================================================ recommendations cache (used by the Store shelf and the Big Picture "For You" tab)
+_fy_cache = {"t": 0.0, "v": None}
+
+def _fy_recs(force=False):
+    """[{'appid','title','base','because'}] from the games you play; cached for 10 minutes. Blocking: call from a worker."""
+    if force or _fy_cache["v"] is None or time.time() - _fy_cache["t"] > 600:
+        _fy_cache["v"], _fy_cache["t"] = compute_recommendations(4, 6), time.time()
+    return list(_fy_cache["v"])
+
+# ================================================================ Big Picture Friends tab: activity under the friend list
+_fa_prev_build = _BigPicture._fr_build
+
+def _fa_build(self):
+    _fa_prev_build(self)
+    fr = self._fr
+    rows = [r for r in fr["rows"] if r["kind"] != "act"]
+    items = _act_load()[:8]
+    rows.append({"kind": "act", "uid": "", "name": "Recent activity", "ago": "", "head": True, "d": {}})
+    if not items:
+        rows.append({"kind": "act", "uid": "", "name": "Nothing yet. Friend activity is collected while the launcher is open.",
+                     "ago": "", "d": {}})
+    for it in items:
+        rows.append({"kind": "act", "uid": it.get("u", ""), "name": f"{it.get('n', '')} {it.get('x', '')}",
+                     "ago": _act_ago(it.get("t", 0)), "d": {}})
+    fr["rows"] = rows
+    fr["sel"] = min(fr["sel"], max(0, len(rows) - 1))
+
+_BigPicture._fr_build = _fa_build
+
+_fa_prev_paint = _BigPicture._paint_friends
+
+def _fa_paint(self, p, w, h, m, acc):
+    fr = self._fr
+    allrows = fr["rows"]
+    real = [r for r in allrows if r["kind"] != "act"]
+    fr["rows"] = real
+    try:
+        _fa_prev_paint(self, p, w, h, m, acc)
+    finally:
+        fr["rows"] = allrows
+    if not real or fr["chat"]:
+        return
+    cx, cw = w * 0.18, w * 0.64
+    top, bot, rh, pitch = h * 0.19, h * 0.86, h * 0.07, h * 0.102
+    focus = self._zone == "content"
+    p.save()
+    p.setClipRect(QRectF(0, top - h * 0.01, w, bot - top + h * 0.02))
+    for i in range(len(real), len(allrows)):
+        r = allrows[i]
+        y = top + i * pitch - self._xscroll
+        if y + rh < top - h * 0.01 or y > bot:
+            continue
+        rect = QRectF(cx, y, cw, rh)
+        if r.get("head"):
+            self._x_text(p, QRectF(cx, y, cw, rh), r["name"], 0.026, QColor(235, 235, 245), True)
+            continue
+        sel = focus and i == fr["sel"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 40 if sel else 14))
+        p.drawRoundedRect(rect, rh * 0.2, rh * 0.2)
+        if sel:
+            self._x_ring(p, rect, rh * 0.2)
+        self._xhits.append((rect.intersected(QRectF(0, top, w, bot - top)), ("row", i)))
+        agow = h * 0.12
+        self._x_text(p, QRectF(cx + rh * 0.3, y, cw - agow - rh * 0.6, rh), r["name"], 0.021, QColor(225, 225, 238))
+        self._x_text(p, QRectF(rect.right() - agow - rh * 0.3, y, agow, rh), r["ago"], 0.018, QColor(150, 150, 175), False,
+                     int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+    p.restore()
+
+_BigPicture._paint_friends = _fa_paint
+
+_fa_prev_act = _BigPicture._fr_act
+
+def _fa_act(self, name):
+    fr = self._fr
+    rows = fr["rows"]
+    if (not fr["chat"] and name == "accept" and rows and 0 <= fr["sel"] < len(rows) and rows[fr["sel"]]["kind"] == "act"):
+        r = rows[fr["sel"]]                                         # A on an activity line opens that friend's chat
+        if r.get("uid") and any(x["kind"] == "friend" and x["uid"] == r["uid"] for x in rows):
+            fr["chat"], fr["cbtn"] = r["uid"], 0
+            self._fr_load_chat(r["uid"])
+        return
+    _fa_prev_act(self, name)
+
+_BigPicture._fr_act = _fa_act
+
+# ================================================================ Big Picture Downloads tab: pause / resume all
+def _bpf_pause_all(self):
+    dp = getattr(self._app, "downloads_page", None)
+    if dp is None:
+        return
+    cards = [c for c in _dl_all_cards(dp) if getattr(c, "state", "active") == "active" and hasattr(c.worker, "pause")]
+    if not cards:
+        self._say("No running downloads", 1800)
+        return
+    pause = any(not getattr(c.worker, "_paused", False) for c in cards)
+    _dl_pause_all(dp, pause)
+    self._say("Paused all downloads" if pause else "Resumed all downloads", 1800)
+
+_bpd_prev_paint = _BigPicture._paint_downloads
+
+def _bpd_paint(self, p, w, h, m, acc):
+    _bpd_prev_paint(self, p, w, h, m, acc)
+    cx, cw = w * 0.14, w * 0.72
+    bw, bh, gap = h * 0.17, h * 0.05, h * 0.012
+    for j, label in enumerate(("Pause all", "Resume all")):
+        r = QRectF(cx + cw - (2 - j) * bw - (1 - j) * gap, h * 0.125, bw, bh)
+        self._x_pill(p, r, label, acc, sel=False, size=0.02)
+        self._xhits.append((r, ("dpause", j)))
+
+_BigPicture._paint_downloads = _bpd_paint
+
+_bpd_prev_dl_act = _BigPicture._dl_act
+
+def _bpd_dl_act(self, name):
+    if name == "x":
+        _bpf_pause_all(self)
+        return
+    _bpd_prev_dl_act(self, name)
+
+_BigPicture._dl_act = _bpd_dl_act
+
+_bpd_prev_tag = _BigPicture._x_tag
+
+def _bpd_tag(self, tag):
+    if tag and tag[0] == "dpause":
+        dp = getattr(self._app, "downloads_page", None)
+        if dp is not None:
+            _dl_pause_all(dp, tag[1] == 0)
+            self._say("Paused all downloads" if tag[1] == 0 else "Resumed all downloads", 1800)
+        self.update()
+        return
+    _bpd_prev_tag(self, tag)
+
+_BigPicture._x_tag = _bpd_tag
+
+_bpd_prev_hint = _BigPicture._x_hint
+
+def _bpd_hint(self):
+    h = _bpd_prev_hint(self)
+    return h.replace("Y  Clear finished", "X  Pause / resume all      Y  Clear finished") if self._tab == 3 else h
+
+_BigPicture._x_hint = _bpd_hint
+
+
+# ================================================================ Store: "Recommended for you" shelf (horizontal covers, no popup)
+_REC_W, _REC_H = 280, 131                      # Steam's landscape header art is 460x215
+
+class _RecArt(QObject):
+    """Downloads Steam's landscape header art for recommended games and caches it on disk."""
+    loaded = pyqtSignal(int, str)              # appid, cached image path ("" if there is none)
+
+    def __init__(self):
+        super().__init__()
+        self._pool = ThreadPoolExecutor(max_workers=3)
+        QApplication.instance().aboutToQuit.connect(lambda: self._pool.shutdown(wait=False, cancel_futures=True))
+
+    def request(self, appid):
+        self._pool.submit(self._work, int(appid))
+
+    def _work(self, appid):
+        path = ""
+        try:
+            folder = get_store_cache_dir()
+            os.makedirs(folder, exist_ok=True)
+            dest = os.path.join(folder, f"{appid}-hdr.img")
+            if not os.path.exists(dest):
+                data = b""
+                for url in (_BPX_HDR % appid, f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"):
+                    try:
+                        data = _http_get(url, timeout=12)
+                    except Exception:
+                        data = b""
+                    if data:
+                        break
+                if data:
+                    with open(dest, "wb") as f:
+                        f.write(data)
+            if os.path.exists(dest):
+                path = dest
+        except Exception:
+            path = ""
+        try:
+            self.loaded.emit(appid, path)
+        except RuntimeError:
+            pass
+
+
+class _RecCard(QFrame):
+    clicked = pyqtSignal(object)
+
+    def __init__(self, rec, parent=None):
+        super().__init__(parent)
+        self.rec = rec
+        self.art = ""                          # landscape header
+        self.portrait = ""                     # the Store's normal cover, handed to the detail page
+        self.nsfw = False
+        self.have_art = self.known = False     # header downloaded / NSFW check finished
+        nsfw_bus.revealed.connect(self._refresh)
+        self.setObjectName("GameCard")
+        self.setFixedWidth(_REC_W + 18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("%s\nBecause you played %s\nClick for details" % (rec["title"], rec["because"]))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 10)
+        lay.setSpacing(0)
+        self.cover = QLabel("...")
+        self.cover.setObjectName("CoverPlaceholder")
+        self.cover.setFixedSize(_REC_W, _REC_H)
+        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.cover)
+        lay.addSpacing(8)
+        fm = QFontMetrics(self.font())
+        self.title_label = QLabel(fm.elidedText(rec["title"], Qt.TextElideMode.ElideRight, _REC_W - 6))
+        self.title_label.setObjectName("CardTitle")
+        lay.addWidget(self.title_label)
+        why = QLabel(fm.elidedText("Because you played " + rec["because"], Qt.TextElideMode.ElideRight, _REC_W - 6))
+        why.setObjectName("RowDesc")
+        lay.addWidget(why)
+
+    def _refresh(self):
+        if not (self.have_art and self.known):
+            return
+        hidden = self.nsfw and not nsfw_revealed()
+        pix = rounded_cover_pixmap(self.art, _REC_W, _REC_H, 8, blur=hidden) if self.art else None
+        if pix:
+            self.cover.setText("")
+            self.cover.setPixmap(pix)
+            self.cover.setStyleSheet("background: transparent; border: none;")
+        else:
+            self.cover.setText("No\ncover")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.rec)
+        super().mousePressEvent(event)
+
+
+class _HScroll(QScrollArea):
+    """Horizontal strip: only sideways wheel / trackpad movement scrolls it, so the page itself still scrolls normally."""
+    def wheelEvent(self, e):
+        dx = e.angleDelta().x()
+        if dx:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - dx)
+            e.accept()
+        else:
+            e.ignore()
+
+
+class _RecShelf(QWidget):
+    open_game = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.cards = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 14)
+        lay.setSpacing(6)
+        head = QHBoxLayout()
+        title = QLabel("Recommended for you")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.sub = QLabel("Based on the games you play")
+        self.sub.setObjectName("RowDesc")
+        self.prev_btn, self.next_btn = QPushButton("<"), QPushButton(">")
+        for b, d in ((self.prev_btn, -1), (self.next_btn, 1)):
+            b.setFixedSize(32, 28)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, d=d: self._nudge(d))
+        head.addWidget(title)
+        head.addSpacing(10)
+        head.addWidget(self.sub, 1)
+        head.addWidget(self.prev_btn)
+        head.addWidget(self.next_btn)
+        lay.addLayout(head)
+        self.msg = QLabel("")
+        self.msg.setObjectName("RowDesc")
+        self.msg.setWordWrap(True)
+        self.msg.hide()
+        lay.addWidget(self.msg)
+        self.scroll = _HScroll()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setFixedHeight(_REC_H + 82)
+        inner = QWidget()
+        inner.setObjectName("GridContainer")
+        self.row = QHBoxLayout(inner)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(14)
+        self.row.addStretch()
+        self.scroll.setWidget(inner)
+        lay.addWidget(self.scroll)
+        self.scroll.hide()
+        self.prev_btn.hide()
+        self.next_btn.hide()
+
+    def _nudge(self, d):
+        bar = self.scroll.horizontalScrollBar()
+        bar.setValue(bar.value() + d * 2 * (_REC_W + 32))
+
+    def clear(self):
+        for c in self.cards.values():
+            self.row.removeWidget(c)
+            c.setParent(None)
+            c.deleteLater()
+        self.cards = {}
+
+    def show_message(self, text):
+        self.clear()
+        self.scroll.hide()
+        self.prev_btn.hide()
+        self.next_btn.hide()
+        self.msg.setText(text)
+        self.msg.setVisible(bool(text))
+
+    def fill(self, recs):
+        self.clear()
+        self.msg.hide()
+        for r in recs:
+            card = _RecCard(r)
+            card.clicked.connect(self.open_game.emit)
+            self.row.insertWidget(self.row.count() - 1, card)
+            self.cards[r["appid"]] = card
+        self.scroll.setVisible(bool(recs))
+        self.prev_btn.setVisible(bool(recs))
+        self.next_btn.setVisible(bool(recs))
+
+
+_rs_prev_init = StorePage.__init__
+
+def _rs_init(self, *a, **k):
+    _rs_prev_init(self, *a, **k)
+    if type(self) is not StorePage:
+        return
+    try:
+        self._rec_art = _RecArt()
+        self._rec_shelf = _RecShelf()
+        self._rec_workers, self._rec_t, self._rec_busy = [], 0.0, False
+        old = self.scroll.takeWidget()                      # the shelf scrolls together with the grid
+        outer = QWidget()
+        outer.setObjectName("GridContainer")
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(0)
+        ol.addWidget(self._rec_shelf)
+        ol.addWidget(old, 1)
+        self.scroll.setWidget(outer)
+        self._rec_shelf.open_game.connect(self._rec_open)
+        self._rec_art.loaded.connect(self._rec_art_loaded)
+        self.loader.loaded.connect(self._rec_cover_loaded)
+        self.loader.nsfw_known.connect(self._rec_nsfw_known)
+    except Exception:
+        pass
+
+def _rec_open(self, rec):
+    card = self._rec_shelf.cards.get(rec["appid"])
+    self.window().open_store_game(rec["appid"], rec["title"], card.portrait if card is not None else "")
+
+def _rec_art_loaded(self, appid, path):
+    card = self._rec_shelf.cards.get(appid)
+    if card is not None:
+        card.art, card.have_art = path, True
+        card._refresh()
+
+def _rec_cover_loaded(self, appid, path):                   # the Store loader finishes after its NSFW check
+    card = self._rec_shelf.cards.get(appid)
+    if card is not None:
+        card.portrait, card.known = path or "", True
+        card._refresh()
+
+def _rec_nsfw_known(self, appid, flag):
+    card = self._rec_shelf.cards.get(appid)
+    if card is not None:
+        card.nsfw = bool(flag)
+
+def _rec_visible(self):
+    return not (self._term or self._tag_filter)
+
+def _rec_apply(self, recs):
+    self._rec_busy = False
+    self._rec_t = time.time()
+    shelf = self._rec_shelf
+    if not recs:
+        shelf.show_message("Add some Store games to your library and play them, and games like them show up here.")
+        return
+    shelf.fill(recs)
+    for r in recs:
+        self._rec_art.request(r["appid"])
+        self.loader.request(r["appid"], r["base"], r["title"])      # portrait cover + NSFW check (the header stays blurred until it's done)
+
+def _rec_load(self, force=False):
+    if self._rec_busy or not self._rec_visible():
+        return
+    if not force and self._rec_shelf.cards and time.time() - self._rec_t < 600:
+        return
+    self._rec_busy = True
+    if not self._rec_shelf.cards:
+        self._rec_shelf.show_message("Finding games like the ones you play...")
+    w = TaskWorker(lambda: _fy_recs(force))
+    w.done.connect(self._rec_apply)
+    w.failed.connect(lambda _e: (setattr(self, "_rec_busy", False),
+                                 self._rec_shelf.show_message("Couldn't load recommendations. Check your connection.")))
+    self._rec_workers = [x for x in self._rec_workers if x.isRunning()] + [w]
+    w.start()
+
+StorePage.__init__ = _rs_init
+StorePage._rec_open = _rec_open
+StorePage._rec_art_loaded = _rec_art_loaded
+StorePage._rec_cover_loaded = _rec_cover_loaded
+StorePage._rec_nsfw_known = _rec_nsfw_known
+StorePage._rec_visible = _rec_visible
+StorePage._rec_apply = _rec_apply
+StorePage._rec_load = _rec_load
+
+_rs_prev_start = StorePage._start_search
+
+def _rs_start_search(self):
+    _rs_prev_start(self)
+    if hasattr(self, "_rec_shelf"):
+        self._rec_shelf.setVisible(self._rec_visible())      # hidden while you search or filter by tags
+        self._rec_load()
+
+StorePage._start_search = _rs_start_search
+
+_rs_prev_show = StorePage.showEvent
+
+def _rs_show(self, event):
+    _rs_prev_show(self, event)
+    if hasattr(self, "_rec_shelf"):
+        self._rec_load()
+
+StorePage.showEvent = _rs_show
+
+
+# ================================================================ Big Picture: For You tab, Screenshots tab, library toolbar, download limits
+_BPG_SPEEDS = (0, 1, 2, 5, 10, 20, 50, 100, 250, 500)           # MB/s, 0 = unlimited
+_BPE_BAR_TAGS = _BPE_BAR_TAGS + ("rrefresh", "sgame", "sfolder", "dlimit", "dpause")     # toolbar pills the controller can reach
+
+_bpg_o = {n: getattr(_BigPicture, n) for n in (
+    "__init__", "leave", "_tab_labels", "_x_enter", "_x_act", "_x_hint", "_x_tag", "_paint_extra", "_paint_library",
+    "_paint_downloads", "_act", "mousePressEvent", "keyPressEvent", "_ov_act", "_paint_ov", "_ov_click")}
+
+
+def _bpg_base(self):
+    return 6 + (1 if self._gm_root else 0)          # Library, Store, Friends, Downloads, Workshop, Fan Games, (GMod Addons)
+
+
+def _bpg_kind(self):
+    n0 = _bpg_base(self)
+    return "rec" if self._tab == n0 else ("shot" if self._tab == n0 + 1 else None)
+
+
+@_bpm("__init__")
+def _bpg_init(self, app):
+    _bpg_o["__init__"](self, app)
+    self._rc = {"list": [], "sel": 0, "loading": False, "err": "", "items": {}, "blur": {}, "t": 0.0, "req_t": 0.0}
+    self._sg = {"list": [], "sel": 0, "game": "", "games": [], "pix": {}, "confirm": False, "w": []}
+    self._lbs = 0                                   # Library toolbar focus (zone "lbar")
+    self._lb_rects = []
+    self._loader.loaded.connect(self._rc_cover)
+    self._loader.nsfw_known.connect(self._rc_nsfw)
+
+
+@_bpm("leave")
+def _bpg_leave(self, show_main=True):
+    self._rc["blur"].clear()
+    self._sg["pix"].clear()
+    self._sg["game"] = ""
+    _bpg_o["leave"](self, show_main)
+
+
+@_bpm("_tab_labels")
+def _bpg_tab_labels(self):
+    return tuple(_bpg_o["_tab_labels"](self)) + ("For You", "Screenshots")
+
+
+# ---------------------------------------------------------------- Library toolbar: view filters + favorite / hide
+def _bpg_lb_tags(self):
+    tags = [("view", k) for _l, k in _LB_VIEWS]
+    if self._items:
+        tags += [("fav",), ("hide",)]
+    return tags
+
+
+@_bpm("_lb_apply")
+def _bpg_lb_apply(self, tag):
+    kind = tag[0]
+    if kind == "view":
+        _bpf_set_view(self._app, tag[1])
+        self._refresh()
+        label = next(l for l, k in _LB_VIEWS if k == tag[1])
+        self._say("Library: %s (%d)" % (label, len(self._items)), 2200)
+    elif self._items and 0 <= self._sel < len(self._items):
+        old = self._sel
+        title = self._items[old]["title"]
+        key = "fav" if kind == "fav" else "hidden"
+        lb_toggle(key, title)
+        on = title in lbmeta()[key]
+        self._app.apply_filter(self._app.search_edit.text())
+        self._refresh()
+        if self._items:
+            self._sel = min(old, len(self._items) - 1)
+            self._pos = float(self._sel)
+        self._cache.clear()
+        self._sync_bg(animate=False)
+        self._say(("Added to favorites: " if (key == "fav" and on) else "Removed from favorites: " if key == "fav"
+                   else "Hidden from your library: " if on else "Back in your library: ") + title, 2600)
+    self.update()
+
+
+def _bpg_plain(self):
+    return (self._kb is None and not self._embs and self._st is None and self._ov is None and self._detail is None)
+
+
+@_bpm("_act")
+def _bpg_act(self, name):
+    if _bpg_plain(self) and self._tab == 0:
+        z = self._zone
+        if z == "lbar":
+            tags = _bpg_lb_tags(self)
+            self._lbs = max(0, min(len(tags) - 1, self._lbs))
+            if name in ("left", "right", "up", "down", "back", "accept"):
+                self.setCursor(Qt.CursorShape.BlankCursor)
+                if name == "left":
+                    self._lbs = max(0, self._lbs - 1)
+                elif name == "right":
+                    self._lbs = min(len(tags) - 1, self._lbs + 1)
+                elif name == "up":
+                    self._zone = "tabs"
+                elif name in ("down", "back"):
+                    self._zone = "content"
+                else:
+                    self._lb_apply(tags[self._lbs])
+                self.update()
+                return
+        elif (z == "content" and name == "up") or (z == "tabs" and name == "down"):
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            self._hsel = None
+            modes = [k for _l, k in _LB_VIEWS]
+            self._zone, self._lbs = "lbar", (modes.index(_lb_view["mode"]) if _lb_view["mode"] in modes else 0)
+            self.update()
+            return
+    _bpg_o["_act"](self, name)
+
+
+@_bpm("mousePressEvent")
+def _bpg_mouse(self, e):
+    if self._tab == 0 and _bpg_plain(self):
+        pt = e.position()
+        for n, (r, tag) in enumerate(self._lb_rects):
+            if r.contains(pt):
+                self._zone, self._lbs = "lbar", n
+                self._lb_apply(tag)
+                return
+    _bpg_o["mousePressEvent"](self, e)
+
+
+@_bpm("_paint_library")
+def _bpg_paint_library(self, p, w, h, m, acc, k):
+    self._lb_rects = []
+    mode, zone = _lb_view["mode"], self._zone
+    if zone == "lbar":
+        self._zone = "tabs"                          # no focus ring on the tile while the toolbar has focus
+    try:
+        if not self._items and mode != "all":
+            p.setOpacity(k)
+            p.setFont(self._font(h * 0.035))
+            p.setPen(QColor(200, 200, 220))
+            msg = {"fav": "No favorites yet\nOpen a game's options (X) and pick Add to favorites",
+                   "recent": "Nothing played yet\nGames you launch show up here",
+                   "hidden": "No hidden games"}.get(mode, "Nothing here")
+            p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), msg)
+        else:
+            _bpg_o["_paint_library"](self, p, w, h, m, acc, k)
+    finally:
+        self._zone = zone
+    n = len(self._items)
+    if n:                                            # gold star on favorites
+        fav = lbmeta()["fav"]
+        for i in range(max(0, int(self._pos) - 4), min(n, int(self._pos) + 6)):
+            if self._items[i]["title"] not in fav:
+                continue
+            r = self._tile_rect(i)
+            if r.right() < 0 or r.left() > w:
+                continue
+            near = max(0.0, 1 - abs(i - self._pos))
+            p.setOpacity(k * (0.5 + 0.5 * near))
+            d = h * 0.042
+            b = QRectF(r.left() + h * 0.012, r.top() + h * 0.012, d, d)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawEllipse(b)
+            p.setFont(self._font(d * 0.62, True))
+            p.setPen(QColor(255, 200, 61))
+            p.drawText(b, int(Qt.AlignmentFlag.AlignCenter), "★")
+    p.setOpacity(k)
+    # toolbar: view pills on the left, favorite / hide for the selected game on the right
+    y, bh, gap = h * 0.127, h * 0.046, h * 0.012
+    fm = QFontMetrics(self._font(h * 0.0185, True))
+    focus = self._zone == "lbar"
+    tags = _bpg_lb_tags(self)
+    x = m
+    for idx, tag in enumerate(tags):
+        if tag[0] == "view":
+            text = next(l for l, kk in _LB_VIEWS if kk == tag[1])
+            active = tag[1] == mode
+            if active:
+                text += "  (%d)" % n
+        else:
+            title = self._items[self._sel]["title"] if 0 <= self._sel < n else ""
+            if tag[0] == "fav":
+                text, active = ("Remove favorite" if title in lbmeta()["fav"] else "Add favorite"), False
+            else:
+                text, active = ("Unhide game" if title in lbmeta()["hidden"] else "Hide game"), False
+        bw = fm.horizontalAdvance(text) + h * 0.05
+        if tag[0] == "fav":
+            x = w - m - bw - gap - (fm.horizontalAdvance("Unhide game") + h * 0.05)
+        elif tag[0] == "hide":
+            x = w - m - bw
+        r = QRectF(x, y, bw, bh)
+        self._x_pill(p, r, text, acc, sel=(focus and idx == self._lbs), primary=active, size=0.0185)
+        self._lb_rects.append((r, tag))
+        if tag[0] == "view":
+            x += bw + gap
+
+
+# ---------------------------------------------------------------- Downloads: speed limit and schedule
+@_bpm("_paint_downloads")
+def _bpg_paint_dl(self, p, w, h, m, acc):
+    _bpg_o["_paint_downloads"](self, p, w, h, m, acc)
+    cx, cw = w * 0.14, w * 0.72
+    bw, bh, gap = h * 0.17, h * 0.05, h * 0.012
+    d = dl_limits()
+    text = "Limit: " + ("Unlimited" if not d.get("mb_s") else "%g MB/s" % float(d["mb_s"])) + ("  +  schedule" if d.get("sched") else "")
+    lw = h * 0.34
+    r = QRectF(cx + cw - 2 * bw - gap - gap - lw, h * 0.125, lw, bh)
+    self._x_pill(p, r, text, acc, sel=False, primary=bool(d.get("mb_s") or d.get("sched")), size=0.019)
+    self._xhits.append((r, ("dlimit",)))
+
+
+@_bpm("_dlim_open")
+def _bpg_dlim_open(self):
+    d = dl_limits()
+    self._ov = {"kind": "dlim", "sel": 0, "d": {"mb_s": float(d.get("mb_s") or 0), "sched": bool(d.get("sched")),
+                                                 "from": int(d.get("from", 1)), "to": int(d.get("to", 8))}, "rects": []}
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+def _bpg_dlim_text(ov, row):
+    d = ov["d"]
+    if row == 0:
+        return "Unlimited" if not d["mb_s"] else "%g MB/s" % d["mb_s"]
+    if row == 1:
+        return "On" if d["sched"] else "Off"
+    if row == 2:
+        return "%02d:00" % d["from"]
+    return "%02d:00" % d["to"]
+
+
+def _bpg_dlim_adjust(ov, row, step, wrap=False):
+    d = ov["d"]
+    if row == 0:
+        cur = min(range(len(_BPG_SPEEDS)), key=lambda i: abs(_BPG_SPEEDS[i] - d["mb_s"]))
+        j = cur + step
+        j = j % len(_BPG_SPEEDS) if wrap else max(0, min(len(_BPG_SPEEDS) - 1, j))
+        d["mb_s"] = float(_BPG_SPEEDS[j])
+    elif row == 1:
+        d["sched"] = not d["sched"]
+    elif row == 2:
+        d["from"] = (d["from"] + step) % 24
+    elif row == 3:
+        d["to"] = (d["to"] + step) % 24
+    dl_limits_save({"mb_s": d["mb_s"], "sched": d["sched"], "from": d["from"], "to": d["to"]})
+
+
+# ---------------------------------------------------------------- For You tab (horizontal covers)
+@_bpm("_rc_load")
+def _bpg_rc_load(self, force=False):
+    rc = self._rc
+    if rc["loading"]:
+        return
+    rc["loading"], rc["err"] = True, ""
+    w = TaskWorker(lambda: _fy_recs(force))
+    w.done.connect(self._rc_done)
+    w.failed.connect(self._rc_fail)
+    self._workers = [x for x in self._workers if x.isRunning()] + [w]
+    w.start()
+    self.update()
+
+
+@_bpm("_rc_done")
+def _bpg_rc_done(self, recs):
+    rc = self._rc
+    rc["loading"], rc["t"] = False, time.time()
+    rc["list"], rc["sel"], rc["items"] = list(recs), 0, {}
+    for r in recs:
+        rc["items"][r["appid"]] = {"appid": r["appid"], "title": r["title"], "path": "", "nsfw": False, "done": False}
+        self._loader.request(r["appid"], r["base"], r["title"])      # portrait cover (for the detail page) + NSFW check
+    if not recs:
+        rc["err"] = "Nothing to recommend yet. Add Store games to your library and play them first."
+    self._x_reset_scroll()
+    self.update()
+
+
+@_bpm("_rc_fail")
+def _bpg_rc_fail(self, msg):
+    self._rc["loading"] = False
+    self._rc["err"] = "Couldn't load recommendations. Press A to try again."
+    self.update()
+
+
+@_bpm("_rc_cover")
+def _bpg_rc_cover(self, appid, path):
+    it = self._rc["items"].get(appid)
+    if it is None:
+        return
+    it["path"], it["done"] = path or "", True
+    self._spix.pop(appid, None)
+    if self._active:
+        self.update()
+
+
+@_bpm("_rc_nsfw")
+def _bpg_rc_nsfw(self, appid, flag):
+    it = self._rc["items"].get(appid)
+    if it is not None:
+        it["nsfw"] = bool(flag)
+
+
+@_bpm("_rc_enter")
+def _bpg_rc_enter(self):
+    rc = self._rc
+    if not rc["loading"] and (not rc["list"] or time.time() - rc["t"] > 600):
+        self._rc_load(False)
+    self._rc_ensure()
+
+
+@_bpm("_rc_ensure")
+def _bpg_rc_ensure(self):
+    gap, tw, th, cols, x0, top, bot = self._x_grid(2.14)
+    row = self._rc["sel"] // cols
+    pitch = th + gap
+    self._x_ensure(row * pitch, row * pitch + pitch + self.height() * 0.024, bot - top)
+
+
+@_bpm("_rc_open")
+def _bpg_rc_open(self, rec):
+    it = self._rc["items"].get(rec["appid"])
+    if it is None:
+        return
+    self._detail, self._detail_btn = {"item": it}, 0
+    self._load_details(rec["appid"])
+    self.update()
+
+
+@_bpm("_rc_act")
+def _bpg_rc_act(self, name):
+    rc = self._rc
+    lst = rc["list"]
+    n = len(lst)
+    rc["sel"] = max(0, min(max(0, n - 1), rc["sel"]))
+    if name == "back":
+        self._switch_tab(0)
+    elif name in ("left", "right", "up", "down"):
+        if not n:
+            if name == "up":
+                _bpx_top(self)
+            return
+        new = _bpx_grid_nav(rc["sel"], n, self._x_grid(2.14)[3], name)
+        if new < 0:
+            _bpx_top(self)
+            return
+        rc["sel"] = new
+        self._rc_ensure()
+    elif name == "accept":
+        if n:
+            self._rc_open(lst[rc["sel"]])
+        elif not rc["loading"]:
+            self._rc_load(False)
+    elif name == "x":
+        self._say("Refreshing recommendations...", 2000)
+        self._rc_load(True)
+
+
+@_bpm("_paint_rec")
+def _bpg_paint_rec(self, p, w, h, m, acc):
+    rc = self._rc
+    lst = rc["list"]
+    top, bot = h * 0.2, h * 0.86
+    area = QRectF(0, top, w, bot - top)
+    y, bh = h * 0.128, h * 0.046
+    self._x_text(p, QRectF(m, y, w * 0.6, bh), "Recommended for you   -   based on the games you play", 0.028, QColor(235, 235, 245), True)
+    r = QRectF(w - m - h * 0.2, y, h * 0.2, bh)
+    self._x_pill(p, r, "Refresh", acc, size=0.019)
+    self._xhits.append((r, ("rrefresh",)))
+    if not lst:
+        if rc["loading"]:
+            self._paint_loading(p, w, h, area, "Finding games you'll like...")
+        else:
+            self._x_msg(p, area, rc["err"] or "Nothing to recommend yet.")
+        return
+    now = time.time()
+    if now - rc["req_t"] > 5:                       # covers whose request was cancelled by another tab are asked for again
+        rc["req_t"] = now
+        for rec in lst:
+            if not rc["items"][rec["appid"]]["done"]:
+                self._loader.request(rec["appid"], rec["base"], rec["title"])
+
+    def draw(r, i, s):
+        rec = lst[i]
+        it = rc["items"][rec["appid"]]
+        url = _BPX_HDR % rec["appid"]
+        pm = self._ws_pix(url) if it["done"] else None      # the header waits for the NSFW check
+        if pm is not None and not pm.isNull() and it["nsfw"] and not nsfw_revealed():
+            b = rc["blur"].get(url)
+            if b is None:
+                small = pm.scaled(max(8, pm.width() // 24), max(4, pm.height() // 24),
+                                  Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                b = rc["blur"][url] = small.scaled(pm.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                   Qt.TransformationMode.SmoothTransformation)
+            pm = b
+        badge = "IN LIBRARY" if self._in_library(rec["appid"]) else None
+        self._x_tile(p, r, pm, rec["title"], "Because you played " + rec["because"], acc, badge)
+    self._x_grid_paint(p, w, h, acc, len(lst), rc["sel"], 2.14, draw)
+
+
+# ---------------------------------------------------------------- Screenshots tab
+def _bpg_shots_all():
+    try:
+        d = _screenshots_dir()
+        paths = [os.path.join(d, n) for n in os.listdir(d) if n.lower().endswith(".png")]
+    except Exception:
+        return []
+    return sorted(paths, key=lambda q: os.path.getmtime(q), reverse=True)
+
+
+def _bpg_shot_game(path):
+    base = os.path.splitext(os.path.basename(path))[0]
+    return base.rsplit(" - ", 1)[0] if " - " in base else base
+
+
+@_bpm("_shots_open")
+def _bpg_shots_open(self, title):
+    """From a game's options: jump to the Screenshots tab filtered to that game."""
+    self._sg["game"] = title
+    idx = _bpg_base(self) + 1
+    if self._tab == idx:
+        self._sg_enter()
+    else:
+        self._switch_tab(idx)
+    self._say("Screenshots: %s (%d)" % (title, len(self._sg["list"])), 2600)
+
+
+@_bpm("_sg_rebuild")
+def _bpg_sg_rebuild(self):
+    sg = self._sg
+    allp = _bpg_shots_all()
+    sg["games"] = sorted({_bpg_shot_game(q) for q in allp}, key=str.casefold)
+    lst = _shots_for(sg["game"]) if sg["game"] else allp
+    cur = sg["list"][sg["sel"]] if sg["list"] and 0 <= sg["sel"] < len(sg["list"]) else None
+    sg["list"] = lst
+    sg["sel"] = lst.index(cur) if cur in lst else 0
+    if len(sg["pix"]) > 150:
+        sg["pix"].clear()
+
+
+@_bpm("_sg_enter")
+def _bpg_sg_enter(self):
+    self._sg_rebuild()
+    self._sg_ensure()
+
+
+@_bpm("_sg_ensure")
+def _bpg_sg_ensure(self):
+    gap, tw, th, cols, x0, top, bot = self._x_grid(1.78)
+    row = self._sg["sel"] // cols
+    pitch = th + gap
+    self._x_ensure(row * pitch, row * pitch + pitch + self.height() * 0.024, bot - top)
+
+
+def _bpg_sg_pix(sg, path):
+    pm = sg["pix"].get(path)
+    if pm is None:
+        q = QPixmap(path)
+        pm = QPixmap() if q.isNull() else q.scaledToWidth(480, Qt.TransformationMode.SmoothTransformation)
+        sg["pix"][path] = pm
+    return pm
+
+
+@_bpm("_sg_cycle_game")
+def _bpg_sg_cycle_game(self):
+    sg = self._sg
+    opts = [""] + sg["games"]
+    sg["game"] = opts[(opts.index(sg["game"]) + 1) % len(opts)] if sg["game"] in opts else ""
+    self._sg_rebuild()
+    sg["sel"] = 0
+    self._x_reset_scroll()
+    self._say("Screenshots: %s" % (sg["game"] or "all games"), 2000)
+
+
+@_bpm("_sg_act")
+def _bpg_sg_act(self, name):
+    sg = self._sg
+    lst = sg["list"]
+    n = len(lst)
+    sg["sel"] = max(0, min(max(0, n - 1), sg["sel"]))
+    if name == "back":
+        self._switch_tab(0)
+    elif name in ("left", "right", "up", "down"):
+        if not n:
+            if name == "up":
+                _bpx_top(self)
+            return
+        new = _bpx_grid_nav(sg["sel"], n, self._x_grid(1.78)[3], name)
+        if new < 0:
+            _bpx_top(self)
+            return
+        sg["sel"] = new
+        self._sg_ensure()
+    elif name == "accept" and n:
+        self._shot_view(sg["sel"])
+    elif name == "x":
+        self._sg_cycle_game()
+    elif name == "alt":
+        os.makedirs(_screenshots_dir(), exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(_screenshots_dir()))
+
+
+@_bpm("_paint_shots")
+def _bpg_paint_shots(self, p, w, h, m, acc):
+    sg = self._sg
+    lst = sg["list"]
+    top, bot = h * 0.2, h * 0.86
+    area = QRectF(0, top, w, bot - top)
+    y, bh, gap = h * 0.128, h * 0.046, h * 0.012
+    fm = QFontMetrics(self._font(h * 0.019, True))
+    self._x_text(p, QRectF(m, y, w * 0.3, bh), "Screenshots", 0.028, QColor(235, 235, 245), True)
+    x = w - m
+    for text, tag in (("Open folder", "sfolder"), ("Game: " + (sg["game"] or "All"), "sgame")):
+        bw = min(h * 0.5, fm.horizontalAdvance(text) + h * 0.06)
+        x -= bw
+        r = QRectF(x, y, bw, bh)
+        self._x_pill(p, r, fm.elidedText(text, Qt.TextElideMode.ElideRight, int(bw - h * 0.03)), acc, size=0.019)
+        self._xhits.append((r, (tag,)))
+        x -= gap
+    if not lst:
+        self._x_msg(p, area, ("No screenshots for %s yet" % sg["game"]) if sg["game"]
+                    else "No screenshots yet. Press F9 while a game is running to take one.")
+        return
+    budget = [3]                                     # decode a few thumbnails per frame so scrolling stays smooth
+
+    def draw(r, i, s):
+        path = lst[i]
+        pm = sg["pix"].get(path)
+        if pm is None:
+            if budget[0] > 0:
+                budget[0] -= 1
+                pm = _bpg_sg_pix(sg, path)
+            else:
+                QTimer.singleShot(30, self.update)
+        try:
+            when = time.strftime("%d %b %Y  %H:%M", time.localtime(os.path.getmtime(path)))
+        except OSError:
+            when = ""
+        self._x_tile(p, r, pm, _bpg_shot_game(path), when, acc)
+    self._x_grid_paint(p, w, h, acc, len(lst), sg["sel"], 1.78, draw)
+
+
+@_bpm("_shot_view")
+def _bpg_shot_view(self, i):
+    lst = list(self._sg["list"])
+    if not lst:
+        return
+    i = max(0, min(len(lst) - 1, i))
+    self._ov = {"kind": "shot", "list": lst, "i": i, "pm": QPixmap(lst[i]), "confirm": False, "rects": []}
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+def _bpg_shot_step(ov, d):
+    n = len(ov["list"])
+    if n:
+        ov["i"] = (ov["i"] + d) % n
+        ov["pm"] = QPixmap(ov["list"][ov["i"]])
+        ov["confirm"] = False
+
+
+def _bpg_shot_share(bp, path):
+    fp = getattr(bp._app, "friends_page", None)
+    try:
+        friends = {(d.get("username") or "Friend"): uid for uid, d in (fp.friends.items() if fp else [])}
+    except Exception:
+        friends = {}
+    if not friends:
+        bp._say("Add a friend first to share screenshots", 2800)
+        return
+    name, ok = QInputDialog.getItem(bp, "Share", "Send to:", sorted(friends), 0, False)
+    if not ok:
+        return
+    game = _bpg_shot_game(path)
+
+    def send():
+        cloud_send_message(friends[name], "Screenshot from %s" % game, [prepare_attachment(path)])
+        return name
+    w = TaskWorker(send)
+    w.done.connect(lambda n: bp._say("Sent to %s" % n, 2600))
+    w.failed.connect(lambda e: bp._say(e, 3500))
+    bp._sg["w"] = [x for x in bp._sg["w"] if x.isRunning()] + [w]
+    w.start()
+    bp._say("Sending...", 0)
+
+
+def _bpg_shot_delete(bp, ov):
+    path = ov["list"][ov["i"]]
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    bp._sg["pix"].pop(path, None)
+    ov["list"].pop(ov["i"])
+    bp._sg_rebuild()
+    if not ov["list"]:
+        bp._ov = None
+        bp._say("Screenshot deleted", 2000)
+        return
+    ov["i"] = min(ov["i"], len(ov["list"]) - 1)
+    ov["pm"] = QPixmap(ov["list"][ov["i"]])
+    ov["confirm"] = False
+    bp._say("Screenshot deleted", 2000)
+
+
+# ---------------------------------------------------------------- tab plumbing
+@_bpm("_x_enter")
+def _bpg_x_enter(self, t):
+    n0 = _bpg_base(self)
+    kind = "rec" if t == n0 else ("shot" if t == n0 + 1 else None)
+    if kind is None:
+        _bpg_o["_x_enter"](self, t)
+        return
+    self._xtimer.stop()
+    self._xticks = 0
+    self._x_reset_scroll()
+    if kind == "rec":
+        self._rc_enter()
+    else:
+        self._sg_enter()
+    if self._active and not self._asleep:
+        self._xtimer.start()
+
+
+@_bpm("_x_act")
+def _bpg_x_act(self, name):
+    kind = _bpg_kind(self)
+    if kind == "rec":
+        self._rc_act(name)
+    elif kind == "shot":
+        self._sg_act(name)
+    else:
+        _bpg_o["_x_act"](self, name)
+        return
+    self.update()
+
+
+@_bpm("_x_hint")
+def _bpg_x_hint(self):
+    kind = _bpg_kind(self)
+    if kind == "rec" and self._zone != "bar":
+        return "Arrows  Browse      A  Details      X  Refresh      LB / RB  Switch tab      B  Library"
+    if kind == "shot" and self._zone != "bar":
+        return "Arrows  Browse      A  View      X  Filter by game      Y  Open folder      LB / RB  Switch tab      B  Library"
+    return _bpg_o["_x_hint"](self)
+
+
+@_bpm("_x_tag")
+def _bpg_x_tag(self, tag):
+    k = tag[0]
+    if k == "dlimit":
+        self._dlim_open()
+    elif k == "rrefresh":
+        self._rc_act("x")
+    elif k == "sgame":
+        self._sg_cycle_game()
+    elif k == "sfolder":
+        self._sg_act("alt")
+    elif _bpg_kind(self) == "rec" and k == "tile":
+        rc = self._rc
+        if rc["sel"] == tag[1]:
+            self._rc_act("accept")
+        else:
+            rc["sel"] = tag[1]
+            self._rc_ensure()
+    elif _bpg_kind(self) == "shot" and k == "tile":
+        sg = self._sg
+        if sg["sel"] == tag[1]:
+            self._sg_act("accept")
+        else:
+            sg["sel"] = tag[1]
+            self._sg_ensure()
+    else:
+        _bpg_o["_x_tag"](self, tag)
+        return
+    self.update()
+
+
+@_bpm("_paint_extra")
+def _bpg_paint_extra(self, p, w, h, m, acc, k):
+    kind = _bpg_kind(self)
+    if kind is None:
+        _bpg_o["_paint_extra"](self, p, w, h, m, acc, k)
+        return
+    self._xhits = []
+    p.setOpacity(k)
+    if kind == "rec":
+        self._paint_rec(p, w, h, m, acc)
+    else:
+        self._paint_shots(p, w, h, m, acc)
+    p.setOpacity(1.0)
+    if self._zone == "bar":
+        items = self._bar_items()
+        if items:
+            r = items[max(0, min(len(items) - 1, self._barsel))][0]
+            self._x_ring(p, r, r.height() / 2)
+
+
+# ---------------------------------------------------------------- overlays: download limits + screenshot viewer
+@_bpm("_ov_act")
+def _bpg_ov_act(self, name):
+    ov = self._ov
+    if ov is None or ov["kind"] not in ("dlim", "shot"):
+        _bpg_o["_ov_act"](self, name)
+        return
+    if name == "start":
+        name = "accept"
+    if ov["kind"] == "dlim":
+        sel = ov["sel"]
+        if name == "up":
+            ov["sel"] = max(0, sel - 1)
+        elif name == "down":
+            ov["sel"] = min(4, sel + 1)
+        elif name in ("left", "right") and sel < 4:
+            _bpg_dlim_adjust(ov, sel, -1 if name == "left" else 1)
+        elif name == "accept":
+            if sel == 4:
+                self._ov = None
+            else:
+                _bpg_dlim_adjust(ov, sel, 1, wrap=True)
+        elif name in ("back", "x"):
+            self._ov = None
+    else:
+        if name in ("left", "right"):
+            _bpg_shot_step(ov, -1 if name == "left" else 1)
+        elif name in ("back", "accept"):
+            self._ov = None
+        elif name == "x":
+            if ov["confirm"]:
+                _bpg_shot_delete(self, ov)
+            else:
+                ov["confirm"] = True
+        elif name == "alt":
+            path = ov["list"][ov["i"]]
+            QTimer.singleShot(0, lambda: _bpg_shot_share(self, path))
+    self.update()
+
+
+@_bpm("_ov_click")
+def _bpg_ov_click(self, tag):
+    ov = self._ov
+    if ov is None or ov["kind"] not in ("dlim", "shot"):
+        _bpg_o["_ov_click"](self, tag)
+        return
+    k = tag[0]
+    if k == "dclose" or k == "sclose":
+        self._ov = None
+    elif k == "dlm":
+        ov["sel"] = tag[1]
+        _bpg_dlim_adjust(ov, tag[1], tag[2])
+    elif k == "row":
+        ov["sel"] = tag[1]
+        self._ov_act("accept")
+    elif k == "sprev":
+        _bpg_shot_step(ov, -1)
+    elif k == "snext":
+        _bpg_shot_step(ov, 1)
+    elif k == "sact":
+        self._ov_act(("alt", "x", "back")[tag[1]])
+    self.update()
+
+
+@_bpm("keyPressEvent")
+def _bpg_key(self, e):
+    ov = self._ov
+    if ov is not None and ov["kind"] in ("dlim", "shot"):
+        K = Qt.Key
+        self._pad_last = False
+        name = {K.Key_Up: "up", K.Key_Down: "down", K.Key_Left: "left", K.Key_Right: "right", K.Key_Return: "accept",
+                K.Key_Enter: "accept", K.Key_Space: "accept", K.Key_Escape: "back", K.Key_Backspace: "back",
+                K.Key_F11: "back", K.Key_X: "x", K.Key_Delete: "x", K.Key_Y: "alt", K.Key_S: "alt"}.get(e.key())
+        if name:
+            self._ov_act(name)
+        return
+    _bpg_o["keyPressEvent"](self, e)
+
+
+@_bpm("_paint_ov")
+def _bpg_paint_ov(self, p, w, h, acc):
+    ov = self._ov
+    if ov["kind"] not in ("dlim", "shot"):
+        _bpg_o["_paint_ov"](self, p, w, h, acc)
+        return
+    ov["rects"] = []
+    al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    p.setPen(Qt.PenStyle.NoPen)
+    if ov["kind"] == "shot":
+        p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 238))
+        pm, path = ov["pm"], ov["list"][ov["i"]]
+        area = QRectF(w * 0.05, h * 0.1, w * 0.9, h * 0.74)
+        if not pm.isNull():
+            s = min(area.width() / pm.width(), area.height() / pm.height())
+            rw, rh = pm.width() * s, pm.height() * s
+            p.drawPixmap(QRectF(area.center().x() - rw / 2, area.center().y() - rh / 2, rw, rh), pm, QRectF(pm.rect()))
+        else:
+            self._x_msg(p, area, "Couldn't open this screenshot")
+        try:
+            when = time.strftime("%d %b %Y  %H:%M", time.localtime(os.path.getmtime(path)))
+        except OSError:
+            when = ""
+        self._x_text(p, QRectF(w * 0.05, h * 0.03, w * 0.7, h * 0.05), "%s   -   %s" % (_bpg_shot_game(path), when), 0.026,
+                     QColor(235, 235, 245), True)
+        self._x_text(p, QRectF(w * 0.75, h * 0.03, w * 0.2, h * 0.05), "%d / %d" % (ov["i"] + 1, len(ov["list"])), 0.022,
+                     QColor(170, 170, 200), False, al_r)
+        bw, bh, gap = h * 0.24, h * 0.055, h * 0.015
+        labels = ("Share (Y)", "Press X again to delete" if ov["confirm"] else "Delete (X)", "Close (B)")
+        widths = (bw, h * 0.4 if ov["confirm"] else bw, bw)
+        x = w / 2 - (sum(widths) + 2 * gap) / 2
+        for j, t in enumerate(labels):
+            r = QRectF(x, h * 0.87, widths[j], bh)
+            self._x_pill(p, r, t, acc, primary=(j == 1 and ov["confirm"]), size=0.02)
+            ov["rects"].append((r, ("sact", j)))
+            x += widths[j] + gap
+        ov["rects"].append((QRectF(0, h * 0.1, w * 0.15, h * 0.74), ("sprev",)))
+        ov["rects"].append((QRectF(w * 0.85, h * 0.1, w * 0.15, h * 0.74), ("snext",)))
+        ov["rects"].append((QRectF(0, 0, w, h), ("sclose",)))
+        p.setFont(self._font(h * 0.0185))
+        p.setPen(QColor(150, 150, 175))
+        p.drawText(QRectF(w * 0.05, h * 0.945, w * 0.9, h * 0.035), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   "Left / Right  Previous / Next      Y  Share with a friend      X  Delete      A / B  Close")
+        return
+    # download limits panel
+    bw, bh, pad = w * 0.5, h * 0.7, h * 0.03
+    bx, by = (w - bw) / 2, (h - bh) / 2
+    p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 175))
+    p.setBrush(QColor(14, 14, 26, 250))
+    p.drawRoundedRect(QRectF(bx, by, bw, bh), h * 0.025, h * 0.025)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.025, bw - 2 * pad, h * 0.05), "Download limits", 0.032, QColor(245, 245, 252), True)
+    self._x_text(p, QRectF(bx + pad, by + h * 0.08, bw - 2 * pad, h * 0.04),
+                 "Applies to every launcher download. Changes are saved straight away.", 0.0185, QColor(170, 170, 200))
+    d = ov["d"]
+    rows = ("Speed limit", "Only download between set hours", "Start hour", "End hour")
+    y, rh, pitch = by + h * 0.15, h * 0.075, h * 0.087
+    ar = h * 0.055
+    for i in range(5):
+        r = QRectF(bx + pad, y + i * pitch, bw - 2 * pad, rh)
+        s = i == ov["sel"]
+        dim = i in (2, 3) and not d["sched"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc if s else QColor(255, 255, 255, 22))
+        p.drawRoundedRect(r, rh * 0.25, rh * 0.25)
+        col = QColor(_on_accent()) if s else (QColor(120, 120, 140) if dim else QColor(235, 235, 245))
+        if i == 4:
+            self._x_text(p, r, "Done", 0.026, col, True, int(Qt.AlignmentFlag.AlignCenter))
+            ov["rects"].append((r, ("row", 4)))
+            continue
+        self._x_text(p, QRectF(r.left() + pad * 0.7, r.top(), r.width() * 0.55, rh), rows[i], 0.0235, col, s)
+        right = QRectF(r.right() - pad * 0.5 - ar, r.top(), ar, rh)
+        left = QRectF(right.left() - h * 0.24 - ar, r.top(), ar, rh)
+        self._x_text(p, QRectF(left.right(), r.top(), h * 0.24, rh), _bpg_dlim_text(ov, i), 0.0235, col, True, int(Qt.AlignmentFlag.AlignCenter))
+        self._x_text(p, left, "<", 0.028, col, True, int(Qt.AlignmentFlag.AlignCenter))
+        self._x_text(p, right, ">", 0.028, col, True, int(Qt.AlignmentFlag.AlignCenter))
+        ov["rects"].append((left, ("dlm", i, -1)))
+        ov["rects"].append((right, ("dlm", i, 1)))
+        ov["rects"].append((r, ("row", i)))
+    ov["rects"].append((QRectF(0, 0, w, h), ("dclose",)))
+    p.setFont(self._font(h * 0.0185))
+    p.setPen(QColor(150, 150, 175))
+    p.drawText(QRectF(bx + pad, by + bh - h * 0.055, bw - 2 * pad, h * 0.035), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+               "Up / Down  Select      Left / Right  Change      A  Toggle / Done      B  Close")
+
+
+
+# ---------------------------------------------------------------- games started outside the launcher
+# A game that was already running when the launcher opened, or that was started some other way (desktop shortcut,
+# Steam, Explorer, a terminal...), is noticed by a background scan and then counted exactly like a game started with
+# the Launch button: Stop button, "Playing" status, playtime, Discord presence, friends. A game is recognised when one
+# of its processes is a library game's exe (or runs from that game's folder). Turn it off with
+# "detect_running_games": false in the launcher settings file.
+_EXT_SCAN_SECS = 4.0
+_EXT_EXE_SUFFIX = (".exe", ".x86_64", ".x86", ".appimage", ".sh", ".bat", ".cmd", ".bin")
+_EXT_SKIP_WORDS = tuple(globals().get("_BAD_EXE_WORDS", ())) + ("crashpad", "bugreport", "installer")
+
+
+class _AdoptedProc:
+    """Popen look-alike for a game process the launcher did not start itself (so Stop and the watchers work on it)."""
+    def __init__(self, ps):
+        self._ps = ps
+        self.pid = ps.pid
+        self.args = []
+        self.returncode = None
+
+    def _alive(self):
+        import psutil
+        try:
+            return self._ps.is_running() and self._ps.status() != psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            return False
+
+    def poll(self):
+        if self._alive():
+            return None
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def wait(self, timeout=None):
+        end = None if timeout is None else time.time() + timeout
+        while self._alive():
+            if end is not None and time.time() >= end:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.25)
+        return self.poll()
+
+    def terminate(self):
+        try:
+            self._ps.terminate()
+        except Exception:
+            pass
+
+    def kill(self):
+        try:
+            self._ps.kill()
+        except Exception:
+            pass
+
+    def send_signal(self, sig):
+        try:
+            self._ps.send_signal(sig)
+        except Exception:
+            pass
+
+
+def _ext_fix_path(p):
+    """An absolute, comparable path from a process path (Wine's Z:\\ drive is mapped back to /), or ''."""
+    if not isinstance(p, str) or not p:
+        return ""
+    if not sys.platform.startswith("win") and re.match(r"^[A-Za-z]:[\\/]", p):
+        if p[0] not in "zZ":
+            return ""                       # another Wine drive: can't tell where it lives
+        p = p[2:].replace("\\", "/")
+    if not os.path.isabs(p):
+        return ""
+    return os.path.abspath(p)
+
+
+def _ext_build_index():
+    """What the library knows: {'exes': {norm exe: title}, 'folders': {norm folder + sep: title}, 'roots': [norm root + sep]}."""
+    exes, folders = {}, {}
+    try:
+        fan = load_fan_library()
+    except Exception:
+        fan = []
+    for g in load_steam_library() + load_custom_games() + fan:
+        exe, title = g.get("exe_path"), g.get("title")
+        if not (exe and title):
+            continue
+        full = _ext_fix_path(exe) or os.path.abspath(exe)
+        title = pretty_game_name(_canonical_title(title))
+        exes[os.path.normcase(full)] = title
+        fol = _game_folder_for([full], os.path.dirname(full))     # None for the shared library folder, a drive root, home
+        if fol:
+            folders[fol + os.sep] = title
+    # Store games don't save an exe_path: the launcher finds the exe inside the game's install folder when you click
+    # Launch (find_best_game_exe), or from the exe recorded after a setup.exe install. Index both the same way.
+    try:
+        recorded = _load_installed_exes()
+    except Exception:
+        recorded = {}
+    for g in load_steam_library() + fan:
+        raw_title = g.get("title")
+        if not raw_title:
+            continue
+        title = pretty_game_name(_canonical_title(raw_title))
+        try:
+            d = os.path.abspath(_safe_installed_game_dir(raw_title))
+            if os.path.isdir(d):
+                folders[os.path.normcase(d) + os.sep] = title
+        except Exception:
+            pass
+        rec = recorded.get(raw_title) or recorded.get(sanitize_folder_name(raw_title))
+        if rec and os.path.isfile(rec):
+            full = os.path.abspath(rec)
+            exes[os.path.normcase(full)] = title
+            fol = _game_folder_for([full], os.path.dirname(full))
+            if fol:
+                folders[fol + os.sep] = title
+    try:
+        roots = [os.path.normcase(os.path.abspath(r)) + os.sep for r in library_roots()]
+    except Exception:
+        roots = []
+    return {"exes": exes, "folders": folders, "roots": roots}
+
+
+def _ext_title_for_path(path, idx):
+    norm = os.path.normcase(path)
+    if norm in idx["exes"]:
+        return idx["exes"][norm]
+    best = ""
+    for fol in idx["folders"]:
+        if norm.startswith(fol) and len(fol) > len(best):
+            best = fol
+    if best:
+        return idx["folders"][best]
+    for root in idx["roots"]:
+        if norm.startswith(root):
+            rel = os.path.relpath(path, root[:-1]).split(os.sep)
+            if len(rel) < 2 or rel[0] == "..":
+                return None                  # a loose file in the library folder, not a game's folder
+            first = rel[0]
+            for info in GAME_INFO.values():
+                if first.lower().startswith(info["name"].lower()):
+                    return pretty_game_name(_canonical_title(info["name"]))
+            return pretty_game_name(_canonical_title(first))
+    return None
+
+
+def _ext_match_process(info, idx):
+    """(title, exe path) if this process is a library game, else None."""
+    name = (info.get("name") or "").lower()
+    if name in _TRACK_IGNORE:
+        return None
+    paths = [info.get("exe")]
+    paths += [a for a in (info.get("cmdline") or [])[:8] if isinstance(a, str) and a.lower().endswith(_EXT_EXE_SUFFIX)]
+    for raw in paths:
+        path = _ext_fix_path(raw)
+        if not path:
+            continue
+        base = os.path.basename(path).lower()
+        if any(w in base for w in _EXT_SKIP_WORDS):
+            continue
+        title = _ext_title_for_path(path, idx)
+        if title:
+            return title, path
+    return None
+
+
+def _ext_is_running(title):
+    low = pretty_game_name(title).casefold()
+    return any(pretty_game_name(n).casefold() == low for n in list(_running))
+
+
+def _ext_scan(cache):
+    """-> {title: [(create_time, psutil.Process, exe path)]} for every library game that has a live process."""
+    import psutil
+    idx = _ext_build_index()
+    sig = (tuple(sorted(idx["exes"].items())), tuple(sorted(idx["folders"].items())), tuple(idx["roots"]))
+    if cache.get("sig") != sig:                 # the library changed: forget what was decided before
+        cache.clear()
+        cache["sig"] = sig
+    seen_keys = cache.setdefault("procs", {})
+    me = os.getpid()
+    mine = {me}
+    try:
+        mine.update(c.pid for c in psutil.Process(me).children(recursive=True))   # the launcher's own helpers/installers
+    except psutil.Error:
+        pass
+    live, found = set(), {}
+    for p in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]):
+        info = p.info
+        pid, ct = info.get("pid"), info.get("create_time") or 0
+        if pid is None or pid in mine:
+            continue
+        key = (pid, ct)
+        live.add(key)
+        if key not in seen_keys:
+            try:
+                seen_keys[key] = _ext_match_process(info, idx)
+            except Exception:
+                seen_keys[key] = None
+        hit = seen_keys[key]
+        if hit:
+            found.setdefault(hit[0], []).append((ct, p, hit[1]))
+    for key in [k for k in seen_keys if k not in live]:
+        del seen_keys[key]
+    return found
+
+
+class _ExtGameBus(QObject):
+    adopt = pyqtSignal(str, object, str)       # title, _AdoptedProc, game folder ('' if unknown)
+
+
+def _ext_on_adopt(title, proc, folder):
+    """GUI thread: from here on it is the same as a game started with Launch."""
+    try:
+        if _ext_is_running(title) or proc.poll() is not None:
+            return
+        _track_playing(title, proc, folder or None)
+    except Exception:
+        pass
+
+
+def _ext_loop(bus):
+    try:
+        import psutil  # noqa: F401
+    except ImportError:
+        return                                  # without psutil there is nothing to scan with
+    cache, streak = {}, {}
+    time.sleep(3.0)                             # let the window finish building
+    while True:
+        try:
+            if load_launcher_settings().get("detect_running_games", True):
+                found = _ext_scan(cache)
+                for title in list(streak):
+                    if title not in found:
+                        del streak[title]
+                for title, procs in found.items():
+                    if _ext_is_running(title):
+                        streak.pop(title, None)
+                        continue
+                    streak[title] = streak.get(title, 0) + 1
+                    if streak[title] < 2:       # seen on two scans in a row, so a game the launcher is just starting isn't doubled
+                        continue
+                    ct, ps, path = min(procs, key=lambda x: x[0])      # the oldest process is the game's root
+                    streak.pop(title, None)
+                    bus.adopt.emit(title, _AdoptedProc(ps), _game_folder_for([path], None) or "")
+        except Exception:
+            pass
+        time.sleep(_EXT_SCAN_SECS)
+
+
+_ext_prev_init = AdaptiveApp.__init__
+
+def _ext_init(self, *a, **k):
+    _ext_prev_init(self, *a, **k)
+    try:
+        self._ext_bus = _ExtGameBus(self)
+        self._ext_bus.adopt.connect(_ext_on_adopt)
+        threading.Thread(target=_ext_loop, args=(self._ext_bus,), daemon=True).start()
+    except Exception:
+        pass
+
+AdaptiveApp.__init__ = _ext_init
+
+
+# ================================================================ desktop shortcuts
+# 1. A game's desktop shortcut runs `main.py --launch-game <title>`: if the launcher is open it is told to start the
+#    game, otherwise the launcher starts and then starts the game.
+# 2. Desktop shortcuts whose name is a game in the store are added to the library automatically (with their path).
+# 3. Switching theme / changing the Classic accent colour deletes the launcher's desktop shortcut and makes a new one
+#    with the new icon.
+_ncz_workers = set()
+
+def _ncz_game_launch_argv(title):
+    """([launcher, args..., '--launch-game', <title>], working dir). The title is percent-encoded so any name is safe."""
+    target, args, workdir = get_launch_command()
+    return [target] + list(args) + ["--launch-game", urllib.parse.quote(str(title), safe="")], workdir
+
+def _ncz_desktop_exec(argv):
+    """argv -> the value of a .desktop file's Exec= line (quoting and escaping as the Desktop Entry spec wants)."""
+    def q(a):
+        a = str(a).replace("\\", "\\\\\\\\")
+        for ch in ('"', "`", "$"):
+            a = a.replace(ch, "\\\\" + ch)
+        return '"' + a.replace("%", "%%") + '"'
+    return " ".join(q(a) for a in argv)
+
+def _ncz_launch_arg():
+    """The game name from `--launch-game <title>` ('' if the launcher wasn't started from a game's shortcut)."""
+    try:
+        i = sys.argv.index("--launch-game")
+    except ValueError:
+        return ""
+    return urllib.parse.unquote(sys.argv[i + 1]).strip() if i + 1 < len(sys.argv) else ""
+
+def _ncz_send_launch(title, wait=0):
+    """Asks the running launcher to start `title`. True if one answered (retries for `wait` seconds)."""
+    try:
+        from PyQt6.QtNetwork import QLocalSocket
+    except ImportError:
+        return False
+    deadline = time.time() + wait
+    while True:
+        try:
+            sock = QLocalSocket()
+            sock.connectToServer(_instance_name())
+            if sock.waitForConnected(800):
+                sock.write(b"launch:" + str(title).encode("utf-8"))
+                sock.flush()
+                sock.waitForBytesWritten(800)
+                sock.disconnectFromServer()
+                return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
+
+def _ncz_launch_requested(app, title, tries=0):
+    """Presses the Play / Launch button of the library game called `title`. The library is built in the background
+    while the launcher starts, so keep trying for about 30 seconds."""
+    window = getattr(app, "_ncz_main_window", None)
+    try:
+        if window is not None:
+            want = _norm_title(title)
+            for card, name in _remote_cards(window):
+                if name == title or _norm_title(name) == want:
+                    btn = _remote_play_button(card)
+                    if btn is not None:
+                        if name not in _running:          # already running: nothing to do
+                            btn.click()
+                        return
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    if tries < 60:
+        QTimer.singleShot(500, lambda: _ncz_launch_requested(app, title, tries + 1))
+    elif window is not None:
+        QMessageBox.information(window, "Launch Game",
+                                f"Couldn't start {title}. Is it installed and in your library?")
+
+def _ncz_after_window_created(app, window, title):
+    """Called once from main(): starts the game a shortcut asked for, and sets up the desktop auto-add."""
+    pending = list(getattr(app, "_ncz_pending_launches", []))
+    app._ncz_pending_launches = []
+    if title:
+        pending.insert(0, title)
+    for t in dict.fromkeys(pending):
+        QTimer.singleShot(1500, lambda t=t: _ncz_launch_requested(app, t))
+    QTimer.singleShot(7000, lambda: _ncz_autoadd_desktop(window))
+    QTimer.singleShot(10000, lambda: _ncz_migrate_old_shortcuts(window))     # first launch since the update
+    timer = QTimer(window)
+    timer.setInterval(3 * 60 * 1000)                 # picks up shortcuts added while the launcher stays open
+    timer.timeout.connect(lambda: (_ncz_autoadd_desktop(window), _ncz_migrate_old_shortcuts(window)))
+    timer.start()
+    window._ncz_autoadd_timer = timer
+
+# ---------------------------------------------------------------- auto-add desktop shortcuts that are store games
+def _ncz_autoadd_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_autoadd.json")
+
+def _ncz_autoadd_load():
+    try:
+        with open(_ncz_autoadd_path(), encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("added", {})
+            st.setdefault("cache", {})
+            return st
+    except Exception:
+        pass
+    return {"added": {}, "cache": {}}
+
+def _ncz_autoadd_save(st):
+    try:
+        os.makedirs(os.path.dirname(_ncz_autoadd_path()), exist_ok=True)
+        with open(_ncz_autoadd_path(), "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+def _ncz_store_lookup(title, cache):
+    """(appid, store title, image base) when `title` is exactly a game's name in the Steam store, else None.
+    Answers are cached on disk (misses for a week) so the same shortcut isn't looked up on every start."""
+    key = _norm_title(title)
+    hit = cache.get(key)
+    now = time.time()
+    if isinstance(hit, list) and len(hit) == 3:
+        ts, appid, base = hit
+        if appid:
+            return appid, title, base
+        if now - ts < 7 * 86400:
+            return None
+    res = _desk_steam_lookup(title)
+    if res and _norm_title(res[1]) != key:
+        res = None                       # only an exact name counts here, so apps like "Discord" are never taken for games
+    cache[key] = [now, res[0] if res else 0, res[2] if res else ""]
+    return res
+
+def _ncz_is_own_shortcut(c):
+    """The launcher's own shortcuts (and game shortcuts that already open the launcher) are not games to add."""
+    blob = " ".join([str(c.get("title", "")), str(c.get("args", "")), " ".join(map(str, c.get("launch_cmd") or [])),
+                     str(c.get("launch_file", "")), str(c.get("source", ""))]).lower()
+    if "--launch-game" in blob or "ncz games launcher" in blob:
+        return True
+    here = os.path.dirname(os.path.abspath(__file__)).lower()
+    return bool(here) and here in blob
+
+def _ncz_autoadd_scan(dirs, titles, exes, urls, appids, state, key, loader):
+    """Worker thread: desktop entries that are exactly a store game and aren't in the library, with a cover each."""
+    cache = state.setdefault("cache", {})
+    cands = scan_desktop_games(dirs, titles, exes, urls, appids, steam_lookup=lambda t: _ncz_store_lookup(t, cache))
+    done = state.get("added", {})
+    out = []
+    for c in cands:
+        if not c.get("appid") or _norm_title(c["title"]) in done or _ncz_is_own_shortcut(c):
+            continue
+        if c.get("launch_url") and not _norm_title(c["title"]):
+            continue
+        out.append(c)
+    for c in out:
+        try:
+            c["cover_path"] = _desk_find_cover(c, key, loader) or ""
+        except Exception:
+            c["cover_path"] = ""
+    return out
+
+def _ncz_reroute_shortcut(c, gid):
+    """Makes the desktop shortcut open the launcher, which then starts the game. The original is kept in the settings
+    folder. Only .desktop (Linux) and .lnk (Windows) files can be changed; .url / .exe / folders are left alone."""
+    src = c.get("source") or ""
+    low = src.lower()
+    if not src or not os.path.isfile(src) or os.path.islink(src):
+        return False
+    argv, workdir = _ncz_game_launch_argv(c["title"])
+    keep_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
+    os.makedirs(keep_dir, exist_ok=True)
+    if low.endswith(".desktop") and not sys.platform.startswith("win"):
+        shutil.copyfile(src, os.path.join(keep_dir, f"{gid}.orig.desktop"))
+        with open(src, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        out, in_entry, done = [], False, False
+        for ln in lines:
+            st = ln.strip()
+            if st.startswith("["):
+                in_entry = st == "[Desktop Entry]"
+            if in_entry and ln.startswith("Exec=") and not done:
+                out += ["Exec=" + _ncz_desktop_exec(argv), "X-NCZ-Launcher-Game=true"]
+                done = True
+                continue
+            if in_entry and ln.startswith("Terminal="):
+                out.append("Terminal=false")
+                continue
+            out.append(ln)
+        if not done:
+            return False
+        with open(src, "w", encoding="utf-8") as f:           # same file, so its permissions / trusted flag stay
+            f.write("\n".join(out) + "\n")
+        return True
+    if low.endswith(".lnk") and sys.platform.startswith("win"):
+        if os.path.normcase(c.get("launch_file", "")) == os.path.normcase(src):
+            return False                                         # the library would launch this very file again
+        shutil.copyfile(src, os.path.join(keep_dir, f"{gid}.orig.lnk"))
+        q = _ps_quote
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(src)});"
+              "if(-not $s.TargetPath){exit 3};"
+              "$i=$s.IconLocation;if(-not $i -or $i.StartsWith(',')){$i=$s.TargetPath+',0'};"
+              f"$s.TargetPath={q(argv[0])};$s.Arguments={q(subprocess.list2cmdline(argv[1:]))};"
+              f"$s.WorkingDirectory={q(workdir)};$s.IconLocation=$i;$s.Save()")
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                           capture_output=True, timeout=30, creationflags=0x08000000)
+        return r.returncode == 0
+    return False
+
+def _ncz_autoadd_apply(window, cands, state):
+    """GUI thread: adds the found games to the library and points their desktop shortcuts at the launcher."""
+    if cands:
+        games = load_custom_games()
+        stamp = int(time.time() * 1000)
+        for n, c in enumerate(cands):
+            gid = f"custom_{stamp}_{n}"
+            cover = c.get("cover_path") or ""
+            if not cover or not os.path.exists(cover):
+                source = c["exe_path"] if os.path.exists(c["exe_path"]) else c["source"]
+                cover = _desk_icon_cover(source, c["title"],
+                                         os.path.join(get_library_cover_dir(), f"desk-{_cover_key(c['title'])}.png"))
+            if cover and os.path.exists(cover):
+                try:
+                    os.makedirs(get_library_cover_dir(), exist_ok=True)
+                    dest = os.path.join(get_library_cover_dir(), f"{gid}.img")
+                    shutil.copyfile(cover, dest)
+                    cover = dest
+                except Exception:
+                    pass
+            entry = {"id": gid, "title": c["title"], "exe_path": c["exe_path"], "cover_path": cover, "compat_tool": ""}
+            if c.get("launch_file"):
+                try:
+                    folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
+                    os.makedirs(folder, exist_ok=True)
+                    keep = os.path.join(folder, f"{gid}.lnk")
+                    shutil.copyfile(c["launch_file"], keep)
+                    c["launch_file"] = keep
+                except Exception:
+                    pass
+            for k in ("launch_url", "launch_file", "launch_args", "launch_cmd", "workdir"):
+                if c.get(k):
+                    entry[k] = c[k]
+            games.append(entry)
+            save_custom_games(games)         # saved per game so a crash half way doesn't lose the earlier ones
+            window.create_custom_card(gid, entry["title"], entry["exe_path"], cover, "")
+            state.setdefault("added", {})[_norm_title(c["title"])] = gid
+            try:
+                _ncz_reroute_shortcut(c, gid)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        window.apply_filter()
+    _ncz_autoadd_save(state)
+
+def _ncz_autoadd_desktop(window):
+    """Looks through the Desktop for shortcuts named like a store game and adds the new ones to the library."""
+    try:
+        if getattr(window, "_ncz_autoadd_busy", False) or _ncz_profile:
+            return
+        dirs = _desktop_dirs()
+        if not dirs:
+            return
+        titles, exes, urls, appids = _desk_known(window)
+        state = _ncz_autoadd_load()
+        key = get_steamgriddb_key()
+        loader = CoverLoader()
+        loader.set_key(key)
+        window._ncz_autoadd_busy = True
+        worker = TaskWorker(lambda: _ncz_autoadd_scan(dirs, titles, exes, urls, appids, state, key, loader))
+        _ncz_workers.add(worker)
+
+        def done(cands):
+            window._ncz_autoadd_busy = False
+            try:
+                _ncz_autoadd_apply(window, cands, state)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+        def failed(_msg):
+            window._ncz_autoadd_busy = False
+        worker.done.connect(done)
+        worker.failed.connect(failed)
+        worker.finished.connect(lambda: _ncz_workers.discard(worker))
+        worker.start()
+    except Exception:
+        window._ncz_autoadd_busy = False
+        import traceback
+        traceback.print_exc()
+
+# ---------------------------------------------------------------- update game shortcuts made by older launchers (once)
+def _ncz_migration_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "shortcut_migration.json")
+
+def _ncz_old_shortcut_title(path):
+    """Game name for a desktop shortcut an older launcher made for a game (it started the game directly), else ''."""
+    low = path.lower()
+    try:
+        if low.endswith(".desktop") and not sys.platform.startswith("win"):
+            info = _desk_read_ini(path)
+            ex = info.get("Exec", "").replace("\\", "/")
+            if "game-launcher/shortcuts/" in ex and "--launch-game" not in ex:
+                return info.get("Name", "").strip()
+        elif low.endswith(".lnk") and sys.platform.startswith("win"):
+            r = _desk_parse_lnk(path)
+            if r and r[0].lower().endswith(".exe") and "--launch-game" not in r[1]:
+                return os.path.splitext(os.path.basename(path))[0]    # old ones are named after the game
+    except Exception:
+        pass
+    return ""
+
+def _ncz_migrate_old_shortcuts(window):
+    """First launch since this update: every desktop shortcut an older launcher made for a library game is rewritten
+    to open the launcher and then the game. Retries a couple of times in case the library is still loading."""
+    try:
+        try:
+            with open(_ncz_migration_path(), encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+        if st.get("done") or _ncz_profile:
+            return
+        cards = list(getattr(window, "cards", []))
+        if not cards:
+            return                                   # library not built yet: try again on the next tick
+        lookup = {}
+        for _c, t in cards:
+            for k in (_norm_title(t), _norm_title(sanitize_folder_name(t))):
+                lookup.setdefault(k, t)
+        stamp, changed, left = int(time.time() * 1000), 0, 0
+        for d in _desktop_dirs():
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                continue
+            for n in names:
+                p = os.path.join(d, n)
+                if not os.path.isfile(p) or os.path.islink(p):
+                    continue
+                t = _ncz_old_shortcut_title(p)
+                if not t:
+                    continue
+                card_title = lookup.get(_norm_title(t))
+                if not card_title:
+                    left += 1                        # not in the library (any more): leave that shortcut alone
+                    continue
+                try:
+                    if _ncz_reroute_shortcut({"source": p, "title": card_title}, f"old_{stamp}_{changed}"):
+                        changed += 1
+                    else:
+                        left += 1
+                except Exception:
+                    left += 1
+        st["tries"] = int(st.get("tries", 0)) + 1
+        st["updated"] = int(st.get("updated", 0)) + changed
+        if left == 0 or st["tries"] >= 3:
+            st["done"] = True
+        os.makedirs(os.path.dirname(_ncz_migration_path()), exist_ok=True)
+        with open(_ncz_migration_path(), "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+# ---------------------------------------------------------------- launcher shortcut: delete + recreate with the new icon
+def _ncz_theme_icon_src(kind):
+    """The icon file a theme uses ('' -> the normal one). Mirrors asset_path('icon.png') for another theme."""
+    if kind == "classic":
+        if os.path.exists(accent_icon_path()):
+            return accent_icon_path()                       # Classic with its own accent colour
+        return _theme_icon_file("classic") or os.path.join(ASSETS_DIR, "icon_default.png")
+    if kind in ("sunset", "legacy"):
+        return _theme_icon_file(kind) or os.path.join(ASSETS_DIR, "icon.png")
+    if kind in _ACCOUNT_THEMES:
+        return _ensure_theme_icon(_ACCOUNT_THEMES[kind]) or os.path.join(ASSETS_DIR, "icon.png")
+    return os.path.join(ASSETS_DIR, "icon.png")
+
+def _ncz_launcher_shortcut_files():
+    """The 'NCZ Games Launcher' shortcuts on the Desktop right now. Call from the GUI thread."""
+    out = []
+    for d in _desktop_dirs():
+        for n in ("NCZ Games Launcher.lnk", "NCZ Games Launcher.desktop"):
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                out.append(p)
+    return out
+
+def _ncz_recreate_launcher_shortcut(existing, theme_key, only_if_changed):
+    backups = {}
+    try:
+        src = _ncz_theme_icon_src(theme_key) if theme_key else None
+        icon = prepare_shortcut_icon(src)
+        if only_if_changed:
+            try:
+                with open(_shortcut_marker(), encoding="utf-8") as f:
+                    old = f.read().strip()
+            except Exception:
+                return                                   # this launcher never made the shortcut
+            if not icon or os.path.basename(icon) == old:
+                return                                   # same icon as before
+        for p in existing:
+            try:
+                with open(p, "rb") as f:
+                    backups[p] = f.read()
+                os.remove(p)                             # delete the old shortcut ...
+            except OSError:
+                pass
+        create_desktop_shortcut(src)                     # ... and make a new one with the new icon
+    except Exception:
+        for p, data in backups.items():                  # couldn't make the new one: put the old one back
+            try:
+                if not os.path.exists(p):
+                    with open(p, "wb") as f:
+                        f.write(data)
+                    os.chmod(p, 0o755)
+            except Exception:
+                pass
+
+def _ncz_refresh_launcher_shortcut(theme_key=None, only_if_changed=False):
+    """Replaces the launcher's desktop shortcut (if there is one) with a fresh one using the current / chosen
+    theme's icon. Runs in the background. Never creates a shortcut the user doesn't have."""
+    if _ncz_profile:
+        return
+    try:
+        existing = _ncz_launcher_shortcut_files()
+    except Exception:
+        return
+    if not existing:
+        return
+    threading.Thread(target=_ncz_recreate_launcher_shortcut, args=(existing, theme_key, only_if_changed),
+                     daemon=True).start()
 
 
 if __name__ == "__main__":
