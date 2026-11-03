@@ -52,7 +52,6 @@ commands:
   list [filter]                           list the games in your library (a filter only shows matching names)
   auto-update [on|off]                    show or change the launcher's Automatic Updates switch
   status                                  launcher, account, theme and update overview
-  folder [launcher]                       open the settings folder (or the launcher's own folder)
   config [get|set|unset] [key] [value]    list / read / change / remove a launcher.json setting
   backup [file]                           save your settings (launcher.json etc., not your sign-in) to a zip
   quit                                    close the launcher
@@ -1503,46 +1502,6 @@ def cmd_status(_args):
     return 0
 
 
-def _open_path(path):
-    """Opens a folder in the file manager. False when this system has no way to do it."""
-    try:
-        if IS_WIN:
-            os.startfile(path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            opener = shutil.which("xdg-open")
-            if not opener:
-                return False
-            subprocess.Popen([opener, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        return True
-    except Exception:
-        return False
-
-
-def cmd_folder(args):
-    if args and [a.lower() for a in args] != ["launcher"]:
-        err("usage: ncz-gm folder [launcher]")
-        return 2
-    if args:
-        mp = main_py()
-        if not mp:
-            err("main.py not found next to ncz_gm.py (set NCZ_MAIN to its path)")
-            return 1
-        path = os.path.dirname(mp)
-    else:
-        path = settings_dir()
-    if not os.path.isdir(path):
-        err(f"{path} doesn't exist yet.")
-        return 1
-    if _open_path(path):
-        say(paint("\u2714 Opened", "ok") + f" {path}")
-    else:
-        say(path)
-    return 0
-
-
 def _mask_setting(key, text):
     return "(hidden)" if re.search(r"key|token|secret|pass", key, re.I) else text
 
@@ -1659,12 +1618,12 @@ COMMANDS = {
     "change-theme": cmd_change_theme, "theme": cmd_change_theme, "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
     "update": cmd_update, "account": cmd_account, "logout": cmd_logout, "list": cmd_list, "auto-update": cmd_auto_update,
-    "autoupdate": cmd_auto_update, "status": cmd_status, "folder": cmd_folder, "config": cmd_config, "backup": cmd_backup, "quit": cmd_quit, "restart": cmd_restart, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
+    "autoupdate": cmd_auto_update, "status": cmd_status, "config": cmd_config, "backup": cmd_backup, "quit": cmd_quit, "restart": cmd_restart, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
 }
 
 
-SIGNED_OUT_OK = ("login", "google-login", "github-login", "demo", "account", "logout", "status", "folder")
+SIGNED_OUT_OK = ("login", "google-login", "github-login", "demo", "account", "logout", "status")
 
 
 def main(argv=None, launcher=None):
