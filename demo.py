@@ -134,8 +134,66 @@ def _read_theme_choice():
 
 THEME_NAME, _THEME_ACCENT = _read_theme_choice()
 
+_CT_KEYS = ("bg", "sidebar", "panel", "text", "subtext", "accent", "button", "border")
+
+
+def _read_custom_theme():
+    """(id, entry) of the custom theme picked in the launcher (launcher.json: ui_theme = "custom_<id>", colours in
+    custom_themes[id]["colors"]), or None. Missing / broken colours are replaced so the window always gets a full palette."""
+    try:
+        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        key = d.get("ui_theme") or ""
+        tid = key[7:] if isinstance(key, str) and key.startswith("custom_") else ""
+        ent = (d.get("custom_themes") or {}).get(tid)
+        if not tid or not re.fullmatch(r"[0-9a-f]{4,12}", tid) or not isinstance(ent, dict):
+            return None
+        src = ent.get("colors") if isinstance(ent.get("colors"), dict) else {}
+        base = dict(bg="#080808", sidebar="#000000", panel="#1a1a1a", text="#ffffff", subtext="#aaaaaa",
+                    accent="#fcfcfc", button="#222222", border="#2e2e2e")
+        colors = {k: (src[k].lower() if isinstance(src.get(k), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", src[k]) else base[k])
+                  for k in _CT_KEYS}
+        return tid, {"colors": colors, "icon": "user" if ent.get("icon") == "user" else ""}
+    except Exception:
+        return None
+
+
+_CUSTOM_THEME = _read_custom_theme()
+if _CUSTOM_THEME:
+    THEME_NAME = "custom"
+
+def _custom_palette(colors):
+    """Sign-in window colours from a custom theme's 8 colours. The window is always dark (its text is white), so a dark theme
+    uses its own sidebar/background colours fading into the accent, and a light theme falls back to darkened accent shades."""
+    def lum(c):
+        return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255.0
+
+    def mix(a, b, t):
+        return (int(a.red() + (b.red() - a.red()) * t), int(a.green() + (b.green() - a.green()) * t),
+                int(a.blue() + (b.blue() - a.blue()) * t))
+
+    def cap(rgb, mx=0.42):                       # keep the white text readable over bright accents
+        l = lum(QColor(*rgb))
+        return rgb if l <= mx else tuple(int(v * mx / l) for v in rgb)
+
+    acc, bg, sb = QColor(colors["accent"]), QColor(colors["bg"]), QColor(colors["sidebar"])
+    r, g, b = acc.red(), acc.green(), acc.blue()
+    if lum(bg) >= 0.5:                           # light theme
+        dark = lambda f: (int(r * f), int(g * f), int(b * f))
+        stops = [(0.0, (0, 0, 0)), (0.45, (13, 13, 15)), (0.70, dark(0.28)), (0.88, dark(0.55)), (1.0, dark(0.82))]
+    else:
+        black = QColor(0, 0, 0)
+        stops = [(0.0, mix(sb, black, 0.35)), (0.45, (bg.red(), bg.green(), bg.blue())),
+                 (0.70, cap(mix(bg, acc, 0.28))), (0.88, cap(mix(bg, acc, 0.50))), (1.0, cap(mix(bg, acc, 0.72)))]
+    on_accent = QColor(20, 20, 20) if lum(acc) > 0.6 else QColor(255, 255, 255)
+    return dict(bg=stops, mist=(r, g, b), halo=(r, g, b), btn=(acc, acc), btn_text=on_accent,
+                bar0=acc.darker(125), bar1=acc.lighter(120), glow=(r, g, b))
+
+
 def _make_theme(name, accent_hex):
     """Colours of the sign-in / download window for each launcher theme."""
+    if name == "custom" and _CUSTOM_THEME:
+        return _custom_palette(_CUSTOM_THEME[1]["colors"])
     if name == "sunset":
         acc = QColor("#ff7a2f")
         return dict(bg=[(0.0, (15, 8, 38)), (0.45, (26, 13, 60)), (0.70, (54, 22, 92)), (0.88, (96, 38, 120)), (1.0, (140, 58, 130))],
@@ -178,6 +236,26 @@ def _hue_shift_icon(src, hue, sat_scale, size=512):
 def theme_icon_path():
     """The icon of the active theme (same files the launcher uses). '' if none is available yet."""
     try:
+        if THEME_NAME == "custom" and _CUSTOM_THEME:
+            tid, ent = _CUSTOM_THEME
+            user = os.path.join(settings_dir(), f"icon_custom_{tid}_user.png")      # the icon picked in the launcher
+            if ent["icon"] == "user" and os.path.isfile(user):
+                return user
+            cl = os.path.join(ASSETS_DIR, "icon-cl.png")
+            accent = QColor(ent["colors"]["accent"]).name().lower()
+            if accent == "#a666ff":
+                return cl if os.path.isfile(cl) else ""
+            dest = os.path.join(settings_dir(), f"icon_custom_{tid}_{accent[1:]}.png")   # same file the launcher makes
+            if os.path.isfile(dest):
+                return dest
+            if not os.path.isfile(cl):
+                return ""
+            c = QColor(accent)
+            img = _hue_shift_icon(cl, max(0.0, c.hueF()), c.saturationF() / 0.6)
+            if img is None:
+                return ""
+            os.makedirs(settings_dir(), exist_ok=True)
+            return dest if img.save(dest, "PNG") else ""
         if THEME_NAME == "sunset":
             f = os.path.join(ASSETS_DIR, "icon-ss.png")
             return f if os.path.isfile(f) else ""
