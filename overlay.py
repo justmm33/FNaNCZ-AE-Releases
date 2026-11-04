@@ -319,24 +319,61 @@ def _draw_text(p, rect, text, flags=Qt.AlignmentFlag.AlignVCenter):
 ICON_D = 46                       # size of the little icon on the right (unscaled toast units)
 ICON_PAD = 14                     # gap to the toast's right edge
 ICON_RESERVE = ICON_D + ICON_PAD + 6      # text stops this far from the right edge
-_icon_cache = {"pm": None, "tried": False}
+_icon_cache = {"pm": None, "key": None}
+_icon_provider = None             # launcher side: callable returning the launcher's current icon path
+_icon_path = ""                   # helper side: the path the launcher sent along with the toast
+
+
+def set_icon_provider(fn):
+    """Launcher side: fn() returns the path of the launcher's CURRENT icon (it changes with the accent colour)."""
+    global _icon_provider
+    _icon_provider = fn
+
+
+def set_icon_path(path):
+    """Helper process side: the launcher's current icon path, sent along with each toast."""
+    global _icon_path
+    _icon_path = str(path or "")
+
+
+def _current_icon_path():
+    """The launcher's current icon (follows accent recolouring), or "" when unknown."""
+    if _icon_provider is not None:
+        try:
+            p = _icon_provider()
+            if p:
+                return str(p)
+        except Exception:
+            pass
+    return _icon_path
 
 
 def _toast_icon():
-    """assets/icon.png as a square, cropped to the middle (None when the file isn't there)."""
-    if not _icon_cache["tried"]:
-        _icon_cache["tried"] = True
-        for d in _assets_dirs():
-            path = os.path.join(d, "icon.png")
-            if os.path.isfile(path):
-                pm = QPixmap(path)
-                if not pm.isNull():
-                    big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                    Qt.TransformationMode.SmoothTransformation)
-                    _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
-                                                 ICON_D * 2, ICON_D * 2)
-                    break
-    return _icon_cache["pm"]
+    """The launcher's current icon as a square, cropped to the middle (falls back to assets/icon.png)."""
+    cands = []
+    cur = _current_icon_path()
+    if cur:
+        cands.append(cur)
+    cands += [os.path.join(d, "icon.png") for d in _assets_dirs()]
+    for path in cands:
+        try:
+            if not os.path.isfile(path):
+                continue
+            key = (path, os.path.getmtime(path))
+        except OSError:
+            continue
+        if _icon_cache["key"] == key:
+            return _icon_cache["pm"]
+        pm = QPixmap(path)
+        if pm.isNull():
+            continue
+        big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+        _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
+                                     ICON_D * 2, ICON_D * 2)
+        _icon_cache["key"] = key
+        return _icon_cache["pm"]
+    return None
 
 
 def _draw_icon(p, cy):
@@ -1001,7 +1038,7 @@ class OverlayManager:
                                          "prefix": prefix, "image": image or "", "link": link or "",
                                          "badge": badge or "", "plain": bool(plain), "chess": chess or {},
                                          "accent": _accent_hex, "light": _light, "sunset": _sunset,
-                                         "emoji_dir": emoji_dir}) + "\n")
+                                         "icon": _current_icon_path(), "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
                 self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain, chess))
@@ -1377,6 +1414,8 @@ class _ServerBridge(QObject):
             set_emoji_dir(d["emoji_dir"])
         if d.get("accent"):
             set_accent(str(d["accent"]))
+        if d.get("icon"):
+            set_icon_path(d["icon"])
         if "sunset" in d:
             set_sunset(bool(d["sunset"]))
         if "light" in d:

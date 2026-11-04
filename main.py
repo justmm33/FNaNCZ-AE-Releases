@@ -2966,12 +2966,14 @@ def _start_instance_server(app, window=None):
         friends_req = False
         friends_cli = False              # `ncz-gm shiftq`: opens the panel even with no game running
         bigpic_req = False
+        build_req = False
         launch_reqs = []
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
             conn.waitForReadyRead(200)
             data = bytes(conn.readAll())
             woke = woke or data == b"show"
+            build_req = build_req or data == b"build"        # a game shortcut started: load the launcher, hidden
             quit_req = quit_req or data == b"quit"
             friends_req = friends_req or data in (b"friends", b"friends:cli")
             friends_cli = friends_cli or data == b"friends:cli"
@@ -2979,6 +2981,11 @@ def _start_instance_server(app, window=None):
             if data.startswith(b"launch:"):          # a game's desktop shortcut was opened while the launcher is running
                 launch_reqs.append(data[7:].decode("utf-8", "replace"))
             conn.disconnectFromServer()
+        if window is None and getattr(app, "_ncz_lazy_build", None) and (launch_reqs or woke or friends_req or bigpic_req):
+            # only the lite tray is running: build the launcher now (hidden unless somebody asked to see it)
+            app._ncz_pending_launches = list(getattr(app, "_ncz_pending_launches", [])) + launch_reqs
+            launch_reqs = []
+            window = app._ncz_lazy_build(hidden=not (woke or friends_req or bigpic_req))
         for _title in launch_reqs:
             if window is None:                   # still starting up: main() starts it once the library exists
                 app._ncz_pending_launches = list(getattr(app, "_ncz_pending_launches", [])) + [_title]
@@ -7658,6 +7665,175 @@ def ensure_terms_accepted():
     return False
 
 
+def _ncz_build_main_window(app, launch_title="", hidden=False):
+    """Builds the full launcher window. If a lite tray icon is up, the window's own tray replaces it."""
+    window = AdaptiveApp()
+    app._ncz_main_window = window
+    stop_lite = getattr(app, "_ncz_lite_stop", None)
+    if stop_lite is not None:
+        app._ncz_lite_stop = None
+        stop_lite()
+    lite = getattr(app, "_ncz_lite_tray", None)
+    if lite is not None:
+        app._ncz_lite_tray = None
+        try:
+            lite.hide()
+            lite.deleteLater()
+        except Exception:
+            pass
+    _ncz_after_window_created(app, window, launch_title)     # game from a Wine/Proton shortcut
+    _acct_watch_start(window)
+    _memlog_start(window)                # NCZ_MEMLOG=1: memory figures at startup, on hide / show and every 60 s
+    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
+    set_windows_taskbar_identity(window)
+    tray = getattr(window, "_tray", None)
+    if hidden:
+        if tray is None:                                # no tray to hide in
+            window.showMinimized()
+        else:
+            window.hide()                               # start quietly in the tray
+            _ui_timers_pause(window)                    # never shown, so hideEvent doesn't pause the redraw timers
+            # never shown, so hideEvent's trim doesn't run: free memory once startup work has settled
+            QTimer.singleShot(30000, lambda: _mem_free_hidden(window))
+        if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
+            window.showNormal()
+    else:
+        window.showMaximized()
+    return window
+
+def _ncz_ensure_window(app, hidden=False):
+    """The launcher window, built now if only the lite tray exists so far."""
+    window = getattr(app, "_ncz_main_window", None)
+    if window is None:
+        window = _ncz_build_main_window(app, "", hidden=hidden)
+    return window
+
+def _lite_publish_presence():
+    """Light heartbeat for friends: playing / idle / seen only (no library, photo or covers)."""
+    if _presence_state["offline"] or not cloud_configured() or load_account() is None:
+        return
+    with _presence_lock:
+        if _presence_state["offline"]:
+            return
+        token, uid = get_id_token()
+        _http_json(_fdb(f"public/{uid}", token), "PATCH",
+                   {"playing": _now_playing["name"] or "", "idle": True, "seen": {".sv": "timestamp"}})
+
+def _ncz_lite_services(app):
+    """What the tray-only launcher still does, without building the window: notice which library game is running
+    (counts playtime, last played, 'Playing ...'), keep the friends status current, and open the Shift+Q overlay
+    (the full launcher is built, hidden, the first time Shift+Q is pressed in a game)."""
+    app._ncz_lite_active = True
+    bus = _ExtGameBus(app)
+    bus.adopt.connect(_ext_on_adopt)
+    app._ncz_lite_bus = bus
+    threading.Thread(target=_ext_loop, args=(bus, lambda: not getattr(app, "_ncz_lite_active", False)),
+                     daemon=True).start()
+
+    def publish():
+        def work():
+            try:
+                _lite_publish_presence()
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    _playing_listeners.append(publish)               # a game started / ended: tell friends right away
+    timer = QTimer(app)
+    timer.setInterval(45000)
+    timer.timeout.connect(publish)
+    timer.start()
+    QTimer.singleShot(2000, publish)
+
+    class _LiteKeys(QObject):
+        shift_q = pyqtSignal()
+    keys = _LiteKeys(app)
+
+    def on_shift_q():
+        if getattr(app, "_ncz_main_window", None) is not None or not _running:
+            return                                    # the window's own hook handles it / not in a launcher game
+        window = _ncz_ensure_window(app, hidden=True)
+        QTimer.singleShot(300, lambda: window._friends_overlay.toggle_req.emit())
+
+    keys.shift_q.connect(on_shift_q)
+    app._ncz_lite_keys = keys
+    try:
+        if sys.platform.startswith("win"):
+            app._ncz_lite_hook = _start_shift_q_hook(keys.shift_q.emit)
+        elif sys.platform.startswith("linux"):
+            app._ncz_lite_hook = _start_shift_q_hook_linux(keys.shift_q.emit)
+    except Exception:
+        pass
+
+    def stop():
+        app._ncz_lite_active = False
+        timer.stop()
+        try:
+            _playing_listeners.remove(publish)
+        except ValueError:
+            pass
+    app._ncz_lite_stop = stop
+
+def _ncz_start_lite_tray(app):
+    """Starts in the tray without building the launcher. False if there is no system tray (the normal start is used)."""
+    try:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+        app.setQuitOnLastWindowClosed(False)
+        icon = app.windowIcon()
+        if icon.isNull():
+            icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        tray = QSystemTrayIcon(icon, app)
+        tray.setToolTip("NCZ Games Launcher")
+        menu = QMenu()
+        open_act = QAction("Open launcher", menu)
+        quit_act = QAction("Quit", menu)
+        menu.addAction(open_act)
+        menu.addAction(quit_act)
+        tray.setContextMenu(menu)
+
+        def open_launcher():
+            window = getattr(app, "_ncz_main_window", None)
+            if window is None:
+                _ncz_build_main_window(app, "", hidden=False)
+            else:
+                window.showNormal()
+                window.raise_()
+                window.activateWindow()
+
+        def quit_app():
+            tray.hide()
+            if getattr(app, "_ncz_lite_stop", None) is not None:
+                def off():
+                    try:
+                        if cloud_configured() and load_account() is not None:
+                            cloud_publish_offline()
+                    except Exception:
+                        pass
+                t = threading.Thread(target=off, daemon=True)
+                t.start()
+                t.join(3)                    # don't hang the exit if the network is down
+            app.quit()
+
+        open_act.triggered.connect(open_launcher)
+        quit_act.triggered.connect(quit_app)
+        tray.activated.connect(lambda reason: open_launcher()
+                               if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        tray.show()
+        app._ncz_lite_tray = tray
+        app._ncz_lite_menu = menu                      # keep the menu alive
+        try:
+            _ncz_lite_services(app)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
         import ncz_gm
@@ -7691,12 +7867,28 @@ def main():
             pass
         sys.exit(0)
     _launch_title = _ncz_launch_arg()    # a game's desktop shortcut: `main.py --launch-game <title>`
+    _game_exe, _game_args = _ncz_game_exe_arg()    # a game's desktop shortcut: `main.py --game-exe <exe>`
+    if _game_exe:
+        _ncz_spawn_game_exe(_game_exe, _game_args)     # the game starts right away, before anything else loads
     if _launch_title and _ncz_send_launch(_launch_title):
         sys.exit(0)                      # the launcher is already open: it starts the game, nothing else to do here
     got_lock = _acquire_instance_lock()
     if got_lock and _another_instance_running(wake=False):
         got_lock = False             # an older launcher (one that doesn't use the lock) is already running
     if not got_lock:
+        if _game_exe:                    # the launcher is already open (or starting): the game is running, nothing else to do
+            try:
+                from PyQt6.QtNetwork import QLocalSocket
+                sock = QLocalSocket()
+                sock.connectToServer(_instance_name())
+                if sock.waitForConnected(800):
+                    sock.write(b"hello")             # nothing to do: the open launcher notices the game by itself
+                    sock.flush()
+                    sock.waitForBytesWritten(800)
+                    sock.disconnectFromServer()
+            except Exception:
+                pass
+            sys.exit(0)
         if "--startup" in sys.argv:
             sys.exit(0)  # started at login while one is already up (or starting): leave it alone
         if _launch_title and _ncz_send_launch(_launch_title, wait=6):
@@ -7713,6 +7905,11 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
+    try:                                         # in-game / desktop toasts show the launcher's current icon
+        import overlay as _overlay_icon_mod
+        _overlay_icon_mod.set_icon_provider(lambda: asset_path("icon.png"))
+    except Exception:
+        pass
     set_accent(_saved_accent)
     apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
 
@@ -7728,29 +7925,27 @@ def main():
     if not ensure_terms_accepted():
         sys.exit(0)
 
-    window = AdaptiveApp()
-    app._ncz_main_window = window
-    _ncz_after_window_created(app, window, _launch_title)     # game from a desktop shortcut + desktop auto-add
-    _acct_watch_start(window)
-    _memlog_start(window)                # NCZ_MEMLOG=1: memory figures at startup, on hide / show and every 60 s
     apply_startup_setting()
     register_cli()
-    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
-    set_windows_taskbar_identity(window)
-    tray = getattr(window, "_tray", None)
-    # A game's desktop shortcut starts the launcher quietly in the tray too: the game is what was asked for.
-    if _launch_title or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)):
-        if tray is None:                                # no tray to hide in
-            window.showMinimized()
-        else:
-            window.hide()                               # start quietly in the tray
-            _ui_timers_pause(window)                    # never shown, so hideEvent doesn't pause the redraw timers
-            # never shown, so hideEvent's trim doesn't run: free memory once startup work has settled
-            QTimer.singleShot(30000, lambda: _mem_free_hidden(window))
-        if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
-            window.showNormal()
-    else:
-        window.showMaximized()
+    # Started with the system (or a game's Wine/Proton shortcut) and set to start minimized -> stay in the tray.
+    start_hidden = bool(_game_exe or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)))
+    if start_hidden and not _launch_title and _ncz_start_lite_tray(app):
+        # Only a tray icon plus a few essentials (game detection, "Playing ..." status, Shift+Q) exist now. The full
+        # launcher is built the first time it's opened (tray click, a second start of the launcher, `--friends`,
+        # a game launch request, Shift+Q in a game ...), see _ncz_ensure_window.
+        app._ncz_lazy_build = lambda hidden=True: _ncz_ensure_window(app, hidden)
+        # Friend toasts (playing / online / requests / messages) come from the friends page, which only exists in the
+        # full window. So when signed in, build it now, hidden in the tray, instead of waiting for the first open.
+        def _build_for_toasts():
+            try:
+                if getattr(app, "_ncz_main_window", None) is None and load_account() is not None:
+                    _ncz_ensure_window(app, hidden=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        QTimer.singleShot(3000, _build_for_toasts)
+        sys.exit(app.exec())
+    _ncz_build_main_window(app, _launch_title, hidden=bool(_launch_title or start_hidden))
     sys.exit(app.exec())
 # --- Firebase Steam Link & Downloads Tab Integration ---
 
@@ -51083,6 +51278,13 @@ def _ext_scan(cache):
         mine.update(c.pid for c in psutil.Process(me).children(recursive=True))   # the launcher's own helpers/installers
     except psutil.Error:
         pass
+    for gpid in list(_ncz_game_pids):             # ... except games a shortcut started through this launcher process
+        try:
+            gp = psutil.Process(gpid)
+            mine.discard(gpid)
+            mine.difference_update(c.pid for c in gp.children(recursive=True))
+        except psutil.Error:
+            _ncz_game_pids.discard(gpid)
     live, found = set(), {}
     for p in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]):
         info = p.info
@@ -51118,14 +51320,14 @@ def _ext_on_adopt(title, proc, folder):
         pass
 
 
-def _ext_loop(bus):
+def _ext_loop(bus, stop=None):
     try:
         import psutil  # noqa: F401
     except ImportError:
         return                                  # without psutil there is nothing to scan with
     cache, streak = {}, {}
     time.sleep(3.0)                             # let the window finish building
-    while True:
+    while not (stop is not None and stop()):
         try:
             if load_launcher_settings().get("detect_running_games", True):
                 found = _ext_scan(cache)
@@ -51137,7 +51339,7 @@ def _ext_loop(bus):
                         streak.pop(title, None)
                         continue
                     streak[title] = streak.get(title, 0) + 1
-                    if streak[title] < 2:       # seen on two scans in a row, so a game the launcher is just starting isn't doubled
+                    if streak[title] < (1 if any(pr.pid in _ncz_game_pids for _c, pr, _p in procs) else 2):       # seen on two scans in a row, so a game the launcher is just starting isn't doubled
                         continue
                     ct, ps, path = min(procs, key=lambda x: x[0])      # the oldest process is the game's root
                     streak.pop(title, None)
@@ -51238,20 +51440,14 @@ def _ncz_launch_requested(app, title, tries=0):
                                 f"Couldn't start {title}. Is it installed and in your library?")
 
 def _ncz_after_window_created(app, window, title):
-    """Called once from main(): starts the game a shortcut asked for, and sets up the desktop auto-add."""
+    """Called once when the window is built: starts the game a (Wine/Proton) shortcut asked for. No desktop auto-add."""
     pending = list(getattr(app, "_ncz_pending_launches", []))
     app._ncz_pending_launches = []
     if title:
         pending.insert(0, title)
     for t in dict.fromkeys(pending):
         QTimer.singleShot(1500, lambda t=t: _ncz_launch_requested(app, t))
-    QTimer.singleShot(7000, lambda: _ncz_autoadd_desktop(window))
-    QTimer.singleShot(10000, lambda: _ncz_migrate_old_shortcuts(window))     # first launch since the update
-    timer = QTimer(window)
-    timer.setInterval(3 * 60 * 1000)                 # picks up shortcuts added while the launcher stays open
-    timer.timeout.connect(lambda: (_ncz_autoadd_desktop(window), _ncz_migrate_old_shortcuts(window)))
-    timer.start()
-    window._ncz_autoadd_timer = timer
+    QTimer.singleShot(8000, lambda: _ncz_convert_shortcuts_once(window))     # once: old launcher-routed shortcuts -> direct
 
 # ---------------------------------------------------------------- auto-add desktop shortcuts that are store games
 def _ncz_autoadd_path():
@@ -51850,23 +52046,13 @@ def _dep_settings_init(self, *a, **k):
 SettingsPage.__init__ = _dep_settings_init
 
 
-# ================================================================ Settings: game shortcuts open through the launcher or launch directly
-# Default (on) is how it worked before: desktop shortcuts for library games open the launcher, which starts the game.
-# Turned off: the launcher never rewrites your desktop shortcuts, new game shortcuts start the game's exe directly,
-# and "Restore original shortcuts" puts back the ones it already changed (the originals it saved, or a direct one).
+# ================================================================ Game shortcuts launch the exe directly
+# Shortcuts you create from a game's menu in the launcher start the game's exe on their own. The launcher no longer
+# adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
-    try:
-        return bool(load_launcher_settings().get("shortcuts_via_launcher", True))
-    except Exception:
-        return True
-
-def set_shortcuts_via_launcher(on):
-    try:
-        st = load_launcher_settings()
-        st["shortcuts_via_launcher"] = bool(on)
-        save_launcher_settings(st)
-    except Exception:
-        pass
+    """Game shortcuts always start the game's exe directly now (the option is gone). The launcher never rewrites
+    your own desktop shortcuts. Only a Windows game on Linux, which needs Wine/Proton, still opens through the launcher."""
+    return False
 
 def _sc_args_text(a):
     if not a:
@@ -51881,13 +52067,23 @@ def _sc_can_direct(exe, compat_tool=""):
         return True
     return not compat_tool and not exe.lower().endswith(".exe")
 
+def _sc_game_exe_argv(exe, args=""):
+    """[launcher, ..., '--game-exe', <exe>, ('--game-args', <args>)]: starts the exe itself, then keeps the launcher in the tray."""
+    target, largs, workdir = get_launch_command()
+    argv = [target] + list(largs) + ["--game-exe", urllib.parse.quote(str(exe), safe="")]
+    if args:
+        argv += ["--game-args", urllib.parse.quote(str(args), safe="")]
+    return argv, workdir
+
 def _sc_write_direct(path, title, exe, args="", workdir=""):
-    """Writes a shortcut at `path` that starts the game's exe itself. Raises on failure."""
-    workdir = workdir or os.path.dirname(exe)
+    """Writes a shortcut at `path` that starts the game's exe itself (the launcher only comes along quietly in the tray,
+    unless it is already open). Raises on failure."""
+    argv, lworkdir = _sc_game_exe_argv(exe, args)
     if sys.platform.startswith("win"):
         q = _ps_quote
         ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(path)});"
-              f"$s.TargetPath={q(exe)};$s.Arguments={q(args)};$s.WorkingDirectory={q(workdir)};"
+              f"$s.TargetPath={q(argv[0])};$s.Arguments={q(subprocess.list2cmdline(argv[1:]))};"
+              f"$s.WorkingDirectory={q(lworkdir)};"
               f"$s.IconLocation={q(exe + ',0')};$s.Description={q(title)};$s.Save()")
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
                        check=True, capture_output=True, timeout=30, creationflags=0x08000000)
@@ -51903,12 +52099,43 @@ def _sc_write_direct(path, title, exe, args="", workdir=""):
     if not icon:
         p = _exe_icon_png(exe, sanitize_folder_name(title) or "Game")
         icon = f"Icon={p}" if p else ""
-    argv = [exe] + (shlex.split(args) if args else [])
     with open(path, "w", encoding="utf-8") as f:
         f.write("[Desktop Entry]\nType=Application\n"
-                f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={workdir}\n"
+                f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={lworkdir}\n"
                 + (icon + "\n" if icon else "") + "Terminal=false\nCategories=Game;\n")
     os.chmod(path, 0o755)
+
+def _ncz_game_exe_arg():
+    """(exe, args) from `--game-exe <exe> [--game-args <args>]`, else ('', '')."""
+    def val(flag):
+        try:
+            i = sys.argv.index(flag)
+        except ValueError:
+            return ""
+        return urllib.parse.unquote(sys.argv[i + 1]) if i + 1 < len(sys.argv) else ""
+    return val("--game-exe").strip(), val("--game-args")
+
+_ncz_game_pids = set()      # games this process started for a shortcut (--game-exe): they count as games, not launcher helpers
+
+def _ncz_spawn_game_exe(exe, args=""):
+    """Starts the game's exe on its own, detached from the launcher."""
+    if not exe or not os.path.isfile(exe):
+        return False
+    popen = globals().get("_RealPopen", subprocess.Popen)
+    kw = dict(cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL, close_fds=True)
+    try:
+        if sys.platform.startswith("win"):
+            cmd = subprocess.list2cmdline([exe]) + (" " + args if args else "")
+            proc = popen(cmd, creationflags=0x00000008 | 0x00000200, **kw)      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        else:
+            proc = popen([exe] + (shlex.split(args) if args else []), start_new_session=True, **kw)
+        _ncz_game_pids.add(proc.pid)
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
 
 def _sc_launcher_title(path):
     """Game title if this desktop file opens the launcher for a game (`--launch-game <title>`), else ''."""
@@ -52003,93 +52230,55 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
     except Exception as e:
         QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
 
-class _ScPanel(QFrame):
-    _restored = pyqtSignal(int, int)
+def _sc_downloaded_exe(title):
+    """The exe of a game that was downloaded through the launcher (it has an installed-version record), else ''."""
+    want = _norm_title(title)
+    names = [n for n in _load_installed_versions() if _norm_title(n) == want]
+    for n in names:
+        try:
+            exe = _find_game_exe(_safe_installed_game_dir(n)) or _fan_installed_exe(n)
+        except Exception:
+            exe = ""
+        if exe and os.path.exists(exe):
+            return n, exe
+    return "", ""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        pl = QVBoxLayout(self)
-        pl.setContentsMargins(22, 18, 22, 18)
-        row = QHBoxLayout()
-        text = QVBoxLayout()
-        text.setSpacing(2)
-        name = QLabel("Game shortcuts")
-        name.setObjectName("RowTitle")
-        desc = QLabel("Choose what your desktop shortcuts for games do. \"Through the launcher\" opens the launcher and "
-                      "it starts the game (applies Proton/Wine, launch options, cloud saves). \"Directly\" never touches "
-                      "your existing shortcuts and new ones start the game's exe on their own. On Linux, Windows games "
-                      "that need Wine/Proton still go through the launcher.")
-        desc.setObjectName("RowDesc")
-        desc.setWordWrap(True)
-        self.status = QLabel()
-        self.status.setObjectName("RowDesc")
-        self.status.setWordWrap(True)
-        text.addWidget(name)
-        text.addWidget(desc)
-        text.addWidget(self.status)
-        self.combo = QComboBox()
-        self.combo.setFixedWidth(240)
-        self.combo.addItem("Through the launcher", True)
-        self.combo.addItem("Launch the game directly", False)
-        self.combo.setCurrentIndex(0 if get_shortcuts_via_launcher() else 1)
-        self.combo.currentIndexChanged.connect(self._changed)
-        self.restore = QPushButton("Restore original shortcuts")
-        self.restore.clicked.connect(self._restore_clicked)
-        btns = QVBoxLayout()
-        btns.addWidget(self.combo)
-        btns.addWidget(self.restore)
-        row.addLayout(text, 1)
-        row.addLayout(btns)
-        pl.addLayout(row)
-        self._restored.connect(self._on_restored)
-
-    def _changed(self, _i):
-        via = bool(self.combo.currentData())
-        set_shortcuts_via_launcher(via)
-        if not via:
-            ans = QMessageBox.question(self, "Game shortcuts",
-                                       "Also put back the desktop shortcuts the launcher already changed?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if ans == QMessageBox.StandardButton.Yes:
-                self._restore_clicked()
-
-    def _restore_clicked(self):
-        self.restore.setEnabled(False)
-        self.status.setText("Restoring shortcuts...")
+def _ncz_convert_shortcuts_once(window):
+    """Once: a desktop shortcut that opens the launcher for a game (`--launch-game`) is rewritten to start the exe directly,
+    but only for games downloaded through the launcher. Every other shortcut is left exactly as it is."""
+    try:
+        if _ncz_profile or load_launcher_settings().get("shortcuts_made_direct_v2"):
+            return
         def work():
             try:
-                d, l = _sc_restore_all()
+                for d in _desktop_dirs():
+                    try:
+                        names = sorted(os.listdir(d))
+                    except OSError:
+                        continue
+                    for n in names:
+                        path = os.path.join(d, n)
+                        if not os.path.isfile(path) or os.path.islink(path):
+                            continue
+                        title = _sc_launcher_title(path)
+                        if not title:
+                            continue
+                        game, exe = _sc_downloaded_exe(title)
+                        if not exe or not _sc_can_direct(exe, ""):
+                            continue                       # not a launcher download (or needs Wine/Proton): untouched
+                        try:
+                            _sc_write_direct(path, game, exe)
+                        except Exception:
+                            pass
+                st = load_launcher_settings()
+                st["shortcuts_made_direct_v2"] = True
+                save_launcher_settings(st)
             except Exception:
-                d, l = 0, -1
-            self._restored.emit(d, l)
+                import traceback
+                traceback.print_exc()
         threading.Thread(target=work, daemon=True).start()
-
-    def _on_restored(self, done, left):
-        self.restore.setEnabled(True)
-        if left < 0:
-            self.status.setText("Couldn't restore the shortcuts.")
-        elif done == 0 and left == 0:
-            self.status.setText("No shortcuts needed restoring.")
-        else:
-            self.status.setText(f"Restored {done} shortcut(s)." +
-                                (f" {left} couldn't be restored (delete and re-create those from the game's menu)."
-                                 if left else ""))
-
-_sc_prev_settings_init = SettingsPage.__init__
-
-def _sc_settings_init(self, *a, **k):
-    _sc_prev_settings_init(self, *a, **k)
-    try:
-        layout = self.layout()
-        panel = _ScPanel()
-        idx = max(layout.count() - 1, 0)
-        layout.insertSpacing(idx, 12)
-        layout.insertWidget(idx + 1, panel)
     except Exception:
         pass
-
-SettingsPage.__init__ = _sc_settings_init
 
 
 # ================================================================ pages built the first time they're opened
@@ -52385,6 +52574,580 @@ def _mem_hide_event(self, ev):
         _memlog("window hidden")
         QTimer.singleShot(1500, lambda: _mem_free_hidden(self))      # not on a quick hide / show
 AdaptiveApp.hideEvent = _mem_hide_event
+
+
+# ================================================================ Big Picture: startup animation
+# Plays a full-screen animation (with sound) every time Big Picture opens. Press ANY key / mouse button / controller button to skip.
+# Settings -> "Big Picture startup animation": pick the NCZ default, turn it off, or use your own. A custom animation is an image
+# file (GIF / WebP / APNG, or a PNG / JPG still) dropped in the "startup_animations" folder inside the launcher's settings folder
+# (Settings has an "Add custom animation" button and an "Open folder" button). An audio file with the SAME NAME (WAV / MP3 / OGG /
+# FLAC / M4A) next to it plays together with it. The default is assets/ncz_bigpicture_startup.gif + .wav.
+_NCZ_SU_IMG = (".gif", ".webp", ".apng", ".png", ".jpg", ".jpeg")
+_NCZ_SU_SND = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac")
+_NCZ_SU_DEFAULT = "ncz_bigpicture_startup"
+_NCZ_SU_STILL_MS = 3500          # a still image (PNG / JPG) is shown this long
+_NCZ_SU_MAX_MS = 15000           # safety cap: never block Big Picture longer than this
+_NCZ_SU_GRACE_MS = 450           # ignore input this long (the key / button that opened Big Picture may still be held)
+_NCZ_SU = {"snd": None}
+
+
+def _ncz_su_dir():
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "startup_animations")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _ncz_su_find_sound(base):
+    for ext in _NCZ_SU_SND:
+        for e in (ext, ext.upper()):
+            if os.path.isfile(base + e):
+                return base + e
+    return ""
+
+
+def _ncz_su_customs():
+    """[(name, image path, sound path or "")] for every custom animation in the folder."""
+    out, d = [], _ncz_su_dir()
+    try:
+        for fn in sorted(os.listdir(d), key=str.lower):
+            base, ext = os.path.splitext(fn)
+            if ext.lower() in _NCZ_SU_IMG:
+                out.append((base, os.path.join(d, fn), _ncz_su_find_sound(os.path.join(d, base))))
+    except OSError:
+        pass
+    return out
+
+
+def _ncz_su_choice():
+    """(image, sound) to play, or None when the startup animation is off / missing."""
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    if sel == "off":
+        return None
+    if sel.startswith("custom:"):
+        for name, img, snd in _ncz_su_customs():
+            if name == sel[7:]:
+                return img, snd
+    img = os.path.join(ASSETS_DIR, _NCZ_SU_DEFAULT + ".gif")        # default (also the fallback if a custom one was deleted)
+    if not os.path.isfile(img):
+        return None
+    return img, _ncz_su_find_sound(os.path.join(ASSETS_DIR, _NCZ_SU_DEFAULT))
+
+
+class _NczSuSound:
+    """WAV through QSoundEffect, anything else through QMediaPlayer. It is LOADED first and played on play(), so the picture and
+    the sound can start on the same instant (on_ready is called once the audio is loaded, or at once if there is no audio)."""
+
+    def __init__(self, path, on_ready):
+        self._fx = self._pl = self._ao = None
+        self._vol = 0.7
+        self._cb = on_ready
+        try:
+            if path.lower().endswith(".wav"):
+                from PyQt6.QtMultimedia import QSoundEffect
+                self._fx = QSoundEffect()
+                self._fx.setVolume(self._vol)
+                self._fx.statusChanged.connect(self._fx_status)
+                self._fx.setSource(QUrl.fromLocalFile(path))
+                self._fx_status()
+            else:
+                from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+                self._ao = QAudioOutput()
+                self._ao.setVolume(self._vol)
+                self._pl = QMediaPlayer()
+                self._pl.setAudioOutput(self._ao)
+                self._pl.mediaStatusChanged.connect(self._pl_status)
+                self._pl.setSource(QUrl.fromLocalFile(path))
+        except Exception:
+            self._fx = self._pl = self._ao = None
+            self._ready()
+
+    def _ready(self):
+        cb, self._cb = self._cb, None
+        if cb is not None:
+            try:
+                cb()
+            except RuntimeError:                      # the overlay was already closed
+                pass
+
+    def _fx_status(self, *_a):
+        if self._fx is not None and self._fx.status().name in ("Ready", "Error"):
+            self._ready()
+
+    def _pl_status(self, st):
+        if getattr(st, "name", "") in ("LoadedMedia", "BufferedMedia", "InvalidMedia"):
+            self._ready()
+
+    def play(self):
+        try:
+            if self._fx is not None:
+                self._fx.play()
+            if self._pl is not None:
+                self._pl.play()
+        except Exception:
+            pass
+
+    def _set(self, v):
+        try:
+            if self._fx is not None:
+                self._fx.setVolume(v)
+            if self._ao is not None:
+                self._ao.setVolume(v)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            if self._fx is not None:
+                self._fx.stop()
+            if self._pl is not None:
+                self._pl.stop()
+        except Exception:
+            pass
+
+    def fade_stop(self, ms=180):
+        steps = 8
+        for i in range(1, steps + 1):
+            QTimer.singleShot(int(ms * i / steps), lambda v=self._vol * (1 - i / steps): self._set(v))
+        QTimer.singleShot(ms + 30, self.stop)
+
+
+class _NczStartup(QWidget):
+    """Covers Big Picture while the startup animation plays."""
+    done = pyqtSignal()
+
+    def __init__(self, host, img, snd):
+        from PyQt6.QtCore import QEvent, QVariantAnimation, QEasingCurve
+        super().__init__(host)
+        self._host, self._ending, self._skipped = host, False, False
+        self._op, self._last, self._sched = 1.0, -1, False
+        self._t0 = time.time()
+        self._movie, self._still = QMovie(img), None
+        if not self._movie.isValid() or self._movie.frameCount() == 1:
+            self._movie = None
+            self._still = QPixmap(img)
+        self.setGeometry(host.rect())
+        host.installEventFilter(self)
+        self._fade = QVariantAnimation(self)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.valueChanged.connect(self._on_fade)
+        self._fade.finished.connect(self._finish_now)
+        self._cap = QTimer(self)
+        self._cap.setSingleShot(True)
+        self._cap.timeout.connect(lambda: self.end(False))
+        _ncz_su_stop_sound()
+        self._started = self._sndok = self._snd_made = False
+        self._cap_ms = _NCZ_SU_MAX_MS if self._movie is not None else _NCZ_SU_STILL_MS
+        if self._movie is not None:
+            self._movie.frameChanged.connect(self._on_frame)
+        self._wait = QTimer(self)                        # never wait long for the audio device
+        self._wait.setSingleShot(True)
+        self._wait.timeout.connect(self._go)
+        if snd:
+            self._wait.start(700)
+            _NCZ_SU["snd"] = _NczSuSound(snd, self._snd_ready)
+        else:
+            self._sndok = True
+        self._snd_made = True
+        self._try_go()
+
+    def _snd_ready(self):
+        self._sndok = True
+        self._try_go()
+
+    def _try_go(self):
+        if self._sndok and self._snd_made:
+            self._go()
+
+    def _go(self):
+        """Picture and sound start on the same instant, so they stay in sync."""
+        if self._started or self._ending:
+            return
+        self._started = True
+        self._wait.stop()
+        snd = _NCZ_SU.get("snd")
+        if snd is not None:
+            snd.play()
+        if self._movie is not None:
+            self._movie.start()
+        self._cap.start(self._cap_ms)
+
+    def eventFilter(self, obj, ev):
+        from PyQt6.QtCore import QEvent
+        try:
+            if obj is self._host and ev.type() == QEvent.Type.Resize:
+                self.setGeometry(self._host.rect())
+        except RuntimeError:
+            pass
+        return False
+
+    def _on_frame(self, n):
+        if self._ending:
+            return
+        cnt = self._movie.frameCount()
+        if n < self._last:                               # wrapped around: one full play-through is done
+            self.end(False)
+            return
+        self._last = n
+        if cnt > 1 and n >= cnt - 1 and not self._sched:
+            self._sched = True
+            QTimer.singleShot(max(0, self._movie.nextFrameDelay()), lambda: self.end(False))
+        self.update()
+
+    def can_skip(self):
+        return (time.time() - self._t0) * 1000.0 >= _NCZ_SU_GRACE_MS
+
+    def end(self, skipped):
+        """Fade out. Skipped -> quick fade and the sound fades too; played to the end -> the sound's tail rings on over Big Picture."""
+        if self._ending:
+            return
+        self._ending, self._skipped = True, skipped
+        self._cap.stop()
+        if skipped:
+            snd = _NCZ_SU.get("snd")
+            if snd is not None:
+                snd.fade_stop(180)
+        self._fade.setDuration(180 if skipped else 380)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_fade(self, v):
+        self._op = float(v)
+        self.update()
+
+    def _finish_now(self):
+        if self._movie is not None:
+            self._movie.stop()
+        try:
+            self._host.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self.hide()
+        self.done.emit()
+        self.deleteLater()
+        try:
+            self._host.setFocus()
+            self._host.update()
+        except RuntimeError:
+            pass
+
+    def kill(self):
+        """Close at once (Big Picture left / went to sleep)."""
+        if self._movie is not None:
+            self._movie.stop()
+        self._cap.stop()
+        self._fade.stop()
+        _ncz_su_stop_sound()
+        try:
+            self._host.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self.hide()
+        self.deleteLater()
+
+    def mousePressEvent(self, e):
+        if self.can_skip():
+            self.end(True)
+        e.accept()
+
+    def keyPressEvent(self, e):
+        if self.can_skip() and not e.isAutoRepeat():
+            self.end(True)
+        e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setOpacity(self._op)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        pm = self._movie.currentPixmap() if self._movie is not None else self._still
+        w, h = self.width(), self.height()
+        if pm is not None and not pm.isNull():
+            s = pm.size().scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding)       # cover the screen, like Steam
+            p.drawPixmap(QRectF((w - s.width()) / 2.0, (h - s.height()) / 2.0, s.width(), s.height()), pm, QRectF(pm.rect()))
+        age = (time.time() - self._t0) * 1000.0
+        if age > 700 and not self._ending:                  # small hint at the top (the bottom of the default animation is white)
+            p.setOpacity(self._op * min(1.0, (age - 700) / 500.0) * 0.55)
+            f = p.font()
+            f.setPixelSize(max(12, int(h * 0.019)))
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(QRectF(0, h * 0.03, w - w * 0.025, h * 0.04),
+                       int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), "Press any key to skip")
+        p.end()
+
+
+def _ncz_su_stop_sound():
+    snd = _NCZ_SU.get("snd")
+    if snd is not None:
+        snd.stop()
+    _NCZ_SU["snd"] = None
+
+
+def _ncz_su_live(bp):
+    ov = getattr(bp, "_ncz_su", None)
+    try:
+        if ov is not None and ov.isVisible() and not ov._ending:
+            return ov
+    except RuntimeError:
+        pass
+    return None
+
+
+def _ncz_su_kill(bp):
+    ov = getattr(bp, "_ncz_su", None)
+    bp._ncz_su = None
+    if ov is not None:
+        try:
+            ov.kill()
+        except RuntimeError:
+            pass
+
+
+def _ncz_su_start(bp):
+    _ncz_su_kill(bp)
+    ch = _ncz_su_choice()
+    if ch is None:
+        return
+    img, snd = ch
+    if not load_launcher_settings().get("bp_startup_sound", True):
+        snd = ""
+    ov = _NczStartup(bp, img, snd)
+    bp._ncz_su = ov
+    ov.show()
+    ov.raise_()
+
+
+_ncz_su_enter_o = _BigPicture.enter
+
+
+def _ncz_su_enter(self):
+    was_active = bool(self._active)
+    _ncz_su_enter_o(self)
+    if not was_active:                                    # only when Big Picture really opens (not when it wakes after a game)
+        try:
+            _ncz_su_start(self)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+
+_BigPicture.enter = _ncz_su_enter
+
+_ncz_su_leave_o = _BigPicture.leave
+_ncz_su_stopawake_o = _BigPicture._stop_awake
+
+
+def _ncz_su_leave(self, *a, **k):
+    _ncz_su_kill(self)
+    return _ncz_su_leave_o(self, *a, **k)
+
+
+def _ncz_su_stopawake(self):
+    _ncz_su_kill(self)
+    return _ncz_su_stopawake_o(self)
+
+
+_BigPicture.leave = _ncz_su_leave
+_BigPicture._stop_awake = _ncz_su_stopawake
+
+_ncz_su_key_o = _BigPicture.keyPressEvent
+_ncz_su_act_o = _BigPicture._act
+
+
+def _ncz_su_key(self, e):
+    ov = _ncz_su_live(self)
+    if ov is not None:                                    # any key skips (key repeat of the opening shortcut is ignored)
+        if ov.can_skip() and not e.isAutoRepeat():
+            ov.end(True)
+        e.accept()
+        return
+    _ncz_su_key_o(self, e)
+
+
+def _ncz_su_act(self, name, *a, **k):
+    ov = _ncz_su_live(self)
+    if ov is not None:                                    # any controller button / stick direction skips
+        if ov.can_skip():
+            ov.end(True)
+        return
+    return _ncz_su_act_o(self, name, *a, **k)
+
+
+_BigPicture.keyPressEvent = _ncz_su_key
+_BigPicture._act = _ncz_su_act
+
+
+# ---- Settings: choose / add / remove startup animations
+def _ncz_su_fill(combo):
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItem("NCZ default", "default")
+    combo.addItem("Off", "off")
+    for name, _img, _snd in _ncz_su_customs():
+        combo.addItem(name, "custom:" + name)
+    i = combo.findData(sel)
+    combo.setCurrentIndex(i if i >= 0 else 0)
+    combo.blockSignals(False)
+
+
+def _ncz_su_set(key, value):
+    s = load_launcher_settings()
+    s[key] = value
+    save_launcher_settings(s)
+
+
+def _ncz_su_add_custom(sp):
+    imgs = " ".join("*" + e for e in _NCZ_SU_IMG)
+    path, _f = QFileDialog.getOpenFileName(sp, "Choose a startup animation", "",
+                                           "Animations / images (%s);;All files (*)" % imgs)
+    if not path:
+        return
+    base, ext = os.path.splitext(os.path.basename(path))
+    if ext.lower() not in _NCZ_SU_IMG or not QMovie(path).isValid():
+        QMessageBox.warning(sp, "Startup animation", "Pick a GIF, WebP, APNG, PNG or JPG file.")
+        return
+    d = _ncz_su_dir()
+    safe = re.sub(r"[^\w\-. ()]", "_", base).strip() or "custom"
+    name, n = safe, 2
+    while any(os.path.exists(os.path.join(d, name + e)) for e in _NCZ_SU_IMG):
+        name, n = "%s %d" % (safe, n), n + 1
+    try:
+        shutil.copy2(path, os.path.join(d, name + ext.lower()))
+        ask = QMessageBox.question(sp, "Startup animation",
+                                   "Add a sound to play with it? (WAV, MP3, OGG, FLAC or M4A)")
+        if ask == QMessageBox.StandardButton.Yes:
+            snds = " ".join("*" + e for e in _NCZ_SU_SND)
+            sp2, _f = QFileDialog.getOpenFileName(sp, "Choose a startup sound", "", "Audio (%s);;All files (*)" % snds)
+            if sp2:
+                e2 = os.path.splitext(sp2)[1].lower()
+                if e2 in _NCZ_SU_SND:
+                    shutil.copy2(sp2, os.path.join(d, name + e2))
+                else:
+                    QMessageBox.warning(sp, "Startup animation", "That isn't a supported audio file, so no sound was added.")
+    except OSError as err:
+        QMessageBox.warning(sp, "Startup animation", "Couldn't add it: %s" % err)
+        return
+    _ncz_su_set("bp_startup_anim", "custom:" + name)
+    _ncz_su_fill(sp._ncz_su_combo)
+
+
+def _ncz_su_remove_custom(sp):
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    if not sel.startswith("custom:"):
+        QMessageBox.information(sp, "Startup animation", "Select one of your custom animations first.")
+        return
+    name = sel[7:]
+    if QMessageBox.question(sp, "Startup animation", "Remove \"%s\"?" % name) != QMessageBox.StandardButton.Yes:
+        return
+    for n, img, snd in _ncz_su_customs():
+        if n == name:
+            for f in (img, snd):
+                try:
+                    if f:
+                        os.remove(f)
+                except OSError:
+                    pass
+    _ncz_su_set("bp_startup_anim", "default")
+    _ncz_su_fill(sp._ncz_su_combo)
+
+
+def _ncz_su_add_settings(sp):
+    if getattr(sp, "_ncz_su_panel", None) is not None:
+        return
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+
+    def row(title, desc, ctrl, first=False):
+        if not first:
+            pl.addSpacing(10)
+        r, col = QHBoxLayout(), QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setObjectName("RowTitle")
+        d = QLabel(desc)
+        d.setObjectName("RowDesc")
+        d.setWordWrap(True)
+        col.addWidget(t)
+        col.addWidget(d)
+        ctrl.setFixedWidth(220)
+        r.addLayout(col, 1)
+        r.addWidget(ctrl)
+        pl.addLayout(r)
+
+    combo = QComboBox()
+    combo.setCursor(Qt.CursorShape.PointingHandCursor)
+    _ncz_su_fill(combo)
+    combo.currentIndexChanged.connect(lambda _i, c=combo: _ncz_su_set("bp_startup_anim", c.currentData() or "default"))
+    row("Big Picture startup animation", "Played full-screen when Big Picture opens. Press any key to skip it", combo, True)
+
+    snd = QPushButton()
+    snd.setCheckable(True)
+    snd.setCursor(Qt.CursorShape.PointingHandCursor)
+    on = bool(load_launcher_settings().get("bp_startup_sound", True))
+    snd.setChecked(on)
+    snd.setText("On" if on else "Off")
+
+    def snd_toggled(_c=False, b=snd):
+        b.setText("On" if b.isChecked() else "Off")
+        _ncz_su_set("bp_startup_sound", b.isChecked())
+    snd.clicked.connect(snd_toggled)
+    row("Startup animation sound", "Play the sound that goes with the startup animation", snd)
+
+    add = QPushButton("Add custom animation...")
+    add.setCursor(Qt.CursorShape.PointingHandCursor)
+    add.clicked.connect(lambda _c=False: _ncz_su_add_custom(sp))
+    row("Add custom startup animation", "A GIF, WebP, APNG, PNG or JPG, optionally with a sound", add)
+
+    rem = QPushButton("Remove selected")
+    rem.setCursor(Qt.CursorShape.PointingHandCursor)
+    rem.clicked.connect(lambda _c=False: _ncz_su_remove_custom(sp))
+    row("Remove custom startup animation", "Deletes the custom animation that is currently selected", rem)
+
+    opn = QPushButton("Open folder")
+    opn.setCursor(Qt.CursorShape.PointingHandCursor)
+    opn.clicked.connect(lambda _c=False: QDesktopServices.openUrl(QUrl.fromLocalFile(_ncz_su_dir())))
+    row("Startup animations folder", "Drop files here yourself. A sound with the same file name plays with the animation", opn)
+
+    sp._content_layout.addWidget(panel)
+    sp._ncz_su_panel, sp._ncz_su_combo = panel, combo
+
+
+_ncz_su_init_o = AdaptiveApp.__init__
+
+
+def _ncz_su_init(self, *a, **k):
+    _ncz_su_init_o(self, *a, **k)
+    try:
+        sp = self.settings_page
+        _ncz_su_add_settings(sp)
+        _ncz_organize(sp)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+AdaptiveApp.__init__ = _ncz_su_init
+
+_ncz_su_show_o = SettingsPage.showEvent
+
+
+def _ncz_su_settings_show(self, e):
+    _ncz_su_show_o(self, e)
+    try:
+        if getattr(self, "_ncz_su_combo", None) is not None:
+            _ncz_su_fill(self._ncz_su_combo)              # picks up files dropped into the folder
+    except Exception:
+        pass
+
+
+SettingsPage.showEvent = _ncz_su_settings_show
 
 
 if __name__ == "__main__":
