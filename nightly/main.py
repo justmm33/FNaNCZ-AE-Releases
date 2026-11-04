@@ -10,6 +10,8 @@ import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
+import ssl
+_NCZ_SSL_CTX = ssl.create_default_context()     # one shared context: a fresh one per urlopen re-reads the cert store (~13 ms each)
 import platform
 import base64
 import threading
@@ -27,10 +29,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
-                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
-    _HAS_WEBENGINE = True
+    import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
+    _HAS_WEBENGINE = (importlib.util.find_spec("PyQt6.QtWebEngineWidgets") is not None
+                      and importlib.util.find_spec("PyQt6.QtWebEngineCore") is not None)
 except Exception:
     _HAS_WEBENGINE = False
 
@@ -572,7 +573,37 @@ def get_launcher_settings_path():
         return os.path.join(appdata, "NCZ_Games_Launcher", "launcher.json")
     return os.path.expanduser("~/.config/NCZ_Games_Launcher/launcher.json")
 
+# launcher.json / account.json are read on timers and from ~120 places: parse once, re-read only when the file's
+# modification time or size changes (the save functions drop the entry too). Callers get their own copy.
+_file_cache_lock = threading.Lock()
+_file_cache = {}            # (kind, path) -> ((mtime_ns, size) or None, value)
+
+def _cached_by_mtime(kind, path, build, copy=True):
+    import copy as _copy
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None            # missing file: the defaults are cached until it appears
+    with _file_cache_lock:
+        hit = _file_cache.get((kind, path))
+    if hit is not None and hit[0] == stamp:
+        value = hit[1]
+    else:
+        value = build()         # stat first, then read: a write in between only means one extra re-read later
+        with _file_cache_lock:
+            _file_cache[(kind, path)] = (stamp, value)
+    return _copy.deepcopy(value) if copy else value
+
+def _file_cache_drop(path):
+    with _file_cache_lock:
+        for k in [k for k in _file_cache if k[1] == path]:
+            del _file_cache[k]
+
 def load_launcher_settings():
+    return _cached_by_mtime("settings", get_launcher_settings_path(), _load_launcher_settings_file)
+
+def _load_launcher_settings_file():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
@@ -643,8 +674,10 @@ def load_launcher_settings():
 def save_launcher_settings(settings):
     path = get_launcher_settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    _file_cache_drop(path)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=4)
+    _file_cache_drop(path)
     invalidate_library_roots()
 
 apply_install_dir()
@@ -706,7 +739,7 @@ def parse_remote_version(content):
 
 def fetch_remote_version(version_url):
     req = urllib.request.Request(version_url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
         return parse_remote_version(resp.read().decode('utf-8', errors='replace'))
 
 def get_installed_versions_path():
@@ -822,7 +855,7 @@ def _http_json(url, method="GET", payload=None, form=None, timeout=None):
         headers["Content-Type"] = "application/json"
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
@@ -855,7 +888,7 @@ def _http_json_etag(url, etag=None, timeout=None):
         headers["If-None-Match"] = etag
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             new_etag = resp.headers.get("ETag") or None
     except urllib.error.HTTPError as e:
@@ -877,6 +910,9 @@ def get_account_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "account.json")
 
 def load_account():
+    return _cached_by_mtime("account", get_account_path(), _load_account_file)
+
+def _load_account_file():
     try:
         with open(get_account_path(), encoding='utf-8') as f:
             acct = json.load(f)
@@ -889,9 +925,11 @@ def load_account():
 def save_account(acct):
     path = get_account_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    _file_cache_drop(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(acct, f)
+    _file_cache_drop(path)
     try:
         os.chmod(path, 0o600)
     except Exception:
@@ -905,6 +943,7 @@ def clear_account():
             os.remove(path)
         except OSError:
             pass
+    _file_cache_drop(get_account_path())
 
 def cloud_sign_in(email, password, create=False):
     _require_cloud_config()
@@ -1315,6 +1354,18 @@ def format_cloud_time(ms):
         return "an unknown time"
 
 # ---------------------------------------------------------------- desktop shortcut
+# `python main.py` never caches the compiled file it runs, so all 50k lines were compiled on every start (~5 s, ~20 MiB).
+# Importing it instead lets Python keep __pycache__/main.cpython-*.pyc. This stub does what `python main.py` did
+# (same sys.argv, the script's folder first on sys.path, no '' / cwd entry) and needs no extra file, so the self-updater still only swaps main.py.
+# No quotes, $ or % in it: it goes into .lnk / .desktop / Run-key command lines as one argument.
+_NCZ_IMPORT_STUB = ("import sys,os,importlib;p=os.path.abspath(sys.argv.pop(1));sys.argv[0]=p;"
+                    "sys.path[:]=[os.path.dirname(p)]+[x for x in sys.path if x];"
+                    "importlib.import_module(os.path.splitext(os.path.basename(p))[0]).main()")
+
+def _launcher_script_args(script=None):
+    """Interpreter arguments that run main.py (from source) with its compiled code cached: ['-c', stub, main.py]."""
+    return ["-c", _NCZ_IMPORT_STUB, script or os.path.abspath(__file__)]
+
 def get_launch_command():
     """(target, args, working_dir) that starts this launcher the way it is currently being run."""
     appimage = os.environ.get("APPIMAGE")
@@ -1328,7 +1379,7 @@ def get_launch_command():
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pythonw):
             exe = pythonw  # no console window
-    return exe, [script], os.path.dirname(script)
+    return exe, _launcher_script_args(script), os.path.dirname(script)
 
 def _shortcut_icon_name(src, ext):
     """One file per theme icon, so Windows/the desktop can't keep showing a cached icon of another theme."""
@@ -2024,7 +2075,7 @@ def resumable_download(w, get_link, pick_name, expected_total=0, first=None):
             else:
                 w.status_update.emit("Connecting...")
             try:
-                response = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=NET_TIMEOUT)
+                response = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX)
             except urllib.error.HTTPError as he:
                 if he.code == 416 and done > 0:   # "range not satisfiable": everything had already arrived, or the file changed
                     m = re.search(r"/(\d+)\s*$", he.headers.get("Content-Range") or "")
@@ -2131,7 +2182,7 @@ def _resolve_version_link(w):
     direct link). Called again for a brand-new link whenever a download needs one."""
     w.status_update.emit("Checking version...")
     req = urllib.request.Request(w.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
         content = resp.read().decode('utf-8')
     w.remote_version = parse_remote_version(content)
     download_url = None
@@ -2146,7 +2197,7 @@ def _resolve_version_link(w):
     if "mediafire.com" in download_url:
         w.status_update.emit("Resolving MediaFire link...")
         mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT) as mf_resp:
+        with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as mf_resp:
             mf_html = mf_resp.read().decode('utf-8')
         match = re.search(r'href="(https?://download[^"]+)"', mf_html)
         if match:
@@ -2245,7 +2296,7 @@ class PingWorker(QThread):
     def run(self):
         try:
             req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=3, context=_NCZ_SSL_CTX) as resp:
                 if 200 <= resp.status < 400:
                     self.result.emit(True)
                     return
@@ -2350,7 +2401,7 @@ def download_common_redist(dest_dir, report=None):
             report(f"Downloading {name} ({i} of {total})", 0, 0)
         req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
         tmp = dest + ".part"
-        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+        with urllib.request.urlopen(req, timeout=60, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as out:
             size = int(resp.headers.get("Content-Length") or 0)
             done = 0
             while True:
@@ -2915,12 +2966,14 @@ def _start_instance_server(app, window=None):
         friends_req = False
         friends_cli = False              # `ncz-gm shiftq`: opens the panel even with no game running
         bigpic_req = False
+        build_req = False
         launch_reqs = []
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
             conn.waitForReadyRead(200)
             data = bytes(conn.readAll())
             woke = woke or data == b"show"
+            build_req = build_req or data == b"build"        # a game shortcut started: load the launcher, hidden
             quit_req = quit_req or data == b"quit"
             friends_req = friends_req or data in (b"friends", b"friends:cli")
             friends_cli = friends_cli or data == b"friends:cli"
@@ -2928,6 +2981,11 @@ def _start_instance_server(app, window=None):
             if data.startswith(b"launch:"):          # a game's desktop shortcut was opened while the launcher is running
                 launch_reqs.append(data[7:].decode("utf-8", "replace"))
             conn.disconnectFromServer()
+        if window is None and getattr(app, "_ncz_lazy_build", None) and (launch_reqs or woke or friends_req or bigpic_req):
+            # only the lite tray is running: build the launcher now (hidden unless somebody asked to see it)
+            app._ncz_pending_launches = list(getattr(app, "_ncz_pending_launches", [])) + launch_reqs
+            launch_reqs = []
+            window = app._ncz_lazy_build(hidden=not (woke or friends_req or bigpic_req))
         for _title in launch_reqs:
             if window is None:                   # still starting up: main() starts it once the library exists
                 app._ncz_pending_launches = list(getattr(app, "_ncz_pending_launches", [])) + [_title]
@@ -3401,10 +3459,24 @@ class SettingsPage(QWidget):
 
     def _refresh_archive_tool_status(self):
         saved = load_launcher_settings().get("archive_tool", "")
+        self._archive_probe = getattr(self, "_archive_probe", 0) + 1      # a newer refresh makes older results stale
         if not saved:
-            found = find_tool(*_SEVENZIP_NAMES, *_UNRAR_NAMES, "WinRAR", "Rar")
-            self.archive_tool_status.setText(f"Auto-detected: {found}" if found else
-                                             "No 7-Zip or WinRAR found automatically. Pick the .exe above.")
+            # find_tool checks every PATH / install folder (~0.6 s): off the GUI thread, it used to run at startup
+            self.archive_tool_status.setText("Detecting 7-Zip / WinRAR...")
+            probe = self._archive_probe
+            def done(found, probe=probe):
+                if probe != self._archive_probe:
+                    return
+                try:
+                    self.archive_tool_status.setText(f"Auto-detected: {found}" if found else
+                                                     "No 7-Zip or WinRAR found automatically. Pick the .exe above.")
+                except RuntimeError:
+                    pass        # Settings page already gone
+            worker = TaskWorker(lambda: find_tool(*_SEVENZIP_NAMES, *_UNRAR_NAMES, "WinRAR", "Rar"))
+            worker.done.connect(done)
+            worker.failed.connect(lambda _e: done(None))
+            self._archive_workers = [w for w in getattr(self, "_archive_workers", []) if w.isRunning()] + [worker]
+            worker.start()
         elif os.path.isfile(os.path.expandvars(os.path.expanduser(saved))):
             self.archive_tool_status.setText(f"Using: {saved}")
         else:
@@ -3669,7 +3741,7 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
 
     def on_accent_pick(self):
-        if _SIDE_UI:
+        if _SIDE_UI or globals().get("_CLASSIC_ACCOUNT"):
             return                                   # Sunset / Legacy have a fixed accent
         from PyQt6.QtWidgets import QColorDialog
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
@@ -3678,7 +3750,7 @@ class SettingsPage(QWidget):
             self._set_accent_setting(chosen.name())
 
     def _set_accent_setting(self, color):
-        if _SIDE_UI:
+        if _SIDE_UI or globals().get("_CLASSIC_ACCOUNT"):
             return                                   # the accent is fixed by the theme
         settings = load_launcher_settings()
         settings["accent_color"] = color
@@ -3703,6 +3775,8 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
         apply_dark_mode(mode)
 
+_CIRCLE_PIX_CACHE = {}       # CreditsPage.circular_pixmap results, at most 64
+
 class CreditsPage(QWidget):
     CREDITS = (
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
@@ -3713,6 +3787,24 @@ class CreditsPage(QWidget):
 
     @staticmethod
     def circular_pixmap(image_path, size):
+        # cached per (file, its mtime/size, size): ~16 ms each, and the same avatars are redrawn on every refresh
+        try:
+            st = os.stat(image_path)
+            key = (os.path.abspath(image_path), st.st_mtime_ns, st.st_size, size)
+        except (OSError, TypeError, ValueError):
+            key = None
+        hit = _CIRCLE_PIX_CACHE.get(key) if key else None
+        if hit is not None:
+            return QPixmap(hit)         # implicitly shared copy: a caller painting on it doesn't touch the cache
+        out = CreditsPage._circular_pixmap_uncached(image_path, size)
+        if out is not None and key:
+            if len(_CIRCLE_PIX_CACHE) >= 64:
+                _CIRCLE_PIX_CACHE.pop(next(iter(_CIRCLE_PIX_CACHE)))      # oldest first
+            _CIRCLE_PIX_CACHE[key] = QPixmap(out)
+        return out
+
+    @staticmethod
+    def _circular_pixmap_uncached(image_path, size):
         src = QPixmap(image_path)
         if src.isNull():
             return None
@@ -4543,7 +4635,7 @@ def get_store_cache_dir():
 
 def _http_get(url, headers=None, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_NCZ_SSL_CTX) as resp:
         return resp.read()
 
 _ROW_RE = re.compile(r'<a\b[^>]*?\bdata-ds-appid="(\d+)"[^>]*>(.*?)</a>', re.S)
@@ -4814,13 +4906,24 @@ def get_flag_file(code):
         pass
     return ""
 
+def _screen_dpr(widget=None):
+    """The real device pixel ratio (the widget's screen, else the highest of all screens), at least 1. Images drawn at
+    this scale stay sharp without using 4x the memory on a 100% screen like a fixed 2x did."""
+    try:
+        scr = widget.screen() if widget is not None else None
+        if scr is not None:
+            return max(1.0, float(scr.devicePixelRatio()))
+        return max([1.0] + [float(x.devicePixelRatio()) for x in QApplication.screens()])
+    except Exception:
+        return 1.0
+
 def round_flag_pixmap(path, height=22):
     """Whole flag (3:2) with rounded corners, crisp on HiDPI."""
     src = QPixmap(path)
     if src.isNull():
         return None
-    dpr = 2
-    h = height * dpr
+    dpr = _screen_dpr()
+    h = int(round(height * dpr))
     w = int(round(h * 1.5))
     scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                         Qt.TransformationMode.SmoothTransformation)
@@ -5071,8 +5174,8 @@ def rounded_cover_pixmap(path, width, height, radius, blur=False):
     src = QPixmap(path)
     if src.isNull():
         return None
-    scale = 2
-    w, h = width * scale, height * scale
+    scale = _screen_dpr()
+    w, h = int(round(width * scale)), int(round(height * scale))
     scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                         Qt.TransformationMode.SmoothTransformation)
     if blur:    # shrink a lot then smooth-scale back up = heavy blur
@@ -5117,7 +5220,31 @@ def _nsfw_log(text):
     except Exception:
         pass
 _nsfw_det_lock = threading.RLock()
-_nsfw_det = {"obj": None, "tried": False}
+_nsfw_det = {"obj": None, "tried": False, "used": 0.0}
+NSFW_DET_IDLE_S = 60            # the detector (onnxruntime + model) is dropped after this long without a new cover
+_nudenet_spec = []
+
+def _nudenet_installed():
+    """Is NudeNet installed? Only looks for the package, doesn't load onnxruntime or the model."""
+    if not _nudenet_spec:
+        try:
+            import importlib.util
+            _nudenet_spec.append(importlib.util.find_spec("nudenet") is not None)
+        except Exception:
+            _nudenet_spec.append(False)
+    return _nudenet_spec[0]
+
+def _nsfw_det_reaper():
+    while True:
+        time.sleep(15)
+        with _nsfw_det_lock:
+            if _nsfw_det["obj"] is None:
+                return
+            if time.time() - _nsfw_det["used"] >= NSFW_DET_IDLE_S:
+                _nsfw_det["obj"], _nsfw_det["tried"] = None, False      # loaded again by the next new cover
+                import gc
+                gc.collect()
+                return
 
 def _get_nsfw_detector():
     with _nsfw_det_lock:
@@ -5126,8 +5253,10 @@ def _get_nsfw_detector():
             try:
                 from nudenet import NudeDetector
                 _nsfw_det["obj"] = NudeDetector()
+                threading.Thread(target=_nsfw_det_reaper, daemon=True).start()
             except Exception:
                 _nsfw_det["obj"] = None
+        _nsfw_det["used"] = time.time()
         return _nsfw_det["obj"]
 
 def cover_has_nudity(path, label=""):
@@ -5162,7 +5291,7 @@ class _NsfwBus(QObject):
 nsfw_bus = _NsfwBus()
 
 def _nsfw_cache_path():
-    name = "cover_nsfw3.json" if _get_nsfw_detector() is not None else "nsfw.json"    # picture check vs descriptor fallback
+    name = "cover_nsfw3.json" if _nudenet_installed() else "nsfw.json"    # picture check vs descriptor fallback (find_spec: no model load)
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", name)
 
 def nsfw_cached(appid):
@@ -5214,6 +5343,8 @@ def check_app_nsfw(appid, path=None, title=""):
     known = nsfw_cached(appid)
     if known is not None:
         return known
+    if _nudenet_installed() and nsfw_revealed():
+        return None         # every cover is shown anyway: don't load the detector for it (not cached, so "Hide again" re-checks)
     if _get_nsfw_detector() is not None:
         if not path or not os.path.exists(path):
             return None
@@ -6452,16 +6583,16 @@ class AdaptiveApp(QMainWindow):
         self.account_page = AccountPage()
         self.account_page.account_changed.connect(self.refresh_profile)
         self.pages.addWidget(self.account_page)
-        self.store_page = StorePage()
-        self.pages.addWidget(self.store_page)
-        self.settings_page.steamgriddb_key_changed.connect(self.store_page.on_key_changed)
-        self.store_detail_page = StoreDetailPage()
-        self.pages.addWidget(self.store_detail_page)  # index 5
-        self.store_page.game_selected.connect(self.open_store_game)
-        self.store_detail_page.add_requested.connect(self.add_steam_game)
-        self.store_detail_page.back_requested.connect(lambda: self.pages.setCurrentIndex(4))
-        self.store_detail_page.game_selected.connect(self.open_store_game)
-        self.store_detail_page.tag_requested.connect(self.open_store_tag)
+        def wire_store(sp):
+            self.settings_page.steamgriddb_key_changed.connect(sp.on_key_changed)
+            sp.game_selected.connect(self.open_store_game)
+        _lazy_page(self, "store_page", StorePage, wire_store)                 # index 4, built when first opened
+        def wire_store_detail(dp):
+            dp.add_requested.connect(self.add_steam_game)
+            dp.back_requested.connect(lambda: self.pages.setCurrentIndex(4))
+            dp.game_selected.connect(self.open_store_game)
+            dp.tag_requested.connect(self.open_store_tag)
+        _lazy_page(self, "store_detail_page", StoreDetailPage, wire_store_detail)    # index 5
         root_layout.addWidget(self.pages, 1)
 
         self.apply_filter()
@@ -7372,7 +7503,8 @@ class AdaptiveApp(QMainWindow):
         save_steam_library(games)
         self.create_steam_card(appid, title, saved_cover)
         self.apply_filter()
-        self.store_detail_page.set_in_library(True)
+        if self.__dict__.get("store_detail_page") is not None:      # don't build it just for this
+            self.store_detail_page.set_in_library(True)
 
     def remove_steam_game(self, appid):
         card = self.steam_cards.pop(appid, None)
@@ -7387,7 +7519,7 @@ class AdaptiveApp(QMainWindow):
         except OSError:
             pass
         self.apply_filter()
-        if self.store_detail_page._appid == appid:
+        if getattr(self.__dict__.get("store_detail_page"), "_appid", None) == appid:
             self.store_detail_page.set_in_library(False)
 
     def reload_brand_logo(self):
@@ -7533,6 +7665,175 @@ def ensure_terms_accepted():
     return False
 
 
+def _ncz_build_main_window(app, launch_title="", hidden=False):
+    """Builds the full launcher window. If a lite tray icon is up, the window's own tray replaces it."""
+    window = AdaptiveApp()
+    app._ncz_main_window = window
+    stop_lite = getattr(app, "_ncz_lite_stop", None)
+    if stop_lite is not None:
+        app._ncz_lite_stop = None
+        stop_lite()
+    lite = getattr(app, "_ncz_lite_tray", None)
+    if lite is not None:
+        app._ncz_lite_tray = None
+        try:
+            lite.hide()
+            lite.deleteLater()
+        except Exception:
+            pass
+    _ncz_after_window_created(app, window, launch_title)     # game from a Wine/Proton shortcut
+    _acct_watch_start(window)
+    _memlog_start(window)                # NCZ_MEMLOG=1: memory figures at startup, on hide / show and every 60 s
+    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
+    set_windows_taskbar_identity(window)
+    tray = getattr(window, "_tray", None)
+    if hidden:
+        if tray is None:                                # no tray to hide in
+            window.showMinimized()
+        else:
+            window.hide()                               # start quietly in the tray
+            _ui_timers_pause(window)                    # never shown, so hideEvent doesn't pause the redraw timers
+            # never shown, so hideEvent's trim doesn't run: free memory once startup work has settled
+            QTimer.singleShot(30000, lambda: _mem_free_hidden(window))
+        if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
+            window.showNormal()
+    else:
+        window.showMaximized()
+    return window
+
+def _ncz_ensure_window(app, hidden=False):
+    """The launcher window, built now if only the lite tray exists so far."""
+    window = getattr(app, "_ncz_main_window", None)
+    if window is None:
+        window = _ncz_build_main_window(app, "", hidden=hidden)
+    return window
+
+def _lite_publish_presence():
+    """Light heartbeat for friends: playing / idle / seen only (no library, photo or covers)."""
+    if _presence_state["offline"] or not cloud_configured() or load_account() is None:
+        return
+    with _presence_lock:
+        if _presence_state["offline"]:
+            return
+        token, uid = get_id_token()
+        _http_json(_fdb(f"public/{uid}", token), "PATCH",
+                   {"playing": _now_playing["name"] or "", "idle": True, "seen": {".sv": "timestamp"}})
+
+def _ncz_lite_services(app):
+    """What the tray-only launcher still does, without building the window: notice which library game is running
+    (counts playtime, last played, 'Playing ...'), keep the friends status current, and open the Shift+Q overlay
+    (the full launcher is built, hidden, the first time Shift+Q is pressed in a game)."""
+    app._ncz_lite_active = True
+    bus = _ExtGameBus(app)
+    bus.adopt.connect(_ext_on_adopt)
+    app._ncz_lite_bus = bus
+    threading.Thread(target=_ext_loop, args=(bus, lambda: not getattr(app, "_ncz_lite_active", False)),
+                     daemon=True).start()
+
+    def publish():
+        def work():
+            try:
+                _lite_publish_presence()
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    _playing_listeners.append(publish)               # a game started / ended: tell friends right away
+    timer = QTimer(app)
+    timer.setInterval(45000)
+    timer.timeout.connect(publish)
+    timer.start()
+    QTimer.singleShot(2000, publish)
+
+    class _LiteKeys(QObject):
+        shift_q = pyqtSignal()
+    keys = _LiteKeys(app)
+
+    def on_shift_q():
+        if getattr(app, "_ncz_main_window", None) is not None or not _running:
+            return                                    # the window's own hook handles it / not in a launcher game
+        window = _ncz_ensure_window(app, hidden=True)
+        QTimer.singleShot(300, lambda: window._friends_overlay.toggle_req.emit())
+
+    keys.shift_q.connect(on_shift_q)
+    app._ncz_lite_keys = keys
+    try:
+        if sys.platform.startswith("win"):
+            app._ncz_lite_hook = _start_shift_q_hook(keys.shift_q.emit)
+        elif sys.platform.startswith("linux"):
+            app._ncz_lite_hook = _start_shift_q_hook_linux(keys.shift_q.emit)
+    except Exception:
+        pass
+
+    def stop():
+        app._ncz_lite_active = False
+        timer.stop()
+        try:
+            _playing_listeners.remove(publish)
+        except ValueError:
+            pass
+    app._ncz_lite_stop = stop
+
+def _ncz_start_lite_tray(app):
+    """Starts in the tray without building the launcher. False if there is no system tray (the normal start is used)."""
+    try:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+        app.setQuitOnLastWindowClosed(False)
+        icon = app.windowIcon()
+        if icon.isNull():
+            icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        tray = QSystemTrayIcon(icon, app)
+        tray.setToolTip("NCZ Games Launcher")
+        menu = QMenu()
+        open_act = QAction("Open launcher", menu)
+        quit_act = QAction("Quit", menu)
+        menu.addAction(open_act)
+        menu.addAction(quit_act)
+        tray.setContextMenu(menu)
+
+        def open_launcher():
+            window = getattr(app, "_ncz_main_window", None)
+            if window is None:
+                _ncz_build_main_window(app, "", hidden=False)
+            else:
+                window.showNormal()
+                window.raise_()
+                window.activateWindow()
+
+        def quit_app():
+            tray.hide()
+            if getattr(app, "_ncz_lite_stop", None) is not None:
+                def off():
+                    try:
+                        if cloud_configured() and load_account() is not None:
+                            cloud_publish_offline()
+                    except Exception:
+                        pass
+                t = threading.Thread(target=off, daemon=True)
+                t.start()
+                t.join(3)                    # don't hang the exit if the network is down
+            app.quit()
+
+        open_act.triggered.connect(open_launcher)
+        quit_act.triggered.connect(quit_app)
+        tray.activated.connect(lambda reason: open_launcher()
+                               if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        tray.show()
+        app._ncz_lite_tray = tray
+        app._ncz_lite_menu = menu                      # keep the menu alive
+        try:
+            _ncz_lite_services(app)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
         import ncz_gm
@@ -7548,6 +7849,8 @@ def main():
         except Exception:
             pass
     _prefer_xwayland()
+    if _HAS_WEBENGINE:      # lets QtWebEngine be imported after the QApplication exists (it's only loaded when NCZFront opens)
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
     if "--friends" in sys.argv:          # toggles the friends panel of the running launcher, then exits
@@ -7564,12 +7867,28 @@ def main():
             pass
         sys.exit(0)
     _launch_title = _ncz_launch_arg()    # a game's desktop shortcut: `main.py --launch-game <title>`
+    _game_exe, _game_args = _ncz_game_exe_arg()    # a game's desktop shortcut: `main.py --game-exe <exe>`
+    if _game_exe:
+        _ncz_spawn_game_exe(_game_exe, _game_args)     # the game starts right away, before anything else loads
     if _launch_title and _ncz_send_launch(_launch_title):
         sys.exit(0)                      # the launcher is already open: it starts the game, nothing else to do here
     got_lock = _acquire_instance_lock()
     if got_lock and _another_instance_running(wake=False):
         got_lock = False             # an older launcher (one that doesn't use the lock) is already running
     if not got_lock:
+        if _game_exe:                    # the launcher is already open (or starting): the game is running, nothing else to do
+            try:
+                from PyQt6.QtNetwork import QLocalSocket
+                sock = QLocalSocket()
+                sock.connectToServer(_instance_name())
+                if sock.waitForConnected(800):
+                    sock.write(b"hello")             # nothing to do: the open launcher notices the game by itself
+                    sock.flush()
+                    sock.waitForBytesWritten(800)
+                    sock.disconnectFromServer()
+            except Exception:
+                pass
+            sys.exit(0)
         if "--startup" in sys.argv:
             sys.exit(0)  # started at login while one is already up (or starting): leave it alone
         if _launch_title and _ncz_send_launch(_launch_title, wait=6):
@@ -7586,6 +7905,11 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
+    try:                                         # in-game / desktop toasts show the launcher's current icon
+        import overlay as _overlay_icon_mod
+        _overlay_icon_mod.set_icon_provider(lambda: asset_path("icon.png"))
+    except Exception:
+        pass
     set_accent(_saved_accent)
     apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
 
@@ -7601,24 +7925,27 @@ def main():
     if not ensure_terms_accepted():
         sys.exit(0)
 
-    window = AdaptiveApp()
-    app._ncz_main_window = window
-    _ncz_after_window_created(app, window, _launch_title)     # game from a desktop shortcut + desktop auto-add
-    _acct_watch_start(window)
     apply_startup_setting()
     register_cli()
-    lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
-    set_windows_taskbar_identity(window)
-    tray = getattr(window, "_tray", None)
-    if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
-        if tray is None:                                # no tray to hide in
-            window.showMinimized()
-        else:
-            window.hide()                               # start quietly in the tray
-        if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
-            window.showNormal()
-    else:
-        window.showMaximized()
+    # Started with the system (or a game's Wine/Proton shortcut) and set to start minimized -> stay in the tray.
+    start_hidden = bool(_game_exe or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)))
+    if start_hidden and not _launch_title and _ncz_start_lite_tray(app):
+        # Only a tray icon plus a few essentials (game detection, "Playing ..." status, Shift+Q) exist now. The full
+        # launcher is built the first time it's opened (tray click, a second start of the launcher, `--friends`,
+        # a game launch request, Shift+Q in a game ...), see _ncz_ensure_window.
+        app._ncz_lazy_build = lambda hidden=True: _ncz_ensure_window(app, hidden)
+        # Friend toasts (playing / online / requests / messages) come from the friends page, which only exists in the
+        # full window. So when signed in, build it now, hidden in the tray, instead of waiting for the first open.
+        def _build_for_toasts():
+            try:
+                if getattr(app, "_ncz_main_window", None) is None and load_account() is not None:
+                    _ncz_ensure_window(app, hidden=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        QTimer.singleShot(3000, _build_for_toasts)
+        sys.exit(app.exec())
+    _ncz_build_main_window(app, _launch_title, hidden=bool(_launch_title or start_hidden))
     sys.exit(app.exec())
 # --- Firebase Steam Link & Downloads Tab Integration ---
 
@@ -8081,7 +8408,7 @@ def _patched_get_steam_download_link(appid):
             if cover_url and isinstance(cover_url, str):
                 try:
                     req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                         img_data = resp.read()
                     os.makedirs(get_library_cover_dir(), exist_ok=True)
                     local_path = os.path.join(get_library_cover_dir(), f"{appid}.img")
@@ -8116,7 +8443,7 @@ def _patched_build_library_page(self):
                         cover_url = data.get("cover_url")
                         if cover_url and isinstance(cover_url, str):
                             req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                            with urllib.request.urlopen(req, timeout=10) as resp:
+                            with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                                 img_data = resp.read()
                             os.makedirs(get_library_cover_dir(), exist_ok=True)
                             with open(local_cover, 'wb') as f:
@@ -9199,7 +9526,7 @@ def _new_fb_run(self):
         if total_size <= 0 and not self._is_cancelled:
             try:
                 head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(head_req, timeout=10) as head_resp:
+                with urllib.request.urlopen(head_req, timeout=10, context=_NCZ_SSL_CTX) as head_resp:
                     total_size = int(head_resp.headers.get('Content-Length', 0))
             except Exception:
                 pass
@@ -9266,7 +9593,7 @@ def _pw_probe_server(title, sid):
     """Does this server have the game? 'ok', '404' (not there) or 'unknown' (blocked / offline / couldn't tell)."""
     try:
         req = urllib.request.Request(pw_game_url(title, sid), headers={"User-Agent": PW_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as r:
             r.read(1)
         return "ok"
     except urllib.error.HTTPError as e:
@@ -9778,7 +10105,7 @@ def fetch_site_build(title, server="1"):
     try:
         url = pw_game_url(title, "3" if server == "3" else "1")
         req = urllib.request.Request(url, headers={"User-Agent": PW_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as r:
             html = r.read(400000).decode("utf-8", "ignore")
         if server == "3":
             ver = parse_s3_version(html)
@@ -12264,7 +12591,7 @@ def steam_join_via_steamworks(appid, sid, timeout=15):
         _invite_log(("no libsteam_api / steam_api64 file found (put libsteam_api.so in assets/)" if not lib else
                      "no Steam account found (is Steam installed and signed in?)") + f" [appid {appid}]")
         return ""
-    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)])
+    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable] + _launcher_script_args())   # cached compile
     cmd += ["--ncz-rp-helper", str(appid), lib, sid]
     try:
         _r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
@@ -14091,8 +14418,15 @@ class FriendsPage(QWidget):
         self._detect_events()
         if self._prev_last is None:
             self._detect_messages(last)      # baseline only; _poll_messages raises the notifications
-        self._rebuild_requests()
-        self._rebuild_rows()
+        # Every 10 s: only tear down and rebuild the rows (widgets + avatar files) when what they show changed.
+        req_sig = [(uid, d.get("username")) for uid, d in self.requests.items()]
+        if req_sig != getattr(self, "_req_sig", None):
+            self._req_sig = req_sig
+            self._rebuild_requests()
+        row_sig = sorted((uid, d.get("username"), d.get("photo"), _friend_status(d)) for uid, d in self.friends.items())
+        if row_sig != getattr(self, "_row_sig", None):
+            self._row_sig = row_sig
+            self._rebuild_rows()
         if self.current_uid in self.friends and self.stack.currentIndex() == 1:
             self._fill_profile()
 
@@ -15140,7 +15474,7 @@ def self_update_check():
     base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
     req = urllib.request.Request(f"{base}?t={int(time.time())}",
                                  headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as resp:
         remote = resp.read()
     if len(remote) < 2000:
         return False
@@ -15207,7 +15541,7 @@ def companion_update_check():
                 continue
             req = urllib.request.Request(f"{base}{name}?t={int(time.time())}",
                                          headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
                 remote = resp.read()
             path = local_fn()
             if is_py:
@@ -15924,9 +16258,9 @@ _gmod_prev_init = AdaptiveApp.__init__
 
 def _gmod_init(self):
     _gmod_prev_init(self)
-    self.gmod_page = GmodAddonManagerPage()
-    self.pages.addWidget(self.gmod_page)
-    idx = self.pages.indexOf(self.gmod_page)
+    self._gmod_root = None
+    ph = _lazy_page(self, "gmod_page", GmodAddonManagerPage, lambda gp: gp.set_root(self._gmod_root))
+    idx = self.pages.indexOf(ph)
     self.gmod_btn = self.make_nav_button("Garry's Mod Addon Manager", checkable=True)
     self.nav_group.addButton(self.gmod_btn, idx)
     sidebar_layout = self.nav_group.button(0).parent().layout()
@@ -15936,9 +16270,11 @@ def _gmod_init(self):
 
     def refresh_gmod():
         root = find_gmod_root()
+        self._gmod_root = root
         self.gmod_btn.setVisible(bool(root))
-        self.gmod_page.set_root(root)
-        if not root and self.pages.currentWidget() is self.gmod_page:
+        if self.__dict__.get("gmod_page") is not None:       # not built yet: it gets the root when it is
+            self.gmod_page.set_root(root)
+        if not root and self.pages.currentWidget() is _lazy_slot(self, "gmod_page"):
             self.nav_group.button(0).setChecked(True)
             self.pages.setCurrentIndex(0)
 
@@ -15948,7 +16284,8 @@ def _gmod_init(self):
     self._gmod_timer.timeout.connect(refresh_gmod)
     self._gmod_timer.start()
     self.pages.currentChanged.connect(
-        lambda _i: self.gmod_page.refresh_addons() if self.pages.currentWidget() is self.gmod_page else None)
+        lambda _i: self.gmod_page.refresh_addons()
+        if self.__dict__.get("gmod_page") is not None and self.pages.currentWidget() is self.gmod_page else None)
 
 AdaptiveApp.__init__ = _gmod_init
 
@@ -15975,7 +16312,7 @@ def _download_and_run_gmod_fix(root):
     if not py:
         raise RuntimeError("Python isn't installed, so the fix script can't run.\nInstall Python 3 and try again.")
     req = urllib.request.Request(GMOD_FIX_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
         data = resp.read()
     if not data.strip():
         raise RuntimeError("The downloaded fix script was empty.")
@@ -16350,17 +16687,18 @@ def _ws_dir_size(path):
     return total
 
 def _ws_crop_round(pm, w, h, radius=8):
-    scale = 2
-    scaled = pm.scaled(w * scale, h * scale, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+    scale = _screen_dpr()
+    sw, sh = int(round(w * scale)), int(round(h * scale))
+    scaled = pm.scaled(sw, sh, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                        Qt.TransformationMode.SmoothTransformation)
-    out = QPixmap(w * scale, h * scale)
+    out = QPixmap(sw, sh)
     out.fill(Qt.GlobalColor.transparent)
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     clip = QPainterPath()
-    clip.addRoundedRect(QRectF(0, 0, w * scale, h * scale), radius * scale, radius * scale)
+    clip.addRoundedRect(QRectF(0, 0, sw, sh), radius * scale, radius * scale)
     p.setClipPath(clip)
-    p.drawPixmap((w * scale - scaled.width()) // 2, (h * scale - scaled.height()) // 2, scaled)
+    p.drawPixmap((sw - scaled.width()) // 2, (sh - scaled.height()) // 2, scaled)
     p.end()
     out.setDevicePixelRatio(scale)
     return out
@@ -16724,7 +17062,7 @@ class WorkshopLinkWorker(QThread):
             req = urllib.request.Request(
                 "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
                 data=urllib.parse.urlencode(body).encode(), headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as resp:
                 details = json.loads(resp.read().decode("utf-8", "replace")).get("response", {}).get(
                     "publishedfiledetails", [])
         except Exception as e:
@@ -16775,7 +17113,7 @@ class WorkshopDepsWorker(QThread):
         req = urllib.request.Request(
             "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
             data=urllib.parse.urlencode(body).encode(), headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as resp:
             ds = json.loads(resp.read().decode("utf-8", "replace")).get("response", {}).get("publishedfiledetails", [])
         return {str(d.get("publishedfileid")): d for d in ds if isinstance(d, dict)}
 
@@ -18653,7 +18991,7 @@ class GeInstallWorker(QThread):
                     expected = ""
             digest = _hashlib.sha512()
             req = urllib.request.Request(self.info["url"], headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or self.info["size"] or 0)
                 got = 0
                 while True:
@@ -18882,10 +19220,9 @@ def _ge_init(self):
     _ge_prev_init(self)
     if not sys.platform.startswith("linux"):
         return
-    self.ge_page = GeProtonPage()
-    self.pages.addWidget(self.ge_page)
+    ph = _lazy_page(self, "ge_page", GeProtonPage)
     btn = self.make_nav_button("GE Proton", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.ge_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(ph))
     layout = self.nav_group.button(0).parent().layout()
     layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
 
@@ -18950,7 +19287,7 @@ class WineInstallWorker(QThread):
             tmp = os.path.join(dest, "." + name + ".tar.xz.part")
             digest = _hashlib.sha256()
             req = urllib.request.Request(self.info["url"], headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or self.info["size"] or 0)
                 got = 0
                 while True:
@@ -19222,12 +19559,12 @@ def _wine_init(self):
     _wine_prev_init(self)
     if not sys.platform.startswith("linux"):
         return
-    self.wine_page = WinePage()
-    self.pages.addWidget(self.wine_page)
+    ph = _lazy_page(self, "wine_page", WinePage)
     btn = self.make_nav_button("Wine", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.wine_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(ph))
     layout = self.nav_group.button(0).parent().layout()
-    ge_btn = self.nav_group.button(self.pages.indexOf(self.ge_page)) if hasattr(self, "ge_page") else None
+    ge_slot = _lazy_slot(self, "ge_page")              # hasattr(self, "ge_page") would build it
+    ge_btn = self.nav_group.button(self.pages.indexOf(ge_slot)) if ge_slot is not None else None
     at = layout.indexOf(ge_btn) + 1 if ge_btn is not None else layout.indexOf(self.nav_group.button(1))
     layout.insertWidget(at, btn)
 
@@ -20472,7 +20809,7 @@ class ScrapeWorker(QThread):
             self.stage.emit("Downloading the scraper...")
             try:
                 req = urllib.request.Request(GAMEJOLT_SCRAPER_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
                     data = resp.read()
                 if not data.strip():
                     raise ValueError("the downloaded file is empty")
@@ -20722,7 +21059,7 @@ class FanGamesPage(StorePage):
         self.loader.shutdown()
         self.loader = FanCoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
-        self._links = {gid: link for gid, _t, link, _tg in load_fan_games()}
+        self._links_map = None      # self._links is built on first use (reading 15k fan games here cost ~0.4 s at startup)
         lbl = self.findChild(QLabel, "PageTitle")
         if lbl:
             lbl.setText("Fan Games")
@@ -20851,6 +21188,16 @@ class FanGamesPage(StorePage):
                 if event.button() == Qt.MouseButton.LeftButton:
                     self.fan_selected.emit(c.appid, c.title, c.cover_path)
             card.mousePressEvent = press
+
+def _fan_links_get(self):
+    if getattr(self, "_links_map", None) is None:
+        self._links_map = {gid: link for gid, _t, link, _tg in load_fan_games()}
+    return self._links_map
+
+def _fan_links_set(self, value):
+    self._links_map = value
+
+FanGamesPage._links = property(_fan_links_get, _fan_links_set)       # {game id: link}, loaded when first read
 
 # ---------------------------------------------------------------- fan games in the Library (bottom section, horizontal cards)
 def get_fan_library_path():
@@ -20994,7 +21341,7 @@ def _fan_remove(self, gid):
         os.remove(os.path.join(get_library_cover_dir(), f"fan-{gid}.img"))
     except OSError:
         pass
-    if getattr(self, "fan_detail_page", None) is not None and self.fan_detail_page._appid == gid:
+    if self.__dict__.get("fan_detail_page") is not None and self.fan_detail_page._appid == gid:
         self.fan_detail_page.set_in_library(False)
     self.apply_filter()
 
@@ -21004,7 +21351,7 @@ def _fan_view(self, gid):
         return
     self.fan_detail_page.show_game(gid, g["title"], g.get("cover", ""), g.get("link", ""), tuple(g.get("tags", [])))
     self.fan_detail_page.set_in_library(True)
-    btn = self.nav_group.button(self.pages.indexOf(self.fan_page))
+    btn = self.nav_group.button(self.pages.indexOf(_lazy_slot(self, "fan_page")))
     if btn:
         btn.setChecked(True)
     self.pages.setCurrentWidget(self.fan_detail_page)
@@ -21063,10 +21410,14 @@ _fan_prev_init = AdaptiveApp.__init__
 
 def _fan_init(self):
     _fan_prev_init(self)
-    self.fan_page = FanGamesPage()
-    self.pages.addWidget(self.fan_page)
-    self.fan_detail_page = FanDetailPage()
-    self.pages.addWidget(self.fan_detail_page)
+    def wire_fan(fp):
+        fp.fan_selected.connect(open_fan_game)
+    def wire_fan_detail(dp):
+        dp.add_requested.connect(self._fan_add)
+        dp.open_cb = open_fan_game
+        dp.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
+    fan_ph = _lazy_page(self, "fan_page", FanGamesPage, wire_fan)
+    _lazy_page(self, "fan_detail_page", FanDetailPage, wire_fan_detail)
 
     def open_fan_game(gid, title, cover):
         link, tags = "", ()
@@ -21102,12 +21453,8 @@ def _fan_init(self):
     tl.addStretch()
     self.library_tabs = tabs
     self.search_edit.parentWidget().layout().insertWidget(2, tabs)
-    self.fan_detail_page.add_requested.connect(self._fan_add)
-    self.fan_page.fan_selected.connect(open_fan_game)
-    self.fan_detail_page.open_cb = open_fan_game
-    self.fan_detail_page.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
     btn = self.make_nav_button("Fan Games", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.fan_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(fan_ph))
     layout = self.nav_group.button(0).parent().layout()
     i = layout.indexOf(self.nav_group.button(4))
     i = i + 1 if i >= 0 else layout.indexOf(self.nav_group.button(1))
@@ -21642,7 +21989,7 @@ _gj_prev_init = AdaptiveApp.__init__
 
 def _gj_init(self):
     _gj_prev_init(self)
-    self.fan_detail_page.install_cb = lambda i, t, c, u: self._fan_install(i, t, c, u)
+    _lazy_on_built(self, "fan_detail_page", lambda dp: setattr(dp, "install_cb", lambda i, t, c, u: self._fan_install(i, t, c, u)))
 
 AdaptiveApp.__init__ = _gj_init
 
@@ -22292,7 +22639,7 @@ def _fan_add_existing(self):
     entry = {"id": gid, "title": title, "link": link, "tags": d["tags"], "cover": saved_cover, "exe_path": exe}
     save_fan_library(lib + [entry])
     self._fan_create_library_card(entry)
-    if self.fan_detail_page._appid == gid:
+    if getattr(self.__dict__.get("fan_detail_page"), "_appid", None) == gid:
         self.fan_detail_page.set_in_library(True)
     # show it: switch the library to the Fan Games tab
     self._lib_tab = "fan"
@@ -22305,7 +22652,8 @@ def _fan_add_existing(self):
     # no cover cached yet: fetch it from Game Jolt in the background
     card = self.fan_lib_cards.get(gid)
     label = card.findChildren(QLabel)[0] if card is not None else None
-    worker = TaskWorker(lambda: self.fan_page.loader._fetch(gid, link, "", title))
+    fan_loader = self.fan_page.loader       # on the GUI thread: reading fan_page may build the (lazy) page, a QWidget
+    worker = TaskWorker(lambda: fan_loader._fetch(gid, link, "", title))
     if not hasattr(self, "_fan_cover_workers"):
         self._fan_cover_workers = []
     self._fan_cover_workers.append(worker)
@@ -22376,8 +22724,8 @@ def _fan_refresh(self, gid):
         g = next((x for x in load_fan_library() if x["id"] == gid), None)
         if g:
             _fan_update_btn(btn, g["title"])
-    dp = self.fan_detail_page
-    if dp._appid == gid:
+    dp = self.__dict__.get("fan_detail_page")
+    if dp is not None and dp._appid == gid:
         _fan_update_btn(dp.steam_btn, dp._title)
 
 AdaptiveApp._fan_compat_dialog = _fan_compat_dialog
@@ -22749,15 +23097,36 @@ def _desk_parse_lnk(path):
         return None
 
 
+_LNK_CACHE = {}              # (path, mtime_ns, size) -> (target, args, workdir) or None (couldn't be read)
+_LNK_CACHE_LOCK = threading.Lock()
+
 def _resolve_lnks(paths):
-    """{lnk path: (target, arguments, working dir)}. Built-in parser first; PowerShell for any it couldn't resolve."""
-    out = {}
+    """{lnk path: (target, arguments, working dir)}. Built-in parser first; PowerShell for any it couldn't resolve.
+    Results (failures too) are kept per file version, so the 3-minute desktop scan doesn't start PowerShell again
+    for a shortcut it already couldn't read."""
+    out, keys, todo = {}, {}, []
     for p in paths:
+        try:
+            st = os.stat(p)
+            keys[p] = (p, st.st_mtime_ns, st.st_size)
+        except OSError:
+            keys[p] = None
+        with _LNK_CACHE_LOCK:
+            hit = _LNK_CACHE.get(keys[p], False) if keys[p] else False
+        if hit is False:
+            todo.append(p)
+        elif hit is not None:
+            out[p] = hit
+    for p in todo:
         info = _desk_parse_lnk(p)
         if info:
             out[p] = info
-    missing = [p for p in paths if not (out.get(p) or ("",))[0]]
+    missing = [p for p in todo if not (out.get(p) or ("",))[0]]
     out.update(_resolve_lnks_powershell(missing))
+    with _LNK_CACHE_LOCK:
+        for p in todo:
+            if keys[p]:
+                _LNK_CACHE[keys[p]] = out.get(p)
     return out
 
 def _resolve_lnks_powershell(paths):
@@ -23405,7 +23774,7 @@ def restart_launcher(window, use_demo=False):
     if "--launch-game" in args:                                               # don't start the game again after a restart
         _i = args.index("--launch-game")
         del args[_i:_i + 2]
-    cmd = [sys.executable] + args if frozen else [sys.executable, os.path.abspath(__file__)] + args
+    cmd = [sys.executable] + args if frozen else [sys.executable] + _launcher_script_args() + args     # cached compile
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
     if use_demo and not frozen and not os.environ.get("APPIMAGE") and os.path.isfile(demo):
         cmd = [sys.executable, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
@@ -25478,7 +25847,7 @@ _rpc_image_cache = {}
 def _rpc_url_exists(url):
     try:
         req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=6, context=_NCZ_SSL_CTX) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False
@@ -25839,7 +26208,7 @@ def _lib_download_cover(appid):
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                 img = resp.read()
             if img:
                 os.makedirs(get_library_cover_dir(), exist_ok=True)
@@ -25938,8 +26307,9 @@ def _lib_apply(self, result):
                     self._fan_create_library_card(e)
         self.apply_filter()
         try:
-            page = self.store_detail_page
-            page.set_in_library(page._appid in self.steam_cards)
+            page = self.__dict__.get("store_detail_page")        # not built yet: nothing to update
+            if page is not None:
+                page.set_in_library(page._appid in self.steam_cards)
         except Exception:
             pass
     finally:
@@ -29028,10 +29398,14 @@ class CountryDialog(QDialog):
 # The theme is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
 # Account themes: a theme can belong to specific accounts, and a "locked" one can't use any other theme.
 # The admin accounts below can pick every account theme (the existing one and any added later) and are never locked.
-_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
+_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
 _ACCOUNT_THEMES = {
     "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": False},     # free to switch between Sunset and this theme
     "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
+    # Omar V4: only these two accounts (the admin can always pick it). Omar's account gets it as its default ONCE, on the first launch with this update.
+    "omar_v4": {"uids": {"ojTnHLIVMuNpPPfL35FQIancCdz1", "XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False,
+                "default_uids": {"ojTnHLIVMuNpPPfL35FQIancCdz1"},
+                "layout": "classic"},     # built on the Classic theme: top navigation bar, flat colours (no side rail)
 }   # each entry's look (label, theme, extra) is attached next to its colours below
 
 def _saved_uid():
@@ -29040,10 +29414,18 @@ def _saved_uid():
     except Exception:
         return ""
 
-def _raw_setting(name):
+def _raw_launcher_json():
     try:
         with open(get_launcher_settings_path(), encoding="utf-8") as f:
-            return json.load(f).get(name)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _raw_setting(name):
+    try:      # same mtime cache as load_launcher_settings (this ran 3 times per load_launcher_settings call)
+        import copy as _copy
+        return _copy.deepcopy(_cached_by_mtime("raw", get_launcher_settings_path(), _raw_launcher_json, copy=False).get(name))
     except Exception:
         return None
 
@@ -29065,23 +29447,979 @@ def _allowed_theme_keys():
     uid = _saved_uid()
     if uid in _THEME_ADMIN_UIDS:
         return list(_ACCOUNT_THEMES)
-    return [k for k, t in _ACCOUNT_THEMES.items() if uid and uid in t["uids"]]
+    return [k for k, t in _ACCOUNT_THEMES.items()
+            if (t.get("everyone") and (not t.get("custom") or _ct_unlocked())) or (uid and uid in t["uids"])]
+
+def _apply_default_account_themes():
+    """First launch with an update that adds a theme made for this account: make it the account's theme, once.
+    Later changes in Settings are respected (the key is remembered in launcher.json as 'ui_defaults_applied')."""
+    try:
+        uid = _saved_uid()
+        if not uid:
+            return
+        done = _raw_setting("ui_defaults_applied")
+        done = list(done) if isinstance(done, (list, tuple)) else []
+        todo = [k for k, t in _ACCOUNT_THEMES.items() if uid in t.get("default_uids", ()) and k not in done]
+        if not todo:
+            return
+        data = dict(_raw_launcher_json())
+        data["ui_style"] = "new"
+        data["ui_theme"] = todo[-1]
+        data["ui_theme_choice"] = "new"          # skips the first-run theme picker; the account theme rides on the "new" layout
+        data["ui_defaults_applied"] = done + todo
+        save_launcher_settings(data)
+    except Exception:
+        pass
 
 def _active_theme_key():
     key = _locked_theme_key()
     if key:
         return key
+    _apply_default_account_themes()
     chosen = _raw_setting("ui_theme")
     if chosen in _allowed_theme_keys():
         return chosen
     return ""
 
+def _classic_account_key():
+    """The active account theme if it is built on the Classic layout (top bar), else ''."""
+    key = _active_theme_key()
+    return key if key and _ACCOUNT_THEMES.get(key, {}).get("layout") == "classic" else ""
+
 def _ui_read_style():
     """"new" = New (default), "sunset" = purple/orange, "classic" = original top-bar look with a free accent colour, "legacy" = side list + mint."""
     if _locked_theme_key():
         return "new"                       # account themes ride on the Sunset layout
+    if _classic_account_key():
+        return "classic"                   # ...except the ones built on Classic
     choice = _raw_setting("ui_theme_choice")
     return choice if choice in ("sunset", "classic", "legacy") else "new"
+
+# ================================================================ Custom themes (made by the user)
+# A custom theme = a layout + 8 colours the user picks. Everything else (hover colours, input fields, disabled
+# colours, ...) is derived from those 8 colours.
+#   layout "classic": the Classic theme's layout - navigation bar across the top, flat colours.
+#   layout "modern":  the New theme's layout - navigation rail on the left, gradient window, rounded cards.
+# Saved in launcher.json under "custom_themes" ({id: {name, layout, colors}}) and picked with ui_theme = "custom_<id>".
+# They are registered in _ACCOUNT_THEMES (flag "everyone"), so every account can use them and the existing
+# startup / Settings code treats them like any other theme. Like the other themes, a change needs a restart.
+from PyQt6.QtGui import QLinearGradient as _CtLG, QBrush as _CtBrush
+
+_CT_KEYS = ("bg", "sidebar", "panel", "text", "subtext", "accent", "button", "border")
+_CT_LABELS = {"bg": "Background", "sidebar": "Navigation bar", "panel": "Panels & cards", "text": "Text",
+              "subtext": "Secondary text", "accent": "Accent", "button": "Buttons", "border": "Borders"}
+_CT_PRESETS = {
+    "Classic dark":  dict(bg="#0d0d0f", sidebar="#050506", panel="#151518", text="#f2f2f4", subtext="#8d8d96", accent="#a666ff", button="#222226", border="#26262b"),
+    "Classic light": dict(bg="#f2f2f4", sidebar="#e4e4e8", panel="#ffffff", text="#141416", subtext="#6a6a72", accent="#a666ff", button="#e4e4e8", border="#d9d9de"),
+    "Modern (New)":  dict(bg="#080808", sidebar="#000000", panel="#1a1a1a", text="#ffffff", subtext="#aaaaaa", accent="#fcfcfc", button="#222222", border="#2e2e2e"),
+    "Sunset":        dict(bg="#150b30", sidebar="#0f0824", panel="#1e1142", text="#ffffff", subtext="#9d93bd", accent="#ff7a2f", button="#2a1857", border="#2e1a5c"),
+    "Mint":          dict(bg="#121214", sidebar="#151517", panel="#18181b", text="#f2f2f4", subtext="#9a9aa2", accent="#12e87c", button="#222226", border="#26262a"),
+}
+_CT_MAX_THEMES = 20
+_CT_HEX = re.compile(r"#[0-9a-fA-F]{6}")
+_CT_ID = re.compile(r"[0-9a-f]{4,12}")
+
+def _ct_lum(color):
+    c = QColor(color)
+    return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255.0
+
+def _ct_mix(a, b, t):
+    ca, cb = QColor(a), QColor(b)
+    return QColor(int(round(ca.red() + (cb.red() - ca.red()) * t)),
+                  int(round(ca.green() + (cb.green() - ca.green()) * t)),
+                  int(round(ca.blue() + (cb.blue() - ca.blue()) * t))).name()
+
+def _ct_rgba(color, alpha):
+    c = QColor(color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+def _ct_clean(ent):
+    """A saved custom theme checked and completed, or None if it is not usable."""
+    if not isinstance(ent, dict):
+        return None
+    name = str(ent.get("name") or "My theme").strip()[:30] or "My theme"
+    layout = ent.get("layout") if ent.get("layout") in ("classic", "modern") else "modern"
+    src = ent.get("colors") if isinstance(ent.get("colors"), dict) else {}
+    base = _CT_PRESETS["Classic dark" if layout == "classic" else "Modern (New)"]
+    colors = {}
+    for k in _CT_KEYS:
+        v = src.get(k)
+        colors[k] = v.lower() if isinstance(v, str) and _CT_HEX.fullmatch(v) else base[k]
+    g = ent.get("gradient")
+    grad = g.lower() if layout == "classic" and isinstance(g, str) and _CT_HEX.fullmatch(g) else ""
+    return {"name": name, "layout": layout, "colors": colors, "icon": "user" if ent.get("icon") == "user" else "", "gradient": grad}
+
+def _ct_theme(c):
+    """The full colour set (same keys as THEMES['dark']) built from the 8 colours the user picked."""
+    bg, sidebar, panel, text, sub, accent, button, border = (c[k] for k in _CT_KEYS)
+    light = _ct_lum(bg) >= 0.5
+    ac = QColor(accent)
+    hover, press = ac.lighter(120).name(), ac.darker(125).name()
+    on_accent = "#141414" if _ct_lum(accent) > 0.6 else "#ffffff"
+    return dict(
+        bg=bg, sidebar=sidebar, panel=panel, border=border, text=text, subtext=sub,
+        input=_ct_mix(bg, "#ffffff", 0.6) if light else _ct_mix(bg, "#000000", 0.35),
+        on_accent=on_accent, on_accent_force=on_accent,
+        accent=accent, accent_hover=hover, accent_press=press,
+        red=accent, red_hover=hover, red_press=press, accent_fill=_ct_rgba(accent, 0.20),
+        button=button, button_hover=_ct_mix(button, text, 0.10),
+        disabled_bg=_ct_mix(bg, panel, 0.5), disabled_text=_ct_mix(sub, bg, 0.55),
+        handle=_ct_mix(border, text, 0.18), hover=_ct_mix(panel, text, 0.07),
+        nav_text=_ct_mix(sub, text, 0.35), nav_active=text, brand=text, sidebar_border=border,
+        nav_fill=_ct_rgba(text, 0.06), nav_fill_hover=_ct_rgba(text, 0.12),
+    )
+
+def _ct_on_accent_extra(t):
+    """Text that sits on the accent colour (avatars, primary buttons, selected menu items) must stay readable
+    for any accent, and so must button text on hover for light themes."""
+    on, txt = t["on_accent"], t["text"]
+    return f"""
+QPushButton:hover, QPushButton:pressed {{ color: {txt}; }}
+QPushButton:flat:hover {{ color: {txt}; }}
+QLabel#Avatar, QLabel#AvatarLarge, QLabel#SyncAvatar {{ color: {on}; }}
+QPushButton#Primary, QPushButton#Primary:hover, QPushButton#Primary:pressed {{ color: {on}; }}
+QPushButton#Primary:disabled {{ color: {t['disabled_text']}; }}
+QPushButton#Danger:hover, QPushButton#Uninstall:hover {{ color: {on}; }}
+QMenu::item:selected {{ color: {on}; }}
+QLineEdit, QTextEdit {{ selection-background-color: {t['accent']}; selection-color: {on}; }}
+QComboBox QAbstractItemView {{ selection-background-color: {t['accent']}; selection-color: {on}; }}
+"""
+
+def _ct_classic_extra(t, grad=""):
+    """Classic layout = the plain Classic stylesheet with this palette; grad (a colour) adds a top-to-bottom background gradient."""
+    css = _ct_on_accent_extra(t)
+    if grad:
+        css += f"""
+QMainWindow, QWidget#Content, QWidget#GridContainer {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {t['bg']}, stop:1 {grad});
+}}
+QWidget#GridContainer {{ background: transparent; }}
+"""
+    return css
+
+def _ct_modern_extra(t):
+    """Modern layout: the New theme's side rail, gradient window and rounded translucent cards, in the user's colours."""
+    acc, bg, txt = t["accent"], t["bg"], t["text"]
+    top, bottom = _ct_mix(bg, txt, 0.05), _ct_mix(bg, acc, 0.16)
+    rail_end = _ct_mix(t["sidebar"], bg, 0.7)
+    a_hi, a_lo = QColor(acc).lighter(112).name(), QColor(acc).darker(118).name()
+    p85, p70, p95 = _ct_rgba(t["panel"], 0.85), _ct_rgba(t["panel"], 0.70), _ct_rgba(t["panel"], 0.95)
+    bd = t["border"]
+    return f"""
+QMainWindow, QWidget#Content, QWidget#GridContainer {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {top}, stop:0.55 {bg}, stop:1 {bottom});
+}}
+QWidget#GridContainer {{ background: transparent; }}
+QFrame#Sidebar {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['sidebar']}, stop:1 {_ct_mix(t['sidebar'], acc, 0.10)}); border-bottom: 1px solid {bd};
+}}
+QFrame#SideRail {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {t['sidebar']}, stop:1 {rail_end}); border-right: 1px solid {bd};
+}}
+QFrame#SideRail QPushButton#NavButton {{
+    background: transparent; color: {t['nav_text']}; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}}
+QFrame#SideRail QPushButton#NavButton:hover {{ background: {_ct_rgba(txt, 0.08)}; color: {t['nav_active']}; }}
+QFrame#SideRail QPushButton#NavButton:checked {{
+    color: {t['nav_active']}; border: none; border-left: 3px solid {acc};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {_ct_rgba(acc, 0.32)}, stop:1 {_ct_rgba(acc, 0)});
+}}
+QPushButton#Primary {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {a_hi}, stop:1 {a_lo}); border-radius: 8px; font-weight: bold;
+}}
+QPushButton#Primary:hover {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {QColor(a_hi).lighter(110).name()}, stop:1 {QColor(a_lo).lighter(110).name()});
+}}
+QPushButton#Primary:pressed {{ background: {t['accent_press']}; }}
+QPushButton#Primary:disabled {{ background: {t['disabled_bg']}; }}
+QProgressBar::chunk {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {a_hi}, stop:1 {a_lo}); border-radius: 3px;
+}}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard {{ background: {p85}; border: 1px solid {bd}; }}
+QFrame#GameCard {{ background: {p70}; border: 1px solid {bd}; border-radius: 14px; }}
+QFrame#GameCard:hover {{ background: {p95}; border: 1px solid {acc}; }}
+QFrame#ToolBar {{ background: {p85}; border: 1px solid {bd}; border-radius: 16px; }}
+QFrame#ToolBar QLabel {{ background: transparent; border: none; }}
+QFrame#ToolBar QLineEdit#Search {{ border-radius: 20px; background: {t['input']}; }}
+QFrame#SidePanel {{ background: {p85}; border: 1px solid {bd}; border-radius: 16px; }}
+QFrame#SidePanel QLabel {{ background: transparent; border: none; }}
+QLabel#PaneHeader {{ color: {t['subtext']}; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }}
+""" + _ct_on_accent_extra(t)
+
+_CT_FORBIDDEN_NAMES = set()
+
+# ---- unlocking: 8 hours on the launcher, or an admin override (Firebase: themeunlock/<uid> = true / false; missing = the 8 hour rule)
+_CT_UNLOCK_SECONDS = 8 * 3600
+_ct_usage = {"data": None}
+
+def _ct_usage_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "usage.json")
+
+def _ct_usage_get():
+    if _ct_usage["data"] is None:
+        d = {}
+        try:
+            with open(_ct_usage_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            pass
+        d = d if isinstance(d, dict) else {}
+        for k in ("seconds", "override"):
+            if not isinstance(d.get(k), dict):
+                d[k] = {}
+        _ct_usage["data"] = d
+    return _ct_usage["data"]
+
+def _ct_usage_save():
+    try:
+        path = _ct_usage_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".part", "w", encoding="utf-8") as f:
+            json.dump(_ct_usage_get(), f)
+        os.replace(path + ".part", path)
+    except Exception:
+        pass
+
+def _ct_override(uid=None):
+    """True = an admin unlocked custom themes for this account, False = an admin locked them, None = no override."""
+    v = _ct_usage_get()["override"].get(uid or _saved_uid())
+    return v if isinstance(v, bool) else None
+
+def _ct_seconds(uid=None):
+    try:
+        return int(_ct_usage_get()["seconds"].get(uid or _saved_uid(), 0))
+    except Exception:
+        return 0
+
+def _ct_unlocked(uid=None):
+    uid = uid or _saved_uid()
+    if not uid:
+        return False
+    if uid in _THEME_ADMIN_UIDS:
+        return True
+    ov = _ct_override(uid)
+    if ov is not None:
+        return ov
+    return _ct_seconds(uid) >= _CT_UNLOCK_SECONDS
+
+def _ct_progress_text():
+    left = max(0, _CT_UNLOCK_SECONDS - _ct_seconds())
+    return f"{left // 3600}h {(left % 3600) // 60}m left"
+
+def _ct_fetch_override(uid):
+    token, _u = get_id_token()
+    v = _http_json(_fdb(f"themeunlock/{uid}", token))
+    return v if isinstance(v, bool) else None
+
+_ct_tracker = {"started": False}
+
+def _ct_start_tracker():
+    """Counts the minutes this account has the launcher open and keeps the admin override in step (background thread)."""
+    if _ct_tracker["started"]:
+        return
+    _ct_tracker["started"] = True
+
+    def loop():
+        tick = 0
+        while True:
+            try:
+                uid = _saved_uid()
+                if uid:
+                    d = _ct_usage_get()
+                    if tick % 5 == 0:                                   # admin override: now and every 5 minutes
+                        try:
+                            ov = _ct_fetch_override(uid)
+                            if ov is None:
+                                d["override"].pop(uid, None)
+                            else:
+                                d["override"][uid] = ov
+                        except Exception:
+                            pass                                        # offline: keep the last known value
+                    if tick:
+                        d["seconds"][uid] = int(d["seconds"].get(uid, 0)) + 60
+                    _ct_usage_save()
+            except Exception:
+                pass
+            tick += 1
+            time.sleep(60)
+    threading.Thread(target=loop, daemon=True).start()
+
+def _ct_forced_dark_mode():
+    """'on' / 'off' when the active theme is a custom one (its background decides light or dark, the Dark Mode switch is ignored); else None."""
+    try:
+        e = _ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}
+        if e.get("custom"):
+            return "off" if QColor(e["theme"]["bg"]).lightness() >= 128 else "on"
+    except Exception:
+        pass
+    return None
+
+def _ct_user_icon_file(tid):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), f"icon_custom_{tid}_user.png")
+
+def _ct_icon_path(tid, accent, user=False):
+    """The launcher icon of a custom theme: Classic's icon recoloured to the theme's accent, exactly the way the
+    accent colour picker does it (_hue_shift_icon). Made on first use and kept in the settings folder; '' if it can't be made."""
+    try:
+        if user and os.path.isfile(_ct_user_icon_file(tid)):
+            return _ct_user_icon_file(tid)               # the icon the user picked
+        accent = QColor(accent).name().lower()
+        if accent == "#a666ff":
+            cl = _theme_icon_file("classic")             # Classic's own purple: the Classic icon as it is
+            return cl or ""
+        d = os.path.dirname(get_launcher_settings_path())
+        name = f"icon_custom_{tid}_{accent[1:]}.png"
+        path = os.path.join(d, name)
+        if os.path.isfile(path):
+            return path
+        orig = ""
+        for cand in ("icon-cl.png", "icon_default.png", "icon.png"):
+            if os.path.isfile(os.path.join(ASSETS_DIR, cand)):
+                orig = os.path.join(ASSETS_DIR, cand)
+                break
+        if not orig:
+            return ""
+        c = QColor(accent)
+        out = _hue_shift_icon(orig, max(0.0, c.hueF()), c.saturationF() / 0.6)
+        os.makedirs(d, exist_ok=True)
+        if out is None or not out.save(path, "PNG"):
+            return ""
+        try:                                             # drop this theme's icons for older accent colours
+            for f in os.listdir(d):
+                if f.startswith(f"icon_custom_{tid}_") and f != name:
+                    os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+        return path
+    except Exception:
+        return ""
+
+def _ct_register_all():
+    """(Re)loads the user's saved custom themes from launcher.json into _ACCOUNT_THEMES."""
+    for k in [k for k, v in _ACCOUNT_THEMES.items() if v.get("custom")]:
+        del _ACCOUNT_THEMES[k]
+    data = _raw_setting("custom_themes")
+    if not isinstance(data, dict):
+        return
+    for tid, raw in list(data.items())[:_CT_MAX_THEMES]:
+        ent = _ct_clean(raw)
+        if not ent or not _CT_ID.fullmatch(str(tid)):
+            continue
+        try:
+            t = _ct_theme(ent["colors"])
+            classic = ent["layout"] == "classic"
+            entry = {"uids": set(), "locked": False, "everyone": True, "custom": True,
+                     "label": f"{ent['name']} (custom)", "theme": t,
+                     "icon_make": (lambda tid=str(tid), acc=ent["colors"]["accent"], u=(ent["icon"] == "user"): _ct_icon_path(tid, acc, u)),
+                     "extra": _ct_classic_extra(t, ent.get("gradient", "")) if classic else _ct_modern_extra(t)}
+            if classic:
+                entry["layout"] = "classic"
+                if ent.get("gradient"):
+                    entry["grad_css"] = (f"\nQMainWindow, QWidget#Content {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+                                         f"stop:0 {t['bg']}, stop:1 {ent['gradient']}); }}\n"
+                                         "QWidget#GridContainer { background: transparent; }\n")
+            _ACCOUNT_THEMES["custom_" + str(tid)] = entry
+        except Exception:
+            pass
+
+def _ct_persist(themes, use_key=None):
+    """Writes the custom themes to launcher.json; use_key (\"custom_<id>\") also makes that theme the chosen one."""
+    s = load_launcher_settings()
+    s["custom_themes"] = {tid: {"name": t["name"], "layout": t["layout"], "colors": dict(t["colors"]), "icon": t.get("icon", ""),
+                          "gradient": t.get("gradient", "") if t["layout"] == "classic" else ""}
+                          for tid, t in themes.items()}
+    try:                                       # remove picked icons of deleted / reset themes
+        d = os.path.dirname(get_launcher_settings_path())
+        keep = {os.path.basename(_ct_user_icon_file(tid)) for tid, t in themes.items() if t.get("icon") == "user"}
+        for f in os.listdir(d):
+            if f.startswith("icon_custom_") and f.endswith("_user.png") and f not in keep:
+                os.remove(os.path.join(d, f))
+    except OSError:
+        pass
+    chosen = s.get("ui_theme") or ""
+    if use_key:
+        s["ui_style"] = "new"
+        s["ui_theme"] = use_key
+        s["ui_theme_choice"] = "new"
+    elif chosen.startswith("custom_") and chosen[7:] not in themes:      # the chosen theme was deleted: back to New
+        s["ui_theme"] = ""
+        s["ui_theme_choice"] = "new"
+    save_launcher_settings(s)
+    _ct_register_all()
+
+class _CtPreview(QWidget):
+    """Small mock-up of the launcher in the chosen layout and colours."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(330, 210)
+        self._layout = "modern"
+        self._colors = dict(_CT_PRESETS["Modern (New)"])
+
+    def set_state(self, layout, colors, gradient=""):
+        self._layout, self._colors, self._gradient = layout, dict(colors), gradient
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = _ct_theme(self._colors)
+        W, H = self.width(), self.height()
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, W, H), 10, 10)
+        p.setClipPath(clip)
+        modern = self._layout == "modern"
+        bg, panel, border = QColor(t["bg"]), QColor(t["panel"]), QColor(t["border"])
+        acc, text, sub = QColor(t["accent"]), QColor(t["text"]), QColor(t["subtext"])
+        if modern:
+            g = _CtLG(0, 0, 0, H)
+            g.setColorAt(0, QColor(_ct_mix(t["bg"], t["text"], 0.05)))
+            g.setColorAt(0.55, bg)
+            g.setColorAt(1, QColor(_ct_mix(t["bg"], t["accent"], 0.16)))
+            p.fillRect(self.rect(), _CtBrush(g))
+        elif getattr(self, "_gradient", ""):
+            g = _CtLG(0, 0, 0, H)
+            g.setColorAt(0, bg)
+            g.setColorAt(1, QColor(self._gradient))
+            p.fillRect(self.rect(), _CtBrush(g))
+        else:
+            p.fillRect(self.rect(), bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        if modern:
+            rail = 74
+            p.fillRect(QRectF(0, 0, rail, H), QColor(t["sidebar"]))
+            p.setPen(border)
+            p.drawLine(rail, 0, rail, H)
+            p.setPen(Qt.PenStyle.NoPen)
+            for i in range(4):
+                y = 20 + i * 28
+                if i == 0:
+                    g = _CtLG(0, 0, rail, 0)
+                    c1 = QColor(acc)
+                    c1.setAlphaF(0.32)
+                    c2 = QColor(acc)
+                    c2.setAlphaF(0.0)
+                    g.setColorAt(0, c1)
+                    g.setColorAt(1, c2)
+                    p.fillRect(QRectF(0, y, rail, 24), _CtBrush(g))
+                    p.setBrush(acc)
+                    p.drawRect(QRectF(0, y, 3, 24))
+                p.setBrush(text if i == 0 else sub)
+                p.drawRoundedRect(QRectF(14, y + 9, 36, 6), 3, 3)
+            cx, cy, radius = rail + 14, 14, 8
+        else:
+            bar = 32
+            p.fillRect(QRectF(0, 0, W, bar), QColor(t["sidebar"]))
+            p.setPen(border)
+            p.drawLine(0, bar, W, bar)
+            p.setPen(Qt.PenStyle.NoPen)
+            x = 14
+            for i, w in enumerate((40, 46, 36, 42)):
+                p.setBrush(text if i == 0 else sub)
+                p.drawRoundedRect(QRectF(x, 12, w, 6), 3, 3)
+                if i == 0:
+                    p.setBrush(acc)
+                    p.drawRect(QRectF(x, bar - 3, w, 3))
+                x += w + 14
+            cx, cy, radius = 14, bar + 14, 6
+        area_w, area_h = W - cx - 14, H - cy - 14 - 34
+        cw, ch = (area_w - 16) / 3.0, (area_h - 8) / 2.0
+        for r in range(2):
+            for c in range(3):
+                rect = QRectF(cx + c * (cw + 8), cy + r * (ch + 8), cw, ch)
+                fill = QColor(panel)
+                if modern:
+                    fill.setAlphaF(0.80)
+                p.setBrush(fill)
+                p.setPen(QPen(border, 1))
+                p.drawRoundedRect(rect, radius, radius)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(sub)
+                p.drawRoundedRect(QRectF(rect.x() + 8, rect.bottom() - 14, rect.width() * 0.55, 5), 2, 2)
+        by = H - 14 - 22
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc)
+        p.drawRoundedRect(QRectF(cx, by, 84, 22), 8 if modern else 5, 8 if modern else 5)
+        p.setBrush(QColor(t["on_accent"]))
+        p.drawRoundedRect(QRectF(cx + 22, by + 8, 40, 6), 3, 3)
+        p.setBrush(QColor(t["button"]))
+        p.setPen(QPen(border, 1))
+        p.drawRoundedRect(QRectF(cx + 94, by, 70, 22), 8 if modern else 5, 8 if modern else 5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(text)
+        p.drawRoundedRect(QRectF(cx + 112, by + 8, 34, 6), 3, 3)
+        p.end()
+
+class _CtDialog(QDialog):
+    """Make, edit and save custom themes: pick Classic or Modern layout and the colours."""
+    def __init__(self, parent=None, on_saved=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Themes")
+        self.resize(800, 560)
+        self._on_saved = on_saved
+        self.themes = {}
+        raw = _raw_setting("custom_themes")
+        if isinstance(raw, dict):
+            for tid, ent in list(raw.items())[:_CT_MAX_THEMES]:
+                c = _ct_clean(ent)
+                if c and _CT_ID.fullmatch(str(tid)):
+                    self.themes[str(tid)] = c
+        self.cur_id = None
+        self.dirty = False
+        self._loading = False
+        self._build()
+        self._refresh_list()
+        if self.themes:
+            self.list.setCurrentRow(0)
+        else:
+            self._new_theme()
+
+    # ---- UI
+    def _build(self):
+        root = QHBoxLayout(self)
+        root.setSpacing(16)
+        left = QVBoxLayout()
+        head = QLabel("Your themes")
+        head.setObjectName("RowTitle")
+        left.addWidget(head)
+        self.list = QListWidget()
+        self.list.setFixedWidth(200)
+        self.list.currentItemChanged.connect(self._on_select)
+        left.addWidget(self.list, 1)
+        grid = QGridLayout()
+        self.new_btn = QPushButton("New")
+        self.dup_btn = QPushButton("Duplicate")
+        self.del_btn = QPushButton("Delete")
+        self.new_btn.clicked.connect(lambda: self._new_theme())
+        self.dup_btn.clicked.connect(lambda: self._new_theme(copy=True))
+        self.del_btn.clicked.connect(self._delete_theme)
+        grid.addWidget(self.new_btn, 0, 0)
+        grid.addWidget(self.dup_btn, 0, 1)
+        grid.addWidget(self.del_btn, 1, 0, 1, 2)
+        left.addLayout(grid)
+        root.addLayout(left)
+
+        self.editor = QWidget()
+        ev = QVBoxLayout(self.editor)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(8)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Theme name")
+        self.name_edit.setMaxLength(30)
+        self.name_edit.textEdited.connect(self._on_name)
+        ev.addWidget(self.name_edit)
+
+        lt = QLabel("Layout")
+        lt.setObjectName("RowTitle")
+        ev.addWidget(lt)
+        row = QHBoxLayout()
+        self.classic_btn = QPushButton("Classic")
+        self.modern_btn = QPushButton("Modern")
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for b, lay in ((self.classic_btn, "classic"), (self.modern_btn, "modern")):
+            b.setCheckable(True)
+            b.setFixedHeight(34)
+            b.setStyleSheet("QPushButton:checked { border: 2px solid palette(highlight); }")
+            grp.addButton(b)
+            b.clicked.connect(lambda _=False, l=lay: self._set_layout(l))
+            row.addWidget(b)
+        ev.addLayout(row)
+        self.layout_desc = QLabel()
+        self.layout_desc.setObjectName("RowDesc")
+        self.layout_desc.setWordWrap(True)
+        ev.addWidget(self.layout_desc)
+
+        ct = QLabel("Colours")
+        ct.setObjectName("RowTitle")
+        ev.addWidget(ct)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Start from a preset...")
+        for n in _CT_PRESETS:
+            self.preset_combo.addItem(n)
+        self.preset_combo.activated.connect(self._on_preset)
+        ev.addWidget(self.preset_combo)
+        cg = QGridLayout()
+        cg.setSpacing(6)
+        self.swatches = {}
+        for i, k in enumerate(_CT_KEYS):
+            b = QPushButton()
+            b.setFixedHeight(32)
+            b.clicked.connect(lambda _=False, key=k: self._pick(key))
+            self.swatches[k] = b
+            cg.addWidget(b, i % 4, i // 4)
+        ev.addLayout(cg)
+
+        from PyQt6.QtWidgets import QCheckBox
+        self.grad_row = QWidget()
+        gl = QHBoxLayout(self.grad_row)
+        gl.setContentsMargins(0, 0, 0, 0)
+        self.grad_check = QCheckBox("Background gradient")
+        self.grad_check.toggled.connect(self._on_grad_toggle)
+        self.grad_btn = QPushButton()
+        self.grad_btn.setFixedHeight(32)
+        self.grad_btn.clicked.connect(self._pick_grad)
+        gl.addWidget(self.grad_check)
+        gl.addWidget(self.grad_btn, 1)
+        ev.addWidget(self.grad_row)
+
+        it = QLabel("Icon")
+        it.setObjectName("RowTitle")
+        ev.addWidget(it)
+        irow = QHBoxLayout()
+        self.icon_lbl = QLabel()
+        self.icon_lbl.setFixedSize(40, 40)
+        self.icon_lbl.setScaledContents(True)
+        self.icon_btn = QPushButton("Choose image...")
+        self.icon_reset_btn = QPushButton("Use automatic icon")
+        self.icon_btn.clicked.connect(self._pick_icon)
+        self.icon_reset_btn.clicked.connect(self._reset_icon)
+        self.icon_desc = QLabel()
+        self.icon_desc.setObjectName("RowDesc")
+        self.icon_desc.setWordWrap(True)
+        irow.addWidget(self.icon_lbl)
+        irow.addWidget(self.icon_btn)
+        irow.addWidget(self.icon_reset_btn)
+        irow.addWidget(self.icon_desc, 1)
+        ev.addLayout(irow)
+
+        self.preview = _CtPreview()
+        ev.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        ev.addStretch()
+        self.status = QLabel("")
+        self.status.setObjectName("RowDesc")
+        ev.addWidget(self.status)
+        bottom = QHBoxLayout()
+        self.save_btn = QPushButton("Save")
+        self.use_btn = QPushButton("Save && Use")
+        self.use_btn.setObjectName("Primary")
+        self.close_btn = QPushButton("Close")
+        self.save_btn.clicked.connect(lambda: self._save(False))
+        self.use_btn.clicked.connect(lambda: self._save(True))
+        self.close_btn.clicked.connect(self.close)
+        bottom.addStretch()
+        bottom.addWidget(self.close_btn)
+        bottom.addWidget(self.save_btn)
+        bottom.addWidget(self.use_btn)
+        ev.addLayout(bottom)
+        root.addWidget(self.editor, 1)
+
+    def _cur(self):
+        return self.themes.get(self.cur_id) if self.cur_id else None
+
+    def _refresh_list(self, select=None):
+        self.list.blockSignals(True)
+        self.list.clear()
+        active = _raw_setting("ui_theme") or ""
+        for tid, t in self.themes.items():
+            it = QListWidgetItem(t["name"] + ("  (in use)" if active == "custom_" + tid else ""))
+            it.setData(Qt.ItemDataRole.UserRole, tid)
+            self.list.addItem(it)
+            if tid == (select or self.cur_id):
+                self.list.setCurrentItem(it)
+        self.list.blockSignals(False)
+
+    def _on_select(self, item, _prev=None):
+        self.cur_id = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+        self._load()
+
+    def _load(self):
+        t = self._cur()
+        self.editor.setEnabled(t is not None)
+        self.dup_btn.setEnabled(t is not None and len(self.themes) < _CT_MAX_THEMES)
+        self.del_btn.setEnabled(t is not None)
+        self.new_btn.setEnabled(len(self.themes) < _CT_MAX_THEMES)
+        if t is None:
+            return
+        self._loading = True
+        self.name_edit.setText(t["name"])
+        self.classic_btn.setChecked(t["layout"] == "classic")
+        self.modern_btn.setChecked(t["layout"] == "modern")
+        self._refresh_all()
+        self._loading = False
+
+    def _refresh_all(self):
+        t = self._cur()
+        if t is None:
+            return
+        self.layout_desc.setText("Classic: the navigation bar runs across the top and the colours are flat, like the Classic theme."
+                                 if t["layout"] == "classic" else
+                                 "Modern: the navigation rail is on the left, with a gradient window and rounded cards, like the New theme.")
+        for k, b in self.swatches.items():
+            c = t["colors"][k]
+            fg = "#000000" if _ct_lum(c) > 0.55 else "#ffffff"
+            b.setText(f"{_CT_LABELS[k]}   {c.upper()}")
+            b.setStyleSheet(f"QPushButton {{ background: {c}; color: {fg}; border: 1px solid #888888; border-radius: 6px; "
+                            f"text-align: left; padding: 0px 10px; }} QPushButton:hover {{ border: 2px solid {fg}; color: {fg}; }}")
+        classic = t["layout"] == "classic"
+        grad = t.get("gradient", "") if classic else ""
+        self.grad_row.setVisible(classic)
+        self.grad_check.blockSignals(True)
+        self.grad_check.setChecked(bool(grad))
+        self.grad_check.blockSignals(False)
+        self.grad_btn.setEnabled(bool(grad))
+        gc = grad or _ct_mix(t["colors"]["bg"], t["colors"]["accent"], 0.25)
+        gfg = "#000000" if _ct_lum(gc) > 0.55 else "#ffffff"
+        self.grad_btn.setText(f"Gradient colour (bottom)   {gc.upper()}")
+        self.grad_btn.setStyleSheet(f"QPushButton {{ background: {gc}; color: {gfg}; border: 1px solid #888888; border-radius: 6px; "
+                                    f"text-align: left; padding: 0px 10px; }}")
+        self.preview.set_state(t["layout"], t["colors"], grad)
+        user = t.get("icon") == "user" and os.path.isfile(_ct_user_icon_file(self.cur_id))
+        pm = QPixmap(_ct_user_icon_file(self.cur_id)) if user else QPixmap(_ct_icon_path(self.cur_id, t["colors"]["accent"]) or asset_path("icon.png"))
+        self.icon_lbl.setPixmap(pm)
+        self.icon_reset_btn.setEnabled(user)
+        self.icon_desc.setText("Your own icon." if user else "Made from the Classic icon in your accent colour.")
+
+    def _pick_icon(self):
+        t = self._cur()
+        if t is None:
+            return
+        from PyQt6.QtWidgets import QFileDialog
+        path, _f = QFileDialog.getOpenFileName(self, "Choose an icon", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.ico)")
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Custom Themes", "That file couldn't be read as an image.")
+            return
+        if max(img.width(), img.height()) > 512:
+            img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        try:
+            os.makedirs(os.path.dirname(_ct_user_icon_file(self.cur_id)), exist_ok=True)
+            if not img.save(_ct_user_icon_file(self.cur_id), "PNG"):
+                raise OSError("couldn't write the icon")
+        except Exception as e:
+            QMessageBox.warning(self, "Custom Themes", f"Couldn't use that image: {e}")
+            return
+        t["icon"] = "user"
+        self._touch()
+
+    def _reset_icon(self):
+        t = self._cur()
+        if t is not None and t.get("icon") == "user":
+            t["icon"] = ""
+            self._touch()
+
+    def _touch(self):
+        if self._loading:
+            return
+        self.dirty = True
+        self.status.setText("Unsaved changes.")
+        self._refresh_all()
+
+    # ---- editing
+    def _on_name(self, text):
+        t = self._cur()
+        if t is None:
+            return
+        t["name"] = text.strip()[:30] or "My theme"
+        it = self.list.currentItem()
+        if it is not None:
+            active = _raw_setting("ui_theme") or ""
+            it.setText(t["name"] + ("  (in use)" if active == "custom_" + self.cur_id else ""))
+        self._touch()
+
+    def _set_layout(self, layout):
+        t = self._cur()
+        if t is not None and t["layout"] != layout:
+            t["layout"] = layout
+            self._touch()
+
+    def _pick(self, key):
+        t = self._cur()
+        if t is None:
+            return
+        from PyQt6.QtWidgets import QColorDialog
+        chosen = QColorDialog.getColor(QColor(t["colors"][key]), self, f"Pick: {_CT_LABELS[key]}")
+        if chosen.isValid():
+            t["colors"][key] = chosen.name()
+            self._touch()
+
+    def _on_grad_toggle(self, on):
+        t = self._cur()
+        if t is None or self._loading:
+            return
+        t["gradient"] = _ct_mix(t["colors"]["bg"], t["colors"]["accent"], 0.25) if on else ""
+        self._touch()
+
+    def _pick_grad(self):
+        t = self._cur()
+        if t is None or not t.get("gradient"):
+            return
+        from PyQt6.QtWidgets import QColorDialog
+        chosen = QColorDialog.getColor(QColor(t["gradient"]), self, "Pick: Gradient colour")
+        if chosen.isValid():
+            t["gradient"] = chosen.name()
+            self._touch()
+
+    def _on_preset(self, index):
+        t = self._cur()
+        if t is not None and index > 0:
+            t["colors"] = dict(_CT_PRESETS[self.preset_combo.itemText(index)])
+            self._touch()
+        self.preset_combo.setCurrentIndex(0)
+
+    def _new_theme(self, copy=False):
+        if len(self.themes) >= _CT_MAX_THEMES:
+            return
+        src = self._cur() if copy else None
+        tid = _secrets.token_hex(4)
+        while tid in self.themes:
+            tid = _secrets.token_hex(4)
+        if src is not None:
+            self.themes[tid] = {"name": (src["name"] + " copy")[:30], "layout": src["layout"], "colors": dict(src["colors"]), "icon": "", "gradient": src.get("gradient", "")}
+            if src.get("icon") == "user" and os.path.isfile(_ct_user_icon_file(self.cur_id)):
+                try:
+                    import shutil
+                    shutil.copyfile(_ct_user_icon_file(self.cur_id), _ct_user_icon_file(tid))
+                    self.themes[tid]["icon"] = "user"
+                except OSError:
+                    pass
+        else:
+            self.themes[tid] = {"name": "My theme", "layout": "modern", "colors": dict(_CT_PRESETS["Modern (New)"]), "icon": ""}
+        self.cur_id = tid
+        self.dirty = True
+        self.status.setText("Unsaved changes.")
+        self._refresh_list(select=tid)
+        self._load()
+
+    def _delete_theme(self):
+        t = self._cur()
+        if t is None:
+            return
+        if QMessageBox.question(self, "Delete theme", f"Delete \"{t['name']}\"?") != QMessageBox.StandardButton.Yes:
+            return
+        del self.themes[self.cur_id]
+        self.cur_id = None
+        self.dirty = True
+        self.status.setText("Unsaved changes. Press Save to finish deleting.")
+        self._refresh_list()
+        if self.themes:
+            self.list.setCurrentRow(0)
+        else:
+            self._load()
+
+    # ---- saving
+    def _save(self, use):
+        t = self._cur()
+        if use and t is None:
+            return False
+        try:
+            was_active = (_raw_setting("ui_theme") or "").startswith("custom_")
+            key = ("custom_" + self.cur_id) if use else None
+            _ct_persist(self.themes, key)
+        except Exception as e:
+            QMessageBox.warning(self, "Custom Themes", f"Couldn't save: {e}")
+            return False
+        self.dirty = False
+        self.status.setText("Saved. Restart the launcher to apply it." if (use or was_active) else "Saved.")
+        self._refresh_list()
+        if self._on_saved:
+            try:
+                self._on_saved(key, bool(use or was_active))
+            except Exception:
+                pass
+        return True
+
+    def closeEvent(self, ev):
+        if self.dirty:
+            r = QMessageBox.question(self, "Custom Themes", "You have unsaved changes. Save them?",
+                                     QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
+            if r == QMessageBox.StandardButton.Cancel:
+                ev.ignore()
+                return
+            if r == QMessageBox.StandardButton.Save and not self._save(False):
+                ev.ignore()
+                return
+        ev.accept()
+
+def _ct_sync_combo(sp, select_key=None):
+    """Keeps the Theme drop-down in Settings in step with the custom themes (without needing a restart)."""
+    combo = getattr(sp, "ui_style_combo", None)
+    if combo is None:
+        return
+    prev = combo.currentData()
+    combo.blockSignals(True)
+    for i in range(combo.count() - 1, -1, -1):
+        d = combo.itemData(i)
+        if isinstance(d, str) and d.startswith("custom_"):
+            combo.removeItem(i)
+    pos = combo.findData("sunset")
+    for key in _allowed_theme_keys():
+        if key.startswith("custom_") and key in _ACCOUNT_THEMES:
+            combo.insertItem(pos if pos >= 0 else combo.count(), _ACCOUNT_THEMES[key]["label"], key)
+            if pos >= 0:
+                pos += 1
+    idx = combo.findData(select_key or prev)
+    combo.setCurrentIndex(idx if idx >= 0 else max(0, combo.findData(_active_theme_key() or "new")))
+    combo.blockSignals(False)
+
+def _ui_add_custom_theme_setting(self):
+    """Settings row under Theme: opens the custom theme maker."""
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("Custom Themes")
+    title.setObjectName("RowTitle")
+    desc = QLabel("Make your own theme: pick the Classic or Modern layout and your own colours, then save it. "
+                  "Saved themes show up in the Theme list above. Needs a restart.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    btn = QPushButton("Customize...")
+    btn.setFixedWidth(110)
+    base_desc = desc.text()
+
+    def refresh():
+        if _custom_theme_locked():
+            btn.setEnabled(False)
+            desc.setText("Your theme is fixed for this account.")
+        elif _ct_unlocked():
+            btn.setEnabled(True)
+            desc.setText(base_desc)
+        else:
+            btn.setEnabled(False)
+            desc.setText("Locked by an admin." if _ct_override() is False else
+                         f"Locked: custom themes unlock after 8 hours on the launcher ({_ct_progress_text()}). "
+                         "An admin can also unlock them for you.")
+    refresh()
+    _ct_start_tracker()
+    tm = QTimer(sp)
+    tm.timeout.connect(refresh)
+    tm.start(30000)
+    sp._ct_timer = tm
+    if _ct_forced_dark_mode():                           # a custom theme decides light / dark itself
+        try:
+            sp.dark_mode_combo.setEnabled(False)
+            sp.dark_mode_combo.setToolTip("Your custom theme sets light or dark itself.")
+        except Exception:
+            pass
+
+    def opened():
+        if not _ct_unlocked():
+            refresh()
+            return
+        def saved(use_key, needs_restart):
+            _ct_sync_combo(sp, use_key)
+            active = use_key or (_raw_setting("ui_theme") if needs_restart else "")
+            if active:
+                _ncz_refresh_launcher_shortcut(active)
+            if needs_restart:
+                QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new theme.")
+        dlg = _CtDialog(sp, saved)
+        dlg.exec()
+        _ct_sync_combo(sp)
+    btn.clicked.connect(opened)
+    row.addLayout(col, 1)
+    row.addWidget(btn)
+    lay.insertLayout(4, row)                             # right under the Theme row
+    lay.insertSpacing(5, 12)
+    sp.custom_theme_btn = btn
+
+_ct_register_all()
 
 _UI_STYLE_AT_START = _ui_read_style()
 _SIDE_UI = _UI_STYLE_AT_START in ("new", "sunset", "legacy")     # layouts with the left navigation list and a fixed accent
@@ -29092,6 +30430,10 @@ def load_launcher_settings():
     s["ui_style"] = _ui_read_style()
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
+    s["ui_defaults_applied"] = _raw_setting("ui_defaults_applied") or []
+    _ct_saved = _raw_setting("custom_themes")
+    if isinstance(_ct_saved, dict):
+        s["custom_themes"] = _ct_saved          # custom themes (ncz-theme) must survive every other settings save
     return s
 
 SUNSET_THEME = dict(      # the "New" theme: same colours as the sign-in window (black fading to grey, white accent)
@@ -29167,7 +30509,7 @@ def _ui_apply_sunset():
     _theme_state["nav_active"] = theme["nav_active"]
     try:
         import overlay as _overlay_mod
-        _overlay_mod.set_light(False)
+        _overlay_mod.set_light(QColor(theme["bg"]).lightness() >= 128)      # a custom theme can be light
         _overlay_mod.set_sunset(_UI_STYLE_AT_START == "new")
         _overlay_mod.set_accent(theme["accent"])
     except Exception:
@@ -29289,10 +30631,29 @@ QFrame#SidePanel QLabel { background: transparent; border: none; }
 QLabel#PaneHeader { color: #9db8b3; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
 """
 
+# Omar V4 (built on the Classic theme: top bar, flat colours). Colours come from Omar's profile - the deep-space nebula avatar (blue-black space with a violet glow),
+# Discord-dark charcoal card and the green online dot. Violet highlight and purple-black surfaces matching assets/icon-v4.png (black sky, purple glow).
+_OMAR_V4_THEME = dict(
+    bg="#0c0a14", sidebar="#06050b", panel="#151222", input="#09080f", border="#2a2442",
+    text="#f2f0fa", subtext="#a8a3c4", accent="#8a63e8", accent_hover="#a283f2", accent_press="#6a46c8",
+    button="#211c36", button_hover="#2e2750", disabled_bg="#120f1c", disabled_text="#5f5a7c",
+    handle="#3d3466", hover="#1b1730",
+    red="#8a63e8", red_hover="#a283f2", red_press="#6a46c8", accent_fill="rgba(138,99,232,0.22)",
+    nav_text="#aaa4c8", nav_active="#ffffff", brand="#ffffff", sidebar_border="#1c1830",
+    nav_fill="rgba(255,255,255,0.05)", nav_fill_hover="rgba(255,255,255,0.10)",
+)
+
+_OMAR_V4_EXTRA = ""      # Classic layout: the plain Classic stylesheet with this palette, nothing extra
+
 _ACCOUNT_THEMES["mm33"].update(label="MM33 (custom)", theme=_MM33_THEME, extra=_MM33_EXTRA,
                                icon="icon_mm33.png",          # teal and gold launcher icon (assets/, downloaded if missing)
                                icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_mm33.png",
                                           "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_mm33.png?raw=true"])
+
+_ACCOUNT_THEMES["omar_v4"].update(label="Omar V4", theme=_OMAR_V4_THEME, extra=_OMAR_V4_EXTRA,
+                                  icon="icon-v4.png",            # assets/icon-v4.png (downloaded if missing; the normal icon is used if it can't be found)
+                                  icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon-v4.png",
+                                             "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon-v4.png?raw=true"])
 
 _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
                                    icon="icon_kablooey.png",      # recoloured launcher icon (assets/, downloaded if missing)
@@ -29398,7 +30759,8 @@ def _theme_icon_file(kind):
     f = os.path.join(ASSETS_DIR, {"sunset": "icon-ss.png", "new": "icon.png"}.get(kind, "icon-cl.png"))
     return f if os.path.isfile(f) else ""
 
-_ACTIVE_THEME_AT_START = _active_theme_key() if _UI_STYLE_AT_START == "new" else ""
+_CLASSIC_ACCOUNT = bool(_classic_account_key())            # an account theme on the Classic layout: Classic look, fixed colours, always dark
+_ACTIVE_THEME_AT_START = _active_theme_key() if (_UI_STYLE_AT_START == "new" or _CLASSIC_ACCOUNT) else ""
 if _UI_STYLE_AT_START in ("legacy", "sunset"):
     SUNSET_THEME, _SUNSET_EXTRA = (_LEGACY_THEME, _LEGACY_EXTRA) if _UI_STYLE_AT_START == "legacy" else (_SS_THEME, _SS_EXTRA)
     SUNSET_ACCENT = SUNSET_THEME["accent"]
@@ -29413,17 +30775,25 @@ if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the
 _ui_prev_set_accent = set_accent
 def set_accent(color):
     """The theme always uses its own accent (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
-    _ui_prev_set_accent(SUNSET_ACCENT if _SIDE_UI else color)
+    _ui_prev_set_accent(SUNSET_ACCENT if (_SIDE_UI or _CLASSIC_ACCOUNT) else color)
 
 _ui_prev_apply_accent_to_icon = apply_accent_to_icon
 def apply_accent_to_icon(color):
-    if _SIDE_UI:
+    if _SIDE_UI or _CLASSIC_ACCOUNT:
         return False                                 # the theme icon is never recoloured
     return _ui_prev_apply_accent_to_icon(color)
 
 _ui_prev_apply_dark_mode = apply_dark_mode
 def apply_dark_mode(mode):
-    _ui_prev_apply_dark_mode(mode)
+    _ui_prev_apply_dark_mode(_ct_forced_dark_mode() or ("on" if _CLASSIC_ACCOUNT else mode))      # the Omar V4 theme is always dark; a custom theme sets light/dark itself
+    if _CLASSIC_ACCOUNT:                  # Classic-layout custom theme with a background gradient
+        try:
+            _gcss = (_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}).get("grad_css")
+            _app = QApplication.instance()
+            if _gcss and _app is not None:
+                _app.setStyleSheet(_app.styleSheet() + _gcss)
+        except Exception:
+            pass
     if _SIDE_UI:
         _ui_apply_sunset()                # the theme is always dark
 
@@ -29433,6 +30803,8 @@ _icon_download_tried = set()
 def _ensure_theme_icon(entry):
     """Path of a theme's own icon. If it isn't in assets/ (or the config folder) it is downloaded once per run;
     '' when it isn't there and can't be downloaded (the normal icon is used then)."""
+    if entry.get("icon_make"):                 # custom themes: icon made from the Classic icon + the theme's accent
+        return entry["icon_make"]()
     name = entry.get("icon")
     if not name:
         return ""
@@ -29472,6 +30844,10 @@ def asset_path(filename):
         if _UI_STYLE_AT_START == "new":
             themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the active theme's own icon
             return themed or os.path.join(ASSETS_DIR, "icon.png")
+        if _CLASSIC_ACCOUNT:
+            themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the theme's own icon (icon-v4.png)
+            if themed:
+                return themed
         if not os.path.exists(accent_icon_path()):
             cl = _theme_icon_file("classic")             # Classic: icon-cl.png until the accent colour is changed
             if cl:
@@ -29579,7 +30955,8 @@ def _ui_add_setting(self):
     combo.addItem("Sunset", "sunset")
     combo.addItem("Classic", "classic")
     combo.addItem("Legacy", "legacy")
-    start_data = _UI_STYLE_AT_START if _UI_STYLE_AT_START in ("sunset", "classic", "legacy") else (_active_theme_key() or "new")
+    start_data = (_active_theme_key() if _CLASSIC_ACCOUNT else
+                  _UI_STYLE_AT_START if _UI_STYLE_AT_START in ("sunset", "classic", "legacy") else (_active_theme_key() or "new"))
     combo.setCurrentIndex(max(0, combo.findData(start_data)))
     if _custom_theme_locked():             # this account's theme is fixed
         key = _locked_theme_key()
@@ -29609,7 +30986,15 @@ def _ui_add_setting(self):
     lay.insertSpacing(1, 12)
     lay.insertSpacing(3, 12)
     sp.ui_style_combo = combo
-    if _SIDE_UI:
+    if _CLASSIC_ACCOUNT:
+        sp.accent_btn.setEnabled(False)
+        sp.accent_reset_btn.setEnabled(False)
+        sp.accent_desc.setText("Locked to this theme's color.")
+        try:
+            sp.dark_mode_combo.setEnabled(False)             # always dark
+        except Exception:
+            pass
+    elif _SIDE_UI:
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
         sp.accent_desc.setText("Locked to your custom theme." if _custom_theme_locked() else
@@ -29939,6 +31324,10 @@ def _ui_init(self):
     except Exception:
         traceback.print_exc()
     try:
+        _ui_add_custom_theme_setting(self)
+    except Exception:
+        traceback.print_exc()
+    try:
         _ui_add_nsfw_setting(self)
     except Exception:
         traceback.print_exc()
@@ -30200,12 +31589,14 @@ def _ui_restyle_gmod(self):
 
 def _ui_decorate(self):
     # Store + Friends: new layouts
-    for fn in (_ui_restyle_store, _ui_restyle_friends, _ui_restyle_workshop, _ui_restyle_gmod):
+    for fn in (_ui_restyle_friends, _ui_restyle_workshop):
         try:
             fn(self)
         except Exception:
             import traceback
             traceback.print_exc()
+    _lazy_on_built(self, "store_page", lambda _p: _ui_restyle_store(self))      # lazy pages: restyled when built
+    _lazy_on_built(self, "gmod_page", lambda _p: _ui_restyle_gmod(self))
 
     # Settings: readable column, centred, instead of stretching across the whole window
     sp = self.settings_page
@@ -31783,10 +33174,10 @@ def _rx_ensure_library(win, appid, then):
     def done(res):
         title, cover = res
         try:
-            page = win.store_detail_page
+            page = win.__dict__.get("store_detail_page")
             shown = getattr(page, "_appid", None)
             win.add_steam_game(appid, title, cover)
-            if shown not in (None, appid):          # add_steam_game flips the open store page's button; put it back
+            if page is not None and shown not in (None, appid):     # add_steam_game flips the open store page's button
                 page.set_in_library(shown in win.steam_cards)
         except Exception as e:
             return then(False, f"Couldn't add {title} to the library: {e}")
@@ -32489,7 +33880,7 @@ AccountPage.log_out = _demo_log_out
 # ---------------------------------------------------------------- NCZ Link (stream this PC to your phone over LAN)
 # Like Steam Link, but small: turn it on in Settings, open NCZ Link in the phone app (same Wi-Fi), enter this PC's address and
 # the PIN once. The phone then sees your game list, can start a game, and gets a live view of this screen with touch /
-# mouse / keyboard control, plus the PC's sound. Everything stays on your local network: only private (LAN) addresses are accepted, every request
+# mouse / keyboard control, plus the PC's sound (the PC itself goes quiet while the phone listens). Everything stays on your local network: only private (LAN) addresses are accepted, every request
 # needs a token from PIN pairing, and it is OFF by default. Video is MJPEG; sound is raw PCM; input needs Windows, or xdotool on Linux.
 import http.server as _lk_http
 import socketserver as _lk_ss
@@ -32901,13 +34292,13 @@ def _lk_audio_install():
             import hashlib, io
             tag = "cp%d%d" % sys.version_info[:2]
             plat = "win_amd64" if sys.maxsize > 2 ** 32 else "win32"
-            with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30) as r:
+            with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30, context=_NCZ_SSL_CTX) as r:
                 files = json.load(r)["urls"]
             pick = next((f for f in files if f["packagetype"] == "bdist_wheel" and f"-{tag}-{tag}-{plat}" in f["filename"]), None)
             if not pick:
                 _lk["aerr"] = f"no sound package exists for Python {sys.version_info[0]}.{sys.version_info[1]}"
                 return
-            with urllib.request.urlopen(pick["url"], timeout=120) as r:
+            with urllib.request.urlopen(pick["url"], timeout=120, context=_NCZ_SSL_CTX) as r:
                 blob = r.read()
             if hashlib.sha256(blob).hexdigest() != pick["digests"]["sha256"]:
                 _lk["aerr"] = "the sound package download was corrupt"
@@ -33008,6 +34399,169 @@ def _lk_audio_open():
                 return None
         return rate, ch, get, proc.kill
     raise RuntimeError("this PC can't capture sound (Windows, or Linux with pulseaudio-utils, is needed)")
+
+# ---- mute the PC's own speakers while a phone is listening (the phone still gets the sound).
+# Windows: WASAPI loopback is captured before the endpoint's mute switch, so muting the default output device silences
+# the PC only. Linux: a silent null sink becomes the default output while streaming; its monitor is what gets captured.
+# Reference-counted (a reconnecting phone opens a new audio stream before the old one closes), restored when the last
+# audio stream ends, when the launcher exits, and on the next launch if it ever died while muted.
+import atexit as _lk_atexit
+_lk_mute = {"n": 0, "win": "", "lin": None, "lock": threading.RLock()}
+
+def _lk_mute_pref():
+    return _lk_load().get("mute_pc", True) is not False
+
+def _lk_com(obj, idx, argtypes, *args):
+    import ctypes
+    vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    hr = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vt[idx])(obj, *args)
+    if hr < 0:
+        raise OSError("COM error 0x%08X" % (hr & 0xFFFFFFFF))
+
+def _lk_com_release(obj):
+    import ctypes
+    try:
+        if obj and obj.value:
+            vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])(obj)
+    except Exception:
+        pass
+
+def _lk_win_mute(on, dev_id=""):
+    """on=True: mutes the default output if it isn't muted already and returns its id ('' if nothing was changed).
+    on=False: unmutes the device with that id."""
+    import ctypes
+    ole = ctypes.windll.ole32
+    ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    def guid(s):
+        g = (ctypes.c_byte * 16)()
+        ole.CLSIDFromString(ctypes.c_wchar_p(s), g)
+        return g
+    init = ole.CoInitializeEx(None, 0)
+    enum, dev, vol = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        hr = ole.CoCreateInstance(guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}"), None, 23,
+                                  guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}"), ctypes.byref(enum))
+        if hr < 0:
+            raise OSError("CoCreateInstance 0x%08X" % (hr & 0xFFFFFFFF))
+        if dev_id:
+            _lk_com(enum, 5, [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)], dev_id, ctypes.byref(dev))
+        else:
+            _lk_com(enum, 4, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], 0, 0, ctypes.byref(dev))
+        _lk_com(dev, 3, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                guid("{5CDF2C82-841E-4546-9722-0CF74078229A}"), 23, None, ctypes.byref(vol))
+        if on:
+            m = ctypes.c_int(0)
+            _lk_com(vol, 15, [ctypes.POINTER(ctypes.c_int)], ctypes.byref(m))
+            if m.value:
+                return ""                                  # already muted by the user: leave it exactly as it is
+            idp = ctypes.c_void_p()
+            _lk_com(dev, 5, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(idp))
+            did = ctypes.wstring_at(idp.value)
+            ole.CoTaskMemFree(ctypes.c_void_p(idp.value))
+            _lk_com(vol, 14, [ctypes.c_int, ctypes.c_void_p], 1, None)
+            return did
+        _lk_com(vol, 14, [ctypes.c_int, ctypes.c_void_p], 0, None)
+        return ""
+    finally:
+        for o in (vol, dev, enum):
+            _lk_com_release(o)
+        if init >= 0:
+            ole.CoUninitialize()
+
+def _lk_pactl(*a):
+    try:
+        r = subprocess.run(["pactl", *a], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def _lk_lin_mute(on, st=None):
+    """on=True: returns {'mod':..,'sink':..} (or None). on=False: restores from that dict."""
+    if not shutil.which("pactl"):
+        return None
+    if on:
+        orig = _lk_pactl("get-default-sink")
+        mod = _lk_pactl("load-module", "module-null-sink", "sink_name=ncz_link_silent",
+                        "sink_properties=device.description=NCZ-Link-Silent")
+        if not mod.isdigit():
+            return None
+        idx = {}
+        for line in _lk_pactl("list", "short", "sinks").splitlines():
+            p = line.split("\t")
+            if len(p) > 1:
+                idx[p[1]] = p[0]
+        _lk_pactl("set-default-sink", "ncz_link_silent")
+        for line in _lk_pactl("list", "short", "sink-inputs").splitlines():
+            p = line.split("\t")
+            if len(p) > 1 and orig and p[1] == idx.get(orig):   # only what was playing on the old default output
+                _lk_pactl("move-sink-input", p[0], "ncz_link_silent")
+        return {"mod": mod, "sink": orig}
+    if st:
+        if st.get("sink"):
+            _lk_pactl("set-default-sink", st["sink"])       # the silent sink's streams follow the default when it unloads
+        _lk_pactl("unload-module", str(st.get("mod", "")))
+    return None
+
+def _lk_mute_apply(on):
+    try:
+        if sys.platform.startswith("win"):
+            if on:
+                did = _lk_win_mute(True)
+                _lk_mute["win"] = did
+                if did:
+                    d = _lk_load(); d["mute_recover"] = {"win": did}; _lk_save(d)
+            elif _lk_mute["win"]:
+                did, _lk_mute["win"] = _lk_mute["win"], ""
+                _lk_win_mute(False, did)
+                d = _lk_load(); d.pop("mute_recover", None); _lk_save(d)
+        elif sys.platform.startswith("linux"):
+            if on:
+                _lk_mute["lin"] = _lk_lin_mute(True)
+                if _lk_mute["lin"]:
+                    d = _lk_load(); d["mute_recover"] = {"lin": _lk_mute["lin"]}; _lk_save(d)
+            elif _lk_mute["lin"]:
+                st, _lk_mute["lin"] = _lk_mute["lin"], None
+                _lk_lin_mute(False, st)
+                d = _lk_load(); d.pop("mute_recover", None); _lk_save(d)
+    except Exception as e:
+        print(f"NCZ Link: couldn't {'mute' if on else 'unmute'} the PC sound ({e!r})")
+
+def _lk_pc_mute(on):
+    """Takes (on=True) or gives back (on=False) a hold on the PC mute. The PC is silent while at least one hold exists."""
+    with _lk_mute["lock"]:
+        if on:
+            _lk_mute["n"] += 1
+            if _lk_mute["n"] == 1:
+                _lk_mute_apply(True)
+        elif _lk_mute["n"] > 0:
+            _lk_mute["n"] -= 1
+            if _lk_mute["n"] == 0:
+                _lk_mute_apply(False)
+    return on
+
+def _lk_pc_mute_recover():
+    """Launch-time cleanup: if the launcher died while it had the PC muted, put the sound back."""
+    try:
+        d = _lk_load()
+        r = d.pop("mute_recover", None)
+        if not r:
+            return
+        if r.get("win") and sys.platform.startswith("win"):
+            _lk_win_mute(False, r["win"])
+        elif r.get("lin") and sys.platform.startswith("linux"):
+            _lk_lin_mute(False, r["lin"])
+        _lk_save(d)
+    except Exception as e:
+        print(f"NCZ Link: couldn't restore the PC sound ({e!r})")
+
+def _lk_pc_mute_exit():
+    with _lk_mute["lock"]:
+        if _lk_mute["n"]:
+            _lk_mute["n"] = 0
+            _lk_mute_apply(False)
+_lk_atexit.register(_lk_pc_mute_exit)
+
 
 # ---- v2: WebSocket transport (acked frames, adaptive quality), fast capture, persistent input workers, Input Bridge hand-off.
 # Why the old version felt slow: every frame was grabbed on the launcher's GUI thread, every input batch was its own HTTP request
@@ -33914,10 +35468,21 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
         _lk_ws_session(_LkWS(self), q)
 
     def _audio(self):
+        want = _lk_mute_pref()
+        early = want and not sys.platform.startswith("win")   # Linux: the silent sink must exist before parec starts
+        held = _lk_pc_mute(True) if early else False
         try:
             rate, ch, get, close = _lk_audio_open()
         except RuntimeError as e:
+            if held:
+                _lk_pc_mute(False)
             return self._json(501, {"ok": False, "msg": str(e)[:160]})
+        if want and not early:
+            held = _lk_pc_mute(True)                            # Windows: only once the loopback is really capturing
+        try:
+            self.connection.settimeout(15)                      # a stalled phone must not leave the PC muted forever
+        except Exception:
+            pass
         with _lk["lock"]:
             _lk["agen"] += 1
             gen = _lk["agen"]                                 # a newer audio stream replaces this one
@@ -33937,6 +35502,8 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
                     self.wfile.flush()
         finally:
             close()
+            if held:
+                _lk_pc_mute(False)                              # phone gone: the PC's speakers come back
 
     def _stream(self, q):
         def qi(k, d, lo, hi):
@@ -34029,6 +35596,15 @@ def _lk_add_setting(self):
     desc.setWordWrap(True)
     col.addWidget(title)
     col.addWidget(desc)
+    from PyQt6.QtWidgets import QCheckBox as _LkCB
+    mute_cb = _LkCB("Mute this PC's sound while a phone is listening (the phone keeps the sound)")
+    mute_cb.setChecked(_lk_mute_pref())
+    def _mute_changed(v):
+        d = _lk_load()
+        d["mute_pc"] = bool(v)
+        _lk_save(d)
+    mute_cb.toggled.connect(_mute_changed)
+    col.addWidget(mute_cb)
     btn = _B()
     btn.setCheckable(True)
     btn.setFixedWidth(110)
@@ -34091,6 +35667,7 @@ _lk_prev_init = AdaptiveApp.__init__
 def _lk_init(self):
     _lk_prev_init(self)
     try:
+        _lk_pc_mute_recover()
         _lk["inv"] = _LkInvoker()
         _lk_add_setting(self)
     except Exception as e:
@@ -34102,7 +35679,16 @@ AdaptiveApp.__init__ = _lk_init
 # ================================================================ NCZFront inside the launcher
 # "Play" on the NCZFront card opens the site in a browser tab inside the launcher (QtWebEngine) instead of the
 # default browser. The page stays alive when you switch to another launcher tab, so a running game keeps going.
-if _HAS_WEBENGINE:
+def _ncz_web_classes():
+    """Imports QtWebEngine and defines the browser classes the first time NCZFront opens, so Chromium isn't loaded at
+    startup for everyone who has PyQt6-WebEngine installed. Returns NczWebPage."""
+    global NczWebPage
+    if "NczWebPage" in globals():
+        return NczWebPage
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
+                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
+
     class _NgrokSkipWarning(QWebEngineUrlRequestInterceptor):
         """ngrok's free tunnels show a 'Visit Site' warning page; this header skips it for page loads."""
         def interceptRequest(self, info):
@@ -34335,6 +35921,8 @@ if _HAS_WEBENGINE:
             if effect is None:
                 super().setGraphicsEffect(None)
 
+    return NczWebPage
+
 def _nczfront_mark_playing():
     """Same 'playing NCZFront' status the default-browser path gives (shown to friends)."""
     _web_until["t"] = time.time() + 1800
@@ -34355,7 +35943,14 @@ def _open_nczfront(self):
         return
     page = self.__dict__.get("web_page")
     if page is None:
-        page = NczWebPage()
+        try:
+            web_cls = _ncz_web_classes()
+        except Exception:                       # installed but won't load (broken install): default browser
+            import traceback
+            traceback.print_exc()
+            webbrowser.open(NCZFRONT_URL)
+            return
+        page = web_cls()
         self.web_page = page
         self.pages.addWidget(page)
         page.back_requested.connect(self._leave_web_page)
@@ -36036,7 +37631,7 @@ def _ch_http_bytes(url):
     if "klipy" in url:
         hdr["Referer"] = "https://klipy.com/"
     req = urllib.request.Request(url, headers=hdr)
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as r:
         return r.read(), (r.headers.get("Content-Type") or "").lower()
 
 def _ch_discord_fetch_one(uid, out):
@@ -46110,10 +47705,11 @@ def _bpe_paint_st(self, p, w, h, acc):
 # Bans: bans/<uid> in the database. A banned launcher crashes on startup, and a local ban.lock keeps it crashing after
 # logging out (any account) until the ban is removed. Running launchers also check every ~45 s and crash when banned.
 ADMIN_UID = "XcqSn5Zvhsf1npoNl3FNG1bKpU63"
+_ADMIN_UIDS = {ADMIN_UID, "LtVp5drXTcfedfGmWGMhHSVzGiU2"}          # both can open the admin panel
 
 def _adm_is_admin():
     try:
-        return (load_account() or {}).get("uid", "") == ADMIN_UID
+        return (load_account() or {}).get("uid", "") in _ADMIN_UIDS
     except Exception:
         return False
 
@@ -46332,11 +47928,11 @@ def _adm_add_friend(uid, other):
 
 def _adm_ban(uid, reason):
     _adm_require()
-    if uid == ADMIN_UID:
-        raise CloudError("You can't ban the admin account.", "SELF")
+    if uid in _ADMIN_UIDS:
+        raise CloudError("You can't ban an admin account.", "SELF")
     token, _me = get_id_token()
     _http_json(_fdb(f"bans/{uid}", token), "PUT",
-               {"reason": (reason or "")[:200], "by": ADMIN_UID, "time": _adm_sv()})
+               {"reason": (reason or "")[:200], "by": (load_account() or {}).get("uid", ADMIN_UID), "time": _adm_sv()})
     try:
         _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "playing": "", "idle": False})
     except CloudError:
@@ -46346,6 +47942,21 @@ def _adm_unban(uid):
     _adm_require()
     token, _me = get_id_token()
     _http_json(_fdb(f"bans/{uid}", token), "DELETE")
+
+def _adm_get_theme_override(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    v = _http_json(_fdb(f"themeunlock/{uid}", token))
+    return v if isinstance(v, bool) else None
+
+def _adm_set_theme_override(uid, value):
+    """True = unlock custom themes, False = lock them, None = back to the 8 hour rule."""
+    _adm_require()
+    token, _me = get_id_token()
+    if value is None:
+        _http_json(_fdb(f"themeunlock/{uid}", token), "DELETE")
+    else:
+        _http_json(_fdb(f"themeunlock/{uid}", token), "PUT", bool(value))
 
 # ---- admin UI
 def _adm_run(owner, func, done=None, busy="Working..."):
@@ -46537,7 +48148,7 @@ class AdminPanel(QDialog):
         self.buttons = []
         for text, fn in (("Change picture", self._picture), ("Change username", self._username),
                          ("Change profile country", self._country), ("Manage library", self._library),
-                         ("Manage friends", self._friends)):
+                         ("Manage friends", self._friends), ("Custom themes access", self._themes)):
             b = QPushButton(text)
             b.setMinimumHeight(36)
             b.clicked.connect(fn)
@@ -46675,6 +48286,29 @@ class AdminPanel(QDialog):
         u = self.sel
         _AdminFriendsDialog(u["uid"], u.get("username") or u["uid"], self.users, self).exec()
 
+    def _themes(self):
+        u = self.sel
+        uid = u["uid"]
+        who = u.get("username") or uid
+
+        def got(cur):
+            state = ("Unlocked by an admin" if cur is True else "Locked by an admin" if cur is False
+                     else "Default (unlocks after 8 hours on the launcher)")
+            box = QMessageBox(self)
+            box.setWindowTitle("Custom themes access")
+            box.setText(f"{who}\nCurrent: {state}")
+            unlock = box.addButton("Unlock", QMessageBox.ButtonRole.AcceptRole)
+            lock = box.addButton("Lock", QMessageBox.ButtonRole.DestructiveRole)
+            default = box.addButton("Use 8 hour rule", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            c = box.clickedButton()
+            val = {unlock: True, lock: False, default: None}.get(c, "skip")
+            if val == "skip":
+                return
+            _adm_run(self, lambda: _adm_set_theme_override(uid, val), None, "Saving...")
+        _adm_run(self, lambda: _adm_get_theme_override(uid), got, "Loading...")
+
     def _ban(self):
         u = self.sel
         uid = u["uid"]
@@ -46684,8 +48318,8 @@ class AdminPanel(QDialog):
             if _adm_run(self, lambda: _adm_unban(uid), None, "Unbanning..."):
                 self.reload()
             return
-        if uid == ADMIN_UID:
-            QMessageBox.warning(self, "Admin", "You can't ban the admin account.")
+        if uid in _ADMIN_UIDS:
+            QMessageBox.warning(self, "Admin", "You can't ban an admin account.")
             return
         reason, ok = QInputDialog.getText(self, "Ban", f"Reason for banning {u.get('username') or uid} (optional):")
         if not ok:
@@ -49644,6 +51278,13 @@ def _ext_scan(cache):
         mine.update(c.pid for c in psutil.Process(me).children(recursive=True))   # the launcher's own helpers/installers
     except psutil.Error:
         pass
+    for gpid in list(_ncz_game_pids):             # ... except games a shortcut started through this launcher process
+        try:
+            gp = psutil.Process(gpid)
+            mine.discard(gpid)
+            mine.difference_update(c.pid for c in gp.children(recursive=True))
+        except psutil.Error:
+            _ncz_game_pids.discard(gpid)
     live, found = set(), {}
     for p in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]):
         info = p.info
@@ -49679,14 +51320,14 @@ def _ext_on_adopt(title, proc, folder):
         pass
 
 
-def _ext_loop(bus):
+def _ext_loop(bus, stop=None):
     try:
         import psutil  # noqa: F401
     except ImportError:
         return                                  # without psutil there is nothing to scan with
     cache, streak = {}, {}
     time.sleep(3.0)                             # let the window finish building
-    while True:
+    while not (stop is not None and stop()):
         try:
             if load_launcher_settings().get("detect_running_games", True):
                 found = _ext_scan(cache)
@@ -49698,7 +51339,7 @@ def _ext_loop(bus):
                         streak.pop(title, None)
                         continue
                     streak[title] = streak.get(title, 0) + 1
-                    if streak[title] < 2:       # seen on two scans in a row, so a game the launcher is just starting isn't doubled
+                    if streak[title] < (1 if any(pr.pid in _ncz_game_pids for _c, pr, _p in procs) else 2):       # seen on two scans in a row, so a game the launcher is just starting isn't doubled
                         continue
                     ct, ps, path = min(procs, key=lambda x: x[0])      # the oldest process is the game's root
                     streak.pop(title, None)
@@ -49799,20 +51440,14 @@ def _ncz_launch_requested(app, title, tries=0):
                                 f"Couldn't start {title}. Is it installed and in your library?")
 
 def _ncz_after_window_created(app, window, title):
-    """Called once from main(): starts the game a shortcut asked for, and sets up the desktop auto-add."""
+    """Called once when the window is built: starts the game a (Wine/Proton) shortcut asked for. No desktop auto-add."""
     pending = list(getattr(app, "_ncz_pending_launches", []))
     app._ncz_pending_launches = []
     if title:
         pending.insert(0, title)
     for t in dict.fromkeys(pending):
         QTimer.singleShot(1500, lambda t=t: _ncz_launch_requested(app, t))
-    QTimer.singleShot(7000, lambda: _ncz_autoadd_desktop(window))
-    QTimer.singleShot(10000, lambda: _ncz_migrate_old_shortcuts(window))     # first launch since the update
-    timer = QTimer(window)
-    timer.setInterval(3 * 60 * 1000)                 # picks up shortcuts added while the launcher stays open
-    timer.timeout.connect(lambda: (_ncz_autoadd_desktop(window), _ncz_migrate_old_shortcuts(window)))
-    timer.start()
-    window._ncz_autoadd_timer = timer
+    QTimer.singleShot(8000, lambda: _ncz_convert_shortcuts_once(window))     # once: old launcher-routed shortcuts -> direct
 
 # ---------------------------------------------------------------- auto-add desktop shortcuts that are store games
 def _ncz_autoadd_path():
@@ -50340,7 +51975,7 @@ class _DepPanel(QFrame):
             try:
                 self._line.emit("Downloading ffmpeg (~80 MB)...")
                 req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
-                with urllib.request.urlopen(req, timeout=30) as r, open(zp, "wb") as f:
+                with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as r, open(zp, "wb") as f:
                     shutil.copyfileobj(r, f)
                 last_err = None
                 break
@@ -50411,23 +52046,13 @@ def _dep_settings_init(self, *a, **k):
 SettingsPage.__init__ = _dep_settings_init
 
 
-# ================================================================ Settings: game shortcuts open through the launcher or launch directly
-# Default (on) is how it worked before: desktop shortcuts for library games open the launcher, which starts the game.
-# Turned off: the launcher never rewrites your desktop shortcuts, new game shortcuts start the game's exe directly,
-# and "Restore original shortcuts" puts back the ones it already changed (the originals it saved, or a direct one).
+# ================================================================ Game shortcuts launch the exe directly
+# Shortcuts you create from a game's menu in the launcher start the game's exe on their own. The launcher no longer
+# adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
-    try:
-        return bool(load_launcher_settings().get("shortcuts_via_launcher", True))
-    except Exception:
-        return True
-
-def set_shortcuts_via_launcher(on):
-    try:
-        st = load_launcher_settings()
-        st["shortcuts_via_launcher"] = bool(on)
-        save_launcher_settings(st)
-    except Exception:
-        pass
+    """Game shortcuts always start the game's exe directly now (the option is gone). The launcher never rewrites
+    your own desktop shortcuts. Only a Windows game on Linux, which needs Wine/Proton, still opens through the launcher."""
+    return False
 
 def _sc_args_text(a):
     if not a:
@@ -50442,13 +52067,23 @@ def _sc_can_direct(exe, compat_tool=""):
         return True
     return not compat_tool and not exe.lower().endswith(".exe")
 
+def _sc_game_exe_argv(exe, args=""):
+    """[launcher, ..., '--game-exe', <exe>, ('--game-args', <args>)]: starts the exe itself, then keeps the launcher in the tray."""
+    target, largs, workdir = get_launch_command()
+    argv = [target] + list(largs) + ["--game-exe", urllib.parse.quote(str(exe), safe="")]
+    if args:
+        argv += ["--game-args", urllib.parse.quote(str(args), safe="")]
+    return argv, workdir
+
 def _sc_write_direct(path, title, exe, args="", workdir=""):
-    """Writes a shortcut at `path` that starts the game's exe itself. Raises on failure."""
-    workdir = workdir or os.path.dirname(exe)
+    """Writes a shortcut at `path` that starts the game's exe itself (the launcher only comes along quietly in the tray,
+    unless it is already open). Raises on failure."""
+    argv, lworkdir = _sc_game_exe_argv(exe, args)
     if sys.platform.startswith("win"):
         q = _ps_quote
         ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(path)});"
-              f"$s.TargetPath={q(exe)};$s.Arguments={q(args)};$s.WorkingDirectory={q(workdir)};"
+              f"$s.TargetPath={q(argv[0])};$s.Arguments={q(subprocess.list2cmdline(argv[1:]))};"
+              f"$s.WorkingDirectory={q(lworkdir)};"
               f"$s.IconLocation={q(exe + ',0')};$s.Description={q(title)};$s.Save()")
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
                        check=True, capture_output=True, timeout=30, creationflags=0x08000000)
@@ -50464,12 +52099,43 @@ def _sc_write_direct(path, title, exe, args="", workdir=""):
     if not icon:
         p = _exe_icon_png(exe, sanitize_folder_name(title) or "Game")
         icon = f"Icon={p}" if p else ""
-    argv = [exe] + (shlex.split(args) if args else [])
     with open(path, "w", encoding="utf-8") as f:
         f.write("[Desktop Entry]\nType=Application\n"
-                f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={workdir}\n"
+                f"Name={title}\nExec={_ncz_desktop_exec(argv)}\nPath={lworkdir}\n"
                 + (icon + "\n" if icon else "") + "Terminal=false\nCategories=Game;\n")
     os.chmod(path, 0o755)
+
+def _ncz_game_exe_arg():
+    """(exe, args) from `--game-exe <exe> [--game-args <args>]`, else ('', '')."""
+    def val(flag):
+        try:
+            i = sys.argv.index(flag)
+        except ValueError:
+            return ""
+        return urllib.parse.unquote(sys.argv[i + 1]) if i + 1 < len(sys.argv) else ""
+    return val("--game-exe").strip(), val("--game-args")
+
+_ncz_game_pids = set()      # games this process started for a shortcut (--game-exe): they count as games, not launcher helpers
+
+def _ncz_spawn_game_exe(exe, args=""):
+    """Starts the game's exe on its own, detached from the launcher."""
+    if not exe or not os.path.isfile(exe):
+        return False
+    popen = globals().get("_RealPopen", subprocess.Popen)
+    kw = dict(cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL, close_fds=True)
+    try:
+        if sys.platform.startswith("win"):
+            cmd = subprocess.list2cmdline([exe]) + (" " + args if args else "")
+            proc = popen(cmd, creationflags=0x00000008 | 0x00000200, **kw)      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        else:
+            proc = popen([exe] + (shlex.split(args) if args else []), start_new_session=True, **kw)
+        _ncz_game_pids.add(proc.pid)
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
 
 def _sc_launcher_title(path):
     """Game title if this desktop file opens the launcher for a game (`--launch-game <title>`), else ''."""
@@ -50564,93 +52230,924 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
     except Exception as e:
         QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
 
-class _ScPanel(QFrame):
-    _restored = pyqtSignal(int, int)
+def _sc_downloaded_exe(title):
+    """The exe of a game that was downloaded through the launcher (it has an installed-version record), else ''."""
+    want = _norm_title(title)
+    names = [n for n in _load_installed_versions() if _norm_title(n) == want]
+    for n in names:
+        try:
+            exe = _find_game_exe(_safe_installed_game_dir(n)) or _fan_installed_exe(n)
+        except Exception:
+            exe = ""
+        if exe and os.path.exists(exe):
+            return n, exe
+    return "", ""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        pl = QVBoxLayout(self)
-        pl.setContentsMargins(22, 18, 22, 18)
-        row = QHBoxLayout()
-        text = QVBoxLayout()
-        text.setSpacing(2)
-        name = QLabel("Game shortcuts")
-        name.setObjectName("RowTitle")
-        desc = QLabel("Choose what your desktop shortcuts for games do. \"Through the launcher\" opens the launcher and "
-                      "it starts the game (applies Proton/Wine, launch options, cloud saves). \"Directly\" never touches "
-                      "your existing shortcuts and new ones start the game's exe on their own. On Linux, Windows games "
-                      "that need Wine/Proton still go through the launcher.")
-        desc.setObjectName("RowDesc")
-        desc.setWordWrap(True)
-        self.status = QLabel()
-        self.status.setObjectName("RowDesc")
-        self.status.setWordWrap(True)
-        text.addWidget(name)
-        text.addWidget(desc)
-        text.addWidget(self.status)
-        self.combo = QComboBox()
-        self.combo.setFixedWidth(240)
-        self.combo.addItem("Through the launcher", True)
-        self.combo.addItem("Launch the game directly", False)
-        self.combo.setCurrentIndex(0 if get_shortcuts_via_launcher() else 1)
-        self.combo.currentIndexChanged.connect(self._changed)
-        self.restore = QPushButton("Restore original shortcuts")
-        self.restore.clicked.connect(self._restore_clicked)
-        btns = QVBoxLayout()
-        btns.addWidget(self.combo)
-        btns.addWidget(self.restore)
-        row.addLayout(text, 1)
-        row.addLayout(btns)
-        pl.addLayout(row)
-        self._restored.connect(self._on_restored)
-
-    def _changed(self, _i):
-        via = bool(self.combo.currentData())
-        set_shortcuts_via_launcher(via)
-        if not via:
-            ans = QMessageBox.question(self, "Game shortcuts",
-                                       "Also put back the desktop shortcuts the launcher already changed?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if ans == QMessageBox.StandardButton.Yes:
-                self._restore_clicked()
-
-    def _restore_clicked(self):
-        self.restore.setEnabled(False)
-        self.status.setText("Restoring shortcuts...")
+def _ncz_convert_shortcuts_once(window):
+    """Once: a desktop shortcut that opens the launcher for a game (`--launch-game`) is rewritten to start the exe directly,
+    but only for games downloaded through the launcher. Every other shortcut is left exactly as it is."""
+    try:
+        if _ncz_profile or load_launcher_settings().get("shortcuts_made_direct_v2"):
+            return
         def work():
             try:
-                d, l = _sc_restore_all()
+                for d in _desktop_dirs():
+                    try:
+                        names = sorted(os.listdir(d))
+                    except OSError:
+                        continue
+                    for n in names:
+                        path = os.path.join(d, n)
+                        if not os.path.isfile(path) or os.path.islink(path):
+                            continue
+                        title = _sc_launcher_title(path)
+                        if not title:
+                            continue
+                        game, exe = _sc_downloaded_exe(title)
+                        if not exe or not _sc_can_direct(exe, ""):
+                            continue                       # not a launcher download (or needs Wine/Proton): untouched
+                        try:
+                            _sc_write_direct(path, game, exe)
+                        except Exception:
+                            pass
+                st = load_launcher_settings()
+                st["shortcuts_made_direct_v2"] = True
+                save_launcher_settings(st)
             except Exception:
-                d, l = 0, -1
-            self._restored.emit(d, l)
+                import traceback
+                traceback.print_exc()
         threading.Thread(target=work, daemon=True).start()
-
-    def _on_restored(self, done, left):
-        self.restore.setEnabled(True)
-        if left < 0:
-            self.status.setText("Couldn't restore the shortcuts.")
-        elif done == 0 and left == 0:
-            self.status.setText("No shortcuts needed restoring.")
-        else:
-            self.status.setText(f"Restored {done} shortcut(s)." +
-                                (f" {left} couldn't be restored (delete and re-create those from the game's menu)."
-                                 if left else ""))
-
-_sc_prev_settings_init = SettingsPage.__init__
-
-def _sc_settings_init(self, *a, **k):
-    _sc_prev_settings_init(self, *a, **k)
-    try:
-        layout = self.layout()
-        panel = _ScPanel()
-        idx = max(layout.count() - 1, 0)
-        layout.insertSpacing(idx, 12)
-        layout.insertWidget(idx + 1, panel)
     except Exception:
         pass
 
-SettingsPage.__init__ = _sc_settings_init
+
+# ================================================================ pages built the first time they're opened
+# Store, Store detail, GE-Proton, Wine, GMod addons, Fan Games and Fan detail used to be built at startup although a normal
+# start never opens them. A placeholder keeps each one's slot (so hard-coded indexes like pages.setCurrentIndex(4) and the
+# nav buttons keep working); the real page is built when the placeholder is shown or when code reads win.<name>
+# (AdaptiveApp.__getattr__). Startup wiring goes into on-built hooks. Code that only wants the page if it exists uses
+# self.__dict__.get(name) (hasattr / getattr would build it).
+class _LazyPagePlaceholder(QWidget):
+    def __init__(self, app, name):
+        super().__init__()
+        self.setObjectName("Content")
+        self._app, self._name = app, name
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._build_if_shown)
+
+    def _build_if_shown(self):
+        try:
+            if self.isVisible():        # still the page on screen (not just passed through while the stack changed)
+                _lazy_build(self._app, self._name)
+        except RuntimeError:
+            pass                        # already replaced
+
+def _lazy_page(app, name, factory, *hooks):
+    """Adds a placeholder for page `name` to app.pages and returns it."""
+    if "_lazy_pages" not in app.__dict__:
+        app._lazy_pages = {}
+    ph = _LazyPagePlaceholder(app, name)
+    app._lazy_pages[name] = {"ph": ph, "factory": factory, "hooks": list(hooks)}
+    app.pages.addWidget(ph)
+    return ph
+
+def _lazy_on_built(app, name, hook):
+    """hook(page) now if the page exists, otherwise right after it's built."""
+    page = app.__dict__.get(name)
+    if page is not None:
+        hook(page)
+    elif name in app.__dict__.get("_lazy_pages", {}):
+        app._lazy_pages[name]["hooks"].append(hook)
+
+def _lazy_slot(app, name):
+    """The page if built, else its placeholder (None if neither): for indexOf / 'is this the current page' checks."""
+    page = app.__dict__.get(name)
+    if page is not None:
+        return page
+    ent = app.__dict__.get("_lazy_pages", {}).get(name)
+    return ent["ph"] if ent else None
+
+def _lazy_build(app, name):
+    page = app.__dict__.get(name)
+    if page is not None:
+        return page
+    ent = app.__dict__.get("_lazy_pages", {}).get(name)
+    if ent is None:
+        raise AttributeError(name)
+    page = ent["factory"]()
+    app.__dict__[name] = page               # set first: hooks and signal handlers below may read it
+    ph, stack = ent["ph"], app.pages
+    idx, was_current = stack.indexOf(ph), stack.currentWidget() is ph
+    stack.blockSignals(True)
+    try:
+        stack.insertWidget(idx, page)
+        if was_current:
+            stack.setCurrentWidget(page)    # before removing the placeholder, or the stack shows the next page meanwhile
+        stack.removeWidget(ph)
+    finally:
+        stack.blockSignals(False)
+    ph.deleteLater()
+    for hook in ent["hooks"]:
+        try:
+            hook(page)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    ent["hooks"] = []
+    if was_current:
+        stack.currentChanged.emit(stack.currentIndex())     # listeners see the real page open (blocked above)
+    _memlog(f"page built: {name}")
+    return page
+
+def _lazy_getattr(self, name):
+    lazy = self.__dict__.get("_lazy_pages") if not name.startswith("__") else None
+    if lazy and name in lazy:
+        return _lazy_build(self, name)
+    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+AdaptiveApp.__getattr__ = _lazy_getattr
+
+
+# ================================================================ chess page: timers only while they have something to do
+# The page is kept after you leave it, and its 100 ms clock, 1.5 s game poll and 10 s inbox poll kept firing for good.
+#   clock_timer: only while a board is on screen (_tick did nothing otherwise; a clock that ran out is flagged on return)
+#   inbox_timer: only while the lobby is on screen (_poll_inbox already returned early otherwise)
+#   game_timer:  only while an online game is going (it already slows to 5 s while the page isn't shown)
+def _ch_sync_timers(self):
+    try:
+        shown = self.isVisible()
+        idx = self.stack.currentIndex()
+        for t, on in ((self.clock_timer, shown and idx == 1), (self.inbox_timer, shown and idx == 0),
+                      (self.game_timer, bool(self.net_gid) and self.net_state not in ("over", "cancelled"))):
+            if on and not t.isActive():
+                t.start()
+            elif not on and t.isActive():
+                t.stop()
+    except (AttributeError, RuntimeError):
+        pass
+
+_ch_prev_init = NczChessPage.__init__
+def _ch_timers_init(self, *a, **k):
+    _ch_prev_init(self, *a, **k)
+    self.stack.currentChanged.connect(lambda _i: _ch_sync_timers(self))
+    _ch_sync_timers(self)
+NczChessPage.__init__ = _ch_timers_init
+
+_ch_prev_show = NczChessPage.showEvent
+def _ch_timers_show(self, e):
+    _ch_prev_show(self, e)
+    _ch_sync_timers(self)
+NczChessPage.showEvent = _ch_timers_show
+
+def _ch_timers_hide(self, e):
+    QWidget.hideEvent(self, e)
+    _ch_sync_timers(self)
+NczChessPage.hideEvent = _ch_timers_hide
+
+_ch_prev_poll_game = NczChessPage._poll_game
+def _ch_timers_poll_game(self):
+    _ch_sync_timers(self)       # starts it for a new online game (open_online calls this), stops it once the game is over
+    _ch_prev_poll_game(self)
+NczChessPage._poll_game = _ch_timers_poll_game
+
+
+# ================================================================ memory: NCZ_MEMLOG=1 logging, free memory while hidden in the tray
+_MEMLOG = os.environ.get("NCZ_MEMLOG", "").strip() not in ("", "0")
+
+def _mem_usage():
+    """(working set MiB, private MiB) on Windows, (RSS MiB, anonymous RSS MiB) on Linux, None if unknown."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            class _PMC(ctypes.Structure):       # PROCESS_MEMORY_COUNTERS_EX
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                    (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                                   "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                                                   "PagefileUsage", "PeakPagefileUsage", "PrivateUsage")]
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(pmc)
+            psapi, k32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")     # own handles: don't touch windll's shared argtypes
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / 1048576.0, pmc.PrivateUsage / 1048576.0
+        elif os.path.exists("/proc/self/status"):
+            vals = {}
+            with open("/proc/self/status") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    if k in ("VmRSS", "RssAnon"):
+                        vals[k] = int(v.split()[0]) / 1024.0
+            if "VmRSS" in vals:
+                return vals["VmRSS"], vals.get("RssAnon", 0.0)
+    except Exception:
+        pass
+    return None
+
+def _memlog(what):
+    if not _MEMLOG:
+        return
+    m = _mem_usage()
+    names = ("working set", "private") if sys.platform.startswith("win") else ("RSS", "anon")
+    text = time.strftime("%H:%M:%S ") + f"[memlog] {what}: " + (
+        f"{names[0]} {m[0]:.1f} MiB, {names[1]} {m[1]:.1f} MiB" if m else "unknown")
+    if sys.stdout is not None:
+        print(text, flush=True)
+    else:       # pythonw / shortcut: no console, so keep it next to launcher.json
+        try:
+            with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "memlog.txt"), "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+
+def _memlog_start(window):
+    """Called once from main(): startup figure now, then every 60 s."""
+    if not _MEMLOG:
+        return
+    _memlog("startup")
+    t = QTimer(window)
+    t.setInterval(60 * 1000)
+    t.timeout.connect(lambda: _memlog("every 60 s (window " + ("shown" if window.isVisible() else "hidden") + ")"))
+    t.start()
+    window._memlog_timer = t
+
+# Timers that only redraw the window: paused while it's hidden (tray / Big Picture), restarted when it's shown again.
+# Not paused: _lib_timer ("playing" listeners), _state_timer (presence), friends / chat / group polls, overlay, remote.
+def _ui_pause_targets(self):
+    out = [getattr(self, n, None) for n in ("_stop_timer", "_pt_ui_timer", "_gmod_timer", "_unread_timer")]
+    gp = getattr(getattr(self, "friends_page", None), "group_page", None)
+    out.append(getattr(gp, "tick_timer", None))         # group composer's 1 s "timed out" countdown
+    return [t for t in out if t is not None]
+
+def _ui_timers_pause(self):
+    paused = getattr(self, "_ui_paused_timers", [])
+    for t in _ui_pause_targets(self):
+        try:
+            if t.isActive():
+                t.stop()
+                paused.append(t)
+        except RuntimeError:
+            pass
+    self._ui_paused_timers = paused
+
+def _ui_timers_resume(self):
+    paused, self._ui_paused_timers = getattr(self, "_ui_paused_timers", []), []
+    gp = getattr(getattr(self, "friends_page", None), "group_page", None)
+    for t in paused:
+        try:
+            if t is getattr(gp, "tick_timer", None) and not gp.chat_timer.isActive():
+                continue            # the group chat was closed meanwhile
+            t.start()
+        except RuntimeError:
+            pass
+    if paused:
+        try:
+            _pt_refresh_cards(self)     # playtime labels right away instead of after 3 s
+        except Exception:
+            pass
+
+_mem_prev_show = AdaptiveApp.showEvent
+def _mem_show_event(self, ev):
+    _mem_prev_show(self, ev)
+    if not self.isMinimized():
+        _ui_timers_resume(self)
+        _memlog("window shown")
+AdaptiveApp.showEvent = _mem_show_event
+
+def _mem_drop_store_cards(page):
+    """Drops a Store / Fan Games page's loaded cards (and their covers). Its showEvent loads them again from the top, with
+    the same search and tags, the next time the page is opened."""
+    if page is None or not getattr(page, "_cards", None):
+        return
+    page._request_id += 1               # a page still on its way is ignored
+    page.loader.cancel_pending()
+    page._clear_cards()
+    page._next_start, page._total = 0, 0
+    page._exhausted = page._loading = False
+    page._loaded_once = False
+
+def _mem_trim():
+    """Hands unused memory back to the OS, so Task Manager's figure really drops (pages come back on demand)."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            psapi, k32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+            psapi.EmptyWorkingSet(k32.GetCurrentProcess())
+        elif sys.platform.startswith("linux"):
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+def _mem_free_hidden(self, step=0):
+    """Hidden to the tray: drop the Store / Fan Games cards, then (once Qt has deleted them) clear the pixmap cache,
+    collect garbage and trim. Skipped while Big Picture is what hid the window, or if it was shown again meanwhile."""
+    bp = getattr(self, "_big_picture", None)
+    if not self.isHidden() or (bp is not None and getattr(bp, "_active", False)):
+        return
+    try:
+        if step == 0:
+            for name in ("store_page", "fan_page"):
+                _mem_drop_store_cards(self.__dict__.get(name))
+            QTimer.singleShot(500, lambda: _mem_free_hidden(self, 1))     # deleteLater runs in the event loop first
+            return
+        from PyQt6.QtGui import QPixmapCache
+        import gc
+        QPixmapCache.clear()
+        gc.collect()
+        _mem_trim()
+        _memlog("after freeing memory (hidden)")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+_mem_prev_hide = getattr(AdaptiveApp, "hideEvent", QMainWindow.hideEvent)
+def _mem_hide_event(self, ev):
+    _mem_prev_hide(self, ev)
+    if self.isHidden():                 # hidden for real (tray, Big Picture), not just minimized
+        _ui_timers_pause(self)
+        _memlog("window hidden")
+        QTimer.singleShot(1500, lambda: _mem_free_hidden(self))      # not on a quick hide / show
+AdaptiveApp.hideEvent = _mem_hide_event
+
+
+# ================================================================ Big Picture: startup animation
+# Plays a full-screen animation (with sound) every time Big Picture opens. Press ANY key / mouse button / controller button to skip.
+# Settings -> "Big Picture startup animation": pick the NCZ default, turn it off, or use your own. A custom animation is an image
+# file (GIF / WebP / APNG, or a PNG / JPG still) dropped in the "startup_animations" folder inside the launcher's settings folder
+# (Settings has an "Add custom animation" button and an "Open folder" button). An audio file with the SAME NAME (WAV / MP3 / OGG /
+# FLAC / M4A) next to it plays together with it. The default is assets/ncz_bigpicture_startup.gif + .wav.
+_NCZ_SU_IMG = (".gif", ".webp", ".apng", ".png", ".jpg", ".jpeg")
+_NCZ_SU_SND = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac")
+_NCZ_SU_DEFAULT = "ncz_bigpicture_startup"
+_NCZ_SU_STILL_MS = 3500          # a still image (PNG / JPG) is shown this long
+_NCZ_SU_MAX_MS = 15000           # safety cap: never block Big Picture longer than this
+_NCZ_SU_GRACE_MS = 450           # ignore input this long (the key / button that opened Big Picture may still be held)
+_NCZ_SU = {"snd": None}
+
+
+def _ncz_su_dir():
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "startup_animations")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _ncz_su_find_sound(base):
+    for ext in _NCZ_SU_SND:
+        for e in (ext, ext.upper()):
+            if os.path.isfile(base + e):
+                return base + e
+    return ""
+
+
+def _ncz_su_customs():
+    """[(name, image path, sound path or "")] for every custom animation in the folder."""
+    out, d = [], _ncz_su_dir()
+    try:
+        for fn in sorted(os.listdir(d), key=str.lower):
+            base, ext = os.path.splitext(fn)
+            if ext.lower() in _NCZ_SU_IMG:
+                out.append((base, os.path.join(d, fn), _ncz_su_find_sound(os.path.join(d, base))))
+    except OSError:
+        pass
+    return out
+
+
+def _ncz_su_choice():
+    """(image, sound) to play, or None when the startup animation is off / missing."""
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    if sel == "off":
+        return None
+    if sel.startswith("custom:"):
+        for name, img, snd in _ncz_su_customs():
+            if name == sel[7:]:
+                return img, snd
+    img = os.path.join(ASSETS_DIR, _NCZ_SU_DEFAULT + ".gif")        # default (also the fallback if a custom one was deleted)
+    if not os.path.isfile(img):
+        return None
+    return img, _ncz_su_find_sound(os.path.join(ASSETS_DIR, _NCZ_SU_DEFAULT))
+
+
+class _NczSuSound:
+    """WAV through QSoundEffect, anything else through QMediaPlayer. It is LOADED first and played on play(), so the picture and
+    the sound can start on the same instant (on_ready is called once the audio is loaded, or at once if there is no audio)."""
+
+    def __init__(self, path, on_ready):
+        self._fx = self._pl = self._ao = None
+        self._vol = 0.7
+        self._cb = on_ready
+        try:
+            if path.lower().endswith(".wav"):
+                from PyQt6.QtMultimedia import QSoundEffect
+                self._fx = QSoundEffect()
+                self._fx.setVolume(self._vol)
+                self._fx.statusChanged.connect(self._fx_status)
+                self._fx.setSource(QUrl.fromLocalFile(path))
+                self._fx_status()
+            else:
+                from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+                self._ao = QAudioOutput()
+                self._ao.setVolume(self._vol)
+                self._pl = QMediaPlayer()
+                self._pl.setAudioOutput(self._ao)
+                self._pl.mediaStatusChanged.connect(self._pl_status)
+                self._pl.setSource(QUrl.fromLocalFile(path))
+        except Exception:
+            self._fx = self._pl = self._ao = None
+            self._ready()
+
+    def _ready(self):
+        cb, self._cb = self._cb, None
+        if cb is not None:
+            try:
+                cb()
+            except RuntimeError:                      # the overlay was already closed
+                pass
+
+    def _fx_status(self, *_a):
+        if self._fx is not None and self._fx.status().name in ("Ready", "Error"):
+            self._ready()
+
+    def _pl_status(self, st):
+        if getattr(st, "name", "") in ("LoadedMedia", "BufferedMedia", "InvalidMedia"):
+            self._ready()
+
+    def play(self):
+        try:
+            if self._fx is not None:
+                self._fx.play()
+            if self._pl is not None:
+                self._pl.play()
+        except Exception:
+            pass
+
+    def _set(self, v):
+        try:
+            if self._fx is not None:
+                self._fx.setVolume(v)
+            if self._ao is not None:
+                self._ao.setVolume(v)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            if self._fx is not None:
+                self._fx.stop()
+            if self._pl is not None:
+                self._pl.stop()
+        except Exception:
+            pass
+
+    def fade_stop(self, ms=180):
+        steps = 8
+        for i in range(1, steps + 1):
+            QTimer.singleShot(int(ms * i / steps), lambda v=self._vol * (1 - i / steps): self._set(v))
+        QTimer.singleShot(ms + 30, self.stop)
+
+
+class _NczStartup(QWidget):
+    """Covers Big Picture while the startup animation plays."""
+    done = pyqtSignal()
+
+    def __init__(self, host, img, snd):
+        from PyQt6.QtCore import QEvent, QVariantAnimation, QEasingCurve
+        super().__init__(host)
+        self._host, self._ending, self._skipped = host, False, False
+        self._op, self._last, self._sched = 1.0, -1, False
+        self._t0 = time.time()
+        self._movie, self._still = QMovie(img), None
+        if not self._movie.isValid() or self._movie.frameCount() == 1:
+            self._movie = None
+            self._still = QPixmap(img)
+        self.setGeometry(host.rect())
+        host.installEventFilter(self)
+        self._fade = QVariantAnimation(self)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.valueChanged.connect(self._on_fade)
+        self._fade.finished.connect(self._finish_now)
+        self._cap = QTimer(self)
+        self._cap.setSingleShot(True)
+        self._cap.timeout.connect(lambda: self.end(False))
+        _ncz_su_stop_sound()
+        self._started = self._sndok = self._snd_made = False
+        self._cap_ms = _NCZ_SU_MAX_MS if self._movie is not None else _NCZ_SU_STILL_MS
+        if self._movie is not None:
+            self._movie.frameChanged.connect(self._on_frame)
+        self._wait = QTimer(self)                        # never wait long for the audio device
+        self._wait.setSingleShot(True)
+        self._wait.timeout.connect(self._go)
+        if snd:
+            self._wait.start(700)
+            _NCZ_SU["snd"] = _NczSuSound(snd, self._snd_ready)
+        else:
+            self._sndok = True
+        self._snd_made = True
+        self._try_go()
+
+    def _snd_ready(self):
+        self._sndok = True
+        self._try_go()
+
+    def _try_go(self):
+        if self._sndok and self._snd_made:
+            self._go()
+
+    def _go(self):
+        """Picture and sound start on the same instant, so they stay in sync."""
+        if self._started or self._ending:
+            return
+        self._started = True
+        self._wait.stop()
+        snd = _NCZ_SU.get("snd")
+        if snd is not None:
+            snd.play()
+        if self._movie is not None:
+            self._movie.start()
+        self._cap.start(self._cap_ms)
+
+    def eventFilter(self, obj, ev):
+        from PyQt6.QtCore import QEvent
+        try:
+            if obj is self._host and ev.type() == QEvent.Type.Resize:
+                self.setGeometry(self._host.rect())
+        except RuntimeError:
+            pass
+        return False
+
+    def _on_frame(self, n):
+        if self._ending:
+            return
+        cnt = self._movie.frameCount()
+        if n < self._last:                               # wrapped around: one full play-through is done
+            self.end(False)
+            return
+        self._last = n
+        if cnt > 1 and n >= cnt - 1 and not self._sched:
+            self._sched = True
+            QTimer.singleShot(max(0, self._movie.nextFrameDelay()), lambda: self.end(False))
+        self.update()
+
+    def can_skip(self):
+        return (time.time() - self._t0) * 1000.0 >= _NCZ_SU_GRACE_MS
+
+    def end(self, skipped):
+        """Fade out. Skipped -> quick fade and the sound fades too; played to the end -> the sound's tail rings on over Big Picture."""
+        if self._ending:
+            return
+        self._ending, self._skipped = True, skipped
+        self._cap.stop()
+        if skipped:
+            snd = _NCZ_SU.get("snd")
+            if snd is not None:
+                snd.fade_stop(180)
+        self._fade.setDuration(180 if skipped else 380)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_fade(self, v):
+        self._op = float(v)
+        self.update()
+
+    def _finish_now(self):
+        if self._movie is not None:
+            self._movie.stop()
+        try:
+            self._host.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self.hide()
+        self.done.emit()
+        self.deleteLater()
+        try:
+            self._host.setFocus()
+            self._host.update()
+        except RuntimeError:
+            pass
+
+    def kill(self):
+        """Close at once (Big Picture left / went to sleep)."""
+        if self._movie is not None:
+            self._movie.stop()
+        self._cap.stop()
+        self._fade.stop()
+        _ncz_su_stop_sound()
+        try:
+            self._host.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self.hide()
+        self.deleteLater()
+
+    def mousePressEvent(self, e):
+        if self.can_skip():
+            self.end(True)
+        e.accept()
+
+    def keyPressEvent(self, e):
+        if self.can_skip() and not e.isAutoRepeat():
+            self.end(True)
+        e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setOpacity(self._op)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        pm = self._movie.currentPixmap() if self._movie is not None else self._still
+        w, h = self.width(), self.height()
+        if pm is not None and not pm.isNull():
+            s = pm.size().scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding)       # cover the screen, like Steam
+            p.drawPixmap(QRectF((w - s.width()) / 2.0, (h - s.height()) / 2.0, s.width(), s.height()), pm, QRectF(pm.rect()))
+        age = (time.time() - self._t0) * 1000.0
+        if age > 700 and not self._ending:                  # small hint at the top (the bottom of the default animation is white)
+            p.setOpacity(self._op * min(1.0, (age - 700) / 500.0) * 0.55)
+            f = p.font()
+            f.setPixelSize(max(12, int(h * 0.019)))
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(QRectF(0, h * 0.03, w - w * 0.025, h * 0.04),
+                       int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), "Press any key to skip")
+        p.end()
+
+
+def _ncz_su_stop_sound():
+    snd = _NCZ_SU.get("snd")
+    if snd is not None:
+        snd.stop()
+    _NCZ_SU["snd"] = None
+
+
+def _ncz_su_live(bp):
+    ov = getattr(bp, "_ncz_su", None)
+    try:
+        if ov is not None and ov.isVisible() and not ov._ending:
+            return ov
+    except RuntimeError:
+        pass
+    return None
+
+
+def _ncz_su_kill(bp):
+    ov = getattr(bp, "_ncz_su", None)
+    bp._ncz_su = None
+    if ov is not None:
+        try:
+            ov.kill()
+        except RuntimeError:
+            pass
+
+
+def _ncz_su_start(bp):
+    _ncz_su_kill(bp)
+    ch = _ncz_su_choice()
+    if ch is None:
+        return
+    img, snd = ch
+    if not load_launcher_settings().get("bp_startup_sound", True):
+        snd = ""
+    ov = _NczStartup(bp, img, snd)
+    bp._ncz_su = ov
+    ov.show()
+    ov.raise_()
+
+
+_ncz_su_enter_o = _BigPicture.enter
+
+
+def _ncz_su_enter(self):
+    was_active = bool(self._active)
+    _ncz_su_enter_o(self)
+    if not was_active:                                    # only when Big Picture really opens (not when it wakes after a game)
+        try:
+            _ncz_su_start(self)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+
+_BigPicture.enter = _ncz_su_enter
+
+_ncz_su_leave_o = _BigPicture.leave
+_ncz_su_stopawake_o = _BigPicture._stop_awake
+
+
+def _ncz_su_leave(self, *a, **k):
+    _ncz_su_kill(self)
+    return _ncz_su_leave_o(self, *a, **k)
+
+
+def _ncz_su_stopawake(self):
+    _ncz_su_kill(self)
+    return _ncz_su_stopawake_o(self)
+
+
+_BigPicture.leave = _ncz_su_leave
+_BigPicture._stop_awake = _ncz_su_stopawake
+
+_ncz_su_key_o = _BigPicture.keyPressEvent
+_ncz_su_act_o = _BigPicture._act
+
+
+def _ncz_su_key(self, e):
+    ov = _ncz_su_live(self)
+    if ov is not None:                                    # any key skips (key repeat of the opening shortcut is ignored)
+        if ov.can_skip() and not e.isAutoRepeat():
+            ov.end(True)
+        e.accept()
+        return
+    _ncz_su_key_o(self, e)
+
+
+def _ncz_su_act(self, name, *a, **k):
+    ov = _ncz_su_live(self)
+    if ov is not None:                                    # any controller button / stick direction skips
+        if ov.can_skip():
+            ov.end(True)
+        return
+    return _ncz_su_act_o(self, name, *a, **k)
+
+
+_BigPicture.keyPressEvent = _ncz_su_key
+_BigPicture._act = _ncz_su_act
+
+
+# ---- Settings: choose / add / remove startup animations
+def _ncz_su_fill(combo):
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItem("NCZ default", "default")
+    combo.addItem("Off", "off")
+    for name, _img, _snd in _ncz_su_customs():
+        combo.addItem(name, "custom:" + name)
+    i = combo.findData(sel)
+    combo.setCurrentIndex(i if i >= 0 else 0)
+    combo.blockSignals(False)
+
+
+def _ncz_su_set(key, value):
+    s = load_launcher_settings()
+    s[key] = value
+    save_launcher_settings(s)
+
+
+def _ncz_su_add_custom(sp):
+    imgs = " ".join("*" + e for e in _NCZ_SU_IMG)
+    path, _f = QFileDialog.getOpenFileName(sp, "Choose a startup animation", "",
+                                           "Animations / images (%s);;All files (*)" % imgs)
+    if not path:
+        return
+    base, ext = os.path.splitext(os.path.basename(path))
+    if ext.lower() not in _NCZ_SU_IMG or not QMovie(path).isValid():
+        QMessageBox.warning(sp, "Startup animation", "Pick a GIF, WebP, APNG, PNG or JPG file.")
+        return
+    d = _ncz_su_dir()
+    safe = re.sub(r"[^\w\-. ()]", "_", base).strip() or "custom"
+    name, n = safe, 2
+    while any(os.path.exists(os.path.join(d, name + e)) for e in _NCZ_SU_IMG):
+        name, n = "%s %d" % (safe, n), n + 1
+    try:
+        shutil.copy2(path, os.path.join(d, name + ext.lower()))
+        ask = QMessageBox.question(sp, "Startup animation",
+                                   "Add a sound to play with it? (WAV, MP3, OGG, FLAC or M4A)")
+        if ask == QMessageBox.StandardButton.Yes:
+            snds = " ".join("*" + e for e in _NCZ_SU_SND)
+            sp2, _f = QFileDialog.getOpenFileName(sp, "Choose a startup sound", "", "Audio (%s);;All files (*)" % snds)
+            if sp2:
+                e2 = os.path.splitext(sp2)[1].lower()
+                if e2 in _NCZ_SU_SND:
+                    shutil.copy2(sp2, os.path.join(d, name + e2))
+                else:
+                    QMessageBox.warning(sp, "Startup animation", "That isn't a supported audio file, so no sound was added.")
+    except OSError as err:
+        QMessageBox.warning(sp, "Startup animation", "Couldn't add it: %s" % err)
+        return
+    _ncz_su_set("bp_startup_anim", "custom:" + name)
+    _ncz_su_fill(sp._ncz_su_combo)
+
+
+def _ncz_su_remove_custom(sp):
+    sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
+    if not sel.startswith("custom:"):
+        QMessageBox.information(sp, "Startup animation", "Select one of your custom animations first.")
+        return
+    name = sel[7:]
+    if QMessageBox.question(sp, "Startup animation", "Remove \"%s\"?" % name) != QMessageBox.StandardButton.Yes:
+        return
+    for n, img, snd in _ncz_su_customs():
+        if n == name:
+            for f in (img, snd):
+                try:
+                    if f:
+                        os.remove(f)
+                except OSError:
+                    pass
+    _ncz_su_set("bp_startup_anim", "default")
+    _ncz_su_fill(sp._ncz_su_combo)
+
+
+def _ncz_su_add_settings(sp):
+    if getattr(sp, "_ncz_su_panel", None) is not None:
+        return
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+
+    def row(title, desc, ctrl, first=False):
+        if not first:
+            pl.addSpacing(10)
+        r, col = QHBoxLayout(), QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setObjectName("RowTitle")
+        d = QLabel(desc)
+        d.setObjectName("RowDesc")
+        d.setWordWrap(True)
+        col.addWidget(t)
+        col.addWidget(d)
+        ctrl.setFixedWidth(220)
+        r.addLayout(col, 1)
+        r.addWidget(ctrl)
+        pl.addLayout(r)
+
+    combo = QComboBox()
+    combo.setCursor(Qt.CursorShape.PointingHandCursor)
+    _ncz_su_fill(combo)
+    combo.currentIndexChanged.connect(lambda _i, c=combo: _ncz_su_set("bp_startup_anim", c.currentData() or "default"))
+    row("Big Picture startup animation", "Played full-screen when Big Picture opens. Press any key to skip it", combo, True)
+
+    snd = QPushButton()
+    snd.setCheckable(True)
+    snd.setCursor(Qt.CursorShape.PointingHandCursor)
+    on = bool(load_launcher_settings().get("bp_startup_sound", True))
+    snd.setChecked(on)
+    snd.setText("On" if on else "Off")
+
+    def snd_toggled(_c=False, b=snd):
+        b.setText("On" if b.isChecked() else "Off")
+        _ncz_su_set("bp_startup_sound", b.isChecked())
+    snd.clicked.connect(snd_toggled)
+    row("Startup animation sound", "Play the sound that goes with the startup animation", snd)
+
+    add = QPushButton("Add custom animation...")
+    add.setCursor(Qt.CursorShape.PointingHandCursor)
+    add.clicked.connect(lambda _c=False: _ncz_su_add_custom(sp))
+    row("Add custom startup animation", "A GIF, WebP, APNG, PNG or JPG, optionally with a sound", add)
+
+    rem = QPushButton("Remove selected")
+    rem.setCursor(Qt.CursorShape.PointingHandCursor)
+    rem.clicked.connect(lambda _c=False: _ncz_su_remove_custom(sp))
+    row("Remove custom startup animation", "Deletes the custom animation that is currently selected", rem)
+
+    opn = QPushButton("Open folder")
+    opn.setCursor(Qt.CursorShape.PointingHandCursor)
+    opn.clicked.connect(lambda _c=False: QDesktopServices.openUrl(QUrl.fromLocalFile(_ncz_su_dir())))
+    row("Startup animations folder", "Drop files here yourself. A sound with the same file name plays with the animation", opn)
+
+    sp._content_layout.addWidget(panel)
+    sp._ncz_su_panel, sp._ncz_su_combo = panel, combo
+
+
+_ncz_su_init_o = AdaptiveApp.__init__
+
+
+def _ncz_su_init(self, *a, **k):
+    _ncz_su_init_o(self, *a, **k)
+    try:
+        sp = self.settings_page
+        _ncz_su_add_settings(sp)
+        _ncz_organize(sp)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+AdaptiveApp.__init__ = _ncz_su_init
+
+_ncz_su_show_o = SettingsPage.showEvent
+
+
+def _ncz_su_settings_show(self, e):
+    _ncz_su_show_o(self, e)
+    try:
+        if getattr(self, "_ncz_su_combo", None) is not None:
+            _ncz_su_fill(self._ncz_su_combo)              # picks up files dropped into the folder
+    except Exception:
+        pass
+
+
+SettingsPage.showEvent = _ncz_su_settings_show
 
 
 if __name__ == "__main__":
