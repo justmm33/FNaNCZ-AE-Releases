@@ -29203,7 +29203,7 @@ class CountryDialog(QDialog):
 # The theme is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
 # Account themes: a theme can belong to specific accounts, and a "locked" one can't use any other theme.
 # The admin accounts below can pick every account theme (the existing one and any added later) and are never locked.
-_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
+_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
 _ACCOUNT_THEMES = {
     "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": False},     # free to switch between Sunset and this theme
     "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
@@ -29252,7 +29252,8 @@ def _allowed_theme_keys():
     uid = _saved_uid()
     if uid in _THEME_ADMIN_UIDS:
         return list(_ACCOUNT_THEMES)
-    return [k for k, t in _ACCOUNT_THEMES.items() if uid and uid in t["uids"]]
+    return [k for k, t in _ACCOUNT_THEMES.items()
+            if (t.get("everyone") and (not t.get("custom") or _ct_unlocked())) or (uid and uid in t["uids"])]
 
 def _apply_default_account_themes():
     """First launch with an update that adds a theme made for this account: make it the account's theme, once.
@@ -29299,6 +29300,932 @@ def _ui_read_style():
     choice = _raw_setting("ui_theme_choice")
     return choice if choice in ("sunset", "classic", "legacy") else "new"
 
+# ================================================================ Custom themes (made by the user)
+# A custom theme = a layout + 8 colours the user picks. Everything else (hover colours, input fields, disabled
+# colours, ...) is derived from those 8 colours.
+#   layout "classic": the Classic theme's layout - navigation bar across the top, flat colours.
+#   layout "modern":  the New theme's layout - navigation rail on the left, gradient window, rounded cards.
+# Saved in launcher.json under "custom_themes" ({id: {name, layout, colors}}) and picked with ui_theme = "custom_<id>".
+# They are registered in _ACCOUNT_THEMES (flag "everyone"), so every account can use them and the existing
+# startup / Settings code treats them like any other theme. Like the other themes, a change needs a restart.
+from PyQt6.QtGui import QLinearGradient as _CtLG, QBrush as _CtBrush
+
+_CT_KEYS = ("bg", "sidebar", "panel", "text", "subtext", "accent", "button", "border")
+_CT_LABELS = {"bg": "Background", "sidebar": "Navigation bar", "panel": "Panels & cards", "text": "Text",
+              "subtext": "Secondary text", "accent": "Accent", "button": "Buttons", "border": "Borders"}
+_CT_PRESETS = {
+    "Classic dark":  dict(bg="#0d0d0f", sidebar="#050506", panel="#151518", text="#f2f2f4", subtext="#8d8d96", accent="#a666ff", button="#222226", border="#26262b"),
+    "Classic light": dict(bg="#f2f2f4", sidebar="#e4e4e8", panel="#ffffff", text="#141416", subtext="#6a6a72", accent="#a666ff", button="#e4e4e8", border="#d9d9de"),
+    "Modern (New)":  dict(bg="#080808", sidebar="#000000", panel="#1a1a1a", text="#ffffff", subtext="#aaaaaa", accent="#fcfcfc", button="#222222", border="#2e2e2e"),
+    "Sunset":        dict(bg="#150b30", sidebar="#0f0824", panel="#1e1142", text="#ffffff", subtext="#9d93bd", accent="#ff7a2f", button="#2a1857", border="#2e1a5c"),
+    "Mint":          dict(bg="#121214", sidebar="#151517", panel="#18181b", text="#f2f2f4", subtext="#9a9aa2", accent="#12e87c", button="#222226", border="#26262a"),
+}
+_CT_MAX_THEMES = 20
+_CT_HEX = re.compile(r"#[0-9a-fA-F]{6}")
+_CT_ID = re.compile(r"[0-9a-f]{4,12}")
+
+def _ct_lum(color):
+    c = QColor(color)
+    return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255.0
+
+def _ct_mix(a, b, t):
+    ca, cb = QColor(a), QColor(b)
+    return QColor(int(round(ca.red() + (cb.red() - ca.red()) * t)),
+                  int(round(ca.green() + (cb.green() - ca.green()) * t)),
+                  int(round(ca.blue() + (cb.blue() - ca.blue()) * t))).name()
+
+def _ct_rgba(color, alpha):
+    c = QColor(color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+def _ct_clean(ent):
+    """A saved custom theme checked and completed, or None if it is not usable."""
+    if not isinstance(ent, dict):
+        return None
+    name = str(ent.get("name") or "My theme").strip()[:30] or "My theme"
+    layout = ent.get("layout") if ent.get("layout") in ("classic", "modern") else "modern"
+    src = ent.get("colors") if isinstance(ent.get("colors"), dict) else {}
+    base = _CT_PRESETS["Classic dark" if layout == "classic" else "Modern (New)"]
+    colors = {}
+    for k in _CT_KEYS:
+        v = src.get(k)
+        colors[k] = v.lower() if isinstance(v, str) and _CT_HEX.fullmatch(v) else base[k]
+    g = ent.get("gradient")
+    grad = g.lower() if layout == "classic" and isinstance(g, str) and _CT_HEX.fullmatch(g) else ""
+    return {"name": name, "layout": layout, "colors": colors, "icon": "user" if ent.get("icon") == "user" else "", "gradient": grad}
+
+def _ct_theme(c):
+    """The full colour set (same keys as THEMES['dark']) built from the 8 colours the user picked."""
+    bg, sidebar, panel, text, sub, accent, button, border = (c[k] for k in _CT_KEYS)
+    light = _ct_lum(bg) >= 0.5
+    ac = QColor(accent)
+    hover, press = ac.lighter(120).name(), ac.darker(125).name()
+    on_accent = "#141414" if _ct_lum(accent) > 0.6 else "#ffffff"
+    return dict(
+        bg=bg, sidebar=sidebar, panel=panel, border=border, text=text, subtext=sub,
+        input=_ct_mix(bg, "#ffffff", 0.6) if light else _ct_mix(bg, "#000000", 0.35),
+        on_accent=on_accent, on_accent_force=on_accent,
+        accent=accent, accent_hover=hover, accent_press=press,
+        red=accent, red_hover=hover, red_press=press, accent_fill=_ct_rgba(accent, 0.20),
+        button=button, button_hover=_ct_mix(button, text, 0.10),
+        disabled_bg=_ct_mix(bg, panel, 0.5), disabled_text=_ct_mix(sub, bg, 0.55),
+        handle=_ct_mix(border, text, 0.18), hover=_ct_mix(panel, text, 0.07),
+        nav_text=_ct_mix(sub, text, 0.35), nav_active=text, brand=text, sidebar_border=border,
+        nav_fill=_ct_rgba(text, 0.06), nav_fill_hover=_ct_rgba(text, 0.12),
+    )
+
+def _ct_on_accent_extra(t):
+    """Text that sits on the accent colour (avatars, primary buttons, selected menu items) must stay readable
+    for any accent, and so must button text on hover for light themes."""
+    on, txt = t["on_accent"], t["text"]
+    return f"""
+QPushButton:hover, QPushButton:pressed {{ color: {txt}; }}
+QPushButton:flat:hover {{ color: {txt}; }}
+QLabel#Avatar, QLabel#AvatarLarge, QLabel#SyncAvatar {{ color: {on}; }}
+QPushButton#Primary, QPushButton#Primary:hover, QPushButton#Primary:pressed {{ color: {on}; }}
+QPushButton#Primary:disabled {{ color: {t['disabled_text']}; }}
+QPushButton#Danger:hover, QPushButton#Uninstall:hover {{ color: {on}; }}
+QMenu::item:selected {{ color: {on}; }}
+QLineEdit, QTextEdit {{ selection-background-color: {t['accent']}; selection-color: {on}; }}
+QComboBox QAbstractItemView {{ selection-background-color: {t['accent']}; selection-color: {on}; }}
+"""
+
+def _ct_classic_extra(t, grad=""):
+    """Classic layout = the plain Classic stylesheet with this palette; grad (a colour) adds a top-to-bottom background gradient."""
+    css = _ct_on_accent_extra(t)
+    if grad:
+        css += f"""
+QMainWindow, QWidget#Content, QWidget#GridContainer {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {t['bg']}, stop:1 {grad});
+}}
+QWidget#GridContainer {{ background: transparent; }}
+"""
+    return css
+
+def _ct_modern_extra(t):
+    """Modern layout: the New theme's side rail, gradient window and rounded translucent cards, in the user's colours."""
+    acc, bg, txt = t["accent"], t["bg"], t["text"]
+    top, bottom = _ct_mix(bg, txt, 0.05), _ct_mix(bg, acc, 0.16)
+    rail_end = _ct_mix(t["sidebar"], bg, 0.7)
+    a_hi, a_lo = QColor(acc).lighter(112).name(), QColor(acc).darker(118).name()
+    p85, p70, p95 = _ct_rgba(t["panel"], 0.85), _ct_rgba(t["panel"], 0.70), _ct_rgba(t["panel"], 0.95)
+    bd = t["border"]
+    return f"""
+QMainWindow, QWidget#Content, QWidget#GridContainer {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {top}, stop:0.55 {bg}, stop:1 {bottom});
+}}
+QWidget#GridContainer {{ background: transparent; }}
+QFrame#Sidebar {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['sidebar']}, stop:1 {_ct_mix(t['sidebar'], acc, 0.10)}); border-bottom: 1px solid {bd};
+}}
+QFrame#SideRail {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {t['sidebar']}, stop:1 {rail_end}); border-right: 1px solid {bd};
+}}
+QFrame#SideRail QPushButton#NavButton {{
+    background: transparent; color: {t['nav_text']}; border: none; border-left: 3px solid transparent; border-radius: 0;
+    text-align: left; padding: 0px 18px; min-height: 44px; font-size: 12px; font-weight: bold;
+}}
+QFrame#SideRail QPushButton#NavButton:hover {{ background: {_ct_rgba(txt, 0.08)}; color: {t['nav_active']}; }}
+QFrame#SideRail QPushButton#NavButton:checked {{
+    color: {t['nav_active']}; border: none; border-left: 3px solid {acc};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {_ct_rgba(acc, 0.32)}, stop:1 {_ct_rgba(acc, 0)});
+}}
+QPushButton#Primary {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {a_hi}, stop:1 {a_lo}); border-radius: 8px; font-weight: bold;
+}}
+QPushButton#Primary:hover {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {QColor(a_hi).lighter(110).name()}, stop:1 {QColor(a_lo).lighter(110).name()});
+}}
+QPushButton#Primary:pressed {{ background: {t['accent_press']}; }}
+QPushButton#Primary:disabled {{ background: {t['disabled_bg']}; }}
+QProgressBar::chunk {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {a_hi}, stop:1 {a_lo}); border-radius: 3px;
+}}
+QFrame#Panel, QFrame#AccountCard, QFrame#SyncCard {{ background: {p85}; border: 1px solid {bd}; }}
+QFrame#GameCard {{ background: {p70}; border: 1px solid {bd}; border-radius: 14px; }}
+QFrame#GameCard:hover {{ background: {p95}; border: 1px solid {acc}; }}
+QFrame#ToolBar {{ background: {p85}; border: 1px solid {bd}; border-radius: 16px; }}
+QFrame#ToolBar QLabel {{ background: transparent; border: none; }}
+QFrame#ToolBar QLineEdit#Search {{ border-radius: 20px; background: {t['input']}; }}
+QFrame#SidePanel {{ background: {p85}; border: 1px solid {bd}; border-radius: 16px; }}
+QFrame#SidePanel QLabel {{ background: transparent; border: none; }}
+QLabel#PaneHeader {{ color: {t['subtext']}; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }}
+""" + _ct_on_accent_extra(t)
+
+_CT_FORBIDDEN_NAMES = set()
+
+# ---- unlocking: 8 hours on the launcher, or an admin override (Firebase: themeunlock/<uid> = true / false; missing = the 8 hour rule)
+_CT_UNLOCK_SECONDS = 8 * 3600
+_ct_usage = {"data": None}
+
+def _ct_usage_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "usage.json")
+
+def _ct_usage_get():
+    if _ct_usage["data"] is None:
+        d = {}
+        try:
+            with open(_ct_usage_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            pass
+        d = d if isinstance(d, dict) else {}
+        for k in ("seconds", "override"):
+            if not isinstance(d.get(k), dict):
+                d[k] = {}
+        _ct_usage["data"] = d
+    return _ct_usage["data"]
+
+def _ct_usage_save():
+    try:
+        path = _ct_usage_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".part", "w", encoding="utf-8") as f:
+            json.dump(_ct_usage_get(), f)
+        os.replace(path + ".part", path)
+    except Exception:
+        pass
+
+def _ct_override(uid=None):
+    """True = an admin unlocked custom themes for this account, False = an admin locked them, None = no override."""
+    v = _ct_usage_get()["override"].get(uid or _saved_uid())
+    return v if isinstance(v, bool) else None
+
+def _ct_seconds(uid=None):
+    try:
+        return int(_ct_usage_get()["seconds"].get(uid or _saved_uid(), 0))
+    except Exception:
+        return 0
+
+def _ct_unlocked(uid=None):
+    uid = uid or _saved_uid()
+    if not uid:
+        return False
+    if uid in _THEME_ADMIN_UIDS:
+        return True
+    ov = _ct_override(uid)
+    if ov is not None:
+        return ov
+    return _ct_seconds(uid) >= _CT_UNLOCK_SECONDS
+
+def _ct_progress_text():
+    left = max(0, _CT_UNLOCK_SECONDS - _ct_seconds())
+    return f"{left // 3600}h {(left % 3600) // 60}m left"
+
+def _ct_fetch_override(uid):
+    token, _u = get_id_token()
+    v = _http_json(_fdb(f"themeunlock/{uid}", token))
+    return v if isinstance(v, bool) else None
+
+_ct_tracker = {"started": False}
+
+def _ct_start_tracker():
+    """Counts the minutes this account has the launcher open and keeps the admin override in step (background thread)."""
+    if _ct_tracker["started"]:
+        return
+    _ct_tracker["started"] = True
+
+    def loop():
+        tick = 0
+        while True:
+            try:
+                uid = _saved_uid()
+                if uid:
+                    d = _ct_usage_get()
+                    if tick % 5 == 0:                                   # admin override: now and every 5 minutes
+                        try:
+                            ov = _ct_fetch_override(uid)
+                            if ov is None:
+                                d["override"].pop(uid, None)
+                            else:
+                                d["override"][uid] = ov
+                        except Exception:
+                            pass                                        # offline: keep the last known value
+                    if tick:
+                        d["seconds"][uid] = int(d["seconds"].get(uid, 0)) + 60
+                    _ct_usage_save()
+            except Exception:
+                pass
+            tick += 1
+            time.sleep(60)
+    threading.Thread(target=loop, daemon=True).start()
+
+def _ct_forced_dark_mode():
+    """'on' / 'off' when the active theme is a custom one (its background decides light or dark, the Dark Mode switch is ignored); else None."""
+    try:
+        e = _ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}
+        if e.get("custom"):
+            return "off" if QColor(e["theme"]["bg"]).lightness() >= 128 else "on"
+    except Exception:
+        pass
+    return None
+
+def _ct_user_icon_file(tid):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), f"icon_custom_{tid}_user.png")
+
+def _ct_icon_path(tid, accent, user=False):
+    """The launcher icon of a custom theme: Classic's icon recoloured to the theme's accent, exactly the way the
+    accent colour picker does it (_hue_shift_icon). Made on first use and kept in the settings folder; '' if it can't be made."""
+    try:
+        if user and os.path.isfile(_ct_user_icon_file(tid)):
+            return _ct_user_icon_file(tid)               # the icon the user picked
+        accent = QColor(accent).name().lower()
+        if accent == "#a666ff":
+            cl = _theme_icon_file("classic")             # Classic's own purple: the Classic icon as it is
+            return cl or ""
+        d = os.path.dirname(get_launcher_settings_path())
+        name = f"icon_custom_{tid}_{accent[1:]}.png"
+        path = os.path.join(d, name)
+        if os.path.isfile(path):
+            return path
+        orig = ""
+        for cand in ("icon-cl.png", "icon_default.png", "icon.png"):
+            if os.path.isfile(os.path.join(ASSETS_DIR, cand)):
+                orig = os.path.join(ASSETS_DIR, cand)
+                break
+        if not orig:
+            return ""
+        c = QColor(accent)
+        out = _hue_shift_icon(orig, max(0.0, c.hueF()), c.saturationF() / 0.6)
+        os.makedirs(d, exist_ok=True)
+        if out is None or not out.save(path, "PNG"):
+            return ""
+        try:                                             # drop this theme's icons for older accent colours
+            for f in os.listdir(d):
+                if f.startswith(f"icon_custom_{tid}_") and f != name:
+                    os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+        return path
+    except Exception:
+        return ""
+
+def _ct_register_all():
+    """(Re)loads the user's saved custom themes from launcher.json into _ACCOUNT_THEMES."""
+    for k in [k for k, v in _ACCOUNT_THEMES.items() if v.get("custom")]:
+        del _ACCOUNT_THEMES[k]
+    data = _raw_setting("custom_themes")
+    if not isinstance(data, dict):
+        return
+    for tid, raw in list(data.items())[:_CT_MAX_THEMES]:
+        ent = _ct_clean(raw)
+        if not ent or not _CT_ID.fullmatch(str(tid)):
+            continue
+        try:
+            t = _ct_theme(ent["colors"])
+            classic = ent["layout"] == "classic"
+            entry = {"uids": set(), "locked": False, "everyone": True, "custom": True,
+                     "label": f"{ent['name']} (custom)", "theme": t,
+                     "icon_make": (lambda tid=str(tid), acc=ent["colors"]["accent"], u=(ent["icon"] == "user"): _ct_icon_path(tid, acc, u)),
+                     "extra": _ct_classic_extra(t, ent.get("gradient", "")) if classic else _ct_modern_extra(t)}
+            if classic:
+                entry["layout"] = "classic"
+                if ent.get("gradient"):
+                    entry["grad_css"] = (f"\nQMainWindow, QWidget#Content {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+                                         f"stop:0 {t['bg']}, stop:1 {ent['gradient']}); }}\n"
+                                         "QWidget#GridContainer { background: transparent; }\n")
+            _ACCOUNT_THEMES["custom_" + str(tid)] = entry
+        except Exception:
+            pass
+
+def _ct_persist(themes, use_key=None):
+    """Writes the custom themes to launcher.json; use_key (\"custom_<id>\") also makes that theme the chosen one."""
+    s = load_launcher_settings()
+    s["custom_themes"] = {tid: {"name": t["name"], "layout": t["layout"], "colors": dict(t["colors"]), "icon": t.get("icon", ""),
+                          "gradient": t.get("gradient", "") if t["layout"] == "classic" else ""}
+                          for tid, t in themes.items()}
+    try:                                       # remove picked icons of deleted / reset themes
+        d = os.path.dirname(get_launcher_settings_path())
+        keep = {os.path.basename(_ct_user_icon_file(tid)) for tid, t in themes.items() if t.get("icon") == "user"}
+        for f in os.listdir(d):
+            if f.startswith("icon_custom_") and f.endswith("_user.png") and f not in keep:
+                os.remove(os.path.join(d, f))
+    except OSError:
+        pass
+    chosen = s.get("ui_theme") or ""
+    if use_key:
+        s["ui_style"] = "new"
+        s["ui_theme"] = use_key
+        s["ui_theme_choice"] = "new"
+    elif chosen.startswith("custom_") and chosen[7:] not in themes:      # the chosen theme was deleted: back to New
+        s["ui_theme"] = ""
+        s["ui_theme_choice"] = "new"
+    save_launcher_settings(s)
+    _ct_register_all()
+
+class _CtPreview(QWidget):
+    """Small mock-up of the launcher in the chosen layout and colours."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(330, 210)
+        self._layout = "modern"
+        self._colors = dict(_CT_PRESETS["Modern (New)"])
+
+    def set_state(self, layout, colors, gradient=""):
+        self._layout, self._colors, self._gradient = layout, dict(colors), gradient
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = _ct_theme(self._colors)
+        W, H = self.width(), self.height()
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, W, H), 10, 10)
+        p.setClipPath(clip)
+        modern = self._layout == "modern"
+        bg, panel, border = QColor(t["bg"]), QColor(t["panel"]), QColor(t["border"])
+        acc, text, sub = QColor(t["accent"]), QColor(t["text"]), QColor(t["subtext"])
+        if modern:
+            g = _CtLG(0, 0, 0, H)
+            g.setColorAt(0, QColor(_ct_mix(t["bg"], t["text"], 0.05)))
+            g.setColorAt(0.55, bg)
+            g.setColorAt(1, QColor(_ct_mix(t["bg"], t["accent"], 0.16)))
+            p.fillRect(self.rect(), _CtBrush(g))
+        elif getattr(self, "_gradient", ""):
+            g = _CtLG(0, 0, 0, H)
+            g.setColorAt(0, bg)
+            g.setColorAt(1, QColor(self._gradient))
+            p.fillRect(self.rect(), _CtBrush(g))
+        else:
+            p.fillRect(self.rect(), bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        if modern:
+            rail = 74
+            p.fillRect(QRectF(0, 0, rail, H), QColor(t["sidebar"]))
+            p.setPen(border)
+            p.drawLine(rail, 0, rail, H)
+            p.setPen(Qt.PenStyle.NoPen)
+            for i in range(4):
+                y = 20 + i * 28
+                if i == 0:
+                    g = _CtLG(0, 0, rail, 0)
+                    c1 = QColor(acc)
+                    c1.setAlphaF(0.32)
+                    c2 = QColor(acc)
+                    c2.setAlphaF(0.0)
+                    g.setColorAt(0, c1)
+                    g.setColorAt(1, c2)
+                    p.fillRect(QRectF(0, y, rail, 24), _CtBrush(g))
+                    p.setBrush(acc)
+                    p.drawRect(QRectF(0, y, 3, 24))
+                p.setBrush(text if i == 0 else sub)
+                p.drawRoundedRect(QRectF(14, y + 9, 36, 6), 3, 3)
+            cx, cy, radius = rail + 14, 14, 8
+        else:
+            bar = 32
+            p.fillRect(QRectF(0, 0, W, bar), QColor(t["sidebar"]))
+            p.setPen(border)
+            p.drawLine(0, bar, W, bar)
+            p.setPen(Qt.PenStyle.NoPen)
+            x = 14
+            for i, w in enumerate((40, 46, 36, 42)):
+                p.setBrush(text if i == 0 else sub)
+                p.drawRoundedRect(QRectF(x, 12, w, 6), 3, 3)
+                if i == 0:
+                    p.setBrush(acc)
+                    p.drawRect(QRectF(x, bar - 3, w, 3))
+                x += w + 14
+            cx, cy, radius = 14, bar + 14, 6
+        area_w, area_h = W - cx - 14, H - cy - 14 - 34
+        cw, ch = (area_w - 16) / 3.0, (area_h - 8) / 2.0
+        for r in range(2):
+            for c in range(3):
+                rect = QRectF(cx + c * (cw + 8), cy + r * (ch + 8), cw, ch)
+                fill = QColor(panel)
+                if modern:
+                    fill.setAlphaF(0.80)
+                p.setBrush(fill)
+                p.setPen(QPen(border, 1))
+                p.drawRoundedRect(rect, radius, radius)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(sub)
+                p.drawRoundedRect(QRectF(rect.x() + 8, rect.bottom() - 14, rect.width() * 0.55, 5), 2, 2)
+        by = H - 14 - 22
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(acc)
+        p.drawRoundedRect(QRectF(cx, by, 84, 22), 8 if modern else 5, 8 if modern else 5)
+        p.setBrush(QColor(t["on_accent"]))
+        p.drawRoundedRect(QRectF(cx + 22, by + 8, 40, 6), 3, 3)
+        p.setBrush(QColor(t["button"]))
+        p.setPen(QPen(border, 1))
+        p.drawRoundedRect(QRectF(cx + 94, by, 70, 22), 8 if modern else 5, 8 if modern else 5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(text)
+        p.drawRoundedRect(QRectF(cx + 112, by + 8, 34, 6), 3, 3)
+        p.end()
+
+class _CtDialog(QDialog):
+    """Make, edit and save custom themes: pick Classic or Modern layout and the colours."""
+    def __init__(self, parent=None, on_saved=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Themes")
+        self.resize(800, 560)
+        self._on_saved = on_saved
+        self.themes = {}
+        raw = _raw_setting("custom_themes")
+        if isinstance(raw, dict):
+            for tid, ent in list(raw.items())[:_CT_MAX_THEMES]:
+                c = _ct_clean(ent)
+                if c and _CT_ID.fullmatch(str(tid)):
+                    self.themes[str(tid)] = c
+        self.cur_id = None
+        self.dirty = False
+        self._loading = False
+        self._build()
+        self._refresh_list()
+        if self.themes:
+            self.list.setCurrentRow(0)
+        else:
+            self._new_theme()
+
+    # ---- UI
+    def _build(self):
+        root = QHBoxLayout(self)
+        root.setSpacing(16)
+        left = QVBoxLayout()
+        head = QLabel("Your themes")
+        head.setObjectName("RowTitle")
+        left.addWidget(head)
+        self.list = QListWidget()
+        self.list.setFixedWidth(200)
+        self.list.currentItemChanged.connect(self._on_select)
+        left.addWidget(self.list, 1)
+        grid = QGridLayout()
+        self.new_btn = QPushButton("New")
+        self.dup_btn = QPushButton("Duplicate")
+        self.del_btn = QPushButton("Delete")
+        self.new_btn.clicked.connect(lambda: self._new_theme())
+        self.dup_btn.clicked.connect(lambda: self._new_theme(copy=True))
+        self.del_btn.clicked.connect(self._delete_theme)
+        grid.addWidget(self.new_btn, 0, 0)
+        grid.addWidget(self.dup_btn, 0, 1)
+        grid.addWidget(self.del_btn, 1, 0, 1, 2)
+        left.addLayout(grid)
+        root.addLayout(left)
+
+        self.editor = QWidget()
+        ev = QVBoxLayout(self.editor)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(8)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Theme name")
+        self.name_edit.setMaxLength(30)
+        self.name_edit.textEdited.connect(self._on_name)
+        ev.addWidget(self.name_edit)
+
+        lt = QLabel("Layout")
+        lt.setObjectName("RowTitle")
+        ev.addWidget(lt)
+        row = QHBoxLayout()
+        self.classic_btn = QPushButton("Classic")
+        self.modern_btn = QPushButton("Modern")
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for b, lay in ((self.classic_btn, "classic"), (self.modern_btn, "modern")):
+            b.setCheckable(True)
+            b.setFixedHeight(34)
+            b.setStyleSheet("QPushButton:checked { border: 2px solid palette(highlight); }")
+            grp.addButton(b)
+            b.clicked.connect(lambda _=False, l=lay: self._set_layout(l))
+            row.addWidget(b)
+        ev.addLayout(row)
+        self.layout_desc = QLabel()
+        self.layout_desc.setObjectName("RowDesc")
+        self.layout_desc.setWordWrap(True)
+        ev.addWidget(self.layout_desc)
+
+        ct = QLabel("Colours")
+        ct.setObjectName("RowTitle")
+        ev.addWidget(ct)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Start from a preset...")
+        for n in _CT_PRESETS:
+            self.preset_combo.addItem(n)
+        self.preset_combo.activated.connect(self._on_preset)
+        ev.addWidget(self.preset_combo)
+        cg = QGridLayout()
+        cg.setSpacing(6)
+        self.swatches = {}
+        for i, k in enumerate(_CT_KEYS):
+            b = QPushButton()
+            b.setFixedHeight(32)
+            b.clicked.connect(lambda _=False, key=k: self._pick(key))
+            self.swatches[k] = b
+            cg.addWidget(b, i % 4, i // 4)
+        ev.addLayout(cg)
+
+        from PyQt6.QtWidgets import QCheckBox
+        self.grad_row = QWidget()
+        gl = QHBoxLayout(self.grad_row)
+        gl.setContentsMargins(0, 0, 0, 0)
+        self.grad_check = QCheckBox("Background gradient")
+        self.grad_check.toggled.connect(self._on_grad_toggle)
+        self.grad_btn = QPushButton()
+        self.grad_btn.setFixedHeight(32)
+        self.grad_btn.clicked.connect(self._pick_grad)
+        gl.addWidget(self.grad_check)
+        gl.addWidget(self.grad_btn, 1)
+        ev.addWidget(self.grad_row)
+
+        it = QLabel("Icon")
+        it.setObjectName("RowTitle")
+        ev.addWidget(it)
+        irow = QHBoxLayout()
+        self.icon_lbl = QLabel()
+        self.icon_lbl.setFixedSize(40, 40)
+        self.icon_lbl.setScaledContents(True)
+        self.icon_btn = QPushButton("Choose image...")
+        self.icon_reset_btn = QPushButton("Use automatic icon")
+        self.icon_btn.clicked.connect(self._pick_icon)
+        self.icon_reset_btn.clicked.connect(self._reset_icon)
+        self.icon_desc = QLabel()
+        self.icon_desc.setObjectName("RowDesc")
+        self.icon_desc.setWordWrap(True)
+        irow.addWidget(self.icon_lbl)
+        irow.addWidget(self.icon_btn)
+        irow.addWidget(self.icon_reset_btn)
+        irow.addWidget(self.icon_desc, 1)
+        ev.addLayout(irow)
+
+        self.preview = _CtPreview()
+        ev.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        ev.addStretch()
+        self.status = QLabel("")
+        self.status.setObjectName("RowDesc")
+        ev.addWidget(self.status)
+        bottom = QHBoxLayout()
+        self.save_btn = QPushButton("Save")
+        self.use_btn = QPushButton("Save && Use")
+        self.use_btn.setObjectName("Primary")
+        self.close_btn = QPushButton("Close")
+        self.save_btn.clicked.connect(lambda: self._save(False))
+        self.use_btn.clicked.connect(lambda: self._save(True))
+        self.close_btn.clicked.connect(self.close)
+        bottom.addStretch()
+        bottom.addWidget(self.close_btn)
+        bottom.addWidget(self.save_btn)
+        bottom.addWidget(self.use_btn)
+        ev.addLayout(bottom)
+        root.addWidget(self.editor, 1)
+
+    def _cur(self):
+        return self.themes.get(self.cur_id) if self.cur_id else None
+
+    def _refresh_list(self, select=None):
+        self.list.blockSignals(True)
+        self.list.clear()
+        active = _raw_setting("ui_theme") or ""
+        for tid, t in self.themes.items():
+            it = QListWidgetItem(t["name"] + ("  (in use)" if active == "custom_" + tid else ""))
+            it.setData(Qt.ItemDataRole.UserRole, tid)
+            self.list.addItem(it)
+            if tid == (select or self.cur_id):
+                self.list.setCurrentItem(it)
+        self.list.blockSignals(False)
+
+    def _on_select(self, item, _prev=None):
+        self.cur_id = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+        self._load()
+
+    def _load(self):
+        t = self._cur()
+        self.editor.setEnabled(t is not None)
+        self.dup_btn.setEnabled(t is not None and len(self.themes) < _CT_MAX_THEMES)
+        self.del_btn.setEnabled(t is not None)
+        self.new_btn.setEnabled(len(self.themes) < _CT_MAX_THEMES)
+        if t is None:
+            return
+        self._loading = True
+        self.name_edit.setText(t["name"])
+        self.classic_btn.setChecked(t["layout"] == "classic")
+        self.modern_btn.setChecked(t["layout"] == "modern")
+        self._refresh_all()
+        self._loading = False
+
+    def _refresh_all(self):
+        t = self._cur()
+        if t is None:
+            return
+        self.layout_desc.setText("Classic: the navigation bar runs across the top and the colours are flat, like the Classic theme."
+                                 if t["layout"] == "classic" else
+                                 "Modern: the navigation rail is on the left, with a gradient window and rounded cards, like the New theme.")
+        for k, b in self.swatches.items():
+            c = t["colors"][k]
+            fg = "#000000" if _ct_lum(c) > 0.55 else "#ffffff"
+            b.setText(f"{_CT_LABELS[k]}   {c.upper()}")
+            b.setStyleSheet(f"QPushButton {{ background: {c}; color: {fg}; border: 1px solid #888888; border-radius: 6px; "
+                            f"text-align: left; padding: 0px 10px; }} QPushButton:hover {{ border: 2px solid {fg}; color: {fg}; }}")
+        classic = t["layout"] == "classic"
+        grad = t.get("gradient", "") if classic else ""
+        self.grad_row.setVisible(classic)
+        self.grad_check.blockSignals(True)
+        self.grad_check.setChecked(bool(grad))
+        self.grad_check.blockSignals(False)
+        self.grad_btn.setEnabled(bool(grad))
+        gc = grad or _ct_mix(t["colors"]["bg"], t["colors"]["accent"], 0.25)
+        gfg = "#000000" if _ct_lum(gc) > 0.55 else "#ffffff"
+        self.grad_btn.setText(f"Gradient colour (bottom)   {gc.upper()}")
+        self.grad_btn.setStyleSheet(f"QPushButton {{ background: {gc}; color: {gfg}; border: 1px solid #888888; border-radius: 6px; "
+                                    f"text-align: left; padding: 0px 10px; }}")
+        self.preview.set_state(t["layout"], t["colors"], grad)
+        user = t.get("icon") == "user" and os.path.isfile(_ct_user_icon_file(self.cur_id))
+        pm = QPixmap(_ct_user_icon_file(self.cur_id)) if user else QPixmap(_ct_icon_path(self.cur_id, t["colors"]["accent"]) or asset_path("icon.png"))
+        self.icon_lbl.setPixmap(pm)
+        self.icon_reset_btn.setEnabled(user)
+        self.icon_desc.setText("Your own icon." if user else "Made from the Classic icon in your accent colour.")
+
+    def _pick_icon(self):
+        t = self._cur()
+        if t is None:
+            return
+        from PyQt6.QtWidgets import QFileDialog
+        path, _f = QFileDialog.getOpenFileName(self, "Choose an icon", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.ico)")
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Custom Themes", "That file couldn't be read as an image.")
+            return
+        if max(img.width(), img.height()) > 512:
+            img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        try:
+            os.makedirs(os.path.dirname(_ct_user_icon_file(self.cur_id)), exist_ok=True)
+            if not img.save(_ct_user_icon_file(self.cur_id), "PNG"):
+                raise OSError("couldn't write the icon")
+        except Exception as e:
+            QMessageBox.warning(self, "Custom Themes", f"Couldn't use that image: {e}")
+            return
+        t["icon"] = "user"
+        self._touch()
+
+    def _reset_icon(self):
+        t = self._cur()
+        if t is not None and t.get("icon") == "user":
+            t["icon"] = ""
+            self._touch()
+
+    def _touch(self):
+        if self._loading:
+            return
+        self.dirty = True
+        self.status.setText("Unsaved changes.")
+        self._refresh_all()
+
+    # ---- editing
+    def _on_name(self, text):
+        t = self._cur()
+        if t is None:
+            return
+        t["name"] = text.strip()[:30] or "My theme"
+        it = self.list.currentItem()
+        if it is not None:
+            active = _raw_setting("ui_theme") or ""
+            it.setText(t["name"] + ("  (in use)" if active == "custom_" + self.cur_id else ""))
+        self._touch()
+
+    def _set_layout(self, layout):
+        t = self._cur()
+        if t is not None and t["layout"] != layout:
+            t["layout"] = layout
+            self._touch()
+
+    def _pick(self, key):
+        t = self._cur()
+        if t is None:
+            return
+        from PyQt6.QtWidgets import QColorDialog
+        chosen = QColorDialog.getColor(QColor(t["colors"][key]), self, f"Pick: {_CT_LABELS[key]}")
+        if chosen.isValid():
+            t["colors"][key] = chosen.name()
+            self._touch()
+
+    def _on_grad_toggle(self, on):
+        t = self._cur()
+        if t is None or self._loading:
+            return
+        t["gradient"] = _ct_mix(t["colors"]["bg"], t["colors"]["accent"], 0.25) if on else ""
+        self._touch()
+
+    def _pick_grad(self):
+        t = self._cur()
+        if t is None or not t.get("gradient"):
+            return
+        from PyQt6.QtWidgets import QColorDialog
+        chosen = QColorDialog.getColor(QColor(t["gradient"]), self, "Pick: Gradient colour")
+        if chosen.isValid():
+            t["gradient"] = chosen.name()
+            self._touch()
+
+    def _on_preset(self, index):
+        t = self._cur()
+        if t is not None and index > 0:
+            t["colors"] = dict(_CT_PRESETS[self.preset_combo.itemText(index)])
+            self._touch()
+        self.preset_combo.setCurrentIndex(0)
+
+    def _new_theme(self, copy=False):
+        if len(self.themes) >= _CT_MAX_THEMES:
+            return
+        src = self._cur() if copy else None
+        tid = _secrets.token_hex(4)
+        while tid in self.themes:
+            tid = _secrets.token_hex(4)
+        if src is not None:
+            self.themes[tid] = {"name": (src["name"] + " copy")[:30], "layout": src["layout"], "colors": dict(src["colors"]), "icon": "", "gradient": src.get("gradient", "")}
+            if src.get("icon") == "user" and os.path.isfile(_ct_user_icon_file(self.cur_id)):
+                try:
+                    import shutil
+                    shutil.copyfile(_ct_user_icon_file(self.cur_id), _ct_user_icon_file(tid))
+                    self.themes[tid]["icon"] = "user"
+                except OSError:
+                    pass
+        else:
+            self.themes[tid] = {"name": "My theme", "layout": "modern", "colors": dict(_CT_PRESETS["Modern (New)"]), "icon": ""}
+        self.cur_id = tid
+        self.dirty = True
+        self.status.setText("Unsaved changes.")
+        self._refresh_list(select=tid)
+        self._load()
+
+    def _delete_theme(self):
+        t = self._cur()
+        if t is None:
+            return
+        if QMessageBox.question(self, "Delete theme", f"Delete \"{t['name']}\"?") != QMessageBox.StandardButton.Yes:
+            return
+        del self.themes[self.cur_id]
+        self.cur_id = None
+        self.dirty = True
+        self.status.setText("Unsaved changes. Press Save to finish deleting.")
+        self._refresh_list()
+        if self.themes:
+            self.list.setCurrentRow(0)
+        else:
+            self._load()
+
+    # ---- saving
+    def _save(self, use):
+        t = self._cur()
+        if use and t is None:
+            return False
+        try:
+            was_active = (_raw_setting("ui_theme") or "").startswith("custom_")
+            key = ("custom_" + self.cur_id) if use else None
+            _ct_persist(self.themes, key)
+        except Exception as e:
+            QMessageBox.warning(self, "Custom Themes", f"Couldn't save: {e}")
+            return False
+        self.dirty = False
+        self.status.setText("Saved. Restart the launcher to apply it." if (use or was_active) else "Saved.")
+        self._refresh_list()
+        if self._on_saved:
+            try:
+                self._on_saved(key, bool(use or was_active))
+            except Exception:
+                pass
+        return True
+
+    def closeEvent(self, ev):
+        if self.dirty:
+            r = QMessageBox.question(self, "Custom Themes", "You have unsaved changes. Save them?",
+                                     QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
+            if r == QMessageBox.StandardButton.Cancel:
+                ev.ignore()
+                return
+            if r == QMessageBox.StandardButton.Save and not self._save(False):
+                ev.ignore()
+                return
+        ev.accept()
+
+def _ct_sync_combo(sp, select_key=None):
+    """Keeps the Theme drop-down in Settings in step with the custom themes (without needing a restart)."""
+    combo = getattr(sp, "ui_style_combo", None)
+    if combo is None:
+        return
+    prev = combo.currentData()
+    combo.blockSignals(True)
+    for i in range(combo.count() - 1, -1, -1):
+        d = combo.itemData(i)
+        if isinstance(d, str) and d.startswith("custom_"):
+            combo.removeItem(i)
+    pos = combo.findData("sunset")
+    for key in _allowed_theme_keys():
+        if key.startswith("custom_") and key in _ACCOUNT_THEMES:
+            combo.insertItem(pos if pos >= 0 else combo.count(), _ACCOUNT_THEMES[key]["label"], key)
+            if pos >= 0:
+                pos += 1
+    idx = combo.findData(select_key or prev)
+    combo.setCurrentIndex(idx if idx >= 0 else max(0, combo.findData(_active_theme_key() or "new")))
+    combo.blockSignals(False)
+
+def _ui_add_custom_theme_setting(self):
+    """Settings row under Theme: opens the custom theme maker."""
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("Custom Themes")
+    title.setObjectName("RowTitle")
+    desc = QLabel("Make your own theme: pick the Classic or Modern layout and your own colours, then save it. "
+                  "Saved themes show up in the Theme list above. Needs a restart.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    btn = QPushButton("Customize...")
+    btn.setFixedWidth(110)
+    base_desc = desc.text()
+
+    def refresh():
+        if _custom_theme_locked():
+            btn.setEnabled(False)
+            desc.setText("Your theme is fixed for this account.")
+        elif _ct_unlocked():
+            btn.setEnabled(True)
+            desc.setText(base_desc)
+        else:
+            btn.setEnabled(False)
+            desc.setText("Locked by an admin." if _ct_override() is False else
+                         f"Locked: custom themes unlock after 8 hours on the launcher ({_ct_progress_text()}). "
+                         "An admin can also unlock them for you.")
+    refresh()
+    _ct_start_tracker()
+    tm = QTimer(sp)
+    tm.timeout.connect(refresh)
+    tm.start(30000)
+    sp._ct_timer = tm
+    if _ct_forced_dark_mode():                           # a custom theme decides light / dark itself
+        try:
+            sp.dark_mode_combo.setEnabled(False)
+            sp.dark_mode_combo.setToolTip("Your custom theme sets light or dark itself.")
+        except Exception:
+            pass
+
+    def opened():
+        if not _ct_unlocked():
+            refresh()
+            return
+        def saved(use_key, needs_restart):
+            _ct_sync_combo(sp, use_key)
+            active = use_key or (_raw_setting("ui_theme") if needs_restart else "")
+            if active:
+                _ncz_refresh_launcher_shortcut(active)
+            if needs_restart:
+                QMessageBox.information(sp, "Interface Style", "Restart the launcher to apply the new theme.")
+        dlg = _CtDialog(sp, saved)
+        dlg.exec()
+        _ct_sync_combo(sp)
+    btn.clicked.connect(opened)
+    row.addLayout(col, 1)
+    row.addWidget(btn)
+    lay.insertLayout(4, row)                             # right under the Theme row
+    lay.insertSpacing(5, 12)
+    sp.custom_theme_btn = btn
+
+_ct_register_all()
+
 _UI_STYLE_AT_START = _ui_read_style()
 _SIDE_UI = _UI_STYLE_AT_START in ("new", "sunset", "legacy")     # layouts with the left navigation list and a fixed accent
 
@@ -29309,6 +30236,9 @@ def load_launcher_settings():
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
     s["ui_defaults_applied"] = _raw_setting("ui_defaults_applied") or []
+    _ct_saved = _raw_setting("custom_themes")
+    if isinstance(_ct_saved, dict):
+        s["custom_themes"] = _ct_saved          # custom themes (ncz-theme) must survive every other settings save
     return s
 
 SUNSET_THEME = dict(      # the "New" theme: same colours as the sign-in window (black fading to grey, white accent)
@@ -29384,7 +30314,7 @@ def _ui_apply_sunset():
     _theme_state["nav_active"] = theme["nav_active"]
     try:
         import overlay as _overlay_mod
-        _overlay_mod.set_light(False)
+        _overlay_mod.set_light(QColor(theme["bg"]).lightness() >= 128)      # a custom theme can be light
         _overlay_mod.set_sunset(_UI_STYLE_AT_START == "new")
         _overlay_mod.set_accent(theme["accent"])
     except Exception:
@@ -29660,7 +30590,15 @@ def apply_accent_to_icon(color):
 
 _ui_prev_apply_dark_mode = apply_dark_mode
 def apply_dark_mode(mode):
-    _ui_prev_apply_dark_mode("on" if _CLASSIC_ACCOUNT else mode)      # the Omar V4 theme is always dark
+    _ui_prev_apply_dark_mode(_ct_forced_dark_mode() or ("on" if _CLASSIC_ACCOUNT else mode))      # the Omar V4 theme is always dark; a custom theme sets light/dark itself
+    if _CLASSIC_ACCOUNT:                  # Classic-layout custom theme with a background gradient
+        try:
+            _gcss = (_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {}).get("grad_css")
+            _app = QApplication.instance()
+            if _gcss and _app is not None:
+                _app.setStyleSheet(_app.styleSheet() + _gcss)
+        except Exception:
+            pass
     if _SIDE_UI:
         _ui_apply_sunset()                # the theme is always dark
 
@@ -29670,6 +30608,8 @@ _icon_download_tried = set()
 def _ensure_theme_icon(entry):
     """Path of a theme's own icon. If it isn't in assets/ (or the config folder) it is downloaded once per run;
     '' when it isn't there and can't be downloaded (the normal icon is used then)."""
+    if entry.get("icon_make"):                 # custom themes: icon made from the Classic icon + the theme's accent
+        return entry["icon_make"]()
     name = entry.get("icon")
     if not name:
         return ""
@@ -30186,6 +31126,10 @@ def _ui_init(self):
     import traceback
     try:
         _ui_add_setting(self)
+    except Exception:
+        traceback.print_exc()
+    try:
+        _ui_add_custom_theme_setting(self)
     except Exception:
         traceback.print_exc()
     try:
@@ -46566,10 +47510,11 @@ def _bpe_paint_st(self, p, w, h, acc):
 # Bans: bans/<uid> in the database. A banned launcher crashes on startup, and a local ban.lock keeps it crashing after
 # logging out (any account) until the ban is removed. Running launchers also check every ~45 s and crash when banned.
 ADMIN_UID = "XcqSn5Zvhsf1npoNl3FNG1bKpU63"
+_ADMIN_UIDS = {ADMIN_UID, "LtVp5drXTcfedfGmWGMhHSVzGiU2"}          # both can open the admin panel
 
 def _adm_is_admin():
     try:
-        return (load_account() or {}).get("uid", "") == ADMIN_UID
+        return (load_account() or {}).get("uid", "") in _ADMIN_UIDS
     except Exception:
         return False
 
@@ -46788,11 +47733,11 @@ def _adm_add_friend(uid, other):
 
 def _adm_ban(uid, reason):
     _adm_require()
-    if uid == ADMIN_UID:
-        raise CloudError("You can't ban the admin account.", "SELF")
+    if uid in _ADMIN_UIDS:
+        raise CloudError("You can't ban an admin account.", "SELF")
     token, _me = get_id_token()
     _http_json(_fdb(f"bans/{uid}", token), "PUT",
-               {"reason": (reason or "")[:200], "by": ADMIN_UID, "time": _adm_sv()})
+               {"reason": (reason or "")[:200], "by": (load_account() or {}).get("uid", ADMIN_UID), "time": _adm_sv()})
     try:
         _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "playing": "", "idle": False})
     except CloudError:
@@ -46802,6 +47747,21 @@ def _adm_unban(uid):
     _adm_require()
     token, _me = get_id_token()
     _http_json(_fdb(f"bans/{uid}", token), "DELETE")
+
+def _adm_get_theme_override(uid):
+    _adm_require()
+    token, _me = get_id_token()
+    v = _http_json(_fdb(f"themeunlock/{uid}", token))
+    return v if isinstance(v, bool) else None
+
+def _adm_set_theme_override(uid, value):
+    """True = unlock custom themes, False = lock them, None = back to the 8 hour rule."""
+    _adm_require()
+    token, _me = get_id_token()
+    if value is None:
+        _http_json(_fdb(f"themeunlock/{uid}", token), "DELETE")
+    else:
+        _http_json(_fdb(f"themeunlock/{uid}", token), "PUT", bool(value))
 
 # ---- admin UI
 def _adm_run(owner, func, done=None, busy="Working..."):
@@ -46993,7 +47953,7 @@ class AdminPanel(QDialog):
         self.buttons = []
         for text, fn in (("Change picture", self._picture), ("Change username", self._username),
                          ("Change profile country", self._country), ("Manage library", self._library),
-                         ("Manage friends", self._friends)):
+                         ("Manage friends", self._friends), ("Custom themes access", self._themes)):
             b = QPushButton(text)
             b.setMinimumHeight(36)
             b.clicked.connect(fn)
@@ -47131,6 +48091,29 @@ class AdminPanel(QDialog):
         u = self.sel
         _AdminFriendsDialog(u["uid"], u.get("username") or u["uid"], self.users, self).exec()
 
+    def _themes(self):
+        u = self.sel
+        uid = u["uid"]
+        who = u.get("username") or uid
+
+        def got(cur):
+            state = ("Unlocked by an admin" if cur is True else "Locked by an admin" if cur is False
+                     else "Default (unlocks after 8 hours on the launcher)")
+            box = QMessageBox(self)
+            box.setWindowTitle("Custom themes access")
+            box.setText(f"{who}\nCurrent: {state}")
+            unlock = box.addButton("Unlock", QMessageBox.ButtonRole.AcceptRole)
+            lock = box.addButton("Lock", QMessageBox.ButtonRole.DestructiveRole)
+            default = box.addButton("Use 8 hour rule", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            c = box.clickedButton()
+            val = {unlock: True, lock: False, default: None}.get(c, "skip")
+            if val == "skip":
+                return
+            _adm_run(self, lambda: _adm_set_theme_override(uid, val), None, "Saving...")
+        _adm_run(self, lambda: _adm_get_theme_override(uid), got, "Loading...")
+
     def _ban(self):
         u = self.sel
         uid = u["uid"]
@@ -47140,8 +48123,8 @@ class AdminPanel(QDialog):
             if _adm_run(self, lambda: _adm_unban(uid), None, "Unbanning..."):
                 self.reload()
             return
-        if uid == ADMIN_UID:
-            QMessageBox.warning(self, "Admin", "You can't ban the admin account.")
+        if uid in _ADMIN_UIDS:
+            QMessageBox.warning(self, "Admin", "You can't ban an admin account.")
             return
         reason, ok = QInputDialog.getText(self, "Ban", f"Reason for banning {u.get('username') or uid} (optional):")
         if not ok:
