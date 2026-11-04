@@ -823,13 +823,54 @@ def list_asset_updates(timeout=8, include_scripts=False):
         return []
 
 
-def _download_to(url, dest, on_bytes, is_cancelled):
+# jsDelivr is a free CDN that serves public GitHub repos (no setup) and is often much faster than raw.githubusercontent.com.
+# Every file is checked against the git sha from the GitHub file list, so a stale or broken CDN copy is thrown away and the
+# file is downloaded from GitHub instead (files over jsDelivr's 50 MB limit also fall back automatically).
+USE_JSDELIVR = True
+JSDELIVR_URL = "https://cdn.jsdelivr.net/gh/{repo}@{branch}/{path}"
+
+
+def _mirror_download(url, tmp, sha, on_bytes, is_cancelled, timeout=12):
+    """Tries the jsDelivr copy. True only if it downloaded completely and matches the expected git sha."""
+    written = 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+            while True:
+                if is_cancelled():
+                    on_bytes(-written)
+                    raise CloudError("Cancelled.")
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                on_bytes(len(chunk))
+        if git_blob_sha(tmp) == sha:
+            return True
+    except CloudError:
+        raise
+    except Exception:
+        pass
+    on_bytes(-written)                          # stale / failed copy: step the bar back and use GitHub
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
+
+
+def _download_to(url, dest, on_bytes, is_cancelled, mirror=None, sha=None):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
     last_err = None
     for attempt in range(3):
         written = 0
         try:
+            if attempt == 0 and USE_JSDELIVR and mirror and sha:
+                if _mirror_download(mirror, tmp, sha, on_bytes, is_cancelled):
+                    os.replace(tmp, dest)
+                    return
             with _gh_open(url) as resp, open(tmp, "wb") as f:
                 while True:
                     if is_cancelled():
@@ -899,7 +940,8 @@ def install_launcher(progress, is_cancelled, entries=None, full=None):
             except OSError:
                 pass
         _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
-                     dest, bump, is_cancelled)
+                     dest, bump, is_cancelled,
+                     mirror=JSDELIVR_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)), sha=sha)
     emit(force=True)
     if full:
         with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:

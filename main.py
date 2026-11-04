@@ -12,6 +12,39 @@ import urllib.parse
 import urllib.error
 import ssl
 _NCZ_SSL_CTX = ssl.create_default_context()     # one shared context: a fresh one per urlopen re-reads the cert store (~13 ms each)
+
+# ---- jsDelivr mirror for GitHub files. jsDelivr is a free CDN that serves public GitHub repos (no setup), and is often much faster than
+# raw.githubusercontent.com. Files it can't serve (over 50 MB, missing) fall back to GitHub automatically.
+# jsDelivr caches branch URLs for up to ~12 h, so main.py / companion files only use it when this is True (and you purge after a push:
+# https://purge.jsdelivr.net/gh/<user>/<repo>@<branch>/<file>). Rarely-changing files (gm-fix, scraper, icons) always try it first.
+NCZ_UPDATES_VIA_JSDELIVR = False
+_NCZ_JSD_RE = re.compile(r"^https://(?:raw\.githubusercontent\.com/([^/]+)/([^/]+)|github\.com/([^/]+)/([^/]+)/raw)/(?:refs/heads/)?([^/?]+)/([^?]+)")
+
+def _ncz_jsdelivr(url):
+    m = _NCZ_JSD_RE.match(url or "")
+    if not m:
+        return None
+    user, repo = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+    return f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{m.group(5)}/{m.group(6)}"
+
+def _ncz_fetch_bytes(url, timeout=30, headers=None, mirror="first"):
+    """GET url, trying the jsDelivr copy first ("first"), after GitHub ("last"), or not at all (None). Returns the bytes."""
+    urls = [url]
+    mir = _ncz_jsdelivr(url) if mirror else None
+    if mir:
+        urls = [mir, url] if mirror == "first" else [url, mir]
+    last = None
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers=headers or {"User-Agent": "NCZ-Games-Launcher"})
+            with urllib.request.urlopen(req, timeout=timeout, context=_NCZ_SSL_CTX) as resp:
+                data = resp.read()
+            if not data:
+                raise ValueError("empty response")
+            return data
+        except Exception as e:
+            last = e
+    raise last
 import platform
 import base64
 import threading
@@ -6625,11 +6658,12 @@ class AdaptiveApp(QMainWindow):
         brand_row.setContentsMargins(18, 0, 18, 0)
         brand_row.setSpacing(10)
         self.brand_logo = QLabel()
-        self.brand_logo.setFixedSize(32, 32)
+        self.brand_logo.setFixedSize(44, 44)
         brand_row.addWidget(self.brand_logo)
         self.reload_brand_logo()
         brand = QLabel("NCZ Games")
         brand.setObjectName("Brand")
+        brand.hide()                                  # title text removed: only the logo is shown
         brand_row.addWidget(brand)
         brand_row.addStretch()
         layout.addLayout(brand_row)
@@ -7524,9 +7558,19 @@ class AdaptiveApp(QMainWindow):
 
     def reload_brand_logo(self):
         """(Re)loads the top-left logo from assets/icon.png, e.g. after the accent recolors it."""
-        logo_pix = CreditsPage.circular_pixmap(asset_path("icon.png"), 64)
-        self.brand_logo.setVisible(bool(logo_pix))
-        if logo_pix:
+        src = QPixmap(asset_path("icon.png"))
+        self.brand_logo.setVisible(not src.isNull())
+        if not src.isNull():
+            src = src.scaled(88, 88, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            logo_pix = QPixmap(88, 88)
+            logo_pix.fill(Qt.GlobalColor.transparent)
+            lp = QPainter(logo_pix)
+            lp.setRenderHint(QPainter.RenderHint.Antialiasing)
+            lpath = QPainterPath()
+            lpath.addRoundedRect(0, 0, 88, 88, 20, 20)
+            lp.setClipPath(lpath)
+            lp.drawPixmap((88 - src.width()) // 2, (88 - src.height()) // 2, src)
+            lp.end()
             logo_pix.setDevicePixelRatio(2.0)
             self.brand_logo.setPixmap(logo_pix)
 
@@ -15472,10 +15516,9 @@ def self_update_check():
     path = os.path.abspath(__file__)
     acct = load_account()
     base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
-    req = urllib.request.Request(f"{base}?t={int(time.time())}",
-                                 headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as resp:
-        remote = resp.read()
+    remote = _ncz_fetch_bytes(f"{base}?t={int(time.time())}", timeout=15,
+                              headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"},
+                              mirror="first" if NCZ_UPDATES_VIA_JSDELIVR else None)
     if len(remote) < 2000:
         return False
     def norm(b):
@@ -15539,10 +15582,9 @@ def companion_update_check():
         try:
             if (is_py and frozen) or (name.endswith(".dll") and not sys.platform.startswith("win")):
                 continue
-            req = urllib.request.Request(f"{base}{name}?t={int(time.time())}",
-                                         headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
-                remote = resp.read()
+            remote = _ncz_fetch_bytes(f"{base}{name}?t={int(time.time())}", timeout=30,
+                                      headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"},
+                                      mirror="first" if NCZ_UPDATES_VIA_JSDELIVR else None)
             path = local_fn()
             if is_py:
                 if len(remote) < 200:
@@ -16311,9 +16353,7 @@ def _download_and_run_gmod_fix(root):
     py = _find_python_for_script()
     if not py:
         raise RuntimeError("Python isn't installed, so the fix script can't run.\nInstall Python 3 and try again.")
-    req = urllib.request.Request(GMOD_FIX_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-    with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
-        data = resp.read()
+    data = _ncz_fetch_bytes(GMOD_FIX_URL, timeout=30)
     if not data.strip():
         raise RuntimeError("The downloaded fix script was empty.")
     script = os.path.join(root, GMOD_FIX_NAME)
@@ -20808,9 +20848,7 @@ class ScrapeWorker(QThread):
             # 1) download the newest scraper (an older copy is used if the download fails)
             self.stage.emit("Downloading the scraper...")
             try:
-                req = urllib.request.Request(GAMEJOLT_SCRAPER_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-                with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
-                    data = resp.read()
+                data = _ncz_fetch_bytes(GAMEJOLT_SCRAPER_URL, timeout=30)
                 if not data.strip():
                     raise ValueError("the downloaded file is empty")
                 with open(script, "wb") as f:
@@ -30815,7 +30853,7 @@ def _ensure_theme_icon(entry):
     if name in _icon_download_tried:
         return ""
     _icon_download_tried.add(name)
-    for url in entry.get("icon_urls", []):
+    for url in [x for u in entry.get("icon_urls", []) for x in ((_ncz_jsdelivr(u), u) if _ncz_jsdelivr(u) else (u,))]:
         try:
             data = _http_get(url, timeout=6)
         except Exception:
@@ -30865,13 +30903,13 @@ def _ui_reload_brand_logo(self):
         return _ui_prev_reload_brand_logo(self)
     side = int(min(pm.width(), pm.height()) * (1.0 if _UI_STYLE_AT_START == "sunset" else 0.58))
     pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
-    pm = pm.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    out = QPixmap(64, 64)
+    pm = pm.scaled(88, 88, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(88, 88)
     out.fill(Qt.GlobalColor.transparent)
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     path = QPainterPath()
-    path.addRoundedRect(0, 0, 64, 64, 14, 14)
+    path.addRoundedRect(0, 0, 88, 88, 20, 20)
     p.setClipPath(path)
     p.drawPixmap(0, 0, pm)
     p.end()
@@ -36432,6 +36470,60 @@ import math as _math
 import wave as _wave
 import struct as _struct
 
+# ---- Linux audio: QtMultimedia frequently "plays" into a dead device on Linux (status Ready, no error, no sound).
+# So on Linux we play through an installed command-line player (paplay / pw-play / aplay / ffplay / mpv) and only use Qt without one.
+_LX_PLAYERS = ("paplay", "pw-play", "aplay", "ffplay", "mpv", "cvlc")
+
+def _lx_cli_available():
+    return sys.platform.startswith("linux") and any(shutil.which(x) for x in _LX_PLAYERS)
+
+def _lx_wav_for(path):
+    if path.lower().endswith(".wav"):
+        return path
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return None
+    import tempfile, hashlib
+    out = os.path.join(tempfile.gettempdir(), "ncz_snd_" + hashlib.md5(path.encode()).hexdigest() + ".wav")
+    if not os.path.exists(out):
+        try:
+            subprocess.run([ff, "-y", "-loglevel", "quiet", "-i", path, out], timeout=20, stdin=subprocess.DEVNULL)
+        except Exception:
+            return None
+    return out if os.path.exists(out) else None
+
+def _lx_cli_play(path, volume=0.7):
+    if not sys.platform.startswith("linux"):
+        return None
+    wav = path.lower().endswith(".wav")
+    order = ["paplay", "pw-play", "aplay", "ffplay", "mpv", "cvlc"] if wav else ["ffplay", "mpv", "cvlc", "paplay", "pw-play", "aplay"]
+    for exe in order:
+        exe_path = shutil.which(exe)
+        if not exe_path:
+            continue
+        target = path
+        if exe in ("paplay", "pw-play", "aplay") and not wav:
+            target = _lx_wav_for(path)
+            if not target:
+                continue
+        if exe == "pw-play":
+            cmd = [exe_path, "--volume", str(volume), target]
+        elif exe == "paplay":
+            cmd = [exe_path, "--volume", str(int(65536 * volume)), target]
+        elif exe == "aplay":
+            cmd = [exe_path, "-q", target]
+        elif exe == "ffplay":
+            cmd = [exe_path, "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", str(int(volume * 100)), target]
+        elif exe == "mpv":
+            cmd = [exe_path, "--no-video", "--really-quiet", "--volume=" + str(int(volume * 100)), target]
+        else:
+            cmd = [exe_path, "--play-and-exit", "-q", target]
+        try:
+            return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+    return None
+
 _ch_snd = {"on": True, "fx": {}, "dir": None, "broken": False}
 _CH_SOUNDS = ("move", "capture", "check", "castle", "promote", "end", "start", "premove")
 
@@ -36518,6 +36610,9 @@ def _ch_play(kind):
     if not _ch_snd["on"] or _ch_snd["broken"] or kind not in _CH_SOUNDS:
         return
     try:
+        if _lx_cli_available():
+            _lx_cli_play(_ch_sound_path(kind), 0.7)
+            return
         fx = _ch_snd["fx"].get(kind)
         if fx is None:
             from PyQt6.QtMultimedia import QSoundEffect
@@ -36525,9 +36620,18 @@ def _ch_play(kind):
             fx.setSource(QUrl.fromLocalFile(_ch_sound_path(kind)))
             fx.setVolume(0.7)
             _ch_snd["fx"][kind] = fx
+        if fx.status().name == "Error":
+            _lx_cli_play(_ch_sound_path(kind), 0.7)       # Linux: QtMultimedia can't open the device
+            return
         fx.play()
     except Exception:
-        _ch_snd["broken"] = True          # no QtMultimedia / no audio device: stay silent instead of erroring
+        if sys.platform.startswith("linux"):
+            try:
+                _lx_cli_play(_ch_sound_path(kind), 0.7)
+            except Exception:
+                pass
+        else:
+            _ch_snd["broken"] = True      # no QtMultimedia / no audio device: stay silent instead of erroring
 
 def _ch_sound_for(san, result):
     if result:
@@ -48746,6 +48850,9 @@ def _ncz_chime():
         return
     _NCZ_CHIME["last"] = now
     try:
+        if _lx_cli_available():
+            _lx_cli_play(_ncz_chime_path(), 0.6)
+            return
         fx = _NCZ_CHIME["fx"]
         if fx is None:
             from PyQt6.QtMultimedia import QSoundEffect
@@ -48753,9 +48860,18 @@ def _ncz_chime():
             fx.setSource(QUrl.fromLocalFile(_ncz_chime_path()))
             fx.setVolume(0.6)
             _NCZ_CHIME["fx"] = fx
+        if fx.status().name == "Error":
+            _lx_cli_play(_ncz_chime_path(), 0.6)
+            return
         fx.play()
     except Exception:
-        _NCZ_CHIME["broken"] = True                       # no QtMultimedia / audio device: stay silent
+        if sys.platform.startswith("linux"):
+            try:
+                _lx_cli_play(_ncz_chime_path(), 0.6)
+            except Exception:
+                pass
+        else:
+            _NCZ_CHIME["broken"] = True                   # no QtMultimedia / audio device: stay silent
 
 
 def _ncz_wrap_overlay():
@@ -52642,8 +52758,13 @@ class _NczSuSound:
 
     def __init__(self, path, on_ready):
         self._fx = self._pl = self._ao = None
+        self._cli = None
+        self._path = path
         self._vol = 0.7
         self._cb = on_ready
+        if _lx_cli_available():
+            self._ready()                                 # Linux: played through paplay/ffplay/... in play()
+            return
         try:
             if path.lower().endswith(".wav"):
                 from PyQt6.QtMultimedia import QSoundEffect
@@ -52682,6 +52803,15 @@ class _NczSuSound:
 
     def play(self):
         try:
+            bad = (self._fx is None and self._pl is None) \
+                or (self._fx is not None and self._fx.status().name == "Error") \
+                or (self._pl is not None and (self._pl.mediaStatus().name == "InvalidMedia" or self._pl.error().name != "NoError"))
+        except Exception:
+            bad = True
+        if bad:                                           # Linux: QtMultimedia failed, use a command-line player
+            self._cli = _lx_cli_play(self._path, self._vol)
+            return
+        try:
             if self._fx is not None:
                 self._fx.play()
             if self._pl is not None:
@@ -52704,6 +52834,8 @@ class _NczSuSound:
                 self._fx.stop()
             if self._pl is not None:
                 self._pl.stop()
+            if self._cli is not None and self._cli.poll() is None:
+                self._cli.terminate()
         except Exception:
             pass
 
