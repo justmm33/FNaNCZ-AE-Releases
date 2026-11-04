@@ -10,6 +10,8 @@ import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
+import ssl
+_NCZ_SSL_CTX = ssl.create_default_context()     # one shared context: a fresh one per urlopen re-reads the cert store (~13 ms each)
 import platform
 import base64
 import threading
@@ -27,10 +29,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
-                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
-    _HAS_WEBENGINE = True
+    import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
+    _HAS_WEBENGINE = (importlib.util.find_spec("PyQt6.QtWebEngineWidgets") is not None
+                      and importlib.util.find_spec("PyQt6.QtWebEngineCore") is not None)
 except Exception:
     _HAS_WEBENGINE = False
 
@@ -572,7 +573,37 @@ def get_launcher_settings_path():
         return os.path.join(appdata, "NCZ_Games_Launcher", "launcher.json")
     return os.path.expanduser("~/.config/NCZ_Games_Launcher/launcher.json")
 
+# launcher.json / account.json are read on timers and from ~120 places: parse once, re-read only when the file's
+# modification time or size changes (the save functions drop the entry too). Callers get their own copy.
+_file_cache_lock = threading.Lock()
+_file_cache = {}            # (kind, path) -> ((mtime_ns, size) or None, value)
+
+def _cached_by_mtime(kind, path, build, copy=True):
+    import copy as _copy
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None            # missing file: the defaults are cached until it appears
+    with _file_cache_lock:
+        hit = _file_cache.get((kind, path))
+    if hit is not None and hit[0] == stamp:
+        value = hit[1]
+    else:
+        value = build()         # stat first, then read: a write in between only means one extra re-read later
+        with _file_cache_lock:
+            _file_cache[(kind, path)] = (stamp, value)
+    return _copy.deepcopy(value) if copy else value
+
+def _file_cache_drop(path):
+    with _file_cache_lock:
+        for k in [k for k in _file_cache if k[1] == path]:
+            del _file_cache[k]
+
 def load_launcher_settings():
+    return _cached_by_mtime("settings", get_launcher_settings_path(), _load_launcher_settings_file)
+
+def _load_launcher_settings_file():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
                 "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
@@ -643,8 +674,10 @@ def load_launcher_settings():
 def save_launcher_settings(settings):
     path = get_launcher_settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    _file_cache_drop(path)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=4)
+    _file_cache_drop(path)
     invalidate_library_roots()
 
 apply_install_dir()
@@ -706,7 +739,7 @@ def parse_remote_version(content):
 
 def fetch_remote_version(version_url):
     req = urllib.request.Request(version_url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
         return parse_remote_version(resp.read().decode('utf-8', errors='replace'))
 
 def get_installed_versions_path():
@@ -822,7 +855,7 @@ def _http_json(url, method="GET", payload=None, form=None, timeout=None):
         headers["Content-Type"] = "application/json"
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
@@ -855,7 +888,7 @@ def _http_json_etag(url, etag=None, timeout=None):
         headers["If-None-Match"] = etag
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CLOUD_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             new_etag = resp.headers.get("ETag") or None
     except urllib.error.HTTPError as e:
@@ -877,6 +910,9 @@ def get_account_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "account.json")
 
 def load_account():
+    return _cached_by_mtime("account", get_account_path(), _load_account_file)
+
+def _load_account_file():
     try:
         with open(get_account_path(), encoding='utf-8') as f:
             acct = json.load(f)
@@ -889,9 +925,11 @@ def load_account():
 def save_account(acct):
     path = get_account_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    _file_cache_drop(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(acct, f)
+    _file_cache_drop(path)
     try:
         os.chmod(path, 0o600)
     except Exception:
@@ -905,6 +943,7 @@ def clear_account():
             os.remove(path)
         except OSError:
             pass
+    _file_cache_drop(get_account_path())
 
 def cloud_sign_in(email, password, create=False):
     _require_cloud_config()
@@ -1315,6 +1354,18 @@ def format_cloud_time(ms):
         return "an unknown time"
 
 # ---------------------------------------------------------------- desktop shortcut
+# `python main.py` never caches the compiled file it runs, so all 50k lines were compiled on every start (~5 s, ~20 MiB).
+# Importing it instead lets Python keep __pycache__/main.cpython-*.pyc. This stub does what `python main.py` did
+# (same sys.argv, the script's folder first on sys.path, no '' / cwd entry) and needs no extra file, so the self-updater still only swaps main.py.
+# No quotes, $ or % in it: it goes into .lnk / .desktop / Run-key command lines as one argument.
+_NCZ_IMPORT_STUB = ("import sys,os,importlib;p=os.path.abspath(sys.argv.pop(1));sys.argv[0]=p;"
+                    "sys.path[:]=[os.path.dirname(p)]+[x for x in sys.path if x];"
+                    "importlib.import_module(os.path.splitext(os.path.basename(p))[0]).main()")
+
+def _launcher_script_args(script=None):
+    """Interpreter arguments that run main.py (from source) with its compiled code cached: ['-c', stub, main.py]."""
+    return ["-c", _NCZ_IMPORT_STUB, script or os.path.abspath(__file__)]
+
 def get_launch_command():
     """(target, args, working_dir) that starts this launcher the way it is currently being run."""
     appimage = os.environ.get("APPIMAGE")
@@ -1328,7 +1379,7 @@ def get_launch_command():
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pythonw):
             exe = pythonw  # no console window
-    return exe, [script], os.path.dirname(script)
+    return exe, _launcher_script_args(script), os.path.dirname(script)
 
 def _shortcut_icon_name(src, ext):
     """One file per theme icon, so Windows/the desktop can't keep showing a cached icon of another theme."""
@@ -2024,7 +2075,7 @@ def resumable_download(w, get_link, pick_name, expected_total=0, first=None):
             else:
                 w.status_update.emit("Connecting...")
             try:
-                response = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=NET_TIMEOUT)
+                response = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX)
             except urllib.error.HTTPError as he:
                 if he.code == 416 and done > 0:   # "range not satisfiable": everything had already arrived, or the file changed
                     m = re.search(r"/(\d+)\s*$", he.headers.get("Content-Range") or "")
@@ -2131,7 +2182,7 @@ def _resolve_version_link(w):
     direct link). Called again for a brand-new link whenever a download needs one."""
     w.status_update.emit("Checking version...")
     req = urllib.request.Request(w.version_url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
         content = resp.read().decode('utf-8')
     w.remote_version = parse_remote_version(content)
     download_url = None
@@ -2146,7 +2197,7 @@ def _resolve_version_link(w):
     if "mediafire.com" in download_url:
         w.status_update.emit("Resolving MediaFire link...")
         mf_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT) as mf_resp:
+        with urllib.request.urlopen(mf_req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as mf_resp:
             mf_html = mf_resp.read().decode('utf-8')
         match = re.search(r'href="(https?://download[^"]+)"', mf_html)
         if match:
@@ -2245,7 +2296,7 @@ class PingWorker(QThread):
     def run(self):
         try:
             req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=3, context=_NCZ_SSL_CTX) as resp:
                 if 200 <= resp.status < 400:
                     self.result.emit(True)
                     return
@@ -2350,7 +2401,7 @@ def download_common_redist(dest_dir, report=None):
             report(f"Downloading {name} ({i} of {total})", 0, 0)
         req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
         tmp = dest + ".part"
-        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+        with urllib.request.urlopen(req, timeout=60, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as out:
             size = int(resp.headers.get("Content-Length") or 0)
             done = 0
             while True:
@@ -3401,10 +3452,24 @@ class SettingsPage(QWidget):
 
     def _refresh_archive_tool_status(self):
         saved = load_launcher_settings().get("archive_tool", "")
+        self._archive_probe = getattr(self, "_archive_probe", 0) + 1      # a newer refresh makes older results stale
         if not saved:
-            found = find_tool(*_SEVENZIP_NAMES, *_UNRAR_NAMES, "WinRAR", "Rar")
-            self.archive_tool_status.setText(f"Auto-detected: {found}" if found else
-                                             "No 7-Zip or WinRAR found automatically. Pick the .exe above.")
+            # find_tool checks every PATH / install folder (~0.6 s): off the GUI thread, it used to run at startup
+            self.archive_tool_status.setText("Detecting 7-Zip / WinRAR...")
+            probe = self._archive_probe
+            def done(found, probe=probe):
+                if probe != self._archive_probe:
+                    return
+                try:
+                    self.archive_tool_status.setText(f"Auto-detected: {found}" if found else
+                                                     "No 7-Zip or WinRAR found automatically. Pick the .exe above.")
+                except RuntimeError:
+                    pass        # Settings page already gone
+            worker = TaskWorker(lambda: find_tool(*_SEVENZIP_NAMES, *_UNRAR_NAMES, "WinRAR", "Rar"))
+            worker.done.connect(done)
+            worker.failed.connect(lambda _e: done(None))
+            self._archive_workers = [w for w in getattr(self, "_archive_workers", []) if w.isRunning()] + [worker]
+            worker.start()
         elif os.path.isfile(os.path.expandvars(os.path.expanduser(saved))):
             self.archive_tool_status.setText(f"Using: {saved}")
         else:
@@ -3669,7 +3734,7 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
 
     def on_accent_pick(self):
-        if _SIDE_UI:
+        if _SIDE_UI or globals().get("_CLASSIC_ACCOUNT"):
             return                                   # Sunset / Legacy have a fixed accent
         from PyQt6.QtWidgets import QColorDialog
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
@@ -3678,7 +3743,7 @@ class SettingsPage(QWidget):
             self._set_accent_setting(chosen.name())
 
     def _set_accent_setting(self, color):
-        if _SIDE_UI:
+        if _SIDE_UI or globals().get("_CLASSIC_ACCOUNT"):
             return                                   # the accent is fixed by the theme
         settings = load_launcher_settings()
         settings["accent_color"] = color
@@ -3703,6 +3768,8 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
         apply_dark_mode(mode)
 
+_CIRCLE_PIX_CACHE = {}       # CreditsPage.circular_pixmap results, at most 64
+
 class CreditsPage(QWidget):
     CREDITS = (
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
@@ -3713,6 +3780,24 @@ class CreditsPage(QWidget):
 
     @staticmethod
     def circular_pixmap(image_path, size):
+        # cached per (file, its mtime/size, size): ~16 ms each, and the same avatars are redrawn on every refresh
+        try:
+            st = os.stat(image_path)
+            key = (os.path.abspath(image_path), st.st_mtime_ns, st.st_size, size)
+        except (OSError, TypeError, ValueError):
+            key = None
+        hit = _CIRCLE_PIX_CACHE.get(key) if key else None
+        if hit is not None:
+            return QPixmap(hit)         # implicitly shared copy: a caller painting on it doesn't touch the cache
+        out = CreditsPage._circular_pixmap_uncached(image_path, size)
+        if out is not None and key:
+            if len(_CIRCLE_PIX_CACHE) >= 64:
+                _CIRCLE_PIX_CACHE.pop(next(iter(_CIRCLE_PIX_CACHE)))      # oldest first
+            _CIRCLE_PIX_CACHE[key] = QPixmap(out)
+        return out
+
+    @staticmethod
+    def _circular_pixmap_uncached(image_path, size):
         src = QPixmap(image_path)
         if src.isNull():
             return None
@@ -4543,7 +4628,7 @@ def get_store_cache_dir():
 
 def _http_get(url, headers=None, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_NCZ_SSL_CTX) as resp:
         return resp.read()
 
 _ROW_RE = re.compile(r'<a\b[^>]*?\bdata-ds-appid="(\d+)"[^>]*>(.*?)</a>', re.S)
@@ -4814,13 +4899,24 @@ def get_flag_file(code):
         pass
     return ""
 
+def _screen_dpr(widget=None):
+    """The real device pixel ratio (the widget's screen, else the highest of all screens), at least 1. Images drawn at
+    this scale stay sharp without using 4x the memory on a 100% screen like a fixed 2x did."""
+    try:
+        scr = widget.screen() if widget is not None else None
+        if scr is not None:
+            return max(1.0, float(scr.devicePixelRatio()))
+        return max([1.0] + [float(x.devicePixelRatio()) for x in QApplication.screens()])
+    except Exception:
+        return 1.0
+
 def round_flag_pixmap(path, height=22):
     """Whole flag (3:2) with rounded corners, crisp on HiDPI."""
     src = QPixmap(path)
     if src.isNull():
         return None
-    dpr = 2
-    h = height * dpr
+    dpr = _screen_dpr()
+    h = int(round(height * dpr))
     w = int(round(h * 1.5))
     scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                         Qt.TransformationMode.SmoothTransformation)
@@ -5071,8 +5167,8 @@ def rounded_cover_pixmap(path, width, height, radius, blur=False):
     src = QPixmap(path)
     if src.isNull():
         return None
-    scale = 2
-    w, h = width * scale, height * scale
+    scale = _screen_dpr()
+    w, h = int(round(width * scale)), int(round(height * scale))
     scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                         Qt.TransformationMode.SmoothTransformation)
     if blur:    # shrink a lot then smooth-scale back up = heavy blur
@@ -5117,7 +5213,31 @@ def _nsfw_log(text):
     except Exception:
         pass
 _nsfw_det_lock = threading.RLock()
-_nsfw_det = {"obj": None, "tried": False}
+_nsfw_det = {"obj": None, "tried": False, "used": 0.0}
+NSFW_DET_IDLE_S = 60            # the detector (onnxruntime + model) is dropped after this long without a new cover
+_nudenet_spec = []
+
+def _nudenet_installed():
+    """Is NudeNet installed? Only looks for the package, doesn't load onnxruntime or the model."""
+    if not _nudenet_spec:
+        try:
+            import importlib.util
+            _nudenet_spec.append(importlib.util.find_spec("nudenet") is not None)
+        except Exception:
+            _nudenet_spec.append(False)
+    return _nudenet_spec[0]
+
+def _nsfw_det_reaper():
+    while True:
+        time.sleep(15)
+        with _nsfw_det_lock:
+            if _nsfw_det["obj"] is None:
+                return
+            if time.time() - _nsfw_det["used"] >= NSFW_DET_IDLE_S:
+                _nsfw_det["obj"], _nsfw_det["tried"] = None, False      # loaded again by the next new cover
+                import gc
+                gc.collect()
+                return
 
 def _get_nsfw_detector():
     with _nsfw_det_lock:
@@ -5126,8 +5246,10 @@ def _get_nsfw_detector():
             try:
                 from nudenet import NudeDetector
                 _nsfw_det["obj"] = NudeDetector()
+                threading.Thread(target=_nsfw_det_reaper, daemon=True).start()
             except Exception:
                 _nsfw_det["obj"] = None
+        _nsfw_det["used"] = time.time()
         return _nsfw_det["obj"]
 
 def cover_has_nudity(path, label=""):
@@ -5162,7 +5284,7 @@ class _NsfwBus(QObject):
 nsfw_bus = _NsfwBus()
 
 def _nsfw_cache_path():
-    name = "cover_nsfw3.json" if _get_nsfw_detector() is not None else "nsfw.json"    # picture check vs descriptor fallback
+    name = "cover_nsfw3.json" if _nudenet_installed() else "nsfw.json"    # picture check vs descriptor fallback (find_spec: no model load)
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", name)
 
 def nsfw_cached(appid):
@@ -5214,6 +5336,8 @@ def check_app_nsfw(appid, path=None, title=""):
     known = nsfw_cached(appid)
     if known is not None:
         return known
+    if _nudenet_installed() and nsfw_revealed():
+        return None         # every cover is shown anyway: don't load the detector for it (not cached, so "Hide again" re-checks)
     if _get_nsfw_detector() is not None:
         if not path or not os.path.exists(path):
             return None
@@ -6452,16 +6576,16 @@ class AdaptiveApp(QMainWindow):
         self.account_page = AccountPage()
         self.account_page.account_changed.connect(self.refresh_profile)
         self.pages.addWidget(self.account_page)
-        self.store_page = StorePage()
-        self.pages.addWidget(self.store_page)
-        self.settings_page.steamgriddb_key_changed.connect(self.store_page.on_key_changed)
-        self.store_detail_page = StoreDetailPage()
-        self.pages.addWidget(self.store_detail_page)  # index 5
-        self.store_page.game_selected.connect(self.open_store_game)
-        self.store_detail_page.add_requested.connect(self.add_steam_game)
-        self.store_detail_page.back_requested.connect(lambda: self.pages.setCurrentIndex(4))
-        self.store_detail_page.game_selected.connect(self.open_store_game)
-        self.store_detail_page.tag_requested.connect(self.open_store_tag)
+        def wire_store(sp):
+            self.settings_page.steamgriddb_key_changed.connect(sp.on_key_changed)
+            sp.game_selected.connect(self.open_store_game)
+        _lazy_page(self, "store_page", StorePage, wire_store)                 # index 4, built when first opened
+        def wire_store_detail(dp):
+            dp.add_requested.connect(self.add_steam_game)
+            dp.back_requested.connect(lambda: self.pages.setCurrentIndex(4))
+            dp.game_selected.connect(self.open_store_game)
+            dp.tag_requested.connect(self.open_store_tag)
+        _lazy_page(self, "store_detail_page", StoreDetailPage, wire_store_detail)    # index 5
         root_layout.addWidget(self.pages, 1)
 
         self.apply_filter()
@@ -7372,7 +7496,8 @@ class AdaptiveApp(QMainWindow):
         save_steam_library(games)
         self.create_steam_card(appid, title, saved_cover)
         self.apply_filter()
-        self.store_detail_page.set_in_library(True)
+        if self.__dict__.get("store_detail_page") is not None:      # don't build it just for this
+            self.store_detail_page.set_in_library(True)
 
     def remove_steam_game(self, appid):
         card = self.steam_cards.pop(appid, None)
@@ -7387,7 +7512,7 @@ class AdaptiveApp(QMainWindow):
         except OSError:
             pass
         self.apply_filter()
-        if self.store_detail_page._appid == appid:
+        if getattr(self.__dict__.get("store_detail_page"), "_appid", None) == appid:
             self.store_detail_page.set_in_library(False)
 
     def reload_brand_logo(self):
@@ -7548,6 +7673,8 @@ def main():
         except Exception:
             pass
     _prefer_xwayland()
+    if _HAS_WEBENGINE:      # lets QtWebEngine be imported after the QApplication exists (it's only loaded when NCZFront opens)
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
     if "--friends" in sys.argv:          # toggles the friends panel of the running launcher, then exits
@@ -7605,16 +7732,21 @@ def main():
     app._ncz_main_window = window
     _ncz_after_window_created(app, window, _launch_title)     # game from a desktop shortcut + desktop auto-add
     _acct_watch_start(window)
+    _memlog_start(window)                # NCZ_MEMLOG=1: memory figures at startup, on hide / show and every 60 s
     apply_startup_setting()
     register_cli()
     lc_prefetch()                        # server icon + Wikipedia facts for the loading cards, in the background
     set_windows_taskbar_identity(window)
     tray = getattr(window, "_tray", None)
-    if "--startup" in sys.argv and load_launcher_settings().get("start_minimized", True):
+    # A game's desktop shortcut starts the launcher quietly in the tray too: the game is what was asked for.
+    if _launch_title or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)):
         if tray is None:                                # no tray to hide in
             window.showMinimized()
         else:
             window.hide()                               # start quietly in the tray
+            _ui_timers_pause(window)                    # never shown, so hideEvent doesn't pause the redraw timers
+            # never shown, so hideEvent's trim doesn't run: free memory once startup work has settled
+            QTimer.singleShot(30000, lambda: _mem_free_hidden(window))
         if getattr(app, "_ncz_wake_pending", False):    # someone started the launcher again meanwhile
             window.showNormal()
     else:
@@ -8081,7 +8213,7 @@ def _patched_get_steam_download_link(appid):
             if cover_url and isinstance(cover_url, str):
                 try:
                     req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                         img_data = resp.read()
                     os.makedirs(get_library_cover_dir(), exist_ok=True)
                     local_path = os.path.join(get_library_cover_dir(), f"{appid}.img")
@@ -8116,7 +8248,7 @@ def _patched_build_library_page(self):
                         cover_url = data.get("cover_url")
                         if cover_url and isinstance(cover_url, str):
                             req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                            with urllib.request.urlopen(req, timeout=10) as resp:
+                            with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                                 img_data = resp.read()
                             os.makedirs(get_library_cover_dir(), exist_ok=True)
                             with open(local_cover, 'wb') as f:
@@ -9199,7 +9331,7 @@ def _new_fb_run(self):
         if total_size <= 0 and not self._is_cancelled:
             try:
                 head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(head_req, timeout=10) as head_resp:
+                with urllib.request.urlopen(head_req, timeout=10, context=_NCZ_SSL_CTX) as head_resp:
                     total_size = int(head_resp.headers.get('Content-Length', 0))
             except Exception:
                 pass
@@ -9266,7 +9398,7 @@ def _pw_probe_server(title, sid):
     """Does this server have the game? 'ok', '404' (not there) or 'unknown' (blocked / offline / couldn't tell)."""
     try:
         req = urllib.request.Request(pw_game_url(title, sid), headers={"User-Agent": PW_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as r:
             r.read(1)
         return "ok"
     except urllib.error.HTTPError as e:
@@ -9778,7 +9910,7 @@ def fetch_site_build(title, server="1"):
     try:
         url = pw_game_url(title, "3" if server == "3" else "1")
         req = urllib.request.Request(url, headers={"User-Agent": PW_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as r:
             html = r.read(400000).decode("utf-8", "ignore")
         if server == "3":
             ver = parse_s3_version(html)
@@ -12264,7 +12396,7 @@ def steam_join_via_steamworks(appid, sid, timeout=15):
         _invite_log(("no libsteam_api / steam_api64 file found (put libsteam_api.so in assets/)" if not lib else
                      "no Steam account found (is Steam installed and signed in?)") + f" [appid {appid}]")
         return ""
-    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)])
+    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable] + _launcher_script_args())   # cached compile
     cmd += ["--ncz-rp-helper", str(appid), lib, sid]
     try:
         _r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
@@ -14091,8 +14223,15 @@ class FriendsPage(QWidget):
         self._detect_events()
         if self._prev_last is None:
             self._detect_messages(last)      # baseline only; _poll_messages raises the notifications
-        self._rebuild_requests()
-        self._rebuild_rows()
+        # Every 10 s: only tear down and rebuild the rows (widgets + avatar files) when what they show changed.
+        req_sig = [(uid, d.get("username")) for uid, d in self.requests.items()]
+        if req_sig != getattr(self, "_req_sig", None):
+            self._req_sig = req_sig
+            self._rebuild_requests()
+        row_sig = sorted((uid, d.get("username"), d.get("photo"), _friend_status(d)) for uid, d in self.friends.items())
+        if row_sig != getattr(self, "_row_sig", None):
+            self._row_sig = row_sig
+            self._rebuild_rows()
         if self.current_uid in self.friends and self.stack.currentIndex() == 1:
             self._fill_profile()
 
@@ -15140,7 +15279,7 @@ def self_update_check():
     base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
     req = urllib.request.Request(f"{base}?t={int(time.time())}",
                                  headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as resp:
         remote = resp.read()
     if len(remote) < 2000:
         return False
@@ -15207,7 +15346,7 @@ def companion_update_check():
                 continue
             req = urllib.request.Request(f"{base}{name}?t={int(time.time())}",
                                          headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
                 remote = resp.read()
             path = local_fn()
             if is_py:
@@ -15924,9 +16063,9 @@ _gmod_prev_init = AdaptiveApp.__init__
 
 def _gmod_init(self):
     _gmod_prev_init(self)
-    self.gmod_page = GmodAddonManagerPage()
-    self.pages.addWidget(self.gmod_page)
-    idx = self.pages.indexOf(self.gmod_page)
+    self._gmod_root = None
+    ph = _lazy_page(self, "gmod_page", GmodAddonManagerPage, lambda gp: gp.set_root(self._gmod_root))
+    idx = self.pages.indexOf(ph)
     self.gmod_btn = self.make_nav_button("Garry's Mod Addon Manager", checkable=True)
     self.nav_group.addButton(self.gmod_btn, idx)
     sidebar_layout = self.nav_group.button(0).parent().layout()
@@ -15936,9 +16075,11 @@ def _gmod_init(self):
 
     def refresh_gmod():
         root = find_gmod_root()
+        self._gmod_root = root
         self.gmod_btn.setVisible(bool(root))
-        self.gmod_page.set_root(root)
-        if not root and self.pages.currentWidget() is self.gmod_page:
+        if self.__dict__.get("gmod_page") is not None:       # not built yet: it gets the root when it is
+            self.gmod_page.set_root(root)
+        if not root and self.pages.currentWidget() is _lazy_slot(self, "gmod_page"):
             self.nav_group.button(0).setChecked(True)
             self.pages.setCurrentIndex(0)
 
@@ -15948,7 +16089,8 @@ def _gmod_init(self):
     self._gmod_timer.timeout.connect(refresh_gmod)
     self._gmod_timer.start()
     self.pages.currentChanged.connect(
-        lambda _i: self.gmod_page.refresh_addons() if self.pages.currentWidget() is self.gmod_page else None)
+        lambda _i: self.gmod_page.refresh_addons()
+        if self.__dict__.get("gmod_page") is not None and self.pages.currentWidget() is self.gmod_page else None)
 
 AdaptiveApp.__init__ = _gmod_init
 
@@ -15975,7 +16117,7 @@ def _download_and_run_gmod_fix(root):
     if not py:
         raise RuntimeError("Python isn't installed, so the fix script can't run.\nInstall Python 3 and try again.")
     req = urllib.request.Request(GMOD_FIX_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
         data = resp.read()
     if not data.strip():
         raise RuntimeError("The downloaded fix script was empty.")
@@ -16350,17 +16492,18 @@ def _ws_dir_size(path):
     return total
 
 def _ws_crop_round(pm, w, h, radius=8):
-    scale = 2
-    scaled = pm.scaled(w * scale, h * scale, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+    scale = _screen_dpr()
+    sw, sh = int(round(w * scale)), int(round(h * scale))
+    scaled = pm.scaled(sw, sh, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                        Qt.TransformationMode.SmoothTransformation)
-    out = QPixmap(w * scale, h * scale)
+    out = QPixmap(sw, sh)
     out.fill(Qt.GlobalColor.transparent)
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     clip = QPainterPath()
-    clip.addRoundedRect(QRectF(0, 0, w * scale, h * scale), radius * scale, radius * scale)
+    clip.addRoundedRect(QRectF(0, 0, sw, sh), radius * scale, radius * scale)
     p.setClipPath(clip)
-    p.drawPixmap((w * scale - scaled.width()) // 2, (h * scale - scaled.height()) // 2, scaled)
+    p.drawPixmap((sw - scaled.width()) // 2, (sh - scaled.height()) // 2, scaled)
     p.end()
     out.setDevicePixelRatio(scale)
     return out
@@ -16724,7 +16867,7 @@ class WorkshopLinkWorker(QThread):
             req = urllib.request.Request(
                 "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
                 data=urllib.parse.urlencode(body).encode(), headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as resp:
                 details = json.loads(resp.read().decode("utf-8", "replace")).get("response", {}).get(
                     "publishedfiledetails", [])
         except Exception as e:
@@ -16775,7 +16918,7 @@ class WorkshopDepsWorker(QThread):
         req = urllib.request.Request(
             "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
             data=urllib.parse.urlencode(body).encode(), headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=_NCZ_SSL_CTX) as resp:
             ds = json.loads(resp.read().decode("utf-8", "replace")).get("response", {}).get("publishedfiledetails", [])
         return {str(d.get("publishedfileid")): d for d in ds if isinstance(d, dict)}
 
@@ -18653,7 +18796,7 @@ class GeInstallWorker(QThread):
                     expected = ""
             digest = _hashlib.sha512()
             req = urllib.request.Request(self.info["url"], headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or self.info["size"] or 0)
                 got = 0
                 while True:
@@ -18882,10 +19025,9 @@ def _ge_init(self):
     _ge_prev_init(self)
     if not sys.platform.startswith("linux"):
         return
-    self.ge_page = GeProtonPage()
-    self.pages.addWidget(self.ge_page)
+    ph = _lazy_page(self, "ge_page", GeProtonPage)
     btn = self.make_nav_button("GE Proton", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.ge_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(ph))
     layout = self.nav_group.button(0).parent().layout()
     layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
 
@@ -18950,7 +19092,7 @@ class WineInstallWorker(QThread):
             tmp = os.path.join(dest, "." + name + ".tar.xz.part")
             digest = _hashlib.sha256()
             req = urllib.request.Request(self.info["url"], headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or self.info["size"] or 0)
                 got = 0
                 while True:
@@ -19222,12 +19364,12 @@ def _wine_init(self):
     _wine_prev_init(self)
     if not sys.platform.startswith("linux"):
         return
-    self.wine_page = WinePage()
-    self.pages.addWidget(self.wine_page)
+    ph = _lazy_page(self, "wine_page", WinePage)
     btn = self.make_nav_button("Wine", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.wine_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(ph))
     layout = self.nav_group.button(0).parent().layout()
-    ge_btn = self.nav_group.button(self.pages.indexOf(self.ge_page)) if hasattr(self, "ge_page") else None
+    ge_slot = _lazy_slot(self, "ge_page")              # hasattr(self, "ge_page") would build it
+    ge_btn = self.nav_group.button(self.pages.indexOf(ge_slot)) if ge_slot is not None else None
     at = layout.indexOf(ge_btn) + 1 if ge_btn is not None else layout.indexOf(self.nav_group.button(1))
     layout.insertWidget(at, btn)
 
@@ -20472,7 +20614,7 @@ class ScrapeWorker(QThread):
             self.stage.emit("Downloading the scraper...")
             try:
                 req = urllib.request.Request(GAMEJOLT_SCRAPER_URL, headers={"User-Agent": "NCZ-Games-Launcher"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as resp:
                     data = resp.read()
                 if not data.strip():
                     raise ValueError("the downloaded file is empty")
@@ -20722,7 +20864,7 @@ class FanGamesPage(StorePage):
         self.loader.shutdown()
         self.loader = FanCoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
-        self._links = {gid: link for gid, _t, link, _tg in load_fan_games()}
+        self._links_map = None      # self._links is built on first use (reading 15k fan games here cost ~0.4 s at startup)
         lbl = self.findChild(QLabel, "PageTitle")
         if lbl:
             lbl.setText("Fan Games")
@@ -20851,6 +20993,16 @@ class FanGamesPage(StorePage):
                 if event.button() == Qt.MouseButton.LeftButton:
                     self.fan_selected.emit(c.appid, c.title, c.cover_path)
             card.mousePressEvent = press
+
+def _fan_links_get(self):
+    if getattr(self, "_links_map", None) is None:
+        self._links_map = {gid: link for gid, _t, link, _tg in load_fan_games()}
+    return self._links_map
+
+def _fan_links_set(self, value):
+    self._links_map = value
+
+FanGamesPage._links = property(_fan_links_get, _fan_links_set)       # {game id: link}, loaded when first read
 
 # ---------------------------------------------------------------- fan games in the Library (bottom section, horizontal cards)
 def get_fan_library_path():
@@ -20994,7 +21146,7 @@ def _fan_remove(self, gid):
         os.remove(os.path.join(get_library_cover_dir(), f"fan-{gid}.img"))
     except OSError:
         pass
-    if getattr(self, "fan_detail_page", None) is not None and self.fan_detail_page._appid == gid:
+    if self.__dict__.get("fan_detail_page") is not None and self.fan_detail_page._appid == gid:
         self.fan_detail_page.set_in_library(False)
     self.apply_filter()
 
@@ -21004,7 +21156,7 @@ def _fan_view(self, gid):
         return
     self.fan_detail_page.show_game(gid, g["title"], g.get("cover", ""), g.get("link", ""), tuple(g.get("tags", [])))
     self.fan_detail_page.set_in_library(True)
-    btn = self.nav_group.button(self.pages.indexOf(self.fan_page))
+    btn = self.nav_group.button(self.pages.indexOf(_lazy_slot(self, "fan_page")))
     if btn:
         btn.setChecked(True)
     self.pages.setCurrentWidget(self.fan_detail_page)
@@ -21063,10 +21215,14 @@ _fan_prev_init = AdaptiveApp.__init__
 
 def _fan_init(self):
     _fan_prev_init(self)
-    self.fan_page = FanGamesPage()
-    self.pages.addWidget(self.fan_page)
-    self.fan_detail_page = FanDetailPage()
-    self.pages.addWidget(self.fan_detail_page)
+    def wire_fan(fp):
+        fp.fan_selected.connect(open_fan_game)
+    def wire_fan_detail(dp):
+        dp.add_requested.connect(self._fan_add)
+        dp.open_cb = open_fan_game
+        dp.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
+    fan_ph = _lazy_page(self, "fan_page", FanGamesPage, wire_fan)
+    _lazy_page(self, "fan_detail_page", FanDetailPage, wire_fan_detail)
 
     def open_fan_game(gid, title, cover):
         link, tags = "", ()
@@ -21102,12 +21258,8 @@ def _fan_init(self):
     tl.addStretch()
     self.library_tabs = tabs
     self.search_edit.parentWidget().layout().insertWidget(2, tabs)
-    self.fan_detail_page.add_requested.connect(self._fan_add)
-    self.fan_page.fan_selected.connect(open_fan_game)
-    self.fan_detail_page.open_cb = open_fan_game
-    self.fan_detail_page.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
     btn = self.make_nav_button("Fan Games", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(self.fan_page))
+    self.nav_group.addButton(btn, self.pages.indexOf(fan_ph))
     layout = self.nav_group.button(0).parent().layout()
     i = layout.indexOf(self.nav_group.button(4))
     i = i + 1 if i >= 0 else layout.indexOf(self.nav_group.button(1))
@@ -21642,7 +21794,7 @@ _gj_prev_init = AdaptiveApp.__init__
 
 def _gj_init(self):
     _gj_prev_init(self)
-    self.fan_detail_page.install_cb = lambda i, t, c, u: self._fan_install(i, t, c, u)
+    _lazy_on_built(self, "fan_detail_page", lambda dp: setattr(dp, "install_cb", lambda i, t, c, u: self._fan_install(i, t, c, u)))
 
 AdaptiveApp.__init__ = _gj_init
 
@@ -22292,7 +22444,7 @@ def _fan_add_existing(self):
     entry = {"id": gid, "title": title, "link": link, "tags": d["tags"], "cover": saved_cover, "exe_path": exe}
     save_fan_library(lib + [entry])
     self._fan_create_library_card(entry)
-    if self.fan_detail_page._appid == gid:
+    if getattr(self.__dict__.get("fan_detail_page"), "_appid", None) == gid:
         self.fan_detail_page.set_in_library(True)
     # show it: switch the library to the Fan Games tab
     self._lib_tab = "fan"
@@ -22305,7 +22457,8 @@ def _fan_add_existing(self):
     # no cover cached yet: fetch it from Game Jolt in the background
     card = self.fan_lib_cards.get(gid)
     label = card.findChildren(QLabel)[0] if card is not None else None
-    worker = TaskWorker(lambda: self.fan_page.loader._fetch(gid, link, "", title))
+    fan_loader = self.fan_page.loader       # on the GUI thread: reading fan_page may build the (lazy) page, a QWidget
+    worker = TaskWorker(lambda: fan_loader._fetch(gid, link, "", title))
     if not hasattr(self, "_fan_cover_workers"):
         self._fan_cover_workers = []
     self._fan_cover_workers.append(worker)
@@ -22376,8 +22529,8 @@ def _fan_refresh(self, gid):
         g = next((x for x in load_fan_library() if x["id"] == gid), None)
         if g:
             _fan_update_btn(btn, g["title"])
-    dp = self.fan_detail_page
-    if dp._appid == gid:
+    dp = self.__dict__.get("fan_detail_page")
+    if dp is not None and dp._appid == gid:
         _fan_update_btn(dp.steam_btn, dp._title)
 
 AdaptiveApp._fan_compat_dialog = _fan_compat_dialog
@@ -22749,15 +22902,36 @@ def _desk_parse_lnk(path):
         return None
 
 
+_LNK_CACHE = {}              # (path, mtime_ns, size) -> (target, args, workdir) or None (couldn't be read)
+_LNK_CACHE_LOCK = threading.Lock()
+
 def _resolve_lnks(paths):
-    """{lnk path: (target, arguments, working dir)}. Built-in parser first; PowerShell for any it couldn't resolve."""
-    out = {}
+    """{lnk path: (target, arguments, working dir)}. Built-in parser first; PowerShell for any it couldn't resolve.
+    Results (failures too) are kept per file version, so the 3-minute desktop scan doesn't start PowerShell again
+    for a shortcut it already couldn't read."""
+    out, keys, todo = {}, {}, []
     for p in paths:
+        try:
+            st = os.stat(p)
+            keys[p] = (p, st.st_mtime_ns, st.st_size)
+        except OSError:
+            keys[p] = None
+        with _LNK_CACHE_LOCK:
+            hit = _LNK_CACHE.get(keys[p], False) if keys[p] else False
+        if hit is False:
+            todo.append(p)
+        elif hit is not None:
+            out[p] = hit
+    for p in todo:
         info = _desk_parse_lnk(p)
         if info:
             out[p] = info
-    missing = [p for p in paths if not (out.get(p) or ("",))[0]]
+    missing = [p for p in todo if not (out.get(p) or ("",))[0]]
     out.update(_resolve_lnks_powershell(missing))
+    with _LNK_CACHE_LOCK:
+        for p in todo:
+            if keys[p]:
+                _LNK_CACHE[keys[p]] = out.get(p)
     return out
 
 def _resolve_lnks_powershell(paths):
@@ -23405,7 +23579,7 @@ def restart_launcher(window, use_demo=False):
     if "--launch-game" in args:                                               # don't start the game again after a restart
         _i = args.index("--launch-game")
         del args[_i:_i + 2]
-    cmd = [sys.executable] + args if frozen else [sys.executable, os.path.abspath(__file__)] + args
+    cmd = [sys.executable] + args if frozen else [sys.executable] + _launcher_script_args() + args     # cached compile
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
     if use_demo and not frozen and not os.environ.get("APPIMAGE") and os.path.isfile(demo):
         cmd = [sys.executable, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
@@ -25478,7 +25652,7 @@ _rpc_image_cache = {}
 def _rpc_url_exists(url):
     try:
         req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=6, context=_NCZ_SSL_CTX) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False
@@ -25839,7 +26013,7 @@ def _lib_download_cover(appid):
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as resp:
                 img = resp.read()
             if img:
                 os.makedirs(get_library_cover_dir(), exist_ok=True)
@@ -25938,8 +26112,9 @@ def _lib_apply(self, result):
                     self._fan_create_library_card(e)
         self.apply_filter()
         try:
-            page = self.store_detail_page
-            page.set_in_library(page._appid in self.steam_cards)
+            page = self.__dict__.get("store_detail_page")        # not built yet: nothing to update
+            if page is not None:
+                page.set_in_library(page._appid in self.steam_cards)
         except Exception:
             pass
     finally:
@@ -29032,6 +29207,10 @@ _THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
 _ACCOUNT_THEMES = {
     "kablooey": {"uids": {"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, "locked": False},     # free to switch between Sunset and this theme
     "mm33": {"uids": {"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False},      # his own theme, nothing is locked
+    # Omar V4: only these two accounts (the admin can always pick it). Omar's account gets it as its default ONCE, on the first launch with this update.
+    "omar_v4": {"uids": {"ojTnHLIVMuNpPPfL35FQIancCdz1", "XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, "locked": False,
+                "default_uids": {"ojTnHLIVMuNpPPfL35FQIancCdz1"},
+                "layout": "classic"},     # built on the Classic theme: top navigation bar, flat colours (no side rail)
 }   # each entry's look (label, theme, extra) is attached next to its colours below
 
 def _saved_uid():
@@ -29040,10 +29219,18 @@ def _saved_uid():
     except Exception:
         return ""
 
-def _raw_setting(name):
+def _raw_launcher_json():
     try:
         with open(get_launcher_settings_path(), encoding="utf-8") as f:
-            return json.load(f).get(name)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _raw_setting(name):
+    try:      # same mtime cache as load_launcher_settings (this ran 3 times per load_launcher_settings call)
+        import copy as _copy
+        return _copy.deepcopy(_cached_by_mtime("raw", get_launcher_settings_path(), _raw_launcher_json, copy=False).get(name))
     except Exception:
         return None
 
@@ -29067,19 +29254,48 @@ def _allowed_theme_keys():
         return list(_ACCOUNT_THEMES)
     return [k for k, t in _ACCOUNT_THEMES.items() if uid and uid in t["uids"]]
 
+def _apply_default_account_themes():
+    """First launch with an update that adds a theme made for this account: make it the account's theme, once.
+    Later changes in Settings are respected (the key is remembered in launcher.json as 'ui_defaults_applied')."""
+    try:
+        uid = _saved_uid()
+        if not uid:
+            return
+        done = _raw_setting("ui_defaults_applied")
+        done = list(done) if isinstance(done, (list, tuple)) else []
+        todo = [k for k, t in _ACCOUNT_THEMES.items() if uid in t.get("default_uids", ()) and k not in done]
+        if not todo:
+            return
+        data = dict(_raw_launcher_json())
+        data["ui_style"] = "new"
+        data["ui_theme"] = todo[-1]
+        data["ui_theme_choice"] = "new"          # skips the first-run theme picker; the account theme rides on the "new" layout
+        data["ui_defaults_applied"] = done + todo
+        save_launcher_settings(data)
+    except Exception:
+        pass
+
 def _active_theme_key():
     key = _locked_theme_key()
     if key:
         return key
+    _apply_default_account_themes()
     chosen = _raw_setting("ui_theme")
     if chosen in _allowed_theme_keys():
         return chosen
     return ""
 
+def _classic_account_key():
+    """The active account theme if it is built on the Classic layout (top bar), else ''."""
+    key = _active_theme_key()
+    return key if key and _ACCOUNT_THEMES.get(key, {}).get("layout") == "classic" else ""
+
 def _ui_read_style():
     """"new" = New (default), "sunset" = purple/orange, "classic" = original top-bar look with a free accent colour, "legacy" = side list + mint."""
     if _locked_theme_key():
         return "new"                       # account themes ride on the Sunset layout
+    if _classic_account_key():
+        return "classic"                   # ...except the ones built on Classic
     choice = _raw_setting("ui_theme_choice")
     return choice if choice in ("sunset", "classic", "legacy") else "new"
 
@@ -29092,6 +29308,7 @@ def load_launcher_settings():
     s["ui_style"] = _ui_read_style()
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
+    s["ui_defaults_applied"] = _raw_setting("ui_defaults_applied") or []
     return s
 
 SUNSET_THEME = dict(      # the "New" theme: same colours as the sign-in window (black fading to grey, white accent)
@@ -29289,10 +29506,29 @@ QFrame#SidePanel QLabel { background: transparent; border: none; }
 QLabel#PaneHeader { color: #9db8b3; font-size: 11px; font-weight: bold; background: transparent; letter-spacing: 1px; }
 """
 
+# Omar V4 (built on the Classic theme: top bar, flat colours). Colours come from Omar's profile - the deep-space nebula avatar (blue-black space with a violet glow),
+# Discord-dark charcoal card and the green online dot. Violet highlight and purple-black surfaces matching assets/icon-v4.png (black sky, purple glow).
+_OMAR_V4_THEME = dict(
+    bg="#0c0a14", sidebar="#06050b", panel="#151222", input="#09080f", border="#2a2442",
+    text="#f2f0fa", subtext="#a8a3c4", accent="#8a63e8", accent_hover="#a283f2", accent_press="#6a46c8",
+    button="#211c36", button_hover="#2e2750", disabled_bg="#120f1c", disabled_text="#5f5a7c",
+    handle="#3d3466", hover="#1b1730",
+    red="#8a63e8", red_hover="#a283f2", red_press="#6a46c8", accent_fill="rgba(138,99,232,0.22)",
+    nav_text="#aaa4c8", nav_active="#ffffff", brand="#ffffff", sidebar_border="#1c1830",
+    nav_fill="rgba(255,255,255,0.05)", nav_fill_hover="rgba(255,255,255,0.10)",
+)
+
+_OMAR_V4_EXTRA = ""      # Classic layout: the plain Classic stylesheet with this palette, nothing extra
+
 _ACCOUNT_THEMES["mm33"].update(label="MM33 (custom)", theme=_MM33_THEME, extra=_MM33_EXTRA,
                                icon="icon_mm33.png",          # teal and gold launcher icon (assets/, downloaded if missing)
                                icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_mm33.png",
                                           "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_mm33.png?raw=true"])
+
+_ACCOUNT_THEMES["omar_v4"].update(label="Omar V4", theme=_OMAR_V4_THEME, extra=_OMAR_V4_EXTRA,
+                                  icon="icon-v4.png",            # assets/icon-v4.png (downloaded if missing; the normal icon is used if it can't be found)
+                                  icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon-v4.png",
+                                             "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon-v4.png?raw=true"])
 
 _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
                                    icon="icon_kablooey.png",      # recoloured launcher icon (assets/, downloaded if missing)
@@ -29398,7 +29634,8 @@ def _theme_icon_file(kind):
     f = os.path.join(ASSETS_DIR, {"sunset": "icon-ss.png", "new": "icon.png"}.get(kind, "icon-cl.png"))
     return f if os.path.isfile(f) else ""
 
-_ACTIVE_THEME_AT_START = _active_theme_key() if _UI_STYLE_AT_START == "new" else ""
+_CLASSIC_ACCOUNT = bool(_classic_account_key())            # an account theme on the Classic layout: Classic look, fixed colours, always dark
+_ACTIVE_THEME_AT_START = _active_theme_key() if (_UI_STYLE_AT_START == "new" or _CLASSIC_ACCOUNT) else ""
 if _UI_STYLE_AT_START in ("legacy", "sunset"):
     SUNSET_THEME, _SUNSET_EXTRA = (_LEGACY_THEME, _LEGACY_EXTRA) if _UI_STYLE_AT_START == "legacy" else (_SS_THEME, _SS_EXTRA)
     SUNSET_ACCENT = SUNSET_THEME["accent"]
@@ -29413,17 +29650,17 @@ if _ACTIVE_THEME_AT_START:                    # this account's own theme, or the
 _ui_prev_set_accent = set_accent
 def set_accent(color):
     """The theme always uses its own accent (chat bubbles, in-game toasts etc. follow THEMES / overlay, not the stylesheet)."""
-    _ui_prev_set_accent(SUNSET_ACCENT if _SIDE_UI else color)
+    _ui_prev_set_accent(SUNSET_ACCENT if (_SIDE_UI or _CLASSIC_ACCOUNT) else color)
 
 _ui_prev_apply_accent_to_icon = apply_accent_to_icon
 def apply_accent_to_icon(color):
-    if _SIDE_UI:
+    if _SIDE_UI or _CLASSIC_ACCOUNT:
         return False                                 # the theme icon is never recoloured
     return _ui_prev_apply_accent_to_icon(color)
 
 _ui_prev_apply_dark_mode = apply_dark_mode
 def apply_dark_mode(mode):
-    _ui_prev_apply_dark_mode(mode)
+    _ui_prev_apply_dark_mode("on" if _CLASSIC_ACCOUNT else mode)      # the Omar V4 theme is always dark
     if _SIDE_UI:
         _ui_apply_sunset()                # the theme is always dark
 
@@ -29472,6 +29709,10 @@ def asset_path(filename):
         if _UI_STYLE_AT_START == "new":
             themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the active theme's own icon
             return themed or os.path.join(ASSETS_DIR, "icon.png")
+        if _CLASSIC_ACCOUNT:
+            themed = _ensure_theme_icon(_ACCOUNT_THEMES.get(_ACTIVE_THEME_AT_START) or {})   # the theme's own icon (icon-v4.png)
+            if themed:
+                return themed
         if not os.path.exists(accent_icon_path()):
             cl = _theme_icon_file("classic")             # Classic: icon-cl.png until the accent colour is changed
             if cl:
@@ -29579,7 +29820,8 @@ def _ui_add_setting(self):
     combo.addItem("Sunset", "sunset")
     combo.addItem("Classic", "classic")
     combo.addItem("Legacy", "legacy")
-    start_data = _UI_STYLE_AT_START if _UI_STYLE_AT_START in ("sunset", "classic", "legacy") else (_active_theme_key() or "new")
+    start_data = (_active_theme_key() if _CLASSIC_ACCOUNT else
+                  _UI_STYLE_AT_START if _UI_STYLE_AT_START in ("sunset", "classic", "legacy") else (_active_theme_key() or "new"))
     combo.setCurrentIndex(max(0, combo.findData(start_data)))
     if _custom_theme_locked():             # this account's theme is fixed
         key = _locked_theme_key()
@@ -29609,7 +29851,15 @@ def _ui_add_setting(self):
     lay.insertSpacing(1, 12)
     lay.insertSpacing(3, 12)
     sp.ui_style_combo = combo
-    if _SIDE_UI:
+    if _CLASSIC_ACCOUNT:
+        sp.accent_btn.setEnabled(False)
+        sp.accent_reset_btn.setEnabled(False)
+        sp.accent_desc.setText("Locked to this theme's color.")
+        try:
+            sp.dark_mode_combo.setEnabled(False)             # always dark
+        except Exception:
+            pass
+    elif _SIDE_UI:
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
         sp.accent_desc.setText("Locked to your custom theme." if _custom_theme_locked() else
@@ -30200,12 +30450,14 @@ def _ui_restyle_gmod(self):
 
 def _ui_decorate(self):
     # Store + Friends: new layouts
-    for fn in (_ui_restyle_store, _ui_restyle_friends, _ui_restyle_workshop, _ui_restyle_gmod):
+    for fn in (_ui_restyle_friends, _ui_restyle_workshop):
         try:
             fn(self)
         except Exception:
             import traceback
             traceback.print_exc()
+    _lazy_on_built(self, "store_page", lambda _p: _ui_restyle_store(self))      # lazy pages: restyled when built
+    _lazy_on_built(self, "gmod_page", lambda _p: _ui_restyle_gmod(self))
 
     # Settings: readable column, centred, instead of stretching across the whole window
     sp = self.settings_page
@@ -31783,10 +32035,10 @@ def _rx_ensure_library(win, appid, then):
     def done(res):
         title, cover = res
         try:
-            page = win.store_detail_page
+            page = win.__dict__.get("store_detail_page")
             shown = getattr(page, "_appid", None)
             win.add_steam_game(appid, title, cover)
-            if shown not in (None, appid):          # add_steam_game flips the open store page's button; put it back
+            if page is not None and shown not in (None, appid):     # add_steam_game flips the open store page's button
                 page.set_in_library(shown in win.steam_cards)
         except Exception as e:
             return then(False, f"Couldn't add {title} to the library: {e}")
@@ -32489,7 +32741,7 @@ AccountPage.log_out = _demo_log_out
 # ---------------------------------------------------------------- NCZ Link (stream this PC to your phone over LAN)
 # Like Steam Link, but small: turn it on in Settings, open NCZ Link in the phone app (same Wi-Fi), enter this PC's address and
 # the PIN once. The phone then sees your game list, can start a game, and gets a live view of this screen with touch /
-# mouse / keyboard control, plus the PC's sound. Everything stays on your local network: only private (LAN) addresses are accepted, every request
+# mouse / keyboard control, plus the PC's sound (the PC itself goes quiet while the phone listens). Everything stays on your local network: only private (LAN) addresses are accepted, every request
 # needs a token from PIN pairing, and it is OFF by default. Video is MJPEG; sound is raw PCM; input needs Windows, or xdotool on Linux.
 import http.server as _lk_http
 import socketserver as _lk_ss
@@ -32901,13 +33153,13 @@ def _lk_audio_install():
             import hashlib, io
             tag = "cp%d%d" % sys.version_info[:2]
             plat = "win_amd64" if sys.maxsize > 2 ** 32 else "win32"
-            with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30) as r:
+            with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30, context=_NCZ_SSL_CTX) as r:
                 files = json.load(r)["urls"]
             pick = next((f for f in files if f["packagetype"] == "bdist_wheel" and f"-{tag}-{tag}-{plat}" in f["filename"]), None)
             if not pick:
                 _lk["aerr"] = f"no sound package exists for Python {sys.version_info[0]}.{sys.version_info[1]}"
                 return
-            with urllib.request.urlopen(pick["url"], timeout=120) as r:
+            with urllib.request.urlopen(pick["url"], timeout=120, context=_NCZ_SSL_CTX) as r:
                 blob = r.read()
             if hashlib.sha256(blob).hexdigest() != pick["digests"]["sha256"]:
                 _lk["aerr"] = "the sound package download was corrupt"
@@ -33008,6 +33260,169 @@ def _lk_audio_open():
                 return None
         return rate, ch, get, proc.kill
     raise RuntimeError("this PC can't capture sound (Windows, or Linux with pulseaudio-utils, is needed)")
+
+# ---- mute the PC's own speakers while a phone is listening (the phone still gets the sound).
+# Windows: WASAPI loopback is captured before the endpoint's mute switch, so muting the default output device silences
+# the PC only. Linux: a silent null sink becomes the default output while streaming; its monitor is what gets captured.
+# Reference-counted (a reconnecting phone opens a new audio stream before the old one closes), restored when the last
+# audio stream ends, when the launcher exits, and on the next launch if it ever died while muted.
+import atexit as _lk_atexit
+_lk_mute = {"n": 0, "win": "", "lin": None, "lock": threading.RLock()}
+
+def _lk_mute_pref():
+    return _lk_load().get("mute_pc", True) is not False
+
+def _lk_com(obj, idx, argtypes, *args):
+    import ctypes
+    vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    hr = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vt[idx])(obj, *args)
+    if hr < 0:
+        raise OSError("COM error 0x%08X" % (hr & 0xFFFFFFFF))
+
+def _lk_com_release(obj):
+    import ctypes
+    try:
+        if obj and obj.value:
+            vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])(obj)
+    except Exception:
+        pass
+
+def _lk_win_mute(on, dev_id=""):
+    """on=True: mutes the default output if it isn't muted already and returns its id ('' if nothing was changed).
+    on=False: unmutes the device with that id."""
+    import ctypes
+    ole = ctypes.windll.ole32
+    ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    def guid(s):
+        g = (ctypes.c_byte * 16)()
+        ole.CLSIDFromString(ctypes.c_wchar_p(s), g)
+        return g
+    init = ole.CoInitializeEx(None, 0)
+    enum, dev, vol = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        hr = ole.CoCreateInstance(guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}"), None, 23,
+                                  guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}"), ctypes.byref(enum))
+        if hr < 0:
+            raise OSError("CoCreateInstance 0x%08X" % (hr & 0xFFFFFFFF))
+        if dev_id:
+            _lk_com(enum, 5, [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)], dev_id, ctypes.byref(dev))
+        else:
+            _lk_com(enum, 4, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], 0, 0, ctypes.byref(dev))
+        _lk_com(dev, 3, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                guid("{5CDF2C82-841E-4546-9722-0CF74078229A}"), 23, None, ctypes.byref(vol))
+        if on:
+            m = ctypes.c_int(0)
+            _lk_com(vol, 15, [ctypes.POINTER(ctypes.c_int)], ctypes.byref(m))
+            if m.value:
+                return ""                                  # already muted by the user: leave it exactly as it is
+            idp = ctypes.c_void_p()
+            _lk_com(dev, 5, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(idp))
+            did = ctypes.wstring_at(idp.value)
+            ole.CoTaskMemFree(ctypes.c_void_p(idp.value))
+            _lk_com(vol, 14, [ctypes.c_int, ctypes.c_void_p], 1, None)
+            return did
+        _lk_com(vol, 14, [ctypes.c_int, ctypes.c_void_p], 0, None)
+        return ""
+    finally:
+        for o in (vol, dev, enum):
+            _lk_com_release(o)
+        if init >= 0:
+            ole.CoUninitialize()
+
+def _lk_pactl(*a):
+    try:
+        r = subprocess.run(["pactl", *a], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def _lk_lin_mute(on, st=None):
+    """on=True: returns {'mod':..,'sink':..} (or None). on=False: restores from that dict."""
+    if not shutil.which("pactl"):
+        return None
+    if on:
+        orig = _lk_pactl("get-default-sink")
+        mod = _lk_pactl("load-module", "module-null-sink", "sink_name=ncz_link_silent",
+                        "sink_properties=device.description=NCZ-Link-Silent")
+        if not mod.isdigit():
+            return None
+        idx = {}
+        for line in _lk_pactl("list", "short", "sinks").splitlines():
+            p = line.split("\t")
+            if len(p) > 1:
+                idx[p[1]] = p[0]
+        _lk_pactl("set-default-sink", "ncz_link_silent")
+        for line in _lk_pactl("list", "short", "sink-inputs").splitlines():
+            p = line.split("\t")
+            if len(p) > 1 and orig and p[1] == idx.get(orig):   # only what was playing on the old default output
+                _lk_pactl("move-sink-input", p[0], "ncz_link_silent")
+        return {"mod": mod, "sink": orig}
+    if st:
+        if st.get("sink"):
+            _lk_pactl("set-default-sink", st["sink"])       # the silent sink's streams follow the default when it unloads
+        _lk_pactl("unload-module", str(st.get("mod", "")))
+    return None
+
+def _lk_mute_apply(on):
+    try:
+        if sys.platform.startswith("win"):
+            if on:
+                did = _lk_win_mute(True)
+                _lk_mute["win"] = did
+                if did:
+                    d = _lk_load(); d["mute_recover"] = {"win": did}; _lk_save(d)
+            elif _lk_mute["win"]:
+                did, _lk_mute["win"] = _lk_mute["win"], ""
+                _lk_win_mute(False, did)
+                d = _lk_load(); d.pop("mute_recover", None); _lk_save(d)
+        elif sys.platform.startswith("linux"):
+            if on:
+                _lk_mute["lin"] = _lk_lin_mute(True)
+                if _lk_mute["lin"]:
+                    d = _lk_load(); d["mute_recover"] = {"lin": _lk_mute["lin"]}; _lk_save(d)
+            elif _lk_mute["lin"]:
+                st, _lk_mute["lin"] = _lk_mute["lin"], None
+                _lk_lin_mute(False, st)
+                d = _lk_load(); d.pop("mute_recover", None); _lk_save(d)
+    except Exception as e:
+        print(f"NCZ Link: couldn't {'mute' if on else 'unmute'} the PC sound ({e!r})")
+
+def _lk_pc_mute(on):
+    """Takes (on=True) or gives back (on=False) a hold on the PC mute. The PC is silent while at least one hold exists."""
+    with _lk_mute["lock"]:
+        if on:
+            _lk_mute["n"] += 1
+            if _lk_mute["n"] == 1:
+                _lk_mute_apply(True)
+        elif _lk_mute["n"] > 0:
+            _lk_mute["n"] -= 1
+            if _lk_mute["n"] == 0:
+                _lk_mute_apply(False)
+    return on
+
+def _lk_pc_mute_recover():
+    """Launch-time cleanup: if the launcher died while it had the PC muted, put the sound back."""
+    try:
+        d = _lk_load()
+        r = d.pop("mute_recover", None)
+        if not r:
+            return
+        if r.get("win") and sys.platform.startswith("win"):
+            _lk_win_mute(False, r["win"])
+        elif r.get("lin") and sys.platform.startswith("linux"):
+            _lk_lin_mute(False, r["lin"])
+        _lk_save(d)
+    except Exception as e:
+        print(f"NCZ Link: couldn't restore the PC sound ({e!r})")
+
+def _lk_pc_mute_exit():
+    with _lk_mute["lock"]:
+        if _lk_mute["n"]:
+            _lk_mute["n"] = 0
+            _lk_mute_apply(False)
+_lk_atexit.register(_lk_pc_mute_exit)
+
 
 # ---- v2: WebSocket transport (acked frames, adaptive quality), fast capture, persistent input workers, Input Bridge hand-off.
 # Why the old version felt slow: every frame was grabbed on the launcher's GUI thread, every input batch was its own HTTP request
@@ -33914,10 +34329,21 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
         _lk_ws_session(_LkWS(self), q)
 
     def _audio(self):
+        want = _lk_mute_pref()
+        early = want and not sys.platform.startswith("win")   # Linux: the silent sink must exist before parec starts
+        held = _lk_pc_mute(True) if early else False
         try:
             rate, ch, get, close = _lk_audio_open()
         except RuntimeError as e:
+            if held:
+                _lk_pc_mute(False)
             return self._json(501, {"ok": False, "msg": str(e)[:160]})
+        if want and not early:
+            held = _lk_pc_mute(True)                            # Windows: only once the loopback is really capturing
+        try:
+            self.connection.settimeout(15)                      # a stalled phone must not leave the PC muted forever
+        except Exception:
+            pass
         with _lk["lock"]:
             _lk["agen"] += 1
             gen = _lk["agen"]                                 # a newer audio stream replaces this one
@@ -33937,6 +34363,8 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
                     self.wfile.flush()
         finally:
             close()
+            if held:
+                _lk_pc_mute(False)                              # phone gone: the PC's speakers come back
 
     def _stream(self, q):
         def qi(k, d, lo, hi):
@@ -34029,6 +34457,15 @@ def _lk_add_setting(self):
     desc.setWordWrap(True)
     col.addWidget(title)
     col.addWidget(desc)
+    from PyQt6.QtWidgets import QCheckBox as _LkCB
+    mute_cb = _LkCB("Mute this PC's sound while a phone is listening (the phone keeps the sound)")
+    mute_cb.setChecked(_lk_mute_pref())
+    def _mute_changed(v):
+        d = _lk_load()
+        d["mute_pc"] = bool(v)
+        _lk_save(d)
+    mute_cb.toggled.connect(_mute_changed)
+    col.addWidget(mute_cb)
     btn = _B()
     btn.setCheckable(True)
     btn.setFixedWidth(110)
@@ -34091,6 +34528,7 @@ _lk_prev_init = AdaptiveApp.__init__
 def _lk_init(self):
     _lk_prev_init(self)
     try:
+        _lk_pc_mute_recover()
         _lk["inv"] = _LkInvoker()
         _lk_add_setting(self)
     except Exception as e:
@@ -34102,7 +34540,16 @@ AdaptiveApp.__init__ = _lk_init
 # ================================================================ NCZFront inside the launcher
 # "Play" on the NCZFront card opens the site in a browser tab inside the launcher (QtWebEngine) instead of the
 # default browser. The page stays alive when you switch to another launcher tab, so a running game keeps going.
-if _HAS_WEBENGINE:
+def _ncz_web_classes():
+    """Imports QtWebEngine and defines the browser classes the first time NCZFront opens, so Chromium isn't loaded at
+    startup for everyone who has PyQt6-WebEngine installed. Returns NczWebPage."""
+    global NczWebPage
+    if "NczWebPage" in globals():
+        return NczWebPage
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
+                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
+
     class _NgrokSkipWarning(QWebEngineUrlRequestInterceptor):
         """ngrok's free tunnels show a 'Visit Site' warning page; this header skips it for page loads."""
         def interceptRequest(self, info):
@@ -34335,6 +34782,8 @@ if _HAS_WEBENGINE:
             if effect is None:
                 super().setGraphicsEffect(None)
 
+    return NczWebPage
+
 def _nczfront_mark_playing():
     """Same 'playing NCZFront' status the default-browser path gives (shown to friends)."""
     _web_until["t"] = time.time() + 1800
@@ -34355,7 +34804,14 @@ def _open_nczfront(self):
         return
     page = self.__dict__.get("web_page")
     if page is None:
-        page = NczWebPage()
+        try:
+            web_cls = _ncz_web_classes()
+        except Exception:                       # installed but won't load (broken install): default browser
+            import traceback
+            traceback.print_exc()
+            webbrowser.open(NCZFRONT_URL)
+            return
+        page = web_cls()
         self.web_page = page
         self.pages.addWidget(page)
         page.back_requested.connect(self._leave_web_page)
@@ -36036,7 +36492,7 @@ def _ch_http_bytes(url):
     if "klipy" in url:
         hdr["Referer"] = "https://klipy.com/"
     req = urllib.request.Request(url, headers=hdr)
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as r:
         return r.read(), (r.headers.get("Content-Type") or "").lower()
 
 def _ch_discord_fetch_one(uid, out):
@@ -50340,7 +50796,7 @@ class _DepPanel(QFrame):
             try:
                 self._line.emit("Downloading ffmpeg (~80 MB)...")
                 req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
-                with urllib.request.urlopen(req, timeout=30) as r, open(zp, "wb") as f:
+                with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as r, open(zp, "wb") as f:
                     shutil.copyfileobj(r, f)
                 last_err = None
                 break
@@ -50651,6 +51107,301 @@ def _sc_settings_init(self, *a, **k):
         pass
 
 SettingsPage.__init__ = _sc_settings_init
+
+
+# ================================================================ pages built the first time they're opened
+# Store, Store detail, GE-Proton, Wine, GMod addons, Fan Games and Fan detail used to be built at startup although a normal
+# start never opens them. A placeholder keeps each one's slot (so hard-coded indexes like pages.setCurrentIndex(4) and the
+# nav buttons keep working); the real page is built when the placeholder is shown or when code reads win.<name>
+# (AdaptiveApp.__getattr__). Startup wiring goes into on-built hooks. Code that only wants the page if it exists uses
+# self.__dict__.get(name) (hasattr / getattr would build it).
+class _LazyPagePlaceholder(QWidget):
+    def __init__(self, app, name):
+        super().__init__()
+        self.setObjectName("Content")
+        self._app, self._name = app, name
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._build_if_shown)
+
+    def _build_if_shown(self):
+        try:
+            if self.isVisible():        # still the page on screen (not just passed through while the stack changed)
+                _lazy_build(self._app, self._name)
+        except RuntimeError:
+            pass                        # already replaced
+
+def _lazy_page(app, name, factory, *hooks):
+    """Adds a placeholder for page `name` to app.pages and returns it."""
+    if "_lazy_pages" not in app.__dict__:
+        app._lazy_pages = {}
+    ph = _LazyPagePlaceholder(app, name)
+    app._lazy_pages[name] = {"ph": ph, "factory": factory, "hooks": list(hooks)}
+    app.pages.addWidget(ph)
+    return ph
+
+def _lazy_on_built(app, name, hook):
+    """hook(page) now if the page exists, otherwise right after it's built."""
+    page = app.__dict__.get(name)
+    if page is not None:
+        hook(page)
+    elif name in app.__dict__.get("_lazy_pages", {}):
+        app._lazy_pages[name]["hooks"].append(hook)
+
+def _lazy_slot(app, name):
+    """The page if built, else its placeholder (None if neither): for indexOf / 'is this the current page' checks."""
+    page = app.__dict__.get(name)
+    if page is not None:
+        return page
+    ent = app.__dict__.get("_lazy_pages", {}).get(name)
+    return ent["ph"] if ent else None
+
+def _lazy_build(app, name):
+    page = app.__dict__.get(name)
+    if page is not None:
+        return page
+    ent = app.__dict__.get("_lazy_pages", {}).get(name)
+    if ent is None:
+        raise AttributeError(name)
+    page = ent["factory"]()
+    app.__dict__[name] = page               # set first: hooks and signal handlers below may read it
+    ph, stack = ent["ph"], app.pages
+    idx, was_current = stack.indexOf(ph), stack.currentWidget() is ph
+    stack.blockSignals(True)
+    try:
+        stack.insertWidget(idx, page)
+        if was_current:
+            stack.setCurrentWidget(page)    # before removing the placeholder, or the stack shows the next page meanwhile
+        stack.removeWidget(ph)
+    finally:
+        stack.blockSignals(False)
+    ph.deleteLater()
+    for hook in ent["hooks"]:
+        try:
+            hook(page)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    ent["hooks"] = []
+    if was_current:
+        stack.currentChanged.emit(stack.currentIndex())     # listeners see the real page open (blocked above)
+    _memlog(f"page built: {name}")
+    return page
+
+def _lazy_getattr(self, name):
+    lazy = self.__dict__.get("_lazy_pages") if not name.startswith("__") else None
+    if lazy and name in lazy:
+        return _lazy_build(self, name)
+    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+AdaptiveApp.__getattr__ = _lazy_getattr
+
+
+# ================================================================ chess page: timers only while they have something to do
+# The page is kept after you leave it, and its 100 ms clock, 1.5 s game poll and 10 s inbox poll kept firing for good.
+#   clock_timer: only while a board is on screen (_tick did nothing otherwise; a clock that ran out is flagged on return)
+#   inbox_timer: only while the lobby is on screen (_poll_inbox already returned early otherwise)
+#   game_timer:  only while an online game is going (it already slows to 5 s while the page isn't shown)
+def _ch_sync_timers(self):
+    try:
+        shown = self.isVisible()
+        idx = self.stack.currentIndex()
+        for t, on in ((self.clock_timer, shown and idx == 1), (self.inbox_timer, shown and idx == 0),
+                      (self.game_timer, bool(self.net_gid) and self.net_state not in ("over", "cancelled"))):
+            if on and not t.isActive():
+                t.start()
+            elif not on and t.isActive():
+                t.stop()
+    except (AttributeError, RuntimeError):
+        pass
+
+_ch_prev_init = NczChessPage.__init__
+def _ch_timers_init(self, *a, **k):
+    _ch_prev_init(self, *a, **k)
+    self.stack.currentChanged.connect(lambda _i: _ch_sync_timers(self))
+    _ch_sync_timers(self)
+NczChessPage.__init__ = _ch_timers_init
+
+_ch_prev_show = NczChessPage.showEvent
+def _ch_timers_show(self, e):
+    _ch_prev_show(self, e)
+    _ch_sync_timers(self)
+NczChessPage.showEvent = _ch_timers_show
+
+def _ch_timers_hide(self, e):
+    QWidget.hideEvent(self, e)
+    _ch_sync_timers(self)
+NczChessPage.hideEvent = _ch_timers_hide
+
+_ch_prev_poll_game = NczChessPage._poll_game
+def _ch_timers_poll_game(self):
+    _ch_sync_timers(self)       # starts it for a new online game (open_online calls this), stops it once the game is over
+    _ch_prev_poll_game(self)
+NczChessPage._poll_game = _ch_timers_poll_game
+
+
+# ================================================================ memory: NCZ_MEMLOG=1 logging, free memory while hidden in the tray
+_MEMLOG = os.environ.get("NCZ_MEMLOG", "").strip() not in ("", "0")
+
+def _mem_usage():
+    """(working set MiB, private MiB) on Windows, (RSS MiB, anonymous RSS MiB) on Linux, None if unknown."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            class _PMC(ctypes.Structure):       # PROCESS_MEMORY_COUNTERS_EX
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                    (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                                   "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                                                   "PagefileUsage", "PeakPagefileUsage", "PrivateUsage")]
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(pmc)
+            psapi, k32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")     # own handles: don't touch windll's shared argtypes
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / 1048576.0, pmc.PrivateUsage / 1048576.0
+        elif os.path.exists("/proc/self/status"):
+            vals = {}
+            with open("/proc/self/status") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    if k in ("VmRSS", "RssAnon"):
+                        vals[k] = int(v.split()[0]) / 1024.0
+            if "VmRSS" in vals:
+                return vals["VmRSS"], vals.get("RssAnon", 0.0)
+    except Exception:
+        pass
+    return None
+
+def _memlog(what):
+    if not _MEMLOG:
+        return
+    m = _mem_usage()
+    names = ("working set", "private") if sys.platform.startswith("win") else ("RSS", "anon")
+    text = time.strftime("%H:%M:%S ") + f"[memlog] {what}: " + (
+        f"{names[0]} {m[0]:.1f} MiB, {names[1]} {m[1]:.1f} MiB" if m else "unknown")
+    if sys.stdout is not None:
+        print(text, flush=True)
+    else:       # pythonw / shortcut: no console, so keep it next to launcher.json
+        try:
+            with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "memlog.txt"), "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+
+def _memlog_start(window):
+    """Called once from main(): startup figure now, then every 60 s."""
+    if not _MEMLOG:
+        return
+    _memlog("startup")
+    t = QTimer(window)
+    t.setInterval(60 * 1000)
+    t.timeout.connect(lambda: _memlog("every 60 s (window " + ("shown" if window.isVisible() else "hidden") + ")"))
+    t.start()
+    window._memlog_timer = t
+
+# Timers that only redraw the window: paused while it's hidden (tray / Big Picture), restarted when it's shown again.
+# Not paused: _lib_timer ("playing" listeners), _state_timer (presence), friends / chat / group polls, overlay, remote.
+def _ui_pause_targets(self):
+    out = [getattr(self, n, None) for n in ("_stop_timer", "_pt_ui_timer", "_gmod_timer", "_unread_timer")]
+    gp = getattr(getattr(self, "friends_page", None), "group_page", None)
+    out.append(getattr(gp, "tick_timer", None))         # group composer's 1 s "timed out" countdown
+    return [t for t in out if t is not None]
+
+def _ui_timers_pause(self):
+    paused = getattr(self, "_ui_paused_timers", [])
+    for t in _ui_pause_targets(self):
+        try:
+            if t.isActive():
+                t.stop()
+                paused.append(t)
+        except RuntimeError:
+            pass
+    self._ui_paused_timers = paused
+
+def _ui_timers_resume(self):
+    paused, self._ui_paused_timers = getattr(self, "_ui_paused_timers", []), []
+    gp = getattr(getattr(self, "friends_page", None), "group_page", None)
+    for t in paused:
+        try:
+            if t is getattr(gp, "tick_timer", None) and not gp.chat_timer.isActive():
+                continue            # the group chat was closed meanwhile
+            t.start()
+        except RuntimeError:
+            pass
+    if paused:
+        try:
+            _pt_refresh_cards(self)     # playtime labels right away instead of after 3 s
+        except Exception:
+            pass
+
+_mem_prev_show = AdaptiveApp.showEvent
+def _mem_show_event(self, ev):
+    _mem_prev_show(self, ev)
+    if not self.isMinimized():
+        _ui_timers_resume(self)
+        _memlog("window shown")
+AdaptiveApp.showEvent = _mem_show_event
+
+def _mem_drop_store_cards(page):
+    """Drops a Store / Fan Games page's loaded cards (and their covers). Its showEvent loads them again from the top, with
+    the same search and tags, the next time the page is opened."""
+    if page is None or not getattr(page, "_cards", None):
+        return
+    page._request_id += 1               # a page still on its way is ignored
+    page.loader.cancel_pending()
+    page._clear_cards()
+    page._next_start, page._total = 0, 0
+    page._exhausted = page._loading = False
+    page._loaded_once = False
+
+def _mem_trim():
+    """Hands unused memory back to the OS, so Task Manager's figure really drops (pages come back on demand)."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            psapi, k32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+            psapi.EmptyWorkingSet(k32.GetCurrentProcess())
+        elif sys.platform.startswith("linux"):
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+def _mem_free_hidden(self, step=0):
+    """Hidden to the tray: drop the Store / Fan Games cards, then (once Qt has deleted them) clear the pixmap cache,
+    collect garbage and trim. Skipped while Big Picture is what hid the window, or if it was shown again meanwhile."""
+    bp = getattr(self, "_big_picture", None)
+    if not self.isHidden() or (bp is not None and getattr(bp, "_active", False)):
+        return
+    try:
+        if step == 0:
+            for name in ("store_page", "fan_page"):
+                _mem_drop_store_cards(self.__dict__.get(name))
+            QTimer.singleShot(500, lambda: _mem_free_hidden(self, 1))     # deleteLater runs in the event loop first
+            return
+        from PyQt6.QtGui import QPixmapCache
+        import gc
+        QPixmapCache.clear()
+        gc.collect()
+        _mem_trim()
+        _memlog("after freeing memory (hidden)")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+_mem_prev_hide = getattr(AdaptiveApp, "hideEvent", QMainWindow.hideEvent)
+def _mem_hide_event(self, ev):
+    _mem_prev_hide(self, ev)
+    if self.isHidden():                 # hidden for real (tray, Big Picture), not just minimized
+        _ui_timers_pause(self)
+        _memlog("window hidden")
+        QTimer.singleShot(1500, lambda: _mem_free_hidden(self))      # not on a quick hide / show
+AdaptiveApp.hideEvent = _mem_hide_event
 
 
 if __name__ == "__main__":
