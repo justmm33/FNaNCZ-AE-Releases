@@ -31,7 +31,6 @@ import shutil
 import hashlib
 import threading
 import subprocess
-import zipfile
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -42,7 +41,8 @@ import http.server
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
                          QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption, QImage)
-from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect)
+from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect,
+                             QMessageBox)
 
 # ------------------------------------------------------------------------------------------------ config
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
@@ -67,21 +67,26 @@ REQUIRE_DISCORD_FOR_NEW_ACCOUNTS = True
 # next login counts as "already in the database".
 WRITE_PROFILE_FOR_NEW_ACCOUNTS = True
 BAN_CLOSE_DELAY_MS = 16
-VERSION_TEXT = "v12.5.0"
+VERSION_TEXT = "v12.4.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
 GITHUB_REPO = "justmm33/FNaNCZ-AE-Releases"
 GITHUB_BRANCH = "main"
 LAUNCHER_FILES = ("main.py", "overlay.py", "controller_input.py", "controller_bridge.py","fan_games.csv","gamejolt_scraper.py")
-# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. On every start
-# it is compared with GitHub and re-downloaded when it is missing or different, even with Automatic Updates off.
+# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. When it is
+# missing locally it is fetched on every start, even with Automatic Updates off.
 OPTIONAL_FILES = ("ncz_gm.py",)
 ASSETS_PREFIX = "assets/"
 KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it already exists (locally built)
 TREE_URL = "https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 INSTALLED_MARKER = ".ncz_launcher_installed"
+# Files that belong to the optional "NCZ Big Picture Utilities" download. When one of them is about to be downloaded
+# (and is not on the PC yet), the user is asked first.
+BIGPICTURE_FILES = ("ncz_bigpicture_startup.gif", "ncz_bigpicture_startup.wav")
+BIGPICTURE_TEXT = "NCZ Big Picture Utilities (15 MB)"
+BIGPICTURE_DECLINED_FLAG = "ncz_bigpicture_declined"      # in settings_dir(): the user said No, so don't ask on every start
 
 # Social sign-in (Google / Microsoft / GitHub). Each one opens the system browser, comes back to a temporary
 # http://localhost:<port> address, and the result is exchanged for a Firebase account (accounts:signInWithIdp).
@@ -684,9 +689,9 @@ def discord_check(strict=True):
     return {"status": "ok", "user_id": user_id, "message": ""}
 
 from pathlib import Path
-def send_ban_webhook(user_id, action="make an account in"):
+def send_ban_webhook(user_id):
     body = json.dumps({
-        "content": f"<@{user_id}> has tried to {action} the NCZ Games Launcher, E-mail: {user_email}.",
+        "content": f"<@{user_id}> has tried to make an account in the NCZ Games Launcher, E-mail: {user_email}.",
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
     req = urllib.request.Request(WEBHOOK_URL, data=body, method="POST",
@@ -753,6 +758,27 @@ def git_blob_sha(path):
         return None
 
 
+def _is_bigpicture(path):
+    return os.path.basename(str(path)).lower() in BIGPICTURE_FILES
+
+
+def bigpicture_declined():
+    return os.path.exists(os.path.join(settings_dir(), BIGPICTURE_DECLINED_FLAG))
+
+
+def set_bigpicture_declined(declined):
+    p = os.path.join(settings_dir(), BIGPICTURE_DECLINED_FLAG)
+    try:
+        if declined:
+            os.makedirs(settings_dir(), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("1")
+        elif os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
 def auto_update_on():
     """The launcher's 'Automatic Updates' switch (launcher.json, key auto_update). On when it isn't saved yet,
     same as the launcher's own default."""
@@ -765,8 +791,8 @@ def auto_update_on():
 
 
 def list_asset_updates(timeout=8, include_scripts=False):
-    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder, plus ncz_gm.py,
-    that are new or different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
+    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
     try:
         with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -776,10 +802,9 @@ def list_asset_updates(timeout=8, include_scripts=False):
             if e.get("type") != "blob":
                 continue
             dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
-            # ncz_gm.py is always compared with GitHub (even with Automatic Updates off): it is downloaded when it is
-            # missing locally or its git sha differs from the repo's copy.
-            if not (path.startswith(ASSETS_PREFIX) or path in OPTIONAL_FILES
-                    or (include_scripts and path in LAUNCHER_FILES)):
+            missing_optional = path in OPTIONAL_FILES and not os.path.exists(dest)
+            if not (path.startswith(ASSETS_PREFIX) or missing_optional
+                    or (include_scripts and (path in LAUNCHER_FILES or path in OPTIONAL_FILES))):
                 continue
             if not dest.startswith(INSTALL_DIR + os.sep):
                 continue
@@ -832,124 +857,13 @@ def _download_to(url, dest, on_bytes, is_cancelled):
     raise last_err or CloudError("Download failed.")
 
 
-# ------------------------------------------------------------------------------------------------ FFmpeg (Windows only)
-# NCZ Link streams the PC screen as H.264 through FFmpeg (main.py looks for ffmpeg.exe in its own folder first). Windows has no
-# FFmpeg out of the box, so it is downloaded once into INSTALL_DIR (next to main.py). Only ffmpeg.exe is kept. Never downloaded on
-# Linux (the package manager has it) and a failure here never blocks the launcher: NCZ Link just falls back to its JPEG stream.
-FFMPEG_EXE = os.path.join(INSTALL_DIR, "ffmpeg.exe")
-FFMPEG_FAILED_MARKER = os.path.join(INSTALL_DIR, ".ncz_ffmpeg_failed")
-FFMPEG_RETRY_S = 24 * 3600                      # after a failed download, don't try again for a day
-FFMPEG_SOURCES = (                              # (zip, checksum file): the first one that works wins
-    ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256"),
-    ("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"),
-)
-
-
-def ffmpeg_needed():
-    if not sys.platform.startswith("win") or os.path.isfile(FFMPEG_EXE):
-        return False
-    try:
-        if time.time() - os.path.getmtime(FFMPEG_FAILED_MARKER) < FFMPEG_RETRY_S:
-            return False
-    except OSError:
-        pass
-    return True
-
-
-def _ffmpeg_sha_from(text, name):
-    for line in text.splitlines():
-        parts = line.replace("*", " ").split()
-        if parts and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]) and (len(parts) == 1 or parts[-1].endswith(name)):
-            return parts[0].lower()
-    return None
-
-
-def _ffmpeg_verify(path):
-    r = subprocess.run([path, "-hide_banner", "-version"], capture_output=True, timeout=15,
-                       creationflags=0x08000000 if sys.platform.startswith("win") else 0)
-    return r.returncode == 0
-
-
-def _ffmpeg_fetch(zip_url, sum_url, progress, is_cancelled):
-    tmp_zip = os.path.join(INSTALL_DIR, "ffmpeg_download.zip.part")
-    tmp_exe = FFMPEG_EXE + ".part"
-    try:
-        want = None
-        try:                                                    # the checksum is a nice-to-have: skip the check if it can't be read
-            req = urllib.request.Request(sum_url, headers={"User-Agent": "NCZ-Games-Launcher"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                want = _ffmpeg_sha_from(r.read(200000).decode("utf-8", "replace"), zip_url.rsplit("/", 1)[-1])
-        except Exception:
-            pass
-        req = urllib.request.Request(zip_url, headers={"User-Agent": "NCZ-Games-Launcher"})
-        h, done = hashlib.sha256(), 0
-        with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_zip, "wb") as f:
-            total = int(resp.headers.get("Content-Length") or 0) or 110 * 1048576
-            while True:
-                if is_cancelled():
-                    raise CloudError("Cancelled.")
-                chunk = resp.read(128 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                done += len(chunk)
-                progress(min(0.99, done / total), f"FFmpeg (video encoder)   {done / 1048576:.1f} / {total / 1048576:.0f} MB")
-        if want and h.hexdigest() != want:
-            raise OSError("checksum mismatch")
-        progress(0.99, "FFmpeg (video encoder)   unpacking...")
-        with zipfile.ZipFile(tmp_zip) as z:
-            member = next((n for n in z.namelist() if n.replace("\\", "/").lower().endswith("/bin/ffmpeg.exe")
-                           or n.lower() == "ffmpeg.exe"), None)
-            if not member:
-                raise OSError("ffmpeg.exe not found in the download")
-            with z.open(member) as src, open(tmp_exe, "wb") as dst:
-                shutil.copyfileobj(src, dst, 1024 * 1024)
-        if not _ffmpeg_verify(tmp_exe):
-            raise OSError("the downloaded ffmpeg.exe doesn't run")
-        os.replace(tmp_exe, FFMPEG_EXE)
-    finally:
-        for p in (tmp_zip, tmp_exe):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-
-
-def install_ffmpeg(progress, is_cancelled):
-    """Windows: puts ffmpeg.exe next to main.py if it isn't there. Never raises (except a user cancel)."""
-    if not ffmpeg_needed():
-        return
-    for zip_url, sum_url in FFMPEG_SOURCES:
-        try:
-            progress(0.0, "FFmpeg (video encoder)   connecting...")
-            _ffmpeg_fetch(zip_url, sum_url, progress, is_cancelled)
-            try:
-                os.remove(FFMPEG_FAILED_MARKER)
-            except OSError:
-                pass
-            return
-        except CloudError:
-            if is_cancelled():
-                raise
-        except Exception:
-            if is_cancelled():
-                raise CloudError("Cancelled.")
-    try:                                                        # every source failed: remember, so the next starts aren't delayed
-        with open(FFMPEG_FAILED_MARKER, "w", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-    except OSError:
-        pass
-
-
-def install_launcher(progress, is_cancelled, entries=None):
+def install_launcher(progress, is_cancelled, entries=None, full=None):
     """Downloads the launcher into INSTALL_DIR. progress(fraction, text). Files that are already identical are
     skipped; replaced scripts keep a one-time .bak copy of what was there before.
     entries: a ready-made [(path, size, sha)] list (an assets update) -> only those files are downloaded."""
-    full = entries is None
-    if full:
+    if full is None:
+        full = entries is None
+    if entries is None:
         entries = list_launcher_files()
     total = sum(size for _p, size, _s in entries) or 1
     state = {"done": 0, "name": "", "last": 0.0}
@@ -987,7 +901,6 @@ def install_launcher(progress, is_cancelled, entries=None):
         _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
                      dest, bump, is_cancelled)
     emit(force=True)
-    install_ffmpeg(progress, is_cancelled)                  # Windows only, never fails the install
     if full:
         with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1016,14 +929,15 @@ class DownloadWorker(QThread):
     done = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, parent=None, entries=None):
+    def __init__(self, parent=None, entries=None, full=None):
         super().__init__(parent)
         self.cancel = False
         self.entries = entries
+        self.full = full
 
     def run(self):
         try:
-            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel, self.entries)
+            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel, self.entries, self.full)
             self.done.emit()
         except CloudError as e:
             if not self.cancel:
@@ -2177,7 +2091,49 @@ class LoginWindow(QWidget):
         self.progress.value = self.progress.shown = 0.0
         self.progress.text = "Connecting to GitHub..."
         self._go("downloading")
-        self._dl = DownloadWorker(self, entries)
+        if entries is None:
+            # full install: get the file list first (off the GUI thread), so the Big Picture question can be asked
+            # before anything is downloaded
+            self._lw = Worker(list_launcher_files, self)
+            self._lw.done.connect(lambda ents: self._begin_download(ents, True))
+            self._lw.failed.connect(self._on_download_failed)
+            self._lw.start()
+        else:
+            self._begin_download(entries, False)
+
+    def _ask_bigpicture(self, entries):
+        """If the files to download include the Big Picture startup gif / wav and they aren't on this PC yet, asks
+        whether to download NCZ Big Picture Utilities. Returns the entries to really download (without those files
+        when the answer is No)."""
+        bp = [e for e in entries if _is_bigpicture(e[0])]
+        if not bp:
+            return entries
+        def dest(p):
+            return os.path.normpath(os.path.join(INSTALL_DIR, *p.split("/")))
+        if all(os.path.exists(dest(e[0])) for e in bp):
+            return entries                                  # already installed: just updated like any other file
+        if bigpicture_declined():
+            return [e for e in entries if not _is_bigpicture(e[0])]   # said No earlier: don't ask on every start
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("NCZ Big Picture Utilities")
+        box.setText(f"Do you want to download {BIGPICTURE_TEXT}?")
+        box.setInformativeText("Choose No to continue without them.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            set_bigpicture_declined(False)
+            return entries
+        set_bigpicture_declined(True)
+        return [e for e in entries if not _is_bigpicture(e[0])]
+
+    def _begin_download(self, entries, full):
+        entries = self._ask_bigpicture(entries)
+        if not entries and not full:
+            self.launch_now()                               # an update that only had the declined files: nothing to do
+            return
+        self.progress.text = "Connecting to GitHub..."
+        self._dl = DownloadWorker(self, entries, full)
         self._dl.progress.connect(self._on_progress)
         self._dl.done.connect(self._on_downloaded)
         self._dl.failed.connect(self._on_download_failed)
@@ -2237,14 +2193,11 @@ class LoginWindow(QWidget):
 def main():
     # signed in and installed: skip the window completely and open the launcher
     changed = []
-    ff_only = False
     if not is_flagged_banned() and load_account() and install_complete():
         # silent: new or modified files in assets/, plus main.py and the other scripts when Automatic Updates is on
         # (empty when offline)
         changed = list_asset_updates(include_scripts=auto_update_on())
-        if not changed and ffmpeg_needed():
-            ff_only = True                            # nothing else to update, but NCZ Link's video encoder is missing (Windows)
-        elif not changed:
+        if not changed:
             try:
                 launch_launcher()
                 return
@@ -2258,7 +2211,7 @@ def main():
     if is_flagged_banned():                           # banned earlier: no sign-in, just the message and close
         QTimer.singleShot(0, lambda: win.ban(None, notify=False))
     elif load_account():                              # signed in but the launcher isn't downloaded (yet), or assets changed
-        QTimer.singleShot(0, lambda: win.start_download([] if ff_only else (changed or None)))
+        QTimer.singleShot(0, lambda: win.start_download(changed or None))
     sys.exit(app.exec())
 
 _old_init = LoginWindow.__init__
