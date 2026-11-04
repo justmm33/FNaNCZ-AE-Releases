@@ -91,11 +91,39 @@ def _read_launcher_json():
         return {}
 
 
+def _custom_theme(cfg=None):
+    """(id, name, colors) of the custom theme picked in the launcher (launcher.json: ui_theme = "custom_<id>", its colours in
+    custom_themes[id]), or None. Same checks main.py does, so a broken entry is ignored."""
+    cfg = _read_launcher_json() if cfg is None else cfg
+    key = cfg.get("ui_theme")
+    tid = key[7:] if isinstance(key, str) and key.startswith("custom_") else ""
+    themes = cfg.get("custom_themes")
+    ent = themes.get(tid) if isinstance(themes, dict) else None
+    if not tid or not re.fullmatch(r"[0-9a-f]{4,12}", tid) or not isinstance(ent, dict):
+        return None
+    colors = ent.get("colors") if isinstance(ent.get("colors"), dict) else {}
+    name = str(ent.get("name") or "My theme").strip()[:30] or "My theme"
+    return tid, name, colors
+
+
+def _theme_label(key, cfg=None):
+    """Display name of a theme key (custom themes show as "<name> (custom)", like in Settings)."""
+    if key in THEME_LABELS:
+        return THEME_LABELS[key]
+    cust = _custom_theme(cfg)
+    if cust and key == "custom_" + cust[0]:
+        return f"{cust[1]} (custom)"
+    return key
+
+
 def _theme_key(cfg=None):
-    """The launcher's active theme: new / sunset / classic / legacy or an account theme such as mm33."""
+    """The launcher's active theme: new / sunset / classic / legacy, an account theme such as mm33, or custom_<id>."""
     cfg = _read_launcher_json() if cfg is None else cfg
     if cfg.get("ui_theme") in THEME_ACCENTS:
         return cfg["ui_theme"]
+    cust = _custom_theme(cfg)
+    if cust:
+        return "custom_" + cust[0]
     choice = cfg.get("ui_theme_choice")
     return choice if choice in ("sunset", "classic", "legacy") else "new"
 
@@ -107,6 +135,12 @@ def _accent_hex():
     key = _theme_key(cfg)
     if key in THEME_ACCENTS:
         return THEME_ACCENTS[key]
+    cust = _custom_theme(cfg)
+    if cust and key == "custom_" + cust[0]:                  # a custom theme: its own accent colour
+        a = cust[2].get("accent")
+        if isinstance(a, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", a):
+            return a.lower()
+        return DEFAULT_ACCENT
     c = cfg.get("accent_color")
     if isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c):
         return c.lower()
@@ -1014,6 +1048,8 @@ def _write_launcher_json(updates, remove=()):
 def cmd_change_theme(args):
     options, locked, mod = _theme_options()
     current = _theme_key()
+    if current not in options and current.startswith("custom_"):
+        options[current] = _theme_label(current)           # keeps its name even when main.py couldn't be loaded
     if locked:
         err(f"Your account's theme is fixed ({options.get(locked, locked)}); it can't be changed.")
         return 1
@@ -1491,7 +1527,7 @@ def cmd_status(_args):
     rows = [
         ("Launcher", paint("running", "ok") if running else paint("not running", "dim")),
         ("Account", paint(email or "signed in", "bold") if is_logged_in() else paint("not signed in", "warn")),
-        ("Theme", THEME_LABELS.get(key, key)),
+        ("Theme", _theme_label(key, cfg)),
         ("Automatic Updates", paint("on", "ok") if auto else paint("off", "warn")),
         ("Library", f"{len(_known_titles())} games"),
         ("Settings folder", settings_dir()),
