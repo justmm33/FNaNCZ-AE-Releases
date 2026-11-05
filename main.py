@@ -148,6 +148,9 @@ DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
 LIBRARY_FOLDER_NAME = "NCZLibrary"       # looked for on every partition
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
+NCZTR_GAME_NAME = "Five Nights at NCZ: The Return"
+NCZTR_RELEASE_DATE = "5 Dec 2026"     # 5/12/2026
+NCZTR_RELEASE_TS = (2026, 12, 5, 0, 0, 0)   # local time the countdown on the card runs to
 NCZFRONT_URL = "https://acapesfront.duckdns.org:9000/"
 
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
@@ -6791,6 +6794,7 @@ class AdaptiveApp(QMainWindow):
 
         self.create_game_card("Five Nights at NCZ AE", asset_path("fnanczaecover.png"), "ae")
         self.create_game_card("Five Nights at NCZ 2", asset_path("fnancz2cover.png"), "ncz2")
+        self.create_game_card(NCZTR_GAME_NAME, asset_path("fnancz-tr.png"), "ncztr")
         self.create_game_card("NCZ Chess", asset_path("nczchess.png"), "chess")
         self.create_game_card("NCZFront", asset_path("nczfront-cover.png"), "nczfront")
         self.steam_cards = {}
@@ -7390,6 +7394,31 @@ class AdaptiveApp(QMainWindow):
             btn_action.setText("Play")
             btn_action.clicked.connect(lambda _c=False: self.open_nczfront())
             menu.addAction("Refresh status").triggered.connect(self.check_nczfront_status)
+        elif game_id == "ncztr":
+            # Five Nights at NCZ: The Return - no download/exe hooked up yet, so the card is a placeholder
+            btn_action.setText("Coming soon")
+            btn_action.setEnabled(False)
+            more_btn.hide()
+            self.set_card_status("ncztr", f"Releases {NCZTR_RELEASE_DATE}")
+            self.btn_ncztr_action = btn_action
+
+            def _tick_ncztr():
+                import datetime as _dt
+                left = int((_dt.datetime(*NCZTR_RELEASE_TS) - _dt.datetime.now()).total_seconds())
+                if left <= 0:
+                    btn_action.setText("Out now")
+                    self.set_card_status("ncztr", f"Released {NCZTR_RELEASE_DATE}")
+                    self._ncztr_timer.stop()
+                    return
+                d, rem = divmod(left, 86400)
+                h, rem = divmod(rem, 3600)
+                m, sec = divmod(rem, 60)
+                btn_action.setText(f"{d}d {h:02d}h {m:02d}m {sec:02d}s" if d else f"{h:02d}h {m:02d}m {sec:02d}s")
+
+            self._ncztr_timer = QTimer(self)
+            self._ncztr_timer.timeout.connect(_tick_ncztr)
+            self._ncztr_timer.start(1000)
+            _tick_ncztr()
         elif game_id == "chess":
             btn_action.setText("Play")
             btn_action.clicked.connect(lambda _c=False: self.open_chess())
@@ -12053,7 +12082,7 @@ def library_cover_paths():
     NCZ games (assets folder), store games + Add Existing Game, and custom games."""
     out = {}
     for name, fname in ((AE_GAME_NAME, "fnanczaecover.png"), (NCZ2_GAME_NAME, "fnancz2cover.png"),
-                        ("NCZFront", "nczfront-cover.png")):
+                        (NCZTR_GAME_NAME, "fnancz-tr.png"), ("NCZFront", "nczfront-cover.png")):
         path = asset_path(fname)
         if os.path.exists(path):
             out[pretty_game_name(name)] = path
@@ -23034,10 +23063,10 @@ _reorder_prev_init = AdaptiveApp.__init__
 
 def _reorder_init(self):
     _reorder_prev_init(self)
-    # the four NCZ games (AE, 2, Chess, NCZFront) are always the first four cards
-    self._fixed_cards = {id(c) for c, _t in self.cards[:4]}
+    # the five NCZ games (AE, 2, The Return, Chess, NCZFront) are always the first five cards
+    self._fixed_cards = {id(c) for c, _t in self.cards[:5]}
     saved = _load_library_order()
-    _apply_saved_order(self.cards, saved.get("main", []), keep_first=4)
+    _apply_saved_order(self.cards, saved.get("main", []), keep_first=5)
     _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
     self._card_reorder = _CardReorder(self)
     self.apply_filter()
@@ -25824,7 +25853,7 @@ SettingsPage.__init__ = _ct_settings_init
 
 # ================================================================ library sort (A to Z) + Discord Rich Presence
 # Library sort: "Custom order" is whatever you dragged the cards into; "A to Z" sorts everything alphabetically
-# but the three NCZ games always stay on top. Your dragged order is kept and comes back when you switch back.
+# but the five NCZ games (AE, 2, The Return, Chess, NCZFront) always stay on top. Your dragged order is kept and comes back when you switch back.
 _lib_sort_cache = {"mode": None}
 
 def get_library_sort():
@@ -25852,7 +25881,7 @@ def _sort_apply_filter(self, text=""):
     orig_main = list(self.cards)
     orig_fan = list(fan) if fan is not None else None
     try:
-        self.cards[4:] = sorted(self.cards[4:], key=lambda it: it[1].casefold())
+        self.cards[5:] = sorted(self.cards[5:], key=lambda it: it[1].casefold())
         if fan is not None:
             fan.sort(key=lambda it: it[1].casefold())
         return _sort_prev_apply_filter(self, text)
