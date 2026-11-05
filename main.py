@@ -1,3 +1,9 @@
+"""NCZ Games Launcher: the main desktop app (PyQt6).
+
+Library, Store, Friends and chat, Settings, Big Picture, the tray and the other pages are all built in this file.
+demo.py (sign-in and installer) downloads and starts it, and the auto-updater replaces it. It uses overlay.py (toasts
+and the in-game overlay), controller_input.py, controller_bridge.py and runs gamejolt_scraper.py as a separate script.
+"""
 import os
 import sys
 import re
@@ -5,7 +11,6 @@ import time
 import json
 import shutil
 import shlex
-import zipfile
 import subprocess
 import urllib.request
 import urllib.parse
@@ -13,7 +18,7 @@ import urllib.error
 import ssl
 _NCZ_SSL_CTX = ssl.create_default_context()     # one shared context: a fresh one per urlopen re-reads the cert store (~13 ms each)
 
-# ---- jsDelivr mirror for GitHub files. jsDelivr is a free CDN that serves public GitHub repos (no setup), and is often much faster than
+# ── jsDelivr mirror for GitHub files. jsDelivr is a free CDN that serves public GitHub repos (no setup), and is often much faster than
 # raw.githubusercontent.com. Files it can't serve (over 50 MB, missing) fall back to GitHub automatically.
 # jsDelivr caches branch URLs for up to ~12 h, so main.py / companion files only use it when this is True (and you purge after a push:
 # https://purge.jsdelivr.net/gh/<user>/<repo>@<branch>/<file>). Rarely-changing files (gm-fix, scraper, icons) always try it first.
@@ -52,27 +57,243 @@ import html as html_lib
 from concurrent.futures import ThreadPoolExecutor
 import webbrowser
 from string import Template
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QFrame, QMenu, QButtonGroup, QStackedWidget,
-    QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
-    QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
-    QAbstractItemView, QTabWidget
-)
-from PyQt6.QtCore import QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
-from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
-try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
-    import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
-    _HAS_WEBENGINE = (importlib.util.find_spec("PyQt6.QtWebEngineWidgets") is not None
-                      and importlib.util.find_spec("PyQt6.QtWebEngineCore") is not None)
-except Exception:
-    _HAS_WEBENGINE = False
 
-if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
-    from overlay import run_server
-    run_server()
-    sys.exit(0)
+# Contents (section banners, in file order)
+#   game library (multiple partitions)
+#   wine (Linux)
+#   Direct3D renderer (Wine / Proton)
+#   Wine builds + compatibility tools (Linux)
+#   launch options (per game)
+#   game versions
+#   profile (username + picture)
+#   country shown on the profile (two-letter code), with its flag
+#   desktop shortcut
+#   resumable downloads: a dropped connection or an expired link keeps what's already on disk
+#   common redistributables
+#   start with the system
+#   only one launcher at a time
+#   Loading card: spinning NCZ logo + a Wikipedia fact
+#   store (Steam games + SteamGridDB art)
+#   Store tags: the tag list, a game's own tags, and "more like this"
+#   system requirements + "can I run it"
+#   NSFW covers: blurred until the user confirms once, then every cover is revealed for good
+#   Terms and Conditions (shown once per terms version)
+#   finding archive tools (7-Zip / WinRAR aren't on PATH on Windows)
+#   "Ask every time": pick the server in a popup for each download
+#   build numbers (server 1 update check)
+#   server 3: Download, Download, then your own browser on a redirect / new tab
+#   server 2: run setup.exe, find where it installed, find the game .exe
+#   friends system
+#   preparing files for sending (runs on a worker thread, so only QImage here, never QPixmap)
+#   chat: Twemoji, picker, message rows
+#   flags are searchable by country name (the downloaded list only has codes like "flag-eg")
+#   background + tray notifications
+#   Launch -> Stop while a game runs
+#   self-update at launch
+#   full library for friends + NCZFront "playing"
+#   idle (minimized) + offline (quit) for friends
+#   Garry's Mod Addon Manager tab
+#   Garry's Mod: "Apply Fix" menu item
+#   Steam Workshop tab
+#   GE Proton tab (Linux only)
+#   Wine tab (Linux only)
+#   H toggles the download browser window
+#   Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store)
+#   Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv)
+#   fan games in the Library (bottom section, horizontal cards)
+#   "use existing file or download again" for steam + Game Jolt installs
+#   QoL: pausable downloads, exe icons, desktop shortcuts, fan-game launching
+#   icon of an .exe (reads the PE resource table; no extra libraries)
+#   winetricks for any game (Linux)
+#   Add Existing Fan Game
+#   drag to reorder the library
+#   Auto-Add Desktop Games
+#   Qt part
+#   frameless window: exit button + draggable top bar
+#   in-game overlay (toast + settings)
+#   second instance with separate data (NCZ_PROFILE=name)
+#   friends overlay (Shift+Q while in a game)
+#   F9 screenshot hotkey (saved to <library>/Screenshots)
+#   controller translator (Windows / XInput)
+#   library sort (A to Z) + Discord Rich Presence
+#   FNaNCZ AE / 2 native launch on Linux
+#   library duplicate-card fix + library saved to account
+#   library <-> account (users/<uid>/library in the cloud)
+#   playtime counter (saved to the account)
+#   group chats (Friends tab)
+#   cloud
+#   small UI helpers
+#   the group chat page
+#   hook into the Friends tab
+#   navbar: Downloads + Settings icon buttons, centred tabs, Credits inside Settings
+#   profiles (Steam-style: currently playing, library, country)
+#   "New" UI theme
+#   Custom themes (made by the user)
+#   custom theme, locked to one account
+#   Legacy theme (side list, mint green)
+#   Sunset theme (purple night sky, orange accent)
+#   Controller Bridge (phone -> PC gamepad)
+#   theme picker (first launch)
+#   Sunset UI: layout touches + fade animations
+#   cloud saves for EVERY game (Firebase)
+#   local config (per device)
+#   cloud access (Realtime Database, same account as the rest)
+#   where the save folders are (per platform)
+#   files -> zip -> files
+#   upload / download (blocking; run in a worker or BusyDialog)
+#   finding the save folders of a game
+#   the save folder = the first NEW folder in AppData
+#   GUI-thread helper (dialogs must not run on a worker thread)
+#   before the game starts
+#   after the game closes
+#   "Cloud Saves..." in every game's menu
+#   start games from your phone
+#   phone: PC store, Workshop mods, cloud saves, download server
+#   download server: the phone's pick beats the launcher's setting
+#   store
+#   Steam Workshop
+#   cloud saves
+#   request loop
+#   "please update" lock (no demo.py next to main.py)
+#   log out -> back to demo.py (sign-in window)
+#   NCZ Link (stream this PC to your phone over LAN)
+#   input injection (Windows: SendInput, Linux: xdotool)
+#   mute the PC's own speakers while a phone is listening (the phone still gets the sound).
+#   WebSocket (RFC 6455, just what we need: text + binary frames, ping / pong, close)
+#   the HTTP side
+#   NCZFront inside the launcher
+#   NCZ Chess: rules engine (pure python)
+#   NCZ Chess: piece icons + move sounds
+#   NCZ Chess: board widget
+#   NCZ Chess: the page
+#   NCZ Chess: bots (their own fast search engine)
+#   the bots
+#   Elo ratings (online games between friends)
+#   NCZ Chess: game review (PGN -> Chesskit through Playwright)
+#   "Play" on the NCZ Chess card opens the chess page inside the launcher
+#   Poll results: Discord picture sync + itch.io fan games
+#   Discord picture sync
+#   itch.io fan games
+#   covers + details page (the details page reads a Game Jolt shaped dict, so we hand it one)
+#   downloading (itch.io's own download flow: page -> download_url -> file -> signed link)
+#   the "itch.io Games" button on the Fan Games page
+#   Store: Trending / Most Popular / Works on your PC
+#   "Can I run it": processor + graphics card
+#   NCZ Big Picture mode
+#   Big Picture extras
+#   setup / lifecycle
+#   input
+#   on-screen keyboard
+#   shared painting helpers
+#   Friends tab
+#   Downloads tab
+#   Workshop tab
+#   downloads stay inside Big Picture
+#   X sidebar (the launcher's 3-dot menu)
+#   Fan Games tab
+#   Garry's Mod Addons tab
+#   Big Picture chat: game invites + attachments
+#   media (thumbnails, invite covers)
+#   chat drawing
+#   chat input
+#   sending: messages, files, invites
+#   in-Big-Picture file browser (images / videos)
+#   Big Picture: embedded windows, settings cog, download covers
+#   controller / keyboard navigation inside an embedded window
+#   Admin panel + bans
+#   ban lock (survives log out, lives next to launcher.json)
+#   admin cloud operations (all need the admin's token + the admin database rules)
+#   admin UI
+#   Settings: grouped sections + Big Picture auto-launch
+#   the two new settings
+#   Big Picture settings menu: same sections (section titles are rows that can't be selected)
+#   Overlay toast chime
+#   NCZ Chess inside Big Picture
+#   NCZ logo (assets/icon.png) in more places
+#   library: favorites / hidden / recently played
+#   downloads: speed limit, schedule, pause all
+#   friends: activity feed
+#   screenshots: per-game gallery + share
+#   store: game reviews and ratings (Firebase: reviews/<appid>/<uid>)
+#   F9 screenshots: fix black captures (Wayland / XWayland)
+#   #14 recommendations ("because you played X")
+#   small dialogs used by Big Picture
+#   library cards: extra entries in the 3-dot menu (also what Big Picture's X menu shows)
+#   Big Picture
+#   recommendations cache (used by the Store shelf and the Big Picture "For You" tab)
+#   Big Picture Friends tab: activity under the friend list
+#   Big Picture Downloads tab: pause / resume all
+#   Store: "Recommended for you" shelf (horizontal covers, no popup)
+#   Big Picture: For You tab, Screenshots tab, library toolbar, download limits
+#   Library toolbar: view filters + favorite / hide
+#   Downloads: speed limit and schedule
+#   For You tab (horizontal covers)
+#   Screenshots tab
+#   tab plumbing
+#   overlays: download limits + screenshot viewer
+#   games started outside the launcher
+#   desktop shortcuts
+#   auto-add desktop shortcuts that are store games
+#   update game shortcuts made by older launchers (once)
+#   launcher shortcut: delete + recreate with the new icon
+#   Settings: install missing dependencies
+#   Game shortcuts launch the exe directly
+#   pages built the first time they're opened
+#   chess page: timers only while they have something to do
+#   memory: NCZ_MEMLOG=1 logging, free memory while hidden in the tray
+#   Big Picture: startup animation
+#   Settings: choose / add / remove startup animations
 
+# ── Logging for former debug prints and swallowed errors (defined first: any later code may call them) ──
+def _ncz_log(msg):
+    """General log for former debug prints and _log_exc: one line in launcher.log next to launcher.json.
+    Past 1 MB the file is moved to launcher.log.1 (replacing an older one). Never raises."""
+    try:
+        path = os.path.join(os.path.dirname(get_launcher_settings_path()), "launcher.log")
+        try:
+            if os.path.getsize(path) > 1000000:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass    # expected: logging must never break the launcher
+
+_LOG_EXC_LAST = {}      # where -> time of its last log line
+
+def _log_exc(where):
+    """For `except` blocks that used to be silent: logs the exception being handled with its traceback through
+    _ncz_log, at most once per place per 60 s so a timer can't flood the log. Never raises."""
+    try:
+        now = time.monotonic()
+        last = _LOG_EXC_LAST.get(where)
+        if last is not None and now - last < 60:
+            return
+        _LOG_EXC_LAST[where] = now
+        import traceback        # lazy: only needed once something went wrong
+        et, ev, tb = sys.exc_info()
+        # file, line and function of each frame, without reading the source: traceback.format_exc() would load the
+        # whole 2 MB main.py into linecache and cost several MiB of memory
+        frames = traceback.StackSummary.extract(traceback.walk_tb(tb), lookup_lines=False)
+        text = "Traceback (most recent call last):\n" + "".join(
+            '  File "%s", line %d, in %s\n' % (f.filename, f.lineno, f.name) for f in frames)
+        _ncz_log(where + ": " + text + "".join(traceback.format_exception_only(et, ev)))
+    except Exception:
+        pass    # expected: logging must never break the launcher
+
+class _LazyModule:
+    """A module imported on first use. zipfile alone cost ~29 ms of every start, and it, tarfile, lzma and uuid are only
+    used by downloads / installs."""
+    def __init__(self, name):
+        self.__dict__["_ncz_name"] = name
+
+    def __getattr__(self, attr):
+        import importlib    # lazy: saves memory/startup until used
+        return getattr(importlib.import_module(self.__dict__["_ncz_name"]), attr)
+
+zipfile = _LazyModule("zipfile")
+# before the Qt imports: the helper only needs ctypes, and loading PyQt6 made every invite lookup slower
 if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the running game's Steam rich presence "connect" text
     import ctypes
     _i = sys.argv.index("--ncz-rp-helper")
@@ -127,6 +348,27 @@ if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the runn
         sys.stderr.write("rp helper error: %r\n" % (_e,))
     sys.exit(0)
 
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QFrame, QMenu, QButtonGroup, QStackedWidget,
+    QDialog, QProgressBar, QFormLayout, QLineEdit, QScrollArea, QComboBox, QMessageBox,
+    QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
+    QAbstractItemView, QTabWidget
+)
+from PyQt6.QtCore import QDate, QDateTime, QTime, QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
+try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
+    import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
+    _HAS_WEBENGINE = (importlib.util.find_spec("PyQt6.QtWebEngineWidgets") is not None
+                      and importlib.util.find_spec("PyQt6.QtWebEngineCore") is not None)
+except Exception:
+    _HAS_WEBENGINE = False
+
+if "--ncz-overlay-server" in sys.argv:      # XWayland overlay helper (see overlay.py), frozen builds
+    from overlay import run_server
+    run_server()
+    sys.exit(0)
+
 def _bundled_dir():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return sys._MEIPASS
@@ -148,9 +390,6 @@ DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
 LIBRARY_FOLDER_NAME = "NCZLibrary"       # looked for on every partition
 AE_GAME_NAME = "Five Nights at NCZ AE"
 NCZ2_GAME_NAME = "Five Nights at NCZ 2"
-NCZTR_GAME_NAME = "Five Nights at NCZ: The Return"
-NCZTR_RELEASE_DATE = "5 Dec 2026"     # 5/12/2026
-NCZTR_RELEASE_TS = (2026, 12, 5, 0, 0, 0)   # local time the countdown on the card runs to
 NCZFRONT_URL = "https://acapesfront.duckdns.org:9000/"
 
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
@@ -161,6 +400,7 @@ def accent_icon_path():
     can't be saved there; the settings folder survives restarts."""
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "icon_accent.png")
 
+# kept: used at import time before the later definition at line 29743
 def asset_path(filename):
     if filename == "icon.png":
         custom = accent_icon_path()
@@ -168,7 +408,7 @@ def asset_path(filename):
             return custom
     return os.path.join(ASSETS_DIR, filename)
 
-# ---------------------------------------------------------------- game library (multiple partitions)
+# ── game library (multiple partitions) ──
 _SKIP_MOUNT_PREFIXES = ("/boot", "/snap", "/var/lib/snapd", "/var/lib/docker", "/sys", "/proc", "/dev", "/run/user",
                         "/run/snapd", "/tmp", "/usr", "/etc", "/opt/pw-browsers")
 _SKIP_FSTYPES = {"squashfs", "iso9660", "udf", "tmpfs", "devtmpfs", "overlay", "proc", "sysfs", "cgroup2",
@@ -197,7 +437,7 @@ def mounted_partitions():
                     continue
                 if dev not in best or len(mp) < len(best[dev]):
                     best[dev] = mp
-    except OSError:
+    except OSError:    # expected: cleanup that may already be done
         pass
     for mp in best.values():
         out.append(mp)
@@ -228,14 +468,14 @@ def library_roots():
         for extra in load_launcher_settings().get("library_dirs", []):
             add(extra)
     except Exception:
-        pass
+        _log_exc("library_roots")
     for mp in mounted_partitions():
         lib = partition_library_path(mp)
         try:
             if os.path.isdir(lib):
                 add(lib)
         except OSError:
-            pass
+            _log_exc("library_roots")
     _roots_cache.update(time=time.time(), roots=roots)
     return roots
 
@@ -246,7 +486,7 @@ def apply_install_dir():
     try:
         chosen = load_launcher_settings().get("install_dir", "")
     except Exception:
-        pass
+        _log_exc("apply_install_dir")
     target = DEFAULT_GAMES_DIR
     if chosen:
         try:
@@ -254,7 +494,7 @@ def apply_install_dir():
             if os.access(chosen, os.W_OK):
                 target = chosen
         except OSError:
-            pass   # drive unplugged / not writable: fall back to the default folder
+            _log_exc("apply_install_dir")   # drive unplugged / not writable: fall back to the default folder
     GAMES_DIR = target
     DOWNLOAD_DIR = os.path.join(GAMES_DIR, "")
     invalidate_library_roots()
@@ -266,14 +506,14 @@ def _find_in_library(name):
             if os.path.exists(path):
                 return path
         except OSError:
-            pass
+            _log_exc("_find_in_library")
     return None
 
 def installed_game_dir(game_name):
     # An already-installed game is found on any partition; a new install goes to the active install folder.
     return _find_in_library(game_name) or os.path.join(GAMES_DIR, game_name)
 
-# ---------------------------------------------------------------- wine (Linux)
+# ── wine (Linux) ──
 GAME_INFO = {
     "ae": dict(
         name=AE_GAME_NAME,
@@ -307,7 +547,7 @@ def system_env():
             env.pop("LD_LIBRARY_PATH", None)
     return env
 
-# ---------------------------------------------------------------- Direct3D renderer (Wine / Proton)
+# ── Direct3D renderer (Wine / Proton) ──
 WINE_D3D_MODES = {
     "default": "Default",
     "wined3d": "WineD3D (OpenGL)",
@@ -377,11 +617,11 @@ def launch_wine(wine_path, exe, cwd, args=None):
                     with open(os.path.join(prefix, ".ncz_d3d_installed"), "a", encoding="utf-8") as f:
                         f.write(" ".join(missing) + "\n")
             except Exception:
-                pass
+                _log_exc("work")
             try:
                 subprocess.Popen([wine_path, exe] + args, cwd=cwd, env=env)
             except Exception:
-                pass
+                _log_exc("work")
         threading.Thread(target=work, daemon=True).start()
         return
     subprocess.Popen([wine_path, exe] + args, cwd=cwd, env=env)
@@ -413,7 +653,7 @@ def find_wine():
             return path, out.split()[0]
     return None
 
-# ---------------------------------------------------------------- Wine builds + compatibility tools (Linux)
+# ── Wine builds + compatibility tools (Linux) ──
 def wine_builds_dir():
     # Wine builds downloaded in the Wine tab live here, one folder per build.
     return os.path.expanduser("~/.local/share/NCZ_Games_Launcher/wine")
@@ -438,7 +678,7 @@ def wine_installed_builds():
             binary = _wine_bin_in(os.path.join(base, name))
             if binary:
                 found[name] = binary
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     return found
 
@@ -615,7 +855,7 @@ _file_cache_lock = threading.Lock()
 _file_cache = {}            # (kind, path) -> ((mtime_ns, size) or None, value)
 
 def _cached_by_mtime(kind, path, build, copy=True):
-    import copy as _copy
+    import copy as _copy    # lazy: saves memory/startup until used
     try:
         st = os.stat(path)
         stamp = (st.st_mtime_ns, st.st_size)
@@ -636,6 +876,7 @@ def _file_cache_drop(path):
         for k in [k for k in _file_cache if k[1] == path]:
             del _file_cache[k]
 
+# kept: used at import time before the later definition at line 29367
 def load_launcher_settings():
     return _cached_by_mtime("settings", get_launcher_settings_path(), _load_launcher_settings_file)
 
@@ -702,7 +943,7 @@ def _load_launcher_settings_file():
                 if isinstance(opts, dict):
                     settings["launch_options"] = {str(k): v for k, v in opts.items()
                                                   if isinstance(v, str) and v.strip()}
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
     settings.setdefault("launch_options", {})
     return settings
@@ -718,7 +959,7 @@ def save_launcher_settings(settings):
 
 apply_install_dir()
 
-# ---------------------------------------------------------------- launch options (per game)
+# ── launch options (per game) ──
 # Keys match the compatibility-tool keys: "ae", "ncz2", a Steam appid, "custom-<id>", "fan-<id>".
 def get_launch_options(key):
     return load_launcher_settings().get("launch_options", {}).get(str(key), "")
@@ -752,7 +993,7 @@ CLOUD_TIMEOUT = 20
 FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts:{action}?key={key}"
 FIREBASE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token?key={key}"
 
-# ---------------------------------------------------------------- game versions
+# ── game versions ──
 VERSION_KEYS = ("version", "latest_version", "current_version", "game_version")
 _versions_lock = threading.Lock()
 
@@ -880,8 +1121,65 @@ def _cloud_error_from(raw_message, http_code=0):
         return CloudError("The cloud refused the request (check the database rules).", code)
     return CloudError(f"Cloud error: {code or 'HTTP ' + str(http_code)}", code)
 
+_fb_conns = threading.local()
+
+def _fb_keepalive_get(url, headers, timeout):
+    """GET on a kept-alive HTTPS connection (one per thread) when `url` is on the Firebase database host: the friends /
+    chat polls made a new TCP + TLS connection for every request. -> (status, body text), or None to use urllib."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "https" or parts.netloc != urllib.parse.urlsplit(FIREBASE_DB_URL.strip()).netloc:
+            return None
+        import http.client    # lazy: saves memory/startup until used
+        path = parts.path + ("?" + parts.query if parts.query else "")
+        for attempt in (0, 1):                      # an idle connection the server already closed: reconnect once
+            conn = getattr(_fb_conns, "conn", None)
+            if conn is None:
+                conn = _fb_conns.conn = http.client.HTTPSConnection(parts.netloc, context=_NCZ_SSL_CTX)
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read().decode("utf-8", errors="replace")
+                if resp.will_close:
+                    conn.close()
+                    _fb_conns.conn = None
+                return resp.status, body
+            except (http.client.HTTPException, OSError):
+                try:
+                    conn.close()
+                except Exception:    # expected: cleanup that may already be done
+                    pass
+                _fb_conns.conn = None
+                if attempt:
+                    return None
+    except Exception:
+        return None
+    return None
+
 def _http_json(url, method="GET", payload=None, form=None, timeout=None):
     headers = {"User-Agent": "NCZ-Games-Launcher"}
+    if method == "GET" and payload is None and form is None:
+        got = _fb_keepalive_get(url, headers, timeout or CLOUD_TIMEOUT)
+        if got is not None and 300 <= got[0] < 400:
+            got = None                              # a redirect: urllib follows those
+        if got is not None:
+            status, body = got
+            if status >= 400:                       # same errors as the urllib path below
+                try:
+                    err = json.loads(body).get("error")
+                    message = err.get("message", "") if isinstance(err, dict) else str(err or "")
+                except Exception:
+                    message = body[:120]
+                raise _cloud_error_from(message, status)
+            if not body.strip():
+                return None
+            try:
+                return json.loads(body)
+            except ValueError:
+                raise CloudError("The cloud sent back something unexpected.", "BAD_REPLY")
     data = None
     if form is not None:
         data = urllib.parse.urlencode(form).encode("utf-8")
@@ -897,7 +1195,7 @@ def _http_json(url, method="GET", payload=None, form=None, timeout=None):
         raw = ""
         try:
             raw = e.read().decode("utf-8", errors="replace")
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         try:
             err = json.loads(raw).get("error")
@@ -954,7 +1252,7 @@ def _load_account_file():
             acct = json.load(f)
         if isinstance(acct, dict) and acct.get("refresh_token") and acct.get("uid"):
             return acct
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return None
 
@@ -968,7 +1266,7 @@ def save_account(acct):
     _file_cache_drop(path)
     try:
         os.chmod(path, 0o600)
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 def clear_account():
@@ -977,7 +1275,7 @@ def clear_account():
     for path in (get_account_path(), get_profile_cache_path(), get_avatar_cache_path()):
         try:
             os.remove(path)
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
     _file_cache_drop(get_account_path())
 
@@ -1050,12 +1348,12 @@ def write_game_text(path, text, default_null=False):
                 existing = f.read()
             if existing:
                 use_null = existing.endswith(b'\x00')
-        except OSError:
+        except OSError:    # expected: file may not exist yet or be unreadable
             pass
         try:
             shutil.copy2(path, path + ".bak")
         except OSError:
-            pass
+            _log_exc("write_game_text")
     payload = text.encode('utf-8') + (b'\x00' if use_null else b'')
     tmp = path + ".tmp"
     with open(tmp, 'wb') as f:
@@ -1099,7 +1397,7 @@ def apply_cloud_game(record, save_path, settings_path):
         written.append(key)
     return written
 
-# ---------------------------------------------------------------- profile (username + picture)
+# ── profile (username + picture) ──
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,20}$")
 AVATAR_SIZE = 128
 MAX_PHOTO_CHARS = 400000
@@ -1115,7 +1413,7 @@ def validate_username(name):
         return "Username must be 3-20 characters: letters, numbers, _ . or -"
     return ""
 
-# ---- country shown on the profile (two-letter code), with its flag
+# ── country shown on the profile (two-letter code), with its flag ──
 COUNTRIES = dict(x.split(":", 1) for x in (
     "AF:Afghanistan|AL:Albania|DZ:Algeria|AD:Andorra|AO:Angola|AG:Antigua and Barbuda|AR:Argentina|AM:Armenia|"
     "AU:Australia|AT:Austria|AZ:Azerbaijan|BS:Bahamas|BH:Bahrain|BD:Bangladesh|BB:Barbados|BY:Belarus|BE:Belgium|"
@@ -1191,7 +1489,7 @@ def get_country_flag_file(code):
             if _fetch_flag_override(code, path):
                 return path
         except Exception:
-            pass
+            _log_exc("get_country_flag_file")
         return ""
     try:
         raw = _http_get(f"https://flagcdn.com/w160/{code.lower()}.png",
@@ -1201,11 +1499,11 @@ def get_country_flag_file(code):
             with open(path, "wb") as f:
                 f.write(raw)
             return path
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return ""
 
-# ---- country auto-detected from the IP address when the account has none (never overrides your own choice)
+# ── country auto-detected from the IP address when the account has none (never overrides your own choice)
 _country_auto_state = {"uid": None, "next": 0.0}
 
 def _country_manual_path():
@@ -1232,7 +1530,7 @@ def mark_country_manual(uid):
             os.makedirs(os.path.dirname(_country_manual_path()), exist_ok=True)
             with open(_country_manual_path(), "w", encoding="utf-8") as f:
                 json.dump(uids, f)
-        except OSError:
+        except OSError:    # expected: file may not exist yet or be unreadable
             pass
 
 def detect_country_by_ip():
@@ -1277,7 +1575,7 @@ def load_profile_country():
         if isinstance(data, dict) and data.get("uid") == acct["uid"]:
             code = str(data.get("country") or "").upper()
             return code if code in COUNTRIES else ""
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return ""
 
@@ -1316,7 +1614,7 @@ def load_profile_cache():
             avatar = get_avatar_cache_path()
             has_photo = bool(data.get("has_photo")) and os.path.exists(avatar)
             return str(data.get("username") or ""), (avatar if has_photo else None)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return "", None
 
@@ -1332,7 +1630,7 @@ def save_profile_cache(uid, username, png_bytes, country=""):
     else:
         try:
             os.remove(avatar)
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
     with open(get_profile_cache_path(), 'w', encoding='utf-8') as f:
         json.dump({"uid": uid, "username": username or "", "has_photo": bool(png_bytes),
@@ -1370,7 +1668,7 @@ def cloud_save_profile(username=None, png=None, remove_photo=False, country=None
     if country is not None:
         try:        # friends see it right away instead of at the next presence update
             _http_json(_fdb(f"public/{uid}", token), "PATCH", {"country": payload["country"]})
-        except CloudError:
+        except CloudError:    # expected: offline or timed out
             pass
     return cloud_pull_profile()
 
@@ -1379,7 +1677,7 @@ def describe_save(text):
         night = json.loads(text).get("night")
         if isinstance(night, (int, float)) and not isinstance(night, bool):
             return f"Night {int(night) if float(night).is_integer() else night}"
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return ""
 
@@ -1389,7 +1687,7 @@ def format_cloud_time(ms):
     except Exception:
         return "an unknown time"
 
-# ---------------------------------------------------------------- desktop shortcut
+# ── desktop shortcut ──
 # `python main.py` never caches the compiled file it runs, so all 50k lines were compiled on every start (~5 s, ~20 MiB).
 # Importing it instead lets Python keep __pycache__/main.cpython-*.pyc. This stub does what `python main.py` did
 # (same sys.argv, the script's folder first on sys.path, no '' / cwd entry) and needs no extra file, so the self-updater still only swaps main.py.
@@ -1421,7 +1719,7 @@ def _shortcut_icon_name(src, ext):
     """One file per theme icon, so Windows/the desktop can't keep showing a cached icon of another theme."""
     stem = re.sub(r"[^A-Za-z0-9_-]", "", os.path.splitext(os.path.basename(src))[0]) or "icon"
     try:
-        import hashlib
+        import hashlib    # lazy: saves memory/startup until used
         with open(src, "rb") as _f:
             tag = "-" + hashlib.md5(_f.read()).hexdigest()[:8]      # changes whenever the icon's pixels change
     except Exception:
@@ -1492,7 +1790,7 @@ def _linux_desktop_dir():
         if out and os.path.isdir(out):
             return out
     except Exception:
-        pass
+        _log_exc("_linux_desktop_dir")
     fallback = os.path.expanduser("~/Desktop")
     return fallback if os.path.isdir(fallback) else None
 
@@ -1525,7 +1823,7 @@ def _create_linux_shortcut(target, args, workdir, icon):
             subprocess.run(["gio", "set", path, "metadata::trusted", "true"],
                            capture_output=True, timeout=5, env=system_env())
         except Exception:
-            pass
+            _log_exc("_create_linux_shortcut")
     return path
 
 def create_desktop_shortcut(icon_src=None):
@@ -1546,7 +1844,7 @@ def create_desktop_shortcut(icon_src=None):
         with open(_shortcut_marker(), "w", encoding="utf-8") as f:
             f.write(os.path.basename(icon or ""))
     except Exception:
-        pass
+        _log_exc("create_desktop_shortcut")
     return result
 
 THEMES = {
@@ -1742,7 +2040,7 @@ def load_app_font():
         for f in sorted(os.listdir(ASSETS_DIR)):
             if f.lower().startswith("ubuntu") and f.lower().endswith((".ttf", ".otf")) and f.lower() != "ubuntu.ttf":
                 paths.append(os.path.join(ASSETS_DIR, f))
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     for path in paths:
         if os.path.isfile(path):
@@ -1773,6 +2071,7 @@ def system_prefers_dark():
         window_color = app.palette().color(QPalette.ColorRole.Window)
         return window_color.lightness() < 128
 
+# kept: used at import time before the later definition at line 29691
 def set_accent(color):
     """Recolors the launcher's accent (buttons, highlights, links) in both themes."""
     c = QColor(color)
@@ -1783,9 +2082,9 @@ def set_accent(color):
         t.update(accent=base, accent_hover=hover, accent_press=press, red=base, red_hover=hover, red_press=press,
                  accent_fill=f"rgba({c.red()},{c.green()},{c.blue()},0.18)")
     try:                                     # in-game toasts follow the accent too
-        import overlay as _overlay_mod
+        import overlay as _overlay_mod    # lazy: saves memory/startup until used
         _overlay_mod.set_accent(base)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
 
 def _hue_shift_icon(src, hue, sat_scale, size=256):
@@ -1805,11 +2104,11 @@ def _hue_shift_icon(src, hue, sat_scale, size=256):
                 img.setPixelColor(x, y, c)
     return img
 
+# kept: used at import time before the later definition at line 29696
 def apply_accent_to_icon(color):
     """Recolors assets/icon.png to match the accent: the icon's background becomes exactly the chosen colour and
     the other shades move with it. The original is kept once as assets/icon_default.png and every recolor starts
     from it, so Reset restores the exact original. Returns True if icon.png changed."""
-    import colorsys
     try:
         icon = accent_icon_path()
         orig = os.path.join(ASSETS_DIR, "icon-cl.png")           # Classic's own icon is the base for recolouring
@@ -1823,7 +2122,7 @@ def apply_accent_to_icon(color):
         if QColor(color).name() == "#a666ff":
             try:
                 os.remove(icon)                      # back to the bundled purple icon
-            except FileNotFoundError:
+            except FileNotFoundError:    # expected: file or process may already be gone
                 pass
             return True
         target = QColor(color)
@@ -1839,7 +2138,7 @@ def _install_crisp_text(app):
     settings, which is what makes small bold text look blocky. This puts them back on every widget once it is polished."""
     if _crisp_filter["obj"] is not None:
         return
-    from PyQt6.QtCore import QEvent
+    from PyQt6.QtCore import QEvent    # lazy: saves memory/startup until used
 
     class _CrispText(QObject):
         def eventFilter(self, obj, ev):
@@ -1852,12 +2151,13 @@ def _install_crisp_text(app):
                         f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
                         obj.setFont(f)
             except Exception:
-                pass
+                _log_exc("eventFilter")
             return False
 
     _crisp_filter["obj"] = _CrispText(app)
     app.installEventFilter(_crisp_filter["obj"])
 
+# kept: used at import time before the later definition at line 29702
 def apply_dark_mode(mode):
     app = QApplication.instance()
     if app is None:
@@ -1866,9 +2166,9 @@ def apply_dark_mode(mode):
     use_dark = mode == "on" or (mode == "system" and system_prefers_dark())
     theme = THEMES["dark" if use_dark else "light"]
     try:                                     # in-game toasts follow light / dark mode
-        import overlay as _overlay_mod
+        import overlay as _overlay_mod    # lazy: saves memory/startup until used
         _overlay_mod.set_light(not use_dark)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     app.setPalette(build_palette(theme))
     app.setFont(build_app_font())
@@ -1882,7 +2182,7 @@ def apply_dark_mode(mode):
         try:
             listener()
         except Exception:
-            pass
+            _log_exc("apply_dark_mode")
 
 class JsonEditorDialog(QDialog):
     def __init__(self, file_path, title="Edit Save File", parent=None):
@@ -1969,7 +2269,7 @@ class JsonEditorDialog(QDialog):
             with open(self.file_path, 'wb') as f:
                 f.write(payload)
         except Exception:
-            pass
+            _log_exc("save_and_exit")
 
         self.accept()
 
@@ -2035,7 +2335,7 @@ def stream_download(response, dest_path, emit_progress, is_cancelled=lambda: Fal
     elapsed = max(time.time() - start, 1e-6)
     emit_progress(downloaded, total, downloaded / elapsed)
 
-# ---- resumable downloads: a dropped connection or an expired link keeps what's already on disk ----
+# ── resumable downloads: a dropped connection or an expired link keeps what's already on disk ──
 DL_MAX_FAILS = 6                          # failed attempts in a row (with no new data) before giving up
 DL_DEAD_CODES = (400, 401, 403, 404, 410) # the link itself is dead: ask for a new one right away
 
@@ -2089,7 +2389,7 @@ def resumable_download(w, get_link, pick_name, expected_total=0, first=None):
                 need_new = False
                 try:
                     w.download_url = url        # the card/worker always points at the link in use
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
             except Exception as e:
                 if _dl_cancelled(w) or str(e) == "CANCELLED":
@@ -2302,7 +2602,7 @@ class DownloadWorker(QThread):
                 if downloaded_here:
                     try:
                         os.remove(dest_path)
-                    except OSError:
+                    except OSError:    # expected: cleanup that may already be done
                         pass
             elif sys.platform.startswith("linux"):
                 self.status_update.emit("Linux Conversion Script Running...\nPlease complete installation in the new terminal window.")
@@ -2336,11 +2636,11 @@ class PingWorker(QThread):
                 if 200 <= resp.status < 400:
                     self.result.emit(True)
                     return
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         self.result.emit(False)
 
-# ---------------------------------------------------------------- common redistributables
+# ── common redistributables ──
 REDIST_DIRNAME = "_CommonRedist"
 SERVER2_REDIST_DIRNAME = "_Redist"        # server 2 games: a _Redist folder near the game exe
 REDIST_DOWNLOADS = [
@@ -2758,7 +3058,7 @@ def _ae_redist_dir(game_name):
             return wd
     return installed_game_dir(game_name)
 
-# ---------------------------------------------------------------- start with the system
+# ── start with the system ──
 STARTUP_NAME = "NCZGamesLauncher"
 _WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -2773,21 +3073,21 @@ def _linux_autostart_path():
 def set_startup_registered(enabled):
     """Adds / removes the launcher from the system's startup apps (Windows: Run key, Linux: ~/.config/autostart)."""
     if sys.platform.startswith("win"):
-        import winreg
+        import winreg    # lazy: saves memory/startup until used
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
             if enabled:
                 winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(_startup_command()))
             else:
                 try:
                     winreg.DeleteValue(key, STARTUP_NAME)
-                except FileNotFoundError:
+                except FileNotFoundError:    # expected: file or process may already be gone
                     pass
     elif sys.platform.startswith("linux"):
         path = _linux_autostart_path()
         if not enabled:
             try:
                 os.remove(path)
-            except FileNotFoundError:
+            except FileNotFoundError:    # expected: file or process may already be gone
                 pass
             return
         quote = lambda a: '"' + str(a).replace('"', '\\"').replace("%", "%%") + '"'
@@ -2810,7 +3110,7 @@ def apply_startup_setting():
         if load_launcher_settings().get("start_on_boot", True):
             set_startup_registered(True)
     except Exception:
-        pass
+        _log_exc("apply_startup_setting")
 
 def register_cli():
     """Runs `py "<data folder>/NCZ_Games_Launcher/ncz_gm.py" install` on every launch, so the `ncz-gm` command stays on PATH.
@@ -2837,10 +3137,10 @@ def register_cli():
             subprocess.run([py, script, "install"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=60, **kw)
         except Exception:
-            pass
+            _log_exc("_run")
     threading.Thread(target=_run, daemon=True).start()
 
-# ---------------------------------------------------------------- only one launcher at a time
+# ── only one launcher at a time ──
 def _instance_name():
     user = re.sub(r"[^A-Za-z0-9]", "", os.environ.get("USERNAME") or os.environ.get("USER") or "user")
     return f"NCZGamesLauncher-{user}-{_ncz_profile}"
@@ -2848,7 +3148,7 @@ def _instance_name():
 def _another_instance_running(wake=True):
     """True if a launcher is already running (it's asked to come to the front unless wake=False)."""
     try:
-        from PyQt6.QtNetwork import QLocalSocket
+        from PyQt6.QtNetwork import QLocalSocket    # lazy: optional module: the except below handles it missing
     except ImportError:
         return False
     sock = QLocalSocket()
@@ -2873,7 +3173,7 @@ def _prefer_xwayland():
     if not os.environ.get("DISPLAY") or not load_launcher_settings().get("xwayland_mode", True):
         return
     try:
-        import ctypes.util
+        import ctypes.util    # lazy: saves memory/startup until used
         if not ctypes.util.find_library("xcb-cursor"):      # Qt's xcb plugin refuses to load without it
             return
     except Exception:
@@ -2921,10 +3221,10 @@ def _acquire_instance_lock():
     if _instance_lock_ref is not None:
         return True
     try:
-        from PyQt6.QtCore import QLockFile
+        from PyQt6.QtCore import QLockFile    # lazy: optional module: the except below handles it missing
     except ImportError:
         return True
-    import tempfile
+    import tempfile    # lazy: saves memory/startup until used
     lock = QLockFile(os.path.join(tempfile.gettempdir(), _instance_name() + ".lock"))
     lock.setStaleLockTime(0)           # a dead owner is still detected by its process id; never steal by age
     if lock.tryLock(0):
@@ -2935,13 +3235,13 @@ def _acquire_instance_lock():
 def _kill_other_launchers():
     """Fallback for an old instance that doesn't understand the 'quit' request, or that is still starting up."""
     if sys.platform.startswith("linux"):
-        import signal
+        import signal    # lazy: saves memory/startup until used
         pids = _other_launcher_pids()
         for sig in (signal.SIGTERM, signal.SIGKILL):
             for pid in pids:
                 try:
                     os.kill(pid, sig)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
             for _ in range(15):
                 if not any(os.path.exists(f"/proc/{p}") for p in pids):
@@ -2958,12 +3258,12 @@ def _kill_other_launchers():
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=15, creationflags=0x08000000)
         except Exception:
-            pass
+            _log_exc("_kill_other_launchers")
 
 def _replace_running_instance():
     """Closes the launcher that's already running so this one can take over. True once we hold the lock."""
     try:
-        from PyQt6.QtNetwork import QLocalSocket
+        from PyQt6.QtNetwork import QLocalSocket    # lazy: saves memory/startup until used
         sock = QLocalSocket()
         sock.connectToServer(_instance_name())
         if sock.waitForConnected(400):
@@ -2971,7 +3271,7 @@ def _replace_running_instance():
             sock.flush()
             sock.waitForBytesWritten(400)
             sock.disconnectFromServer()
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     for _ in range(25):                              # up to ~5 s for it to close by itself
         if _acquire_instance_lock() and not _another_instance_running(wake=False):
@@ -2987,7 +3287,7 @@ def _replace_running_instance():
 def _start_instance_server(app, window=None):
     window_arg = window
     try:
-        from PyQt6.QtNetwork import QLocalServer
+        from PyQt6.QtNetwork import QLocalServer    # lazy: optional module: the except below handles it missing
     except ImportError:
         return
     name = _instance_name()
@@ -3414,7 +3714,7 @@ class SettingsPage(QWidget):
     def layout(self):
         return getattr(self, "_content_layout", None) or super().layout()
 
-    # ---- game library locations (NCZLibrary on any partition)
+    # ── game library locations (NCZLibrary on any partition) ──
     def _build_library_panel(self):
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -3456,7 +3756,7 @@ class SettingsPage(QWidget):
         self._refresh_library_panel()
         return panel
 
-    # ---- manual 7-Zip / WinRAR path (for PCs where auto-detection fails)
+    # ── manual 7-Zip / WinRAR path (for PCs where auto-detection fails) ──
     def _build_archive_tool_panel(self):
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -3779,7 +4079,7 @@ class SettingsPage(QWidget):
     def on_accent_pick(self):
         if _SIDE_UI or globals().get("_CLASSIC_ACCOUNT"):
             return                                   # Sunset / Legacy have a fixed accent
-        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtWidgets import QColorDialog    # lazy: saves memory/startup until used
         current = QColor(load_launcher_settings().get("accent_color", "#a666ff"))
         chosen = QColorDialog.getColor(current, self, "Pick an accent color")
         if chosen.isValid():
@@ -3924,7 +4224,7 @@ class TaskWorker(QThread):
         else:
             self.done.emit(result)
 
-# ================================================================ Loading card: spinning NCZ logo + a Wikipedia fact
+# ── Loading card: spinning NCZ logo + a Wikipedia fact ──
 # Logo = the NCZ Discord server icon (guild 1043135802932203641), cached on disk; if it can't be fetched -> assets/ncz.png.
 # Facts are prefetched in the background (never fetched when the card opens), with a built-in list as the offline fallback.
 from PyQt6.QtCore import QVariantAnimation as _LcAnim, QEasingCurve as _LcEase
@@ -3961,7 +4261,7 @@ def _lc_cache_dir():
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
-        pass
+        _log_exc("_lc_cache_dir")
     return d
 
 def _lc_logo_cache():
@@ -4006,7 +4306,7 @@ def _lc_fetch_logo():
             tmp = cached + ".tmp"
             img.save(tmp, "PNG")
             os.replace(tmp, cached)
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 def _lc_trim(text, limit=170):
@@ -4028,7 +4328,7 @@ def _lc_fetch_facts(n=6):
             title = str(d.get("title") or "")
             if len(ext) >= 60 and title:
                 _lc_facts.append((ext, title))
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     finally:
         _lc_fetching = False
@@ -4404,7 +4704,7 @@ class AccountPage(QWidget):
             try:
                 self.profile_view.set_info(profile_info_self())
             except Exception:
-                import traceback
+                import traceback    # lazy: saves memory/startup until used
                 traceback.print_exc()
 
         if not configured:
@@ -4562,7 +4862,7 @@ class AccountPage(QWidget):
         try:
             self.profile_view.set_info(profile_info_self())
         except Exception:
-            pass
+            _log_exc("_tick_profile")
 
     def sync_profile_async(self):
         """Quietly refreshes the username/picture from the cloud (e.g. after changing them on another device)."""
@@ -4628,13 +4928,11 @@ class DownloadDialog(QDialog):
         self.info_label.setText("Please wait..." if self.wine_mode else "Please check terminal / wait...")
 
     def on_progress(self, downloaded, total, speed):
-        dl_mb = downloaded / (1024 * 1024)
         speed_str = f"{speed / 1024:.1f} KB/s" if speed < 1024 * 1024 else f"{speed / (1024 * 1024):.2f} MB/s"
 
         if total > 0:
             percent = int((downloaded / total) * 100)
             self.progress_bar.setValue(percent)
-            total_mb = total / (1024 * 1024)
             self.status_label.setText(f"Downloading... {percent}%")
             self.info_label.setText(f"Speed: {speed_str} | Progress: {_fmt_size(downloaded)} / {_fmt_size(total)}")
         else:
@@ -4654,7 +4952,7 @@ class DownloadDialog(QDialog):
         self.info_label.setText("Error details copied to clipboard.")
         QApplication.clipboard().setText(error_msg)
 
-# ---------------------------------------------------------------- store (Steam games + SteamGridDB art)
+# ── store (Steam games + SteamGridDB art) ──
 SGDB_API = "https://www.steamgriddb.com/api/v2"
 STEAM_SEARCH_URL = "https://store.steampowered.com/search/results/"
 STORE_PAGE_SIZE = 50
@@ -4703,7 +5001,7 @@ def fetch_steam_games(term, start, count=STORE_PAGE_SIZE, tags=None, sort_by="_A
     data = json.loads(_http_get(url).decode("utf-8", errors="replace"))
     return parse_steam_results(data.get("results_html", "")), int(data.get("total_count") or 0)
 
-# ---- Store tags: the tag list, a game's own tags, and "more like this"
+# ── Store tags: the tag list, a game's own tags, and "more like this" ──
 # Used if Steam's tag list can't be downloaded (offline). Name -> tag id.
 _TAG_FALLBACK = (
     ("Action", 19), ("Adventure", 21), ("RPG", 122), ("Strategy", 9), ("Simulation", 599), ("Indie", 492),
@@ -4750,7 +5048,7 @@ def get_steam_tags():
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(tags, f)
-                except OSError:
+                except OSError:    # expected: file may not exist yet or be unreadable
                     pass
         except Exception:
             tags = []
@@ -4887,7 +5185,7 @@ def get_usd_rates():
         live = data.get("rates") or {}
         rates = {c: float(live.get(c) or FALLBACK_RATES[c]) for c in CURRENCIES}
         _rates_cache.update(time=time.time(), rates=rates)
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return _rates_cache["rates"]
 
@@ -4928,7 +5226,7 @@ def get_flag_file(code):
             if _fetch_flag_override(code, path):
                 return path
         except Exception:
-            pass
+            _log_exc("get_flag_file")
         return ""
     try:
         raw = _http_get(f"https://commons.wikimedia.org/wiki/Special:FilePath/{name}?width=240",
@@ -4938,7 +5236,7 @@ def get_flag_file(code):
             with open(path, "wb") as f:
                 f.write(raw)
             return path
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return ""
 
@@ -5032,7 +5330,7 @@ def fetch_steam_details(appid, currency="EGP"):
         shot_urls=shot_urls,
     )
 
-# ---------------------------------------------------------------- system requirements + "can I run it"
+# ── system requirements + "can I run it" ──
 def _req_clean(html):
     text = re.sub(r"<[^>]+>", " ", html or "")
     return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
@@ -5077,14 +5375,14 @@ def get_system_specs():
         return _sys_specs_cache
     cpu, gpu, ram_gb = "", "", 0.0
     try:
-        import psutil
+        import psutil    # lazy: saves memory/startup until used
         ram_gb = psutil.virtual_memory().total / 1024 ** 3
-    except Exception:
+    except Exception:    # expected: the process may already have exited
         pass
     try:
         if sys.platform.startswith("win"):
             if not ram_gb:
-                import ctypes
+                import ctypes    # lazy: saves memory/startup until used
 
                 class _MEM(ctypes.Structure):
                     _fields_ = [("l", ctypes.c_ulong), ("p", ctypes.c_ulong), ("tp", ctypes.c_ulonglong),
@@ -5107,7 +5405,7 @@ def get_system_specs():
                         if line.lower().startswith("model name"):
                             cpu = line.split(":", 1)[1].strip()
                             break
-            except OSError:
+            except OSError:    # expected: file may not exist yet or be unreadable
                 pass
             if not ram_gb:
                 try:
@@ -5116,7 +5414,7 @@ def get_system_specs():
                             if line.startswith("MemTotal:"):
                                 ram_gb = int(line.split()[1]) / 1024 ** 2
                                 break
-                except OSError:
+                except OSError:    # expected: file may not exist yet or be unreadable
                     pass
             gpus = []
             for line in _run_quiet(["lspci"]).splitlines():
@@ -5130,7 +5428,7 @@ def get_system_specs():
                     if name not in gpus:
                         gpus.append(name)
             gpu = " | ".join(gpus)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     probe = GAMES_DIR
     while probe and not os.path.exists(probe):
@@ -5173,6 +5471,7 @@ def _req_gb(items, kind):
 def _fmt_gb(gb):
     return f"{gb:.0f}" if abs(gb - round(gb)) < 0.05 else f"{gb:.1f}"
 
+# kept: used at import time before the later definition at line 41063
 def assess_requirements(reqs, platforms, system):
     """(verdict, colour, notes) from RAM and free disk space only. Never a hard yes/no."""
     mn, rc = (reqs or {}).get("minimum") or [], (reqs or {}).get("recommended") or []
@@ -5231,7 +5530,7 @@ def rounded_cover_pixmap(path, width, height, radius, blur=False):
     out.setDevicePixelRatio(scale)
     return out
 
-# ---- NSFW covers: blurred until the user confirms once, then every cover is revealed for good
+# ── NSFW covers: blurred until the user confirms once, then every cover is revealed for good ──
 NSFW_DESCRIPTOR_IDS = {3, 4}    # Steam content descriptors: 3 = Adult Only Sexual Content, 4 = Frequent Nudity or Sexual Content (only the fallback)
 
 # Preferred check: look at the cover picture itself with NudeNet (pip install nudenet) and blur it only when it really shows
@@ -5253,7 +5552,7 @@ def _nsfw_log(text):
                 os.remove(path)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(text + "\n")
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 _nsfw_det_lock = threading.RLock()
 _nsfw_det = {"obj": None, "tried": False, "used": 0.0}
@@ -5264,7 +5563,7 @@ def _nudenet_installed():
     """Is NudeNet installed? Only looks for the package, doesn't load onnxruntime or the model."""
     if not _nudenet_spec:
         try:
-            import importlib.util
+            import importlib.util    # lazy: saves memory/startup until used
             _nudenet_spec.append(importlib.util.find_spec("nudenet") is not None)
         except Exception:
             _nudenet_spec.append(False)
@@ -5278,7 +5577,7 @@ def _nsfw_det_reaper():
                 return
             if time.time() - _nsfw_det["used"] >= NSFW_DET_IDLE_S:
                 _nsfw_det["obj"], _nsfw_det["tried"] = None, False      # loaded again by the next new cover
-                import gc
+                import gc    # lazy: saves memory/startup until used
                 gc.collect()
                 return
 
@@ -5287,7 +5586,7 @@ def _get_nsfw_detector():
         if not _nsfw_det["tried"]:
             _nsfw_det["tried"] = True
             try:
-                from nudenet import NudeDetector
+                from nudenet import NudeDetector    # lazy: saves memory/startup until used
                 _nsfw_det["obj"] = NudeDetector()
                 threading.Thread(target=_nsfw_det_reaper, daemon=True).start()
             except Exception:
@@ -5406,7 +5705,7 @@ def check_app_nsfw(appid, path=None, title=""):
             os.makedirs(os.path.dirname(_nsfw_cache_path()), exist_ok=True)
             with open(_nsfw_cache_path(), "w", encoding="utf-8") as f:
                 json.dump(_nsfw_cache, f)
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
     return flag
 
@@ -5527,7 +5826,7 @@ class CoverLoader(QObject):
         if first:
             try:
                 self.auth_failed.emit()
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
 
     def _try_sgdb(self, lookup, marker):
@@ -5605,6 +5904,7 @@ def load_steam_library():
     except Exception:
         return []
 
+# kept: used at import time before the later definition at line 26085
 def save_steam_library(games):
     path = get_steam_library_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -6094,12 +6394,12 @@ class StoreDetailPage(QWidget):
             tags, games = [], []
             try:
                 tags = fetch_app_tags(appid)
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             if tags:
                 try:
                     games = fetch_similar_games(appid, tags)
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
             return (appid, tags, games)
 
@@ -6359,7 +6659,7 @@ class StorePage(QWidget):
         self.scroll.verticalScrollBar().valueChanged.connect(lambda _value: self._maybe_load_more())
         layout.addWidget(self.scroll, 1)
 
-    # ------------------------------------------------------------ lifecycle
+    # ── lifecycle ──
     def showEvent(self, event):
         super().showEvent(event)
         self.loader.set_key(get_steamgriddb_key())
@@ -6388,7 +6688,7 @@ class StorePage(QWidget):
         if self._loaded_once:
             self._start_search()
 
-    # ------------------------------------------------------------ banner / status
+    # ── banner / status ──
     def _update_banner(self):
         if self._key_rejected:
             text = "SteamGridDB rejected your API key, so Steam's own art is shown instead. Check it in Settings."
@@ -6407,7 +6707,7 @@ class StorePage(QWidget):
         self.status_label.setText(text)
         self.status_label.setVisible(bool(text))
 
-    # ------------------------------------------------------------ loading
+    # ── loading ──
     def _columns(self):
         available = self.width() - 36 - 24 - 12
         return max(1, (available + STORE_GRID_GAP) // (STORE_CARD_W + STORE_GRID_GAP))
@@ -6525,7 +6825,7 @@ class StorePage(QWidget):
         if card is not None:
             card.nsfw = bool(flag)      # the cover arrives right after and gets drawn blurred
 
-    # ------------------------------------------------------------ tag filter
+    # ── tag filter ──
     def _open_tag_picker(self):
         dlg = TagPickerDialog([t for t, _ in self._tag_filter], self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -6637,8 +6937,45 @@ class AdaptiveApp(QMainWindow):
         self.check_nczfront_status()
         QApplication.instance().aboutToQuit.connect(self._wait_for_version_workers)
         self.check_for_updates()
+        self._init_original()
+        self._init_friends()
+        self._init_tray()
+        self._init_stop()
+        self._init_selfupdate()
+        self._init_lib()
+        self._init_idle()
+        self._init_gmod()
+        self._init_ws()
+        self._init_ge()
+        self._init_wine()
+        self._init_pwh()
+        self._init_fan()
+        self._init_gj()
+        self._init_reorder()
+        self._init_frameless()
+        self._init_fo()
+        self._init_ct()
+        self._init_sort()
+        self._init_acl()
+        self._init_pt()
+        self._init_nav_final()
+        self._init_ui()
+        self._init_ui_anim()
+        self._init_ss_app()
+        self._init_rs_app()
+        self._init_rx_app()
+        self._init_updlock()
+        self._init_lk()
+        self._init_pfp_app()
+        self._init_bp()
+        self._init_adm()
+        self._init_ncz()
+        self._init_ncz_logo()
+        self._init_lb()
+        self._init_ext()
+        self._init_ncz_su()
 
-    # ------------------------------------------------------------ sidebar
+    # ── sidebar ──
     def make_nav_button(self, text, checkable=False):
         short = {"Garry's Mod Addon Manager": "GMod Addons"}.get(text, text)
         btn = QPushButton(short.upper())
@@ -6660,7 +6997,7 @@ class AdaptiveApp(QMainWindow):
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(18, 0, 18, 0)
         brand_row.setSpacing(10)
-        self.brand_logo = QLabel()
+        self.brand_logo = QLabel(sidebar)      # parented: reload_brand_logo's setVisible flashed it as its own window
         self.brand_logo.setFixedSize(44, 44)
         brand_row.addWidget(self.brand_logo, 0, Qt.AlignmentFlag.AlignVCenter)
         self.reload_brand_logo()
@@ -6745,7 +7082,7 @@ class AdaptiveApp(QMainWindow):
             self.profile_name.setText("Account")
             self.profile_sub.setText("Cloud sync unavailable")
 
-    # ------------------------------------------------------------ library page
+    # ── library page ──
     def build_library_page(self):
         page = QWidget()
         page.setObjectName("Content")
@@ -6794,7 +7131,7 @@ class AdaptiveApp(QMainWindow):
 
         self.create_game_card("Five Nights at NCZ AE", asset_path("fnanczaecover.png"), "ae")
         self.create_game_card("Five Nights at NCZ 2", asset_path("fnancz2cover.png"), "ncz2")
-        self.create_game_card(NCZTR_GAME_NAME, asset_path("fnancz-tr.png"), "ncztr")
+        self.create_game_card("Five Nights at NCZ: The Return", asset_path("fnancz-tr.png"), "nczreturn")
         self.create_game_card("NCZ Chess", asset_path("nczchess.png"), "chess")
         self.create_game_card("NCZFront", asset_path("nczfront-cover.png"), "nczfront")
         self.steam_cards = {}
@@ -6813,7 +7150,7 @@ class AdaptiveApp(QMainWindow):
                 available = (scroll.width() - 2 * scroll.frameWidth()
                              - scroll.verticalScrollBar().sizeHint().width() - 12)
         except Exception:
-            pass
+            _log_exc("grid_columns")
         if available is None:
             rail = getattr(self, "_ui_rail", None)
             rail_w = rail.width() if rail is not None else 0
@@ -6868,6 +7205,13 @@ class AdaptiveApp(QMainWindow):
         self.show_page(3)
 
     def show_page(self, index):
+        # from _pf_show_page
+        if index >= 1000:                              # a profile tab
+            for tab in self.__dict__.get("_profile_tabs", {}).values():
+                if tab["id"] == index:
+                    self.pages.setCurrentWidget(tab["page"])
+            return
+        # base body
         self.pages.setCurrentIndex(index)
 
     def open_store_game(self, appid, title, cover_path):
@@ -6888,7 +7232,7 @@ class AdaptiveApp(QMainWindow):
 
         try:
             self.btn_ae_action.clicked.disconnect()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
         if installed:
@@ -6915,6 +7259,10 @@ class AdaptiveApp(QMainWindow):
         self.refresh_update_state("ae")
 
     def launch_ae_game(self):
+        # from _native_launch_ae
+        if sys.platform.startswith("linux"):
+            return _native_linux_launch(self, installed_game_dir(AE_GAME_NAME), "ae", AE_GAME_NAME)
+        # base body
         game_dir = installed_game_dir(AE_GAME_NAME)
         if sys.platform.startswith("win"):
             exe_path = os.path.join(game_dir, "FNaNCZ AE.exe")
@@ -7097,31 +7445,6 @@ class AdaptiveApp(QMainWindow):
             dialog = JsonEditorDialog(settings_path, "Edit Settings File", self)
             dialog.exec()
 
-    def start_ae_install(self):
-        existing_zips = [
-            f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-            if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-        ]
-        version_url = GAME_INFO["ae"]["version_url"]
-        linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-
-        if existing_zips:
-            existing_zip_path = os.path.join(DOWNLOAD_DIR, existing_zips[0])
-            existing_dialog = ExistingFileDialog(existing_zips[0], self)
-            if existing_dialog.exec() == QDialog.DialogCode.Accepted:
-                if existing_dialog.choice == "use":
-                    dialog = DownloadDialog(version_url, AE_GAME_NAME, linux_cmd, self, existing_zip_path=existing_zip_path)
-                    if dialog.exec() == QDialog.DialogCode.Accepted:
-                        self.update_ae_button_state()
-                    return
-                elif existing_dialog.choice != "overwrite":
-                    return
-            else:
-                return
-
-        dialog = DownloadDialog(version_url, AE_GAME_NAME, linux_cmd, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.update_ae_button_state()
 
     def update_ncz2_button_state(self):
         if not self.btn_ncz2_action:
@@ -7130,7 +7453,7 @@ class AdaptiveApp(QMainWindow):
 
         try:
             self.btn_ncz2_action.clicked.disconnect()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
         if installed:
@@ -7157,6 +7480,10 @@ class AdaptiveApp(QMainWindow):
         self.refresh_update_state("ncz2")
 
     def launch_ncz2_game(self):
+        # from _native_launch_ncz2
+        if sys.platform.startswith("linux"):
+            return _native_linux_launch(self, installed_game_dir(NCZ2_GAME_NAME), "ncz2", NCZ2_GAME_NAME)
+        # base body
         game_dir = installed_game_dir(NCZ2_GAME_NAME)
         if sys.platform.startswith("win"):
             exe_path = os.path.join(game_dir, "FNANCZ 2.exe")
@@ -7187,31 +7514,6 @@ class AdaptiveApp(QMainWindow):
             dialog = JsonEditorDialog(settings_path, "Edit Settings File", self)
             dialog.exec()
 
-    def start_ncz2_install(self):
-        existing_zips = [
-            f for f in (os.listdir(DOWNLOAD_DIR) if os.path.isdir(DOWNLOAD_DIR) else [])
-            if f.lower().endswith(".zip") and f.lower().startswith(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-        ]
-        version_url = GAME_INFO["ncz2"]["version_url"]
-        linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-
-        if existing_zips:
-            existing_zip_path = os.path.join(DOWNLOAD_DIR, existing_zips[0])
-            existing_dialog = ExistingFileDialog(existing_zips[0], self)
-            if existing_dialog.exec() == QDialog.DialogCode.Accepted:
-                if existing_dialog.choice == "use":
-                    dialog = DownloadDialog(version_url, NCZ2_GAME_NAME, linux_cmd, self, existing_zip_path=existing_zip_path)
-                    if dialog.exec() == QDialog.DialogCode.Accepted:
-                        self.update_ncz2_button_state()
-                    return
-                elif existing_dialog.choice != "overwrite":
-                    return
-            else:
-                return
-
-        dialog = DownloadDialog(version_url, NCZ2_GAME_NAME, linux_cmd, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.update_ncz2_button_state()
 
     def refresh_sync_buttons(self, game_id):
         pair = self.sync_buttons.get(game_id)
@@ -7337,6 +7639,7 @@ class AdaptiveApp(QMainWindow):
         return rounded_pixmap
 
     def create_game_card(self, title_text, image_filename, game_id):
+        # base body
         card = QFrame(self.grid_container)
         card.setObjectName("GameCard")
         card.setFixedWidth(COVER_W + 18)
@@ -7390,35 +7693,31 @@ class AdaptiveApp(QMainWindow):
         actions.addWidget(more_btn)
         layout.addLayout(actions)
 
-        if game_id == "nczfront":
+        if game_id == "nczreturn":
+            more_btn.hide()
+            btn_action.setEnabled(False)
+            btn_action.setCursor(Qt.CursorShape.ArrowCursor)
+            btn_action.setStyleSheet("QPushButton { background: #1b1b1f; color: #5d5d66; border: 1px solid #26262c; }")
+            self.set_card_status(game_id, "Releases 5 Dec 2026", ORANGE)
+            release = QDateTime(QDate(2026, 12, 5), QTime(0, 0, 0))      # local time
+            def tick(b=btn_action, rel=release):
+                left = QDateTime.currentDateTime().secsTo(rel)
+                if left <= 0:
+                    b.setText("Coming soon")
+                    return
+                d, r = divmod(left, 86400)
+                h, r = divmod(r, 3600)
+                m, sec = divmod(r, 60)
+                b.setText(f"{d}d {h:02d}h {m:02d}m {sec:02d}s")
+            tick()
+            timer = QTimer(card)
+            timer.timeout.connect(tick)
+            timer.start(1000)
+            card._return_timer = timer
+        elif game_id == "nczfront":
             btn_action.setText("Play")
             btn_action.clicked.connect(lambda _c=False: self.open_nczfront())
             menu.addAction("Refresh status").triggered.connect(self.check_nczfront_status)
-        elif game_id == "ncztr":
-            # Five Nights at NCZ: The Return - no download/exe hooked up yet, so the card is a placeholder
-            btn_action.setText("Coming soon")
-            btn_action.setEnabled(False)
-            more_btn.hide()
-            self.set_card_status("ncztr", f"Releases {NCZTR_RELEASE_DATE}")
-            self.btn_ncztr_action = btn_action
-
-            def _tick_ncztr():
-                import datetime as _dt
-                left = int((_dt.datetime(*NCZTR_RELEASE_TS) - _dt.datetime.now()).total_seconds())
-                if left <= 0:
-                    btn_action.setText("Out now")
-                    self.set_card_status("ncztr", f"Released {NCZTR_RELEASE_DATE}")
-                    self._ncztr_timer.stop()
-                    return
-                d, rem = divmod(left, 86400)
-                h, rem = divmod(rem, 3600)
-                m, sec = divmod(rem, 60)
-                btn_action.setText(f"{d}d {h:02d}h {m:02d}m {sec:02d}s" if d else f"{h:02d}h {m:02d}m {sec:02d}s")
-
-            self._ncztr_timer = QTimer(self)
-            self._ncztr_timer.timeout.connect(_tick_ncztr)
-            self._ncztr_timer.start(1000)
-            _tick_ncztr()
         elif game_id == "chess":
             btn_action.setText("Play")
             btn_action.clicked.connect(lambda _c=False: self.open_chess())
@@ -7487,8 +7786,17 @@ class AdaptiveApp(QMainWindow):
                 self.update_ncz2_button_state()
 
         self.cards.append((card, title_text))
+        # from _sc_create_game_card
+        if game_id in ("ae", "ncz2"):
+            name = AE_GAME_NAME if game_id == "ae" else NCZ2_GAME_NAME
+            known = "FNaNCZ AE.exe" if game_id == "ae" else "FNANCZ 2.exe"
+            def exe_fn(n=name, k=known):
+                d = installed_game_dir(n)
+                direct = os.path.join(d, k)
+                return direct if os.path.exists(direct) else _find_game_exe(d)
+            _add_shortcut_action(self, self.cards[-1][0], title_text, exe_fn, cover=image_filename, key=game_id)
 
-    # ------------------------------------------------------------ Steam games in the library
+    # ── Steam games in the library ──
     def create_steam_card(self, appid, title_text, cover_path):
         card = QFrame(self.grid_container)
         card.setObjectName("GameCard")
@@ -7580,7 +7888,7 @@ class AdaptiveApp(QMainWindow):
         save_steam_library([g for g in load_steam_library() if g["appid"] != appid])
         try:
             os.remove(os.path.join(get_library_cover_dir(), f"{appid}.img"))
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
         self.apply_filter()
         if getattr(self.__dict__.get("store_detail_page"), "_appid", None) == appid:
@@ -7589,6 +7897,12 @@ class AdaptiveApp(QMainWindow):
     def reload_brand_logo(self):
         """(Re)loads the top-left wordmark, e.g. after the accent changes."""
         _ncz_apply_wordmark(self)
+        # from _ncz_logo_reload
+        for logo, _t in self.__dict__.get("_ncz_title_logos", []):
+            try:
+                _ncz_set_title_logo(logo)
+            except RuntimeError:    # expected: the widget or object may already be deleted
+                pass
 
     def center_on_screen(self):
         screen = QApplication.primaryScreen().geometry()
@@ -7596,7 +7910,1627 @@ class AdaptiveApp(QMainWindow):
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
 
-# ---- Top-left wordmark: the "NCZ Games" lettering (lavender gradient with a thin white outline), recoloured to the current accent.
+    # ── Firebase Steam Link & Downloads Tab Integration ──
+
+    def change_steam_game_cover(self, appid):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Choose Custom Cover", os.path.expanduser("~"),
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        if not path:
+            return
+        saved_cover = path
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
+            shutil.copyfile(path, saved_cover)
+        except Exception:
+            _log_exc("change_steam_game_cover")
+        games = load_steam_library()
+        for g in games:
+            if g["appid"] == appid:
+                g["cover"] = saved_cover
+        save_steam_library(games)
+        old_card = self.steam_cards.get(appid)
+        if old_card:
+            title_text = ""
+            for card, title in self.cards:
+                if card is old_card:
+                    title_text = title
+                    break
+            _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
+            self.apply_filter()
+
+    def refresh_steam_game_cover(self, appid):
+        busy = self.__dict__.setdefault("_cover_refreshing", set())
+        workers = self.__dict__.setdefault("_cover_refresh_workers", set())
+        if appid in busy:
+            return
+        title_text = next((g["title"] for g in load_steam_library() if g["appid"] == appid), "")
+        busy.add(appid)
+
+        def fail(message):
+            QMessageBox.warning(self, "Refresh Cover", message)
+
+        def finished(data):
+            busy.discard(appid)
+            workers.discard(worker)
+            if not data or not QPixmap().loadFromData(data):
+                fail("Couldn't find a new cover for this game (no connection?).")
+                return
+            try:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
+                with open(saved_cover, "wb") as f:
+                    f.write(data)
+            except Exception as e:
+                fail(f"Couldn't save the new cover: {e}")
+                return
+            games = load_steam_library()
+            for g in games:
+                if g["appid"] == appid:
+                    g["cover"] = saved_cover
+            save_steam_library(games)
+            if appid in self.steam_cards:
+                _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
+                self.apply_filter()
+
+        def failed(message):
+            busy.discard(appid)
+            workers.discard(worker)
+            fail(message)
+
+        worker = TaskWorker(lambda: _fetch_library_cover_bytes(appid, title_text))
+        worker.done.connect(finished)
+        worker.failed.connect(failed)
+        workers.add(worker)
+        worker.start()
+
+    def open_add_custom_game_dialog(self):
+        dlg = AddCustomGameDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_data:
+            data = dlg.result_data
+            saved_cover = data["cover_path"]
+            if saved_cover and os.path.exists(saved_cover):
+                try:
+                    os.makedirs(get_library_cover_dir(), exist_ok=True)
+                    dest_cover = os.path.join(get_library_cover_dir(), f"{data['id']}.img")
+                    shutil.copyfile(saved_cover, dest_cover)
+                    data["cover_path"] = dest_cover
+                except Exception:
+                    _log_exc("open_add_custom_game_dialog")
+            games = load_custom_games()
+            games.append(data)
+            save_custom_games(games)
+            self.create_custom_card(data["id"], data["title"], data["exe_path"], data["cover_path"], data["compat_tool"])
+            self.apply_filter()
+
+    def create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
+        self._create_custom_card_base(game_id, title_text, exe_path, cover_path, compat_tool)
+        # from _gmodfix_create_custom_card
+        if _is_gmod_card(title_text):
+            _add_gmod_fix_action(self, getattr(self, "custom_cards", {}).get(game_id), lambda: True)
+        # from _sc_create_custom_card
+        _add_shortcut_action(self, getattr(self, "custom_cards", {}).get(game_id), title_text,
+                             lambda: exe_path, lambda: _custom_tool(game_id, compat_tool), cover_path,
+                             key=f"custom-{game_id}")
+        # from _desk_create_custom_card
+        entry = next((g for g in load_custom_games() if g.get("id") == game_id), None)
+        if not entry or not (entry.get("launch_url") or entry.get("launch_file") or entry.get("launch_args")
+                             or entry.get("launch_cmd")):
+            return
+        card = getattr(self, "custom_cards", {}).get(game_id)
+        btn = card.findChild(QPushButton, "Primary") if card is not None else None
+        if btn is None:
+            return
+        try:
+            btn.clicked.disconnect()
+        except Exception:    # expected: cleanup that may already be done
+            pass
+        btn.clicked.connect(lambda _c=False, e=entry: _desk_launch(self, e))
+
+    def _create_custom_card_base(self, game_id, title_text, exe_path, cover_path, compat_tool):
+        card = QFrame(self.grid_container)
+        card.setObjectName("GameCard")
+        card.setFixedWidth(COVER_W + 18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(8, 8, 8, 10)
+        layout.setSpacing(0)
+
+        cover = QLabel()
+        cover.setFixedSize(COVER_W, COVER_H)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pix = self.get_rounded_pixmap(cover_path, COVER_W, COVER_H, 8) if cover_path and os.path.exists(cover_path) else None
+        if pix:
+            cover.setPixmap(pix)
+        else:
+            cover.setObjectName("CoverPlaceholder")
+            cover.setText("No\nCover")
+        layout.addWidget(cover)
+        layout.addSpacing(10)
+
+        title = QLabel(title_text)
+        title.setObjectName("CardTitle")
+        title.setWordWrap(True)
+        title.setFixedHeight(38)
+        title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(title)
+
+        status = QLabel("Custom game")
+        status.setObjectName("CardStatus")
+        layout.addWidget(status)
+        layout.addSpacing(12)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        btn_play = QPushButton("Launch")
+        btn_play.setObjectName("Primary")
+        btn_play.setFixedHeight(38)
+        btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def launch_custom():
+            if not os.path.exists(exe_path):
+                QMessageBox.warning(self, "Launch Error", f"Executable not found:\n{exe_path}")
+                return
+            if sys.platform.startswith("win"):
+                try:
+                    subprocess.Popen([exe_path] + launch_args_for(f"custom-{game_id}"), cwd=os.path.dirname(exe_path))
+                except Exception as e:
+                    QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
+            elif sys.platform.startswith("linux"):
+                _launch_exe(self, exe_path, _custom_tool(game_id, compat_tool), _d3d_for(f"custom-{game_id}"),
+                            launch_args_for(f"custom-{game_id}"))
+
+        btn_play.clicked.connect(launch_custom)
+
+        more_btn = QPushButton("\u2022\u2022\u2022")
+        more_btn.setObjectName("MoreButton")
+        more_btn.setFixedSize(42, 38)
+        more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = QMenu(more_btn)
+        more_btn.setMenu(menu)
+
+        def remove_custom_game():
+            games = [g for g in load_custom_games() if g.get("id") != game_id]
+            save_custom_games(games)
+            card.hide()
+            card.setParent(None)
+            card.deleteLater()
+            self.cards = [(c, t) for c, t in self.cards if c is not card]
+            self.apply_filter()
+
+        def switch_custom_tool():
+            games = load_custom_games()
+            entry = next((g for g in games if g.get("id") == game_id), None)
+            if entry is None:
+                return
+            picked = prompt_compat_tool(self, entry.get("compat_tool", ""), _d3d_for(f"custom-{game_id}"))
+            if picked is None:
+                return
+            entry["compat_tool"], d3d = picked
+            save_custom_games(games)
+            save_game_d3d(f"custom-{game_id}", d3d)
+            QMessageBox.information(self, "Compatibility Tool", "Compatibility settings updated for this game.")
+
+        if sys.platform.startswith("linux"):
+            menu.addAction("Switch Compatibility Tool").triggered.connect(switch_custom_tool)
+        menu.addAction("Remove from Library").triggered.connect(remove_custom_game)
+        menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(os.path.dirname(exe_path)))
+        menu.addAction("Install Common Redist").triggered.connect(
+            lambda _c=False: install_redist_for_game(
+                self, lambda: os.path.dirname(exe_path), os.path.basename(os.path.dirname(exe_path)) or "this game",
+                lambda: (exe_path, _custom_tool(game_id, compat_tool))))
+
+        actions.addWidget(btn_play, 1)
+        actions.addWidget(more_btn)
+        layout.addLayout(actions)
+
+        if not hasattr(self, "custom_cards"):
+            self.custom_cards = {}
+        self.custom_cards[game_id] = card
+        self.cards.append((card, title_text))
+
+    # ── Update install triggers to check for existing .rar archives ──
+
+    # --- Update install triggers to check for existing .rar archives ---
+    def start_ae_install(self):
+        existing_archive = find_existing_archive(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
+        version_url = GAME_INFO["ae"]["version_url"]
+        linux_cmd = GAME_INFO["ae"]["linux_cmd"]
+        cover_path = asset_path("fnanczaecover.png")
+
+        existing_zip_path = None
+        if existing_archive:
+            file_name = os.path.basename(existing_archive)
+            dlg = ExistingFileDialog(file_name, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                if dlg.choice == "use":
+                    existing_zip_path = existing_archive
+                elif dlg.choice == "overwrite":
+                    try:
+                        os.remove(existing_archive)
+                    except Exception:    # expected: cleanup that may already be done
+                        pass
+            else:
+                return
+
+        card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
+    
+        def on_dl_finished(_path):
+            self.update_ae_button_state()
+        card_widget.worker.finished.connect(on_dl_finished)
+    
+        self.downloads_page.add_download_card(card_widget)
+        self.nav_group.button(6).setChecked(True)
+        self.pages.setCurrentWidget(self.downloads_page)
+
+    def start_ncz2_install(self):
+        existing_archive = find_existing_archive(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
+        version_url = GAME_INFO["ncz2"]["version_url"]
+        linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
+        cover_path = asset_path("fnancz2cover.png")
+
+        existing_zip_path = None
+        if existing_archive:
+            file_name = os.path.basename(existing_archive)
+            dlg = ExistingFileDialog(file_name, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                if dlg.choice == "use":
+                    existing_zip_path = existing_archive
+                elif dlg.choice == "overwrite":
+                    try:
+                        os.remove(existing_archive)
+                    except Exception:    # expected: cleanup that may already be done
+                        pass
+            else:
+                return
+
+        card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
+    
+        def on_dl_finished(_path):
+            self.update_ncz2_button_state()
+        card_widget.worker.finished.connect(on_dl_finished)
+    
+        self.downloads_page.add_download_card(card_widget)
+        self.nav_group.button(6).setChecked(True)
+        self.pages.setCurrentWidget(self.downloads_page)
+
+    # ── server 2: run setup.exe, find where it installed, find the game .exe ──
+
+    def open_add_existing_game_dialog(self):
+        dlg = SteamStorePickerDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_game:
+            data = dlg.selected_game
+            appid = data["appid"]
+            title = data["title"]
+            cover_path = data["cover"]
+            exe_path = data["exe_path"]
+            compat_tool = data["compat_tool"]
+
+            games = [g for g in load_steam_library() if g["appid"] != appid]
+            games.append({"appid": appid, "title": title, "cover": cover_path, "exe_path": exe_path})
+            save_steam_library(games)
+
+            if compat_tool:
+                compat_config = load_compat_config()
+                compat_config[str(appid)] = compat_tool
+                save_compat_config(compat_config)
+
+            self.create_steam_card(appid, title, cover_path)
+            self.apply_filter()
+
+    # ── background + tray notifications ──
+
+    def closeEvent(self, event):
+        tray = getattr(self, "_tray", None)
+        if getattr(self, "_really_quit", False):
+            event.accept()
+        elif tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
+            event.ignore()
+            self.hide()
+            self._tray_hint_shown = True     # no "still running in the background" popup (notifications muted)
+        else:
+            event.accept()
+            if tray is not None:             # closing the last window doesn't quit while a tray icon is in use
+                self._really_quit = True
+                tray.hide()
+                QTimer.singleShot(0, QApplication.quit)
+
+    # ── fan games in the Library (bottom section, horizontal cards) ──
+
+    def _fan_build_library_section(self):
+        self.fan_lib_cards = {}
+        self.fan_lib_list = []
+        self.fan_section = QWidget(self.grid_container)
+        lay = QVBoxLayout(self.fan_section)
+        lay.setContentsMargins(0, 16, 0, 0)
+        lay.setSpacing(12)
+        head = QLabel("Fan Games")
+        head.setStyleSheet("font-size: 16px; font-weight: bold;")
+        lay.addWidget(head)
+        holder = QWidget()
+        self.fan_grid = QGridLayout(holder)
+        self.fan_grid.setContentsMargins(0, 0, 0, 0)
+        self.fan_grid.setHorizontalSpacing(24)
+        self.fan_grid.setVerticalSpacing(24)
+        self.fan_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(holder)
+        self.fan_section.hide()
+        for g in load_fan_library():
+            self._fan_create_library_card(g)
+
+    def _fan_create_library_card(self, g):
+        self._fan_create_library_card_base(g)
+        # from _sc_fan_card
+        gid, title = g["id"], g["title"]
+        _add_shortcut_action(self, self.fan_lib_cards.get(gid), title, lambda: _fan_installed_exe(title),
+                             lambda: load_compat_config().get(f"fan-{gid}", ""), g.get("cover", ""),
+                             key=f"fan-{gid}")
+
+    def _fan_create_library_card_base(self, g):
+        gid, title_text, link = g["id"], g["title"], g.get("link", "")
+        cover_path = g.get("cover", "")
+        card = QFrame(self.fan_section)
+        card.setObjectName("GameCard")
+        card.setFixedWidth(FAN_CARD_W)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(8, 8, 8, 10)
+        layout.setSpacing(0)
+
+        cover = QLabel()
+        cover.setFixedSize(FAN_COVER_W, FAN_COVER_H)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pix = rounded_cover_pixmap(cover_path, FAN_COVER_W, FAN_COVER_H, 8) if cover_path and os.path.exists(cover_path) else None
+        if pix:
+            cover.setPixmap(pix)
+        else:
+            cover.setObjectName("CoverPlaceholder")
+            cover.setText("No\ncover")
+        layout.addWidget(cover)
+        layout.addSpacing(10)
+
+        title = QLabel(title_text)
+        title.setObjectName("CardTitle")
+        title.setWordWrap(True)
+        title.setFixedHeight(38)
+        title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(title)
+
+        status = QLabel("Fan game")
+        status.setObjectName("CardStatus")
+        layout.addWidget(status)
+        layout.addSpacing(12)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        btn_open = QPushButton("Install")
+        btn_open.setObjectName("Primary")
+        btn_open.setFixedHeight(38)
+        btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.clicked.connect(lambda _c=False, i=gid, t=title_text, c=cover_path, u=link: self._fan_install(i, t, c, u))
+        card._fan_btn = btn_open
+        _fan_update_btn(btn_open, title_text)
+        more_btn = QPushButton("\u2022\u2022\u2022")
+        more_btn.setObjectName("MoreButton")
+        more_btn.setFixedSize(42, 38)
+        more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = QMenu(more_btn)
+        more_btn.setMenu(menu)
+        menu.addAction("View Details").triggered.connect(lambda _c=False, i=gid: self._fan_view(i))
+        menu.addAction("Open on Game Jolt").triggered.connect(lambda _c=False, u=link: webbrowser.open(u))
+        if sys.platform.startswith("linux"):
+            menu.addAction("Switch Compatibility Tool").triggered.connect(lambda _c=False, i=gid: self._fan_compat_dialog(i))
+        menu.addAction("Open Game Location").triggered.connect(
+            lambda _c=False, i=gid, t=title_text: self._fan_open_location(i, t))
+        menu.addAction("Install Common Redist").triggered.connect(
+            lambda _c=False, i=gid, t=title_text: install_redist_for_game(
+                self, lambda: _fan_game_dir(i, t), t,
+                lambda: (_fan_installed_exe(t), load_compat_config().get(f"fan-{i}", ""))))
+        menu.addAction("Uninstall").triggered.connect(lambda _c=False, i=gid, t=title_text: self._fan_uninstall(i, t))
+        menu.addSeparator()
+        menu.addAction("Remove from Library").triggered.connect(lambda _c=False, i=gid: self._fan_remove(i))
+        actions.addWidget(btn_open, 1)
+        actions.addWidget(more_btn)
+        layout.addLayout(actions)
+
+        self.fan_lib_cards[gid] = card
+        self.fan_lib_list.append((card, title_text))
+
+    def _fan_add(self, gid, title, cover_path):
+        if gid in self.fan_lib_cards:
+            return
+        link, tags = "", ()
+        for g in load_fan_games():
+            if g[0] == gid:
+                link, tags = g[2], g[3]
+                break
+        saved_cover = ""
+        if cover_path and os.path.exists(cover_path):
+            try:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+                shutil.copyfile(cover_path, saved_cover)
+            except Exception:
+                saved_cover = cover_path
+        entry = {"id": gid, "title": title, "link": link, "tags": sorted(tags), "cover": saved_cover}
+        save_fan_library([g for g in load_fan_library() if g["id"] != gid] + [entry])
+        self._fan_create_library_card(entry)
+        self.apply_filter()
+        self.fan_detail_page.set_in_library(True)
+
+    def _fan_remove(self, gid):
+        card = self.fan_lib_cards.pop(gid, None)
+        if card is not None:
+            self.fan_lib_list = [(c, t) for c, t in self.fan_lib_list if c is not card]
+            card.hide()
+            card.setParent(None)
+            card.deleteLater()
+        save_fan_library([g for g in load_fan_library() if g["id"] != gid])
+        try:
+            os.remove(os.path.join(get_library_cover_dir(), f"fan-{gid}.img"))
+        except OSError:    # expected: cleanup that may already be done
+            pass
+        if self.__dict__.get("fan_detail_page") is not None and self.fan_detail_page._appid == gid:
+            self.fan_detail_page.set_in_library(False)
+        self.apply_filter()
+
+    def _fan_view(self, gid):
+        g = next((x for x in load_fan_library() if x["id"] == gid), None)
+        if not g:
+            return
+        self.fan_detail_page.show_game(gid, g["title"], g.get("cover", ""), g.get("link", ""), tuple(g.get("tags", [])))
+        self.fan_detail_page.set_in_library(True)
+        btn = self.nav_group.button(self.pages.indexOf(_lazy_slot(self, "fan_page")))
+        if btn:
+            btn.setChecked(True)
+        self.pages.setCurrentWidget(self.fan_detail_page)
+
+    # ── Game Jolt fan games: Playwright finds the real build link, the launcher downloads + extracts it ──
+
+    def _fan_install(self, gid, title, cover_path, link):
+        exe = _fan_installed_exe(title)
+        if exe:  # already installed: this button is "Launch"
+            _launch_exe(self, exe, load_compat_config().get(f"fan-{gid}", ""), _d3d_for(f"fan-{gid}"),
+                        launch_args_for(f"fan-{gid}"))
+            return
+        if not link:
+            QMessageBox.warning(self, "Install", "This game has no Game Jolt link.")
+            return
+        cancelled, existing = _ask_existing_archive(self, title)
+        if cancelled:
+            return
+        worker = GameJoltDownloadWorker(title, link, gid, existing)
+        worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(self, w, builds))
+        worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
+        card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
+        self.downloads_page.add_download_card(card)
+        self.nav_group.button(6).setChecked(True)
+        self.pages.setCurrentWidget(self.downloads_page)
+
+    # ── Add Existing Fan Game ──
+
+    def _fan_open_location(self, gid, title):
+        entry = next((g for g in load_fan_library() if g["id"] == gid), None)
+        exe = entry.get("exe_path") if entry else ""
+        if exe and os.path.exists(exe):
+            folder = os.path.dirname(exe)
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(folder)
+                else:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+            except Exception as e:
+                QMessageBox.warning(self, "Open Game Location", f"Couldn't open the folder: {e}")
+            return
+        self.open_game_location(sanitize_folder_name(title))
+
+    def _fan_add_existing(self):
+        dlg = AddExistingFanGameDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        gid, title, link, exe = d["id"], d["title"], d["link"], d["exe_path"]
+        if d["compat_tool"]:
+            cfg = load_compat_config()
+            cfg[f"fan-{gid}"] = d["compat_tool"]
+            save_compat_config(cfg)
+        lib = load_fan_library()
+        existing = next((g for g in lib if g["id"] == gid), None)
+        if existing is not None:               # already in the library: just link the exe
+            existing["exe_path"] = exe
+            save_fan_library(lib)
+            self._fan_refresh(gid)
+            QMessageBox.information(self, "Add Existing Fan Game",
+                                    f"{title} was already in your library, so its executable was updated.")
+            return
+        saved_cover = ""
+        cached = os.path.join(get_fan_cover_dir(), f"{gid}.img")
+        if os.path.exists(cached):
+            try:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+                shutil.copyfile(cached, saved_cover)
+            except Exception:
+                saved_cover = cached
+        entry = {"id": gid, "title": title, "link": link, "tags": d["tags"], "cover": saved_cover, "exe_path": exe}
+        save_fan_library(lib + [entry])
+        self._fan_create_library_card(entry)
+        if getattr(self.__dict__.get("fan_detail_page"), "_appid", None) == gid:
+            self.fan_detail_page.set_in_library(True)
+        # show it: switch the library to the Fan Games tab
+        self._lib_tab = "fan"
+        btns = self.library_tabs.findChildren(QPushButton) if hasattr(self, "library_tabs") else []
+        if len(btns) > 1:
+            btns[1].setChecked(True)
+        self.apply_filter(self.search_edit.text())
+        if saved_cover:
+            return
+        # no cover cached yet: fetch it from Game Jolt in the background
+        card = self.fan_lib_cards.get(gid)
+        label = card.findChildren(QLabel)[0] if card is not None else None
+        fan_loader = self.fan_page.loader       # on the GUI thread: reading fan_page may build the (lazy) page, a QWidget
+        worker = TaskWorker(lambda: fan_loader._fetch(gid, link, "", title))
+        if not hasattr(self, "_fan_cover_workers"):
+            self._fan_cover_workers = []
+        self._fan_cover_workers.append(worker)
+
+        def got(path):
+            if worker in self._fan_cover_workers:
+                self._fan_cover_workers.remove(worker)
+            if not path or not os.path.exists(path):
+                return
+            try:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                dest = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
+                shutil.copyfile(path, dest)
+                lib2 = load_fan_library()
+                for g in lib2:
+                    if g["id"] == gid:
+                        g["cover"] = dest
+                save_fan_library(lib2)
+                pix = rounded_cover_pixmap(dest, FAN_COVER_W, FAN_COVER_H, 8)
+                if label is not None and pix:
+                    label.setText("")
+                    label.setPixmap(pix)
+                    label.setStyleSheet("background: transparent; border: none;")
+            except (OSError, RuntimeError):
+                _log_exc("got")
+        worker.done.connect(got)
+        worker.failed.connect(lambda _m: None)
+        worker.start()
+
+    # ── fan games: shortcut, compat tool, uninstall, button state ──
+
+    def _fan_compat_dialog(self, gid):
+        self.switch_compat_tool(f"fan-{gid}")
+
+    def _fan_uninstall(self, gid, title):
+        lib = load_fan_library()
+        entry = next((g for g in lib if g["id"] == gid), None)
+        if entry and entry.get("exe_path"):
+            if QMessageBox.question(self, "Unlink", f"Unlink {title} from its existing files?\n"
+                                    "Your game files won't be deleted.") != QMessageBox.StandardButton.Yes:
+                return
+            entry.pop("exe_path", None)
+            save_fan_library(lib)
+            self._fan_refresh(gid)
+            return
+        d = installed_game_dir(sanitize_folder_name(title))
+        if os.path.isdir(d):
+            if QMessageBox.question(self, "Uninstall", f"Delete the installed files for {title}?") != QMessageBox.StandardButton.Yes:
+                return
+            shutil.rmtree(d, ignore_errors=True)
+        self._fan_refresh(gid)
+
+    def _fan_refresh(self, gid):
+        card = self.fan_lib_cards.get(gid)
+        btn = getattr(card, "_fan_btn", None)
+        if btn is not None:
+            g = next((x for x in load_fan_library() if x["id"] == gid), None)
+            if g:
+                _fan_update_btn(btn, g["title"])
+        dp = self.__dict__.get("fan_detail_page")
+        if dp is not None and dp._appid == gid:
+            _fan_update_btn(dp.steam_btn, dp._title)
+
+    # ── Qt part ──
+
+    def auto_add_desktop_games(self):
+        dirs = _desktop_dirs()
+        if not dirs:
+            QMessageBox.information(self, "Auto-Add Desktop Games", "Couldn't find your Desktop folder.")
+            return
+        titles, exes, urls, appids = _desk_known(self)
+        ok, cands, error = BusyDialog(
+            "Scanning your desktop for games...",
+            lambda: scan_desktop_games(dirs, titles, exes, urls, appids), self).run()
+        if not ok:
+            QMessageBox.warning(self, "Auto-Add Desktop Games", f"The scan failed:\n\n{error}")
+            return
+        if not cands:
+            QMessageBox.information(self, "Auto-Add Desktop Games",
+                                    "No new games found on your desktop.\n\nShortcuts (.lnk / .url / .desktop), "
+                                    ".exe files and game folders are checked. Games already in your library are skipped.")
+            return
+        dlg = DesktopGamesDialog(cands, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.chosen:
+            return
+
+        games = load_custom_games()
+        added = 0
+        stamp = int(time.time() * 1000)
+        for n, c in enumerate(dlg.chosen):
+            gid = f"custom_{stamp}_{n}"
+            cover = c.get("cover_path") or ""
+            if cover and os.path.exists(cover):
+                try:
+                    os.makedirs(get_library_cover_dir(), exist_ok=True)
+                    dest = os.path.join(get_library_cover_dir(), f"{gid}.img")
+                    shutil.copyfile(cover, dest)
+                    cover = dest
+                except Exception:
+                    _log_exc("auto_add_desktop_games")
+            entry = {"id": gid, "title": c["title"], "exe_path": c["exe_path"], "cover_path": cover, "compat_tool": ""}
+            if c.get("launch_file"):
+                try:
+                    folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
+                    os.makedirs(folder, exist_ok=True)
+                    keep = os.path.join(folder, f"{gid}.lnk")
+                    shutil.copyfile(c["launch_file"], keep)
+                    c["launch_file"] = keep
+                except Exception:
+                    _log_exc("auto_add_desktop_games")
+            for k in ("launch_url", "launch_file", "launch_args", "launch_cmd", "workdir"):
+                if c.get(k):
+                    entry[k] = c[k]
+            games.append(entry)
+            save_custom_games(games)  # saved per game so a crash half way doesn't lose the earlier ones
+            self.create_custom_card(gid, entry["title"], entry["exe_path"], cover, "")
+            added += 1
+        self.apply_filter()
+        QMessageBox.information(self, "Auto-Add Desktop Games",
+                                f"Added {added} game{'s' if added != 1 else ''} to your library.")
+
+    # ── library <-> account (users/<uid>/library in the cloud) ──
+
+    def sync_library(self):
+        global _lib_last_sync
+        if not cloud_configured() or load_account() is None:
+            return
+        worker = getattr(self, "_lib_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        if time.time() - _lib_last_sync < 20:
+            return
+        _lib_last_sync = time.time()
+        worker = TaskWorker(_lib_sync_worker)
+        worker.done.connect(lambda result: _lib_apply(self, result))
+        self._lib_worker = worker
+        worker.start()
+
+    # ── playtime counter (saved to the account) ──
+
+    def sync_playtime(self):
+        global _pt_last_sync
+        if time.time() - _pt_last_sync < 20:
+            return
+        _pt_last_sync = time.time()
+        threading.Thread(target=_pt_sync_bg, daemon=True).start()
+
+    # ── profile tabs: a temporary tab in the top bar per opened profile, closed with the x next to it ──
+
+    def open_profile_tab(self, uid, seed=None):
+        acct = load_account() or {}
+        if uid == acct.get("uid"):                     # your own profile lives in the Account tab
+            self.open_account()
+            return
+        tabs = self.__dict__.setdefault("_profile_tabs", {})
+        if not self.__dict__.get("_pf_page_hook"):      # a profile tab disappears as soon as you switch to another page
+            self._pf_page_hook = True
+            self.pages.currentChanged.connect(lambda _i: self._pf_prune_tabs())
+        tab = tabs.get(uid)
+        if tab is None:
+            page = ProfilePage(uid, seed)
+            self.pages.addWidget(page)
+            seq = self.__dict__.get("_profile_tab_seq", 0) + 1
+            self._profile_tab_seq = seq
+            tab_id = 1000 + seq
+            label = (seed or {}).get("username") if isinstance(seed, dict) else None
+            btn = self.make_nav_button(str(label or "Profile")[:20], checkable=True)
+            _set_tab_icon(btn, "user")
+            close = QPushButton("\u00d7")
+            close.setFixedSize(20, 20)
+            close.setCursor(Qt.CursorShape.PointingHandCursor)
+            close.setToolTip("Close tab")
+            close.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 10px; font-size: 15px; }"
+                                " QPushButton:hover { background: rgba(128,128,128,0.30); }")
+            wrap = QWidget()
+            wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            hl = QHBoxLayout(wrap)
+            hl.setContentsMargins(0, 0, 6, 0)
+            hl.setSpacing(0)
+            hl.addWidget(btn)
+            hl.addWidget(close, 0, Qt.AlignmentFlag.AlignVCenter)
+            self.nav_group.addButton(btn, tab_id)
+            self._nav_center_layout.addWidget(wrap)
+            page.name_known.connect(lambda n, b=btn: (b.setText(n[:20].upper()), b.setToolTip(n)))
+            close.clicked.connect(lambda _=False, u=uid: self._pf_close_tab(u))
+            tab = tabs[uid] = {"page": page, "wrap": wrap, "btn": btn, "id": tab_id}
+            QTimer.singleShot(0, lambda: self._nav_center_filter.place())
+        tab["btn"].setChecked(True)
+        self.pages.setCurrentWidget(tab["page"])
+
+    def _pf_close_tab(self, uid):
+        tab = self.__dict__.get("_profile_tabs", {}).pop(uid, None)
+        if not tab:
+            return
+        was_current = self.pages.currentWidget() is tab["page"]
+        tab["page"].stop()
+        self.nav_group.removeButton(tab["btn"])
+        self._nav_center_layout.removeWidget(tab["wrap"])
+        tab["wrap"].hide()
+        tab["wrap"].deleteLater()
+        self.pages.removeWidget(tab["page"])
+        tab["page"].deleteLater()
+        QTimer.singleShot(0, lambda: self._nav_center_filter.place())
+        if was_current:
+            fp = getattr(self, "friends_page", None)
+            if fp is not None:
+                b = self.nav_group.button(self.pages.indexOf(fp))
+                if b is not None:
+                    b.setChecked(True)
+                self.pages.setCurrentWidget(fp)
+
+    def _pf_prune_tabs(self):
+        cur = self.pages.currentWidget()
+        for u, t in list(self.__dict__.get("_profile_tabs", {}).items()):
+            if t["page"] is not cur:
+                QTimer.singleShot(0, lambda u=u: self._pf_close_tab(u))
+
+    # ── NCZFront inside the launcher ──
+
+    def open_nczfront(self):
+        if not _HAS_WEBENGINE:                      # PyQt6-WebEngine missing: old behaviour
+            webbrowser.open(NCZFRONT_URL)
+            return
+        page = self.__dict__.get("web_page")
+        if page is None:
+            try:
+                web_cls = _ncz_web_classes()
+            except Exception:                       # installed but won't load (broken install): default browser
+                import traceback    # lazy: saves memory/startup until used
+                traceback.print_exc()
+                webbrowser.open(NCZFRONT_URL)
+                return
+            page = web_cls()
+            self.web_page = page
+            self.pages.addWidget(page)
+            page.back_requested.connect(self._leave_web_page)
+            page.closed.connect(self._web_page_emptied)
+            QApplication.instance().aboutToQuit.connect(page.shutdown)
+        page.open_url(NCZFRONT_URL)
+        self.pages.setCurrentWidget(page)
+        _nczfront_mark_playing()
+
+    def _leave_web_page(self):
+        self.pages.setCurrentIndex(0)
+        btn = self.nav_group.button(0) if hasattr(self, "nav_group") else None
+        if btn is not None:
+            btn.setChecked(True)
+
+    def _web_page_emptied(self):
+        _nczfront_unmark_playing()
+        self._leave_web_page()
+        page = self.__dict__.pop("web_page", None)    # last tab closed: free the browser and its profile (built again on open)
+        if page is not None:
+            self.pages.removeWidget(page)
+            page.shutdown()
+            QTimer.singleShot(2000, page.deleteLater)   # its pages / views (deleteLater'd by shutdown) go before the profile
+
+    # ── "Play" on the NCZ Chess card opens the chess page inside the launcher ──
+
+    def open_chess(self):
+        page = self.__dict__.get("chess_page")
+        if page is None:
+            page = NczChessPage()
+            self.chess_page = page
+            self.pages.addWidget(page)
+            page.back_requested.connect(self._leave_web_page)
+            self.pages.currentChanged.connect(lambda _i, p=page: _ch_sync_launcher_look(p))     # chess look on while chess is shown
+        self.pages.setCurrentWidget(page)
+        _ch_sync_launcher_look(page)
+        if not _ch_theme_saved():
+            QTimer.singleShot(150, page.maybe_first_run_theme)
+
+    # ── Discord picture sync ──
+
+    def _pfp_refresh_ui(self):
+        try:
+            self.refresh_profile()
+            self.account_page.refresh_view()
+        except Exception:
+            _log_exc("_pfp_refresh_ui")
+
+    # ── in-Big-Picture file browser (images / videos) ──
+
+    def open_big_picture(self):
+        bp = getattr(self, "_big_picture", None)
+        if bp is None:
+            bp = self._big_picture = _BigPicture(self)
+        bp.enter()
+
+    # ── Firebase Steam Link & Downloads Tab Integration ──
+
+    def _init_original(self):
+        self.downloads_page = DownloadsPage()
+        self.pages.addWidget(self.downloads_page)
+    
+        downloads_btn = self.make_nav_button("Downloads", checkable=True)
+        self.nav_group.addButton(downloads_btn, 6)
+    
+        sidebar_layout = self.nav_group.button(0).parent().layout()
+        sidebar_layout.insertWidget(2, downloads_btn)
+
+    # ── Apple emoji inside normal text (chat bubbles, reply quotes): the OS font would draw its own emoji otherwise ──
+
+    def _init_friends(self):
+        self.friends_page = FriendsPage()
+        self.pages.addWidget(self.friends_page)
+        idx = self.pages.indexOf(self.friends_page)
+        btn = self.make_nav_button("Friends", checkable=True)
+        self.nav_group.addButton(btn, idx)
+        self.nav_group.button(0).parent().layout().insertWidget(5, btn)
+
+        # friend code row in Settings
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QHBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel("Friend code")
+        t.setObjectName("RowTitle")
+        d = QLabel("Share this so friends can add you in the Friends tab")
+        d.setObjectName("RowDesc")
+        col.addWidget(t)
+        col.addWidget(d)
+        code_lbl = QLabel(friend_code_cached() or "Open Friends tab once")
+        code_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        code_lbl.setStyleSheet("font-weight: bold; font-size: 16px;")
+        copy = QPushButton("Copy")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(friend_code_cached() or ""))
+        pl.addLayout(col, 1)
+        pl.addWidget(code_lbl)
+        pl.addSpacing(8)
+        pl.addWidget(copy)
+        lay = self.settings_page.layout()
+        lay.insertSpacing(3, 14)
+        lay.insertWidget(4, panel)
+        self.friends_page.code_ready.connect(code_lbl.setText)
+        self.account_page.account_changed.connect(
+            lambda: code_lbl.setText(friend_code_cached() or "Open Friends tab once"))
+
+    # ── background + tray notifications ──
+
+    def _init_tray(self):
+        self._really_quit = False
+        self._tray = None
+        self._tray_hint_shown = False
+        app = QApplication.instance()
+
+        # The tray icon is optional. GNOME (without the AppIndicator extension) and some Wayland
+        # setups report "no system tray", but desktop notifications can still work through
+        # notify-send, so only the tray-specific parts are skipped when it's missing.
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            app.setQuitOnLastWindowClosed(False)
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip("NCZ Games Launcher")
+
+        def show_window():
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+        def show_friends():
+            show_window()
+            self.pages.setCurrentWidget(self.friends_page)
+            uid = self.friends_page.notify_uid
+            if uid and uid in self.friends_page.friends:
+                self.friends_page.open_friend(uid)
+            b = self.nav_group.button(self.pages.indexOf(self.friends_page))
+            if b:
+                b.setChecked(True)
+
+        if tray is not None:
+            menu = QMenu(self)
+            self._tray_menu = menu
+            open_act = QAction("Open launcher", menu)
+            quit_act = QAction("Quit", menu)
+            menu.addAction(open_act)
+            menu.addAction(quit_act)
+            tray.setContextMenu(menu)
+
+            def quit_app():
+                self._really_quit = True
+                tray.hide()
+                app.quit()
+
+            open_act.triggered.connect(show_window)
+            quit_act.triggered.connect(quit_app)
+            tray.activated.connect(lambda reason: show_window()
+                                   if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+            tray.messageClicked.connect(show_friends)
+
+        def notify(name, msg, uid):
+            self.friends_page.notify_uid = uid
+            return   # system notifications are muted for good: the overlay toasts replace them
+
+        def on_clicked(uid):
+            self.friends_page.notify_uid = uid
+            show_friends()
+
+        self.friends_page.notif_clicked.connect(on_clicked)
+        self.friends_page.friend_event.connect(notify)
+        if tray is not None:
+            tray.show()
+        self._tray = tray
+
+    # ── Launch -> Stop while a game runs ──
+
+    def _init_stop(self):
+        self._stop_filter = _StopButtonFilter(self)
+
+        def sync():
+            running = {n.lower(): n for n in list(_running)}
+            for card, title in list(self.cards):
+                try:
+                    btn = card.findChild(QPushButton, "Primary")
+                    if btn is None:
+                        continue
+                    name = running.get(str(title).lower())
+                    if name:
+                        if not btn.property("ncz_filter_on"):
+                            btn.installEventFilter(self._stop_filter)
+                            btn.setProperty("ncz_filter_on", True)
+                        if btn.property("ncz_running_name") != name:
+                            btn.setProperty("ncz_orig_text", btn.text())
+                            btn.setProperty("ncz_running_name", name)
+                        if btn.text() != "Stop":
+                            if btn.text() != btn.property("ncz_orig_text") and btn.text() != "Stop":
+                                btn.setProperty("ncz_orig_text", btn.text())
+                            btn.setText("Stop")
+                        btn.setEnabled(True)
+                    elif btn.property("ncz_running_name"):
+                        btn.setProperty("ncz_running_name", "")
+                        if btn.text() == "Stop":
+                            btn.setText(btn.property("ncz_orig_text") or "Launch")
+                except RuntimeError:
+                    continue  # card was deleted
+
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setInterval(700)
+        self._stop_timer.timeout.connect(sync)
+        self._stop_timer.start()
+
+    # ── self-update at launch ──
+
+    def _init_selfupdate(self):
+        self._selfupdate_sig = _SelfUpdateSignal(self)
+        self._selfupdate_sig.updated.connect(lambda: show_updated_dialog(self))
+        def work():
+            if not load_launcher_settings().get("auto_update", True):
+                return                       # "Automatic Updates" is turned off in Settings
+            try:
+                updated = self_update_check()
+            except Exception:
+                updated = False
+            try:
+                updated = companion_update_check() or updated
+            except Exception:
+                _log_exc("work")
+            if updated:
+                self._selfupdate_sig.updated.emit()
+        QTimer.singleShot(1500, lambda: threading.Thread(target=work, daemon=True).start())
+
+    # ── full library for friends + NCZFront "playing" ──
+
+    def _init_lib(self):
+        def snap():
+            titles = []
+            for card, title in list(self.cards):
+                try:
+                    card.objectName()  # raises if the card was deleted
+                except RuntimeError:
+                    continue
+                t = pretty_game_name(title)
+                if t and t not in titles:
+                    titles.append(t)
+            for card, title in list(getattr(self, "fan_lib_list", [])):
+                try:
+                    card.objectName()
+                except RuntimeError:
+                    continue
+                t = pretty_game_name(title)
+                if t and t not in titles:
+                    titles.append(t)
+            covers = library_cover_paths()
+            if titles and (titles != _library_snapshot or covers != _library_covers):
+                first = not _library_snapshot
+                _library_snapshot[:] = titles
+                _library_covers.clear()
+                _library_covers.update(covers)
+                if not first:
+                    for cb in _playing_listeners:
+                        cb()
+        self._lib_timer = QTimer(self)
+        self._lib_timer.setInterval(3000)
+        self._lib_timer.timeout.connect(snap)
+        self._lib_timer.start()
+        snap()
+
+    # ── idle (minimized) + offline (quit) for friends ──
+
+    def _init_idle(self):
+
+        def refresh_state():
+            minimized = self.isMinimized() or not self.isVisible()
+            if minimized != _window_state["minimized"]:
+                _window_state["minimized"] = minimized
+                self.friends_page._playing_changed()  # publishes presence right away if signed in
+
+        self._state_timer = QTimer(self)
+        self._state_timer.setInterval(1000)
+        self._state_timer.timeout.connect(refresh_state)
+        self._state_timer.start()
+
+        def go_offline():
+            if not self.friends_page._signed_in():
+                return
+            def work():
+                try:
+                    cloud_publish_offline()
+                except Exception:    # expected: offline or the server did not answer
+                    pass
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            t.join(3)  # don't hang the exit if the network is down
+
+        QApplication.instance().aboutToQuit.connect(go_offline)
+
+    # ── Garry's Mod Addon Manager tab ──
+
+    def _init_gmod(self):
+        self._gmod_root = None
+        ph = _lazy_page(self, "gmod_page", GmodAddonManagerPage, lambda gp: gp.set_root(self._gmod_root))
+        idx = self.pages.indexOf(ph)
+        self.gmod_btn = self.make_nav_button("Garry's Mod Addon Manager", checkable=True)
+        self.nav_group.addButton(self.gmod_btn, idx)
+        sidebar_layout = self.nav_group.button(0).parent().layout()
+        sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
+        self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 0px 10px; }")
+        self.gmod_btn.hide()
+
+        def refresh_gmod():
+            root = find_gmod_root()
+            self._gmod_root = root
+            self.gmod_btn.setVisible(bool(root))
+            if self.__dict__.get("gmod_page") is not None:       # not built yet: it gets the root when it is
+                self.gmod_page.set_root(root)
+            if not root and self.pages.currentWidget() is _lazy_slot(self, "gmod_page"):
+                self.nav_group.button(0).setChecked(True)
+                self.pages.setCurrentIndex(0)
+
+        refresh_gmod()
+        self._gmod_timer = QTimer(self)
+        self._gmod_timer.setInterval(4000)
+        self._gmod_timer.timeout.connect(refresh_gmod)
+        self._gmod_timer.start()
+        self.pages.currentChanged.connect(
+            lambda _i: self.gmod_page.refresh_addons()
+            if self.__dict__.get("gmod_page") is not None and self.pages.currentWidget() is self.gmod_page else None)
+
+    # ── Steam Workshop tab ──
+
+    def _init_ws(self):
+        self.workshop_page = WorkshopPage()
+        self.pages.addWidget(self.workshop_page)
+        idx = self.pages.indexOf(self.workshop_page)
+        btn = self.make_nav_button("Steam Workshop", checkable=True)
+        self.nav_group.addButton(btn, idx)
+        layout = self.nav_group.button(0).parent().layout()
+        anchor = getattr(self, "gmod_btn", None) or self.nav_group.button(1)
+        layout.insertWidget(layout.indexOf(anchor), btn)
+
+    # ── GE Proton tab (Linux only) ──
+
+    def _init_ge(self):
+        if not sys.platform.startswith("linux"):
+            return
+        ph = _lazy_page(self, "ge_page", GeProtonPage)
+        btn = self.make_nav_button("GE Proton", checkable=True)
+        self.nav_group.addButton(btn, self.pages.indexOf(ph))
+        layout = self.nav_group.button(0).parent().layout()
+        layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
+
+    # ── Wine tab (Linux only) ──
+
+    def _init_wine(self):
+        if not sys.platform.startswith("linux"):
+            return
+        ph = _lazy_page(self, "wine_page", WinePage)
+        btn = self.make_nav_button("Wine", checkable=True)
+        self.nav_group.addButton(btn, self.pages.indexOf(ph))
+        layout = self.nav_group.button(0).parent().layout()
+        ge_slot = _lazy_slot(self, "ge_page")              # hasattr(self, "ge_page") would build it
+        ge_btn = self.nav_group.button(self.pages.indexOf(ge_slot)) if ge_slot is not None else None
+        at = layout.indexOf(ge_btn) + 1 if ge_btn is not None else layout.indexOf(self.nav_group.button(1))
+        layout.insertWidget(at, btn)
+
+    # ── H toggles the download browser window ──
+
+    def _init_pwh(self):
+        self._pw_key_filter = _PwHeadlessKey(self)
+        QApplication.instance().installEventFilter(self._pw_key_filter)
+
+    # ── fan games in the Library (bottom section, horizontal cards) ──
+
+    def _init_fan(self):
+        def wire_fan(fp):
+            fp.fan_selected.connect(open_fan_game)
+        def wire_fan_detail(dp):
+            dp.add_requested.connect(self._fan_add)
+            dp.open_cb = open_fan_game
+            dp.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
+        fan_ph = _lazy_page(self, "fan_page", FanGamesPage, wire_fan)
+        _lazy_page(self, "fan_detail_page", FanDetailPage, wire_fan_detail)
+
+        def open_fan_game(gid, title, cover):
+            link, tags = "", ()
+            for g in load_fan_games():
+                if g[0] == gid:
+                    link, tags = g[2], g[3]
+                    break
+            self.fan_detail_page.show_game(gid, title, cover, link, tags)
+            self.fan_detail_page.set_in_library(gid in self.fan_lib_cards)
+            self.pages.setCurrentWidget(self.fan_detail_page)
+
+        self._fan_build_library_section()
+        self.fan_section.layout().itemAt(0).widget().hide()      # the tab already says "Fan Games"
+        # Games / Fan Games switch under the Library header
+        self._lib_tab = "games"
+        tabs = QWidget()
+        tabs.setStyleSheet("QPushButton { padding: 6px 18px; border-radius: 8px; } "
+                           "QPushButton:checked { background: palette(highlight); color: " + _on_accent() + "; font-weight: bold; }")
+        tl = QHBoxLayout(tabs)
+        tl.setContentsMargins(0, 0, 0, 14)
+        tl.setSpacing(8)
+        group = QButtonGroup(tabs)
+        group.setExclusive(True)
+        for key, label in (("games", "Games"), ("fan", "Fan Games")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(key == "games")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            group.addButton(b)
+            b.clicked.connect(lambda _c=False, k=key: (setattr(self, "_lib_tab", k),
+                                                       self.apply_filter(self.search_edit.text())))
+            tl.addWidget(b)
+        tl.addStretch()
+        self.library_tabs = tabs
+        self.search_edit.parentWidget().layout().insertWidget(2, tabs)
+        btn = self.make_nav_button("Fan Games", checkable=True)
+        self.nav_group.addButton(btn, self.pages.indexOf(fan_ph))
+        layout = self.nav_group.button(0).parent().layout()
+        i = layout.indexOf(self.nav_group.button(4))
+        i = i + 1 if i >= 0 else layout.indexOf(self.nav_group.button(1))
+        layout.insertWidget(i, btn)
+        self.apply_filter()
+
+    # ── Game Jolt fan games: Playwright finds the real build link, the launcher downloads + extracts it ──
+
+    def _init_gj(self):
+        _lazy_on_built(self, "fan_detail_page", lambda dp: setattr(dp, "install_cb", lambda i, t, c, u: self._fan_install(i, t, c, u)))
+
+    # ── drag to reorder the library ──
+
+    def _init_reorder(self):
+        # the five NCZ games (AE, 2, The Return, Chess, NCZFront) are always the first five cards
+        self._fixed_cards = {id(c) for c, _t in self.cards[:5]}
+        saved = _load_library_order()
+        _apply_saved_order(self.cards, saved.get("main", []), keep_first=5)
+        _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
+        self._card_reorder = _CardReorder(self)
+        self.apply_filter()
+
+    # ── frameless window: exit button + draggable top bar ──
+
+    def _init_frameless(self):
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)  # no OS title bar / border
+
+        bar = self.findChild(QFrame, "Sidebar")
+        if bar is None or bar.layout() is None:
+            return
+        _TitleBarDrag(self, bar)
+
+        exit_btn = QPushButton("\u2715")
+        exit_btn.setObjectName("ExitButton")
+        exit_btn.setToolTip("Close")
+        exit_btn.setFixedSize(40, 32)
+        exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        exit_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px;"
+            " font-size: 15px; font-weight: bold; padding: 0; }"
+            "QPushButton:hover { background: #e5484d; color: #ffffff; }"
+            "QPushButton:pressed { background: #c93a3f; color: #ffffff; }")
+
+        def exit_launcher():
+            # With "Close button minimizes to tray" on, this hides the launcher to the tray (Quit is in the tray menu);
+            # otherwise it really quits.
+            tray = getattr(self, "_tray", None)
+            if tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
+                self.close()
+                return
+            self._really_quit = True
+            if tray is not None:
+                tray.hide()
+            QApplication.instance().quit()
+
+        exit_btn.clicked.connect(exit_launcher)
+
+        min_btn = QPushButton("-")
+        min_btn.setObjectName("MinButton")
+        min_btn.setToolTip("Minimize")
+        min_btn.setFixedSize(40, 32)
+        min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        min_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px;"
+            " font-size: 18px; font-weight: bold; padding: 0; }"
+            "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+            "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
+        min_btn.clicked.connect(self.showMinimized)
+
+        max_btn = QPushButton()
+        max_btn.setObjectName("MaxButton")
+        max_btn.setFixedSize(40, 32)
+        max_btn.setIconSize(QSize(12, 12))
+        max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        max_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
+            "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+            "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
+
+        def refresh_max_btn():
+            maximized = self.isMaximized()
+            max_btn.setIcon(_caption_icon(maximized))
+            max_btn.setToolTip("Restore Down" if maximized else "Maximize")
+
+        max_btn.clicked.connect(lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
+        _WindowStateWatcher(self, refresh_max_btn)
+        refresh_max_btn()
+        _theme_listeners.append(refresh_max_btn)   # redraw the glyph when the theme changes
+
+        restart_btn = QPushButton()
+        restart_btn.setObjectName("RestartButton")
+        restart_btn.setToolTip("Restart launcher")
+        restart_btn.setFixedSize(40, 32)
+        restart_btn.setIconSize(QSize(12, 12))
+        restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        restart_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
+            "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
+            "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
+        restart_btn.clicked.connect(lambda: restart_launcher(self, use_demo=True))
+        restart_btn.setIcon(_restart_icon())
+        _theme_listeners.append(lambda: restart_btn.setIcon(_restart_icon()))   # redraw when the theme changes
+
+        bar.layout().addSpacing(8)
+        bar.layout().addWidget(restart_btn)
+        bar.layout().addSpacing(6)
+        bar.layout().addWidget(min_btn)
+        bar.layout().addWidget(max_btn)
+        bar.layout().addWidget(exit_btn)
+
+    # ── F9 screenshot hotkey (saved to <library>/Screenshots) ──
+
+    def _init_fo(self):
+        self._friends_overlay = _FriendsOverlay()
+        self._inject_bridge = _InjectBridge()
+        self._shot_taker = _ScreenshotTaker()
+        if sys.platform.startswith("win"):
+            self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
+            self._f9_hook = _start_key_hook_win(0x78, self._shot_taker.req.emit)
+        elif sys.platform.startswith("linux"):
+            self._kb_hook = _start_shift_q_hook_linux(self._friends_overlay.toggle_req.emit)
+            self._f9_hook = _start_f9_hook_linux(self._shot_taker.req.emit)
+            if self._kb_hook is None and _overlay is not None and get_overlay_mode() != "off":
+                QTimer.singleShot(4000, lambda: _overlay.notify_playing(
+                    "Shift+Q overlay", "pip install pynput", None, "needs: "))
+
+    # ── controller translator (Windows / XInput) ──
+
+    def _init_ct(self):
+        try:
+            from controller_input import ControllerTranslator, AVAILABLE    # lazy: saves memory/startup until used
+            if AVAILABLE:
+                self._controller = ControllerTranslator(
+                    get_controller_enabled, lambda: bool(_now_playing["name"] or _running),
+                    _controller_profile_path())
+                self._controller.start()
+        except Exception:    # expected: optional module may be missing
+            pass
+
+    # ── library sort (A to Z) + Discord Rich Presence ──
+
+    def _init_sort(self):
+        try:
+            header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+            idx = header.indexOf(self.search_edit)
+            if idx >= 0:
+                combo = QComboBox()
+                combo.setFixedHeight(36)
+                combo.setToolTip("Library order. A to Z keeps the NCZ games on top.")
+                combo.addItem("Custom order", "custom")
+                combo.addItem("A to Z", "az")
+                combo.setCurrentIndex(1 if get_library_sort() == "az" else 0)
+
+                def changed(_i):
+                    set_library_sort(combo.currentData())
+                    self.apply_filter(self.search_edit.text())
+
+                combo.currentIndexChanged.connect(changed)
+                header.insertWidget(idx, combo)
+                header.insertSpacing(idx + 1, 10)
+            self.apply_filter(self.search_edit.text())
+        except Exception:
+            _log_exc("_init_sort")
+
+    # ── library <-> account (users/<uid>/library in the cloud) ──
+
+    def _init_acl(self):
+        self.account_page.account_changed.connect(self.sync_library)
+        QTimer.singleShot(1500, self.sync_library)
+
+    # ── playtime counter (saved to the account) ──
+
+    def _init_pt(self):
+        self._pt_ui_timer = QTimer(self)
+        self._pt_ui_timer.setInterval(3000)
+        self._pt_ui_timer.timeout.connect(lambda: _pt_refresh_cards(self))
+        self._pt_ui_timer.start()
+        QTimer.singleShot(2500, lambda: _pt_refresh_cards(self))
+        self.account_page.account_changed.connect(self.sync_playtime)
+        QTimer.singleShot(3000, self.sync_playtime)
+
+    # ── navbar: Downloads + Settings icon buttons, centred tabs, Credits inside Settings ──
+
+    def _init_nav_final(self):
+        try:
+            _rework_navbar(self)
+        except Exception:
+            import traceback    # lazy: saves memory/startup until used
+            traceback.print_exc()
+
+    # ── theme picker (first launch) ──
+
+    def _init_ui(self):
+        import traceback    # lazy: saves memory/startup until used
+        try:
+            _ui_add_setting(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            _ui_add_custom_theme_setting(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            _ui_add_nsfw_setting(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            _ui_add_bridge_setting(self)
+        except Exception:
+            traceback.print_exc()
+        if _SIDE_UI:
+            try:
+                _ui_move_nav_to_rail(self)
+            except Exception:
+                traceback.print_exc()
+        _ncz_refresh_launcher_shortcut(only_if_changed=True)
+        if _UI_STYLE_AT_START != "new":
+            try:
+                _ui_unify_friends_scroll(self)
+            except Exception:
+                traceback.print_exc()
+        if not _raw_setting("ui_theme_choice") and not _custom_theme_locked():
+            QTimer.singleShot(700, lambda: _ui_first_run_theme(self))      # first launch: pick a theme
+
+    # ── Sunset UI: layout touches + fade animations ──
+
+    def _init_ui_anim(self):
+        if _UI_STYLE_AT_START == "new":
+            try:
+                _ui_decorate(self)
+            except Exception:
+                import traceback    # lazy: saves memory/startup until used
+                traceback.print_exc()
+
+    # ── "Cloud Saves..." in every game's menu ──
+
+    def _init_ss_app(self):
+        try:
+            _ss_bridge()
+        except Exception as e:
+            _ss_log(f"couldn't create the GUI bridge: {e!r}")
+
+    # ── start games from your phone ──
+
+    def _init_rs_app(self):
+        try:
+            self._remote_timer = QTimer(self)
+            self._remote_timer.setInterval(REMOTE_POLL_MS)
+            self._remote_timer.timeout.connect(lambda: _remote_tick(self))
+            self._remote_timer.start()
+        except Exception as e:
+            _ncz_log(f"remote start: couldn't start ({e!r})")
+
+    # ── request loop ──
+
+    def _init_rx_app(self):
+        try:
+            self._rx_timer = QTimer(self)
+            self._rx_timer.setInterval(RX_POLL_MS)
+            self._rx_timer.timeout.connect(lambda: _rx_tick(self))
+            self._rx_timer.start()
+        except Exception as e:
+            _ncz_log(f"phone remote: couldn't start ({e!r})")
+
+    # ── "please update" lock (no demo.py next to main.py) ──
+
+    def _init_updlock(self):
+        if _demo_py_present():
+            return
+        try:
+            self._update_lock = _UpdateRequiredOverlay(self)
+        except Exception as e:
+            _ncz_log(f"update lock: couldn't show it ({e!r})")
+
+    # ── the HTTP side ──
+
+    def _init_lk(self):
+        try:
+            _lk_pc_mute_recover()
+            _lk["inv"] = _LkInvoker()
+            _lk_add_setting(self)
+        except Exception as e:
+            _ncz_log(f"NCZ Link: couldn't start ({e!r})")
+
+    # ── Discord picture sync ──
+
+    def _init_pfp_app(self):
+        _discord_pfp.updated.connect(self._pfp_refresh_ui)
+
+    # ── in-Big-Picture file browser (images / videos) ──
+
+    def _init_bp(self):
+        try:                                                           # "Big Picture" button next to the library search box
+            header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+            btn = QPushButton("Big Picture")
+            btn.setFixedHeight(36)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip("Full-screen mode for controller / keyboard (Ctrl+Shift+B)")
+            btn.clicked.connect(lambda _c=False: self.open_big_picture())
+            idx = header.indexOf(self.search_edit)
+            header.insertWidget(idx, btn)
+            header.insertSpacing(idx + 1, 10)
+        except Exception:    # expected: Discord or the controller may not be there
+            pass
+        sc = QShortcut(QKeySequence("Ctrl+Shift+B"), self)
+        sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc.activated.connect(self.open_big_picture)
+        if "--bigpicture" in sys.argv:
+            QTimer.singleShot(300, self.open_big_picture)
+
+    # ── admin UI ──
+
+    def _init_adm(self):
+        try:
+            box = QFrame()
+            bl = QHBoxLayout(box)
+            bl.setContentsMargins(0, 18, 0, 0)
+            btn = QPushButton("Admin panel")
+            btn.setObjectName("Primary")
+            btn.setMinimumHeight(36)
+            btn.clicked.connect(lambda _c=False: _adm_open(self))
+            bl.addWidget(btn)
+            bl.addStretch()
+            content = self.settings_page._content_layout
+            last = content.itemAt(content.count() - 1)
+            if last is not None and last.spacerItem() is not None:
+                content.insertWidget(content.count() - 1, box)
+            else:
+                content.addWidget(box)
+            box.setVisible(_adm_is_admin())
+            self.account_page.account_changed.connect(lambda: box.setVisible(_adm_is_admin()))
+            self._adm_box = box
+            sc = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.activated.connect(lambda: _adm_open(self))
+        except Exception:
+            import traceback    # lazy: saves memory/startup until used
+            traceback.print_exc()
+
+    # ── the two new settings ──
+
+    def _init_ncz(self):
+        try:
+            _NCZ_PAD["app"] = self
+            sp = self.settings_page
+            _ncz_add_bp_settings(sp)
+            _ncz_organize(sp)
+            _ncz_pad_apply()
+            if load_launcher_settings().get("bp_on_startup", False) and "--bigpicture" not in sys.argv:
+                QTimer.singleShot(900, self.open_big_picture)
+        except Exception:
+            import traceback    # lazy: saves memory/startup until used
+            traceback.print_exc()
+
+    # ── NCZ logo (assets/icon.png) in more places ──
+
+    def _init_ncz_logo(self):
+        try:
+            _ncz_add_title_logos(self)
+            QTimer.singleShot(3000, lambda: _ncz_add_title_logos(self))     # pages that are built a little later
+        except Exception:
+            import traceback    # lazy: saves memory/startup until used
+            traceback.print_exc()
+
+    # ── library: favorites / hidden / recently played ──
+
+    def _init_lb(self):
+        try:
+            header = self.search_edit.parentWidget().layout().itemAt(0).layout()
+            idx = header.indexOf(self.search_edit)
+            combo = QComboBox()
+            combo.setFixedHeight(36)
+            combo.setToolTip("Show favorites, recently played or hidden games. Use a game's ••• menu to favorite or hide it.")
+            for label, key in _LB_VIEWS:
+                combo.addItem(label, key)
+            def changed(_i):
+                _lb_view["mode"] = combo.currentData()
+                self.apply_filter(self.search_edit.text())
+            combo.currentIndexChanged.connect(changed)
+            header.insertWidget(idx, combo)
+            header.insertSpacing(idx + 1, 8)
+            self.lib_view_combo = combo
+            self.apply_filter(self.search_edit.text())
+        except Exception:
+            _log_exc("_init_lb")
+
+    # ── games started outside the launcher ──
+
+    def _init_ext(self):
+        try:
+            self._ext_bus = _ExtGameBus(self)
+            self._ext_bus.adopt.connect(_ext_on_adopt)
+            threading.Thread(target=_ext_loop, args=(self._ext_bus,), daemon=True).start()
+        except Exception:
+            _log_exc("_init_ext")
+
+    # ── Settings: startup animation panel ──
+
+    def _init_ncz_su(self):
+        try:
+            sp = self.settings_page
+            _ncz_su_add_settings(sp)
+            _ncz_organize(sp)
+        except Exception:
+            _log_exc("_init_ncz_su")
+
+# ── Top-left wordmark: the "NCZ Games" lettering (lavender gradient with a thin white outline), recoloured to the current accent.
 # The outline (pure white) turns black on light themes. Embedded so there is nothing extra to download.
 _NCZ_WORDMARK_B64 = "iVBORw0KGgoAAAANSUhEUgAAA1wAAACICAYAAADzoupgAAEAAElEQVR42uz9d5Rk13XmC/6+e8OkL++Bgq0qeFPwBAGCAGhEgVZUSyQlUr5b3f26p/u97j9mrTfmrVnrrZk3s6ZbrWmpRVISJVESjUiKFL3o4b1HwRRQ3vvKjMww9+7545yIuHHj3sjIrKxCoRBnrVxlMjLjxLnn7LPNt78PBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwBmMwAJT3jVrFZBD4FzVfF5/uCZVGFL9VFu9MrtFbaV3msHZFv26tfWgQC8xAytmfBiaQgSU2cvq1sUFcHlE0OOaDMRhn7FwHQOi/uo7uLGe2ebYzz7//2UgQl0Zkg9UejMEYjMEYjLd0wFWrmICSd4gngIK/LBskLsyFeP/mpeov2howZVA/2x3l1Bot8g6GgLp3DOwU1yXw6xIJpg2mBfW3qqNRrVjY/Ex+rUrAGNi4QQkUCkLDYpDUdtqCtr/V2rOR/zP2e5J2AGaRUBWYwphETPvXN4O5s8pZ8/toMM7wGDjsC5dwEgTWtFnGMGIMGDWsCBSEAn9ezZ/npB2w1D0UGVZzZ1pB4kzXMauadBKoCBqJ5MwgsTIYgzEYgzEYb82Ay2BE2FrQu4Gl/pJsBhKnGnjJB3HJ968b7BP2iKG9ghkDO9su0oSD3FyjdaB7gGV+jSK/NrV5VLvS62JAFexlTA8jjr1VKl1+nQoGkhGamBA2YTAkNAR2PuhijCsN1iLKgpGEM6ZEpSpSe781nbeQVGBrWANjSugA4iXDXhbabtiM0DRwFJjyzygGGm+m412tWAgMp6t8g3Fah/nkTvXNfv5v1SCrea5xyabFwLg714wAFwCXYGwybCVoWGI4sb/VDqxcwJQIwpJ2z5yNtQjTFHBUYg/wIsZriGMGNbmkyvHmuR4EX4MxGIMxGINxNo5CDmQrEAwBl5vZpyStTzi4LFCVqwsCJtgFGhN8B+MgonYWr10AjIA2m/EbEmsTMBpj/lWu9LrUiPW8BbYdNOkDubMeUmRQEiwBW4I0IeMapOsxu9BlwDUBjCImBGW/nmHG5zeHJTLv4yFysIb+Gw2/RrcLTYJNYaogtho8JHjJsBNCR4EjtYrV3wwnzVf8loJdDYyBwoE5OjMBl4wZZG+AtgMzgyXpOzkQ4s7qErAlgmWgm4DNGKsRwxhjiBF3rlVKVKkzzrVhyPo405E/0zMYJxAnzZgBphBbDJ4UvAR2ROhotWIngGgQeA3GYAzGYAzGWR1wNQMKgzFJK4G1M8cohKH3fv1FaFjrz4xrsuP78tdp+rUWibAMhWHMjKUStUaDrYUCJwT1s3Xh9CTYZsIoYiIMWQGsmTlihbCoZOAKPT571ho2XxtFUB7HFFIj4Cio/BaAFhVwENQVMtYibpPpZsOWS1oOLJE05PddAARxRFCrwJGdaHIfTE9B5RDEEVjkyxGxW8VWKjx0/x8UIAxBBVi0FiZWwMQ6SsOLGA4LjLtHoFjOYbtKcLuZHRU6hLgfeABsv9DBasUqchWP+AxVCcrAFaB/g3ERojgwR2dkxIhjoO8Df12r2L7SiOqDZcmvZmEUgCWGrQCdZ3Cr0I0YyxErgMWST5o4AxZEdQtmTopje1DlEFSOwfRRaNQhjj3+19SCAAgIApd2CAIISzC20p3p4cUwsZqh4rCNS1oGxFILaXEt8F4zOyC01WS/EHoW2Fer2BGD6qDnazAGYzAGYzDO5oALIQFBXLfwx3+kICwC5m46F1E1wwO1sDrIgfl9LrmzPdpfskqCE+W+7v2fISwxGjXYWCjwbrBtoFqtYvHZCKOzzS3AW0CooDFN4cd/rKBQTDQbyX1eEuvVHZsm1sh/TwE0qrD2Srju47kN6GeLU1ZsV7NYC1yH8R7EBcAqxFKhonfcVJs2Hdkh7dsClYMwdcw5YNaAQoHW3gpCvzSWWCKPBWw091rsfxY4sQeiunPYwiIaGiccXgRrroSVG41CSWXEhKQYF8hfhfFBk14S9l2XIdfeWsWmzgTUzAeoY8DFiE1xZMV2O2Or30X9/7rZiXDmNr2O32MpuJdSPXX0eO1Czms+c+/AEoYFIuCwwbMyK3VsrsEA2v2W7lzbSqQ1wO3Au4A1gpXAEp8kCDGC6RNo/8twcCtUjkB9SjR8GBsGbTvfOtfNipb/e9yARuDOtPlndWIP7Ipc8iUcQsWyNLaUYHQ5rLoMFq21UqGoYYklSBcAVwrdCuwEHgZ+LGOHiQPVik0PAq/BGIzBGIzBOKsCLrliTMNkLqSSKI1CoZTyaJpxlPVwdcwFEGbZLqJCaNTgiS/Dzb9BGBZYDtwFegg4wlkK+fF9IA2Xq8UUYKURKA43A8t2oJAMwJoOBR1BWefvDgKoFfzv6nAXdbZBB0vAMsGF7plxJ7AesRoYBgpmBJUjaMeTcGQ7VI6IOPJZ7KL7KjZjTWsHXM01MUutTzIUCSEsuDWMDcKhZuYcapMwcxwOvgGFkhieIFh6AcGFt8DwIkrAMGK1YCOmaxEvAd8CngV21So2cwYC/QAoxBHFn/43FbBUPG6JnIUl9lDinFkqbre4G5+a3m/N91FnA5w7p+nzSUb4d4rzyozGUhOdz7wsIyxshrAKoT4NN/wa4fKLKMqsMDD/mee6YDCEsVLiAtAvATcB64VW+jMfmhGcPIC2PwbHdkLlqFvvQsFVnoMilEud51pqB1Mde93cWZY8/WiCMShMJvAiOLkfju6CHU9BWJIWrULrriZYdTnFQpESYhw4H9gE3GHiaZl9F+kVg4PVis0MoIaDMRiDMRiDcVZVuNJRlKW54hKXpuOWSzlNPujocALTr4mc0310N0wehLEVlC1mk8QnTeyWa4aeOdvYzaoVy8ygY53BQtf36azuNZ1Ei7sDWDubaZ9dr8YGXNb7vcClwArvkBUaVdO2R8S+F2HmhPsshRIUyolAKnafN46790WgzqA1HWx1BLTNUDQZzAYObhj611QnYddTsPMpGFuO1t9IuO5qQqnlpF1ssEnwKPAPBltqFTuGY4Y8rYFX83MEamf800kMywpssmpMYeIsJs9pci2D9s9aXokq9fNNnrmuecXtikVXtJQ3r2TgdqrzCjPOVsa8FCTqh3MsH76N6NybCZRLTdxnMbcGgV0CWtQMtKZPoK2/gMPbYOakO2NBCMWRdvIoy/4pHZynz0CQXa+1OEWjE7qgrnkOTh6AF74LL/4Qll9AcMkdBBOrreAh2MsFG5E2A48I+x7oldqUHUZUzzWpjcEYjMEYjMF46wVchjChejJcEs7BaTozHRdq0F2x6QBIqTtYI8HnXSzDk1+FO/8QKWAcuAa4xmBXtWJ1eca/swwS0oSnGZgjM0+VF5QMPFOOqNQ3eMzOFqfMYFhmq5GuAz5pcLVgDY5kJawcQS/+AI7vEXHDPdfCsO/D8jDApBPcsR5BdqBKEloYuN8VZKxnOhDxNGetoLZQdu8xcxxe+h688RCcdy3BhbcwJFGSuBY432Cj4JuGPSS0tVaxydPunKWCmY4AIidob1YMlP5eMyANUomPnF2U/LmO6lP6vbLmpdRr6WNeqYrUKc2LPueVJiQfjA5YcDqBIrhcAcswlRDBke3wyk/g5CF3pgolGBrzkN44VcVUDrBUiZhanVVIySdeMuxnVnKieQcFIQQj7v+ObIdDr8P4SunC2yis2kTB95YtBi4y2Cz4EeInGK/UKnaSAVPlYAzGYAzGYJwdFa7urGQmRDDjdZbGEAUpxyxsO5dBwWVM33gQLnoHRTPWS3wCeM3gaaBylhZ9urBSSjmWUqfT2vXaJNTLOqGFnF0sZeOCq5A+ZGZ3SLpMMAoUpk+gF74DR3b4ylLJwYoS3ILd1c40rHKW9eqobpAD0LP237sqrs3nUoBiyfWNbb0fdj4NG95FsOYKhoBVgjEz1gvdgfhz4OlaxY6dBnKF2LOlmJI9LekgzPLXK105yFyvIP+sWqJvsOUEW+fPdfXcpNRrO96fuc/LUgmHjnllcaOmnm0ycWF5NmlQzsquahllsNVINwCf8ImuJiQ4PLwdXv6xQx8US+4rbq6zJ7/oWPusMyrafbt5z1Gp52jZNrVjD1lnoKeiS/DUJuG5b8Iby2DDXYTLLmFEUBJaYtiFoFsQfy/jUcS+MwQfHozBGIzBGIxBwNV/0JXsJOoIruLOQMzyWuqzHEt/CZdG4fVH4cJbQCHDZrZJ0t2asT0MaY/TpOJsa+aKeik6W4IvIx1EdFUFg3kod50ZBsKiHFxwM/B7BtdJWolRMgi2/AD2PO+qTqWRzopDV9Ev6IaddgX0pIlHuitdzQpOR29QsrKjHLhSYr/F+OpbBM//k4MbXvcxwtIw4xKX4sgBFhv2d4Jf1Cq2B6idlox4TjDZwamSCIaCoLOXMrmnOuB01rtfsOUMZ8G7smCLluHwpmCR6T3f9Wzofr8ue6HueXSdl4zKedKBT0Irg66AS9FZn8A5/RDCUcQVoA8Ydo/QFTgil8L0cfTsN+HEXlfN6jjXlrFHMvZtXuG+aw+kkk8EkAx/kjZCGfuraVOar4vNzbc2BU99DUaXwrUfpTC6lFGhC3CaiSsR3we+g4MPTw2CrsEYjMEYjME4KwKuJvyvK4EZZDesdxBnZMCckqx8yZ956huw+VcIcZT076HMwxhHvcZS46xcSYlAGdWaJKQrwylMO7RpmB0t6KKyOA7PBC30sCfFuBf4CHCdYBwoHN4GL/wA6iehOOQz33His2a1X2X1ZpH979Z+iXsHKB3LGGT/XssLOGL360ujjjXxgT+FtdegTfdQ9FCk2+R6WFYa/ADYWqtYZQGCLvMU5ZbV89S1XnSvq3ICs67flfFzlgPZIp0omC35ollix+Q/kr1lNv95ZX5my/D/1YfK+9uUGMPv7WsN+0NMN/gEypAZwQvfgQNbXIW6NOKTGpbxPLMg0pZ/ptPQ0FxbkO7Xm21/ZQR35vs5i8NQn4IHPw8rN6KrP0ghEBOIa8xYLtkG0OeAp6sVOzkg1BiMwRiMwRiMswNSqOzGeOVkOMmA1nVcpo6qmThyGP5iGY5sc5otw4spm7FBgT5isA94vVqx6bP2UlSOk5BTWWg5G+nKl/89Ct70ytao4AqMjyHeB1yCMWpY8Ow3xYFXoDwCBR9ska5+Wgr+Zt1rlOWUpZvrOyBh6SqX2u+bVCNQmimT7t/Z2sJNra8QCgHsehJO7IfN/4IwDBlHXIOxWOJi4AsGL/iMuC1kgSvp0Db7z7qqfz3WqyNo73O9Mh3bvPWy7kpkHglCrkOexTaZmFegDIKMNDthjr3BUkkhzd4TxNuP8r3kK7d3YHxS0q2IxUB48gB65utQr/gzTQbhUTKwyYL+5iQ6up6jOp9Va9/Gc7MRma9JzssHXqVhOPQa3P+ncP3HCcZXMiJxoScEGQb+QvBIrWJHSyNqMBiDMRiDMRiDwcLSUs8N8pTx70ySgyzWB2WnKaNGApLo2eye+jogAgUswrgVuAIYO1t8JrVa8FsE2Q5yk/yzD8xSV/8KZw2McFRwPfBvEL8GbMIYrVYIHvqcOPSaC7Ziy3n+ynC0e/UUKWNXava9qLz/y6r4qAcFiXfyosjBDCsHnXM2fZIAGMEFWx8AfldwlcGoh2UtLKQwNxLL+Czq4ZDOsl5S/vp1vW+eUxv0nhd9zEs5z1F5UEt1V++U/l7QG6bJ27eyVRa2DuODwL9C3I7Tzyu88F306N84PSyVPIFFE+as/vat8vaOZilTqc+bKQ0T7rW/UvOKI9dXqhge+WvYej8Cijh44V3A/wS8y2C5rwAOxmAMxmAMxmC8CQFXBkxpVvKIWe7aTOfOE2hUjsKBVwAoG1wi+E3BJUDJQ904S6CEwWxO82zVKsuAaZq9qUyEo3L9Wn+IgxKuA4aP7CR48LMQVV1QHMf5QVZfeynHMRZ9OGwpB6+f/Zjea8r5vgHmYa4PfQ72vICAMo6N8X3AbwmuNBhesKAra+2CPtd2tnXXHBzi2YKmjPdVj30/J7PST+DYz3NW/u+yt2+wNQR2MeiDiN/ECZQviiPCJ74E+19y8LtWoNVvEkgZ1eheeyDI0WpUH3uRU5uXAZFBecgxlD7zj2BGiLEY7BbgX8oFXcsGQddgDMZgDMZgvHkBV/oSTbOYqU9IYpDtsCXpootD8NIPabKtj8axXQbcgstIls+GoMvcJxkCgo6oSb1XW8omRLA0hXb85jTSCzZj/CHwbhz8qPjGw/Dkl5xmWmTdFUvNwgaXDDqT1ZV+nHXN0qekHg6aZglWsoLhJNyuMAQvfAd2PQ1ei2gNTnfsk86BpXS6tLmyeltmq/pJPdj5siqOymb0U69z3EcWJdNGJD+X5hBYKZ9oIbfKlzFXvY0rW2AXGfokxm8BV2GM1aYJ7v8zmNwPYdmRx5C35+Zr69WZFJF6B+NZPZg999wsAV/WlokiKI7C0W3w8F+BGQGmcZzA8+8K3gEs8sysgzEYgzEYgzEYZyjgyqls9e0Uqw/HLH2PBg4G8vx3AQiDQKuBDwIbMUdZzJsPKwzDImWggNRiJswNHDL+Pltj+BmGEQ4D12D8PrJ3AcuBwqs/h62/cOKmcdwd6GgWiFsr0MrreyO7UiX1SQmfE4D1XGPlE2wk5xVHTm9oyz/DnhfAw5DWmnG30L3AylrFiqezD7BXP0tWn5tmq/jlxTnB/KvbPQPnPqGPec941v3R4zN3PVPZ269ny1gHer/gg4jLmtDgB//c9y9m9U5pdlufRwHPbDDfrAA/6J/KfzabOmtCoMluWoTqMXjoL5tBF+PADQafwZEDjS0obHgwBmMwBmMwBgHXnLwz5VBI9wGZyoWBiTa0xP+9MAQHXoX6NGAMxREbMfslk60FRs+CDKQMBz2JI5Qme8hjjOuXFvyMkmYYQ8Am4NMGd4FWAIWXfwbbH3Usfi29mz6iw1blqEfvTSbkTf3B1TLXq48eJCn7vXu9RxxBeRRe/K7bj0DZNdzzUeAmjPFTdcw0S+UpNzCbawVH3fAu5fRcJtcr63nmBrKnOK+uKoryq3+Sd6CZW7DJ20TQWLAG8X7g4zhI9tDxvQQPfs7p5cU2h37JvMoyfSTZ8iqtSZmQ2SqreX2As/UMKgdlEDsmxvokPPyFFmJhQnAb8C9xvZoj1YqFg2rXYAzGYAzGYCx4wOUvnjAVWcwpXd6LLjrJgpb8/WlaYQyCEJ76qiPQCEKWIt0p2GQwonlCIhcIThgbxPKfpFHvDJA02+Xfr/NyhhwzYJ3gQ8DdEquAwmsPwq7HHTV0HPVZzZpv71+/Tfaz9UDlOG7q4QD2hDo1g67YBV3PfhNmJgFjBNfH9ZuIq3x1cEGghLPNay5B6Kz7sUflrFfVSvTJoDjHefWsOs5x7TJhpRK8Ddq5ahUrGCwF7sYJGl+JMTJzEj3xZccGG1tOnKL+g7BZbX0eYrRHVUzqY159QBpnY6lUQgi9PglP/QN45t4lwK2YfRTsAtnpgQ0PxmAMxmAMxqDClUEx6C8rS7gqlvHvdFCVfk1ShyqPys86KeNPHoTjuwEox5FtNPik4AJgqFaxwlmbfUyvExmf23oTO3D6IUehwTLEu3EsfOuA4u7n4I0HO4OteUHi5kqcMAshRN/N+eRQUc8xqE2+JI6hPAyP/U1HNvwWg0+AXegptzlDcNZ8B3j+Oss9K5Cno09tLsGVFqCC9XaoftUqFmCMe+KbTwJXY4zXpgke+yKUhhLkGP3YLzF33LPOQLVxtqRVn9M2c2HWsZ3w0vfBw4ZXGNwTR7zLxOI3M7k3GIMxGIMxGG+DgMtmI4PKuuxslkvc+r+8zZyD8My3fAI81KjQ1cB1wKI5izcv3F3fETJ1BZFkB6F9rYn/9+kmzahVTGrTv/8L4DJg6OQBeOkHnvY9nhvFtk6VBv0U4K199Ymd4rwMiOvw9NehmQ0X3Cp0q2DRaev5mANroDH3fq5TfjbqM6CZLZlgc4ch9onAdL/+bSBrazCMuAr4PRwBznhUJ3j4LyEMIIr7rGT1WzmaSzImAIUZcNUUdFVBH/IQs7FczmXNIsfSuO9FOPQGAGVJFwehPiTjShaogj0YgzEYgzEYg4DrzGXk5+g9KIBoBrY+4JxcM9YZ9vFGg03A0JuhzWUZnHhzgj/1yiifuQJXCdiA8WngeozRRtX0xJecUGgcn8kH3elsBUE76Axw+jmKfZN/1O73C/zrpTlCXuf5OcxARTi2rcVcWAYuNuyjwFxYC133kfUZW5xCEGQ2t+ekhSLayPpZO4X9ozlIJuQIIw+N+xno3IQUVitWElxgLoFyCzBhsuCRL7qz04g5fSw9Gck3BV7M2iCuQa3ienJrM1Cv+j9nMv5dAfPyw0HQ5/63UzhDnhW2MAzPfwvqMyZcMupaZL9usP5MVrAHYzAGYzAG49was1WHAvXRvnXagxtPoLH9MbjoFghChqMGlxUK3APsNKjXKhaXRhS/CaDBxputnTVfKCGOhfAuE5sFEwbBY38nwsCRlp2pSFxywVSj5oI8w8kCBGUoFmBokc+K414zfdytddxwzlnccL1+hZJzzmwhKPVt9mz4Kz+D1VdAocQo6HLgXcCuWsX2l0bUmHOwSW9ikUzmtn6gfxmHeDbIYB7cz9QNZ+yYVz/9WursoTmlZxT4ILjX2gZQm4YLboTRpQDEMquhM24vzsSZXgK8U3AHTkKj8Mw3RPW4E/7tWWVfqCMduOcR1aFed8mb4SUwsRKWXQyjy7Cw4L6CgjnB+1jEEUQN1KgSTB6Cg6/BiX1QPemCr0I5kSLMSyJY73tktsDNYkcm8viXxW2fxq+nbgLbLNOeWsWOvQn3zGAMxmAMxmCc4wHXnIKi2XyjU6ly4asZT34FbvwEQRCyDKcT9ZDgiEEdqJ3BOCEwx1KIEIViag1snpljS8DCOomMZQvYESEYAa4BPiDft/XqT2DmqNPkOe35f++4RzXXvD+6DBavgnVXwMgSrDSCBaFD8OWsZmCGGlVTdVI69DoceA2mDkHUcOKmdhqD4DiGUPD8P8F1HyMUrALeAzwEHE0G4v088lrNbahkFacrILE+4JWW8DutU1A8+buaQVKeExqoc/0UtH9Hx7ys30YZ9zubRA3NqYWF7DNip1CF7IAmBu5JLFoHG+4CIAJOIu02mOYM5hbOwBgWXAF8GLgQKO/bAkfecAmMOF6Ynqq8M9VMGtSmXfJj8Xq44CZYtAaCgBgR+fVuABVgBhQBsQKCoEChUGa4PMrw6FIKqzYSYAT1KsGBl2H3s3DiABRLjuiiK6liczKx+d8PoHIIdj4J52+mDFwg9GGTPSc0BVQHrsNgDMZgDMZgnIaAK/+KWjCH1npnvi12Gdpju+HkARhfqXIcsyEQ/wKxV/BqtWJReUTRme3lctlOCctcC8t3KHkTYUcGF8j4JOIajOHpk7DrGZeNjhqdjvqcnBnr0dfnnfxA0JiBoAArL4OLb4fhiVZw1Ug4ZFMYJxFV/73Aw/CKiGGJkeKQRotDlMeWE154E2EUEezfAq8/CPWptqPZMS/1+Exz+JxBEQ5vcxW34QmGEZt80LWtVrFav1UuCZZf0LlepxLYJDP9lpP8Fz0CLmtXrixFODLbvCxPcyl5vn1VKizA1FGYPtofNLFZycp6/1wLFUNhHG741VawdQx4DLhfcLx0hu3FadXbwi4A/RrY9aDRRtW05YdqnYFcm2SnmFTzybBqBcaWwcV3wNqrOoKsOnAC4yAwaTCJsd1gp0VMusCLssQiBVyAWI8YFSxBLC8OMbLuWorrriWYPIhe/pG7B4pD7T28EDbVYr83Y2cHtz4A666FIGTEYBPoBmBHrWL1QZVrMAZjMAZjME5LhcssBd3Ju7QtcTnnsA9mOXmW/tmcC7E4BM98A975BygIGMeRZ1wN7MNlrM+kAxVHdWphkXqW49kXdKfHZ/ZOklzOdWGqW57UYQK4AbgWDyV86isucxxF3Y5sllOiXk6ZOp+pElAjq0MkWH8DXHgbhIWWU1YFDhocwDgu8TKwDfEqsN989VJQAFtqaL2wi2LTBsFawVLEirDA2NorKa25kmDbw7Djce+gB51OuiWJTjQ/orY4hmLR7cdbP0OAo+G+Dfg2cJDZqlxGBDQk6td9lLdDv2iY/s/Hv9SupvUD++q3Um44gohGHW7/FCjwlS0XbH0eePlcqVT4Mz0Ouhm4FbQUrPDkVz08OCex0HeA0sPWK3BwPxXgyg/AmitAECNqwJQZ+5DtEzyD9CiwHahIzAhmCGiYMwmhu49s2NCwYAxHVnGrwaUS5wPLx1ZQvuHXKZw8CC/8E8x4qGRs/dnUXHihdd5Bsb+/XvwhXPV+ioJ1GL9s4nHB5KDKNRiDMRiDMRgLFnC5O0kdADebCyMh+dnvWR0ny3b6gxBmTsLOJ+D8GyhZzIUK+CSwTTB55qtcFvUsYanz75alN5b1uePTSpRxEcbHERcApa0Pwswx1zDefF+b5dkkAyv1USVSAI1pGF8L130UCiUMl/meMrN9krYDPxE8ZOIo2JShaZxzU1MyfpOKgqdAI4EYdUGjbQTdgXGNxCWCiYtuJTx/M8FTX3UQIZUSdNjKSCaoj/2ddjxDmDzoek0mVjOE2UVItxhsr1XscGlE9a4HMCKrTVmEOAK8Yu7zFc9hOxMCi3Gwy6Hmfz79NTi+y/fmxKml7mEgWtC4ZDUvFUCEgSNhuPGTELq9NgU8DvZ50NMGU+WRN709daFGEbjQ4MPyUMJdz4oTe71geZRiUaUNF+2o9qZJSTR7r1ZtGlZcAld/sFXRqgHHzWyrpC0S/wx6FewwxnFcoBU3j13SLHrEgHzLYYh4VdhPhVYBdxl2p9ClwIrx5Qzd8lsEL/8I9jzndcXybJdlE65YrxbIGApFOPQqNO52fZomNsglqXZWK9YonyPV0cEYjMEYjMF4EwMucy0q3aGBdTves9ZeLJ8lPX3hN29eS1CsWxLi5KtcWx+A864HBQzHMRuDgDsxdiLqtYpNv5mQj9wKnZENGdOpwduYQybcYLHgHSYuE4zGDderUBzuht51VS6zWOIS1aL052syCUrOMbvkDrjwZsBVIafM2CHYgvR94BlgD3BUUPdvFgviUsoxrlWsbg6GdNzv0VDoNeBxxCaMjyGuR5xXKDN24ycJn/827H/F6WhFjYSfbjnQx4zP2fwhawqB+89cLMIrv4Abf5UQaSVwL/BT38uVB8OqGrwo+L+Ble0c1fmRAwsuB3sv6FeBtUC440k4ss2R4aR7cSxVociCKFoqMdHRnxY4JrxL3wUTqwBX+X4V+HtDDwqOnyvOclPgWK6yehkwGtXh1Z86WFxrbS3bpqZjK0snh3JsfRBAdRo2vhvWb26d6UngNeBRSf8Itg3TQWAaqeEr2VbqI9CtVUxAFXQE2Am8IfQj4B7gHpNdLTR+2b0U1lwFT33ZkV00K1OZNtVykoDKhq5Gnhn15R/Blb9EQbAa4y7EQ4ITZxhNMRiDMRiDMRjnPKTQlNkHYqlLuiOAyIMRZlQXlHcvJn9v0okPnBjv01+D6z9OKLHCsPdIelRw1Dvjp5ueMFaiDmU5rNdZ5AfWh+DoaSJ7KAnOA94nWA2Ez34LaDhMj2yWCoNl9HapcwEsVWkIfBb8qg/Cqo3gYXZHgCclvmbwBLDL92o1gMZsDpn/ftR0eGoVkzmIzwnBbpO9LnQb8FFgs8SSq+8jHLofdj6WYGtLVLVmC5o7fLgk/Mj3ch3b4T5naZiSGaslVgFv+F4uy/gMca1iUwavCgXnqB6UcFp5Fxq6QY5BLzy2F175iZceiPq0EeoNg2tVJwOIq7B8A6y/0fnuGLsQ3wH7OejIXBkkz/JRElwE/LJcMFt44bsueo+ts/euLzKfjGAlyyxEDbj5N1oBbd3giIzHEH8P9iRoN2jaRDyf4NafmYY/3w2DPXIw3V3AUzJ9GnEDsGbRaso3/yZ65AuOrCOK8iGUXfsriaLISBiFRTj4KkT3orDIqGEbhFZi7PQV+sEYjMEYjMEYjAUJuJRZncliQZutV0nZfzfNLciwGIISHHrdNdwPL2EojrRRIR8xbJfQtK9yGW9GZSvDYZz1/7P6pmxBM+FFgyUybjNxqWC4VnFrWBpq07H3mleH05J2ZjIyyoUQGg24+dMwvsJDCI39iJ8CXzB4TnDcoIG6K1lzdM4iIKpVrCG0xWC/nGTA7wtuBZZveCdhYwb2P++0tLr67tLOl7JJGMioygaCV38GV76fgg+2bgBeNEf+EfUTOHKOUZQLRoFrMH5D4mqMkagBT37ZVxqj/gN666NaIbnnU1oEV3/QADWAo4j7gW+CdpdHVDtX1rhWsSKub/BuM7tc0khtGva/5lk6o95cK8mkgfWoAJGoGsnb6dt+xyiPyXDJrd0y7kf8JfA86EQ/iZN5nu/dwDHEAYP7BB8ENowsYfjmT6NH/9qRscRxTm9pVsW+BwNo7OUndj8D62+kKLEWuMXE1lrFGlmQ4cEYjMEYjMEYDOYofBz0Aw3MdEqtfU9bAs5iya94lj/9VxPq1uq3idsY+ye/6lFEIRPAzaArgdEzCNEKWle3n9d8IYF2moIt2n00axDvb1a3Xviu63WZTeC4i5DOciB3ia8gdFnwWz4N48uJcbCubci+Cfwp8JjgUGlE1fKIogV0zuLSiKq4bPgDgv8K/Mg8icXl98LI8raoatcHTPbPzSEBUCjB0e1g5rSQ4phbgEU6R6GCfYwh4CqMf4W4HVhkEDz4Fw6rnAy2rB8YbZw+IN3wQ+GYL2/9dIs99ATGQ8BfGWzxe5BzqIRYwFW17pC0HAif+5ZLdCQrh1ln1izj3M7yHMLQPbdbf5tmsDWNsQX4W8QfGzwOHC2NqH66kl2+OnkSl6z5O+BLwCvAzOhSuOqXnWiy8mDBeXvOMtYrUeXa9WzThmo5cCdO4+zterYHYzAGYzAGY4EDrg6nMjNY6vWVeA04THxmRjHFbNgRXCWDtbjdk9Ck5Z46CvtfAqBsxsWCTwOXJpvzTy9kqlOONnN94uz1S0MIO16/gJT7tYoFGCNgl5rZ+UC5Pu0ozYNiRsBBqtejVyCYU2moTcGV98HwYgwxjXN4v2jweYNnDaZOZ5+dhzGdwEEWPyvjfrDjQHTDr3m4VWJf51ZYk0QDcW89rOnjMH1cAEUFLAfG3o5OmacovxCzjxnc4sV4w2e+DlHFr0iK6CIdCFgO02nWszIPM65W4IZfhzAkRpw07CnE5zGeFVRK5w5JBtWKhSYmMG4yc+Q3k4fhyHYXdHbs2RT6wFL9XORVtBP7PwycyPhNn4KhccwHry8h/gbsbzFe9Gt82ntn/XtMA68DXwe+CmwFqisudeLKyYRKLpy7x3nv2JcBTB12ZE1AycxWCIY5BWnJwRiMwRiMwWAAKcxE+WfB3hI9VnHsqhpZsLhmD0YHosP60y/N7akxB5kpluGF78Gqy0COsW4TcKucXkr1jPVr+Es6ts51yVwvz7QWKBVsJnrgLF7QPq4QsVzoXsQaoPjCD7zfm6D7tzY1ZbcQs2UJOWU8xwDiGqy5GpZf7HxDXCP9l8C+JdM2xMyZcH59n9Qk8DTYZ0FjwDvCIhMX3gqv3+9IGzoqWuruSySjv0Pq7Cm02PWr7X4GNryLUNgy0CUYr76dGM08zG016F7gvR5eWXjpn+HQa1AcyYBuZpHI9GEnmj8TBFCdgqs/AiOLAZg27HmhLxg8JnHyHNRNCoFViPcJd6Zf/mdXjYmj/qnzOyCGaWFsa6flZiqw6R4YX+FJSIyXEX8H9i3QjtKozihNurcfM7Up227iWzhiliVCq6++j/Bnf+wqfZZxV3XY2iyIZZYUhmDbI3DZvUjSsNvjvOJ7NOOzTSbAoKCW8mFrRLPJqGe0VDeRlTZgZZyXXEOYkXTrUsVLuEgdrzPm1wO50HP2XQNdnaBny7zPgmctoJBYDzV7/enkJ7Ks85a1hiwgLPuttI7mGZtT9stmwY+pRyHprNmPPQMuw0L5z5GHPOnINs8CYZFSbFfqhB6mA7LMXqHU71MAUQ2e/zZcdR+hJyz4INgzoBO1ik2diQvRzDBTvhBsYo3iPMIQO02KyEYBsdwHo6NxjI7ugLDsoUcpsgv1wZhocadQdSsr3IDhZXDFewFomHEQ8ROw7wq9URrVDGfWMYtrFZs06RnBl4HzgQ0X3UJp1zNA3XkhHVXVROCZpr9PV19bfS04Z/fINuBOQqRFBldIPISjJI/eJg7GhGG3gj4qcSFQOrwddj3pRaij7iDWrLvPJslMmkxoWJbcQBVWXQGrN7ZIMnZI+ibY/Tr3SDKa6zwMXGxwnmCoPmMc3eVFjhv55EZdyRTrlkZIM/jFNVh6gdPO8wmUXYh/BPsn0E4P4eVNosGcAbYKvg7aCEwUyoyv2ODILoIevZoi4w7KiVTDIhzf0wp0lwJXAU/hejTjs6BfMmjmH4Cy0zGzIRNDjlhFgXXYIIs6Lb3JOSodKxDLqCCmZVRqFWt+VhsEYL2fhd8nJad5aaOGhnE5VrnnYNbuiJTAQkuuO6oCU4ITtYrN+PsjPh2+jJ+z/JzLOGTGmMFIc87+mfumCUukYiTXvmHm5z0NVASTtSmrolajxTkVPDQDrKZz7xMcI4IhzEomRpL+tbWedYetCNrBgZq/J5KzKVMGx6sVqzV9hyzG5nPlvCRsVxEYFZTBhprnpnPtWufGsoMsCxPnaBqYFlRqU1bxxGzmEwhnfD0LfQUSzaArzmhqT1zWceSrXGm2qywNlJhObjbrJitQDmtf8u9x5AKHPS+5DGxxiCHMNiHdB+zB2O4rXfFpue6dKHEn5CzhuGey4FlG9SjVnN5F4nAq0CMYl3E9YjVQ3PsCRDOgoRzh6RTNu8U5JBJx5/9JUKvCO3/NkBykT+Ix4B9AW0sjZzbYSvZ91Cp2zOAJOYjhKolla65A2x7KpibPEkhN798ucgfByUMQNVBYZASzS5FGMrJX52qwNQZcJ/QZnF7RSHUSnvqKD7biVNUwhyzDkvsrIJsuvhmMNWB8NVxzH00GzIOIfzYX4O85R0kNQoxliLsFazEKW37outbiiFyyHqXOei/5iqYNEKAQrv84AJEZRyUeAL6DaceZTqBkatpVbNrgVRn/ZNilkkY23kW47yUXKFnWHRS7G1c5CT2ps+oaBDB9AiwmUMB4HHNVENg46NCbxVZYq1jBO8lDwBKwUdAI2BrQZUirMS5CttKzWSZj7zrQaDPtqtjRj+zyhxWD1wU7cEL0Ow2mhVVBR2tTdhJRP12BwByd3/B0Qjx7Zcj9+8s7ixNgi0GLwNaCLifWFYiLJcptl6DJwqnI9wYGbftntdjYGQS8DPaMwU6ho8CRWsWqBqeMmGitmVE0GAdb4hEgq4EriG0j0kbJQWeVqLr4OTf9x5a3ZkbNYLvEFuBFxB5zwdcxg6O1itXeypWv5pqZCxBKggmXYGRILtF4odB5ZlqLWC+zZUhh20VQ3GReNec3FtTywX2h06gCryJeErwA7AOrgKaAY9WKNXUM47cqasNX4L2cD8PAIrBx0BBmy4QuMbGWmPOQXShpqLtsodgHp7HnLCt2pmExM2YM2+Y1Xl9HvG7YpGAGdNzgZLVidR94Nd70gEtI5jnhLc1Ulwq2St55r1c74VZ5wVcygFNOMGJBvhZSOlAJQ3jsb+Edv0sAWgrcDvwCcchv8vhMwAqzWP6sBz2znV4aeHzWYDlwlxeeDXc87ghHLM7va8icVwLu2OEge1hdfQbOuwaKQ8LDup4S+guMF3wf15vpmFVrFdsOfMWMKyQmLr6N0vZHuwPd9P5qQoqyKP7TDI1RFSpH0PgqhkDrvGE+54fBsBeF/ZfAzcC4xRY+8kVRKHqobbpKHc8udNx6TYbUhMzlsm74tRZc6jiOmvzLcgF+lXNVSFosx7gSMWYQHHzDyR3EUb5NbfYjZVLEZ9hUeajmdb8CQejEoyWeBr4IvOyrS2/68FXs44gnhLYCa4cmGBtf7voqUY/gPkf+IpnDN3P7tz4JleNodAllyVa+GWfbQ24CGSVgqWErhS4A3oFxFbAIaQQnND7sHGaV059SzuGPU5AcJf8liBDX+SreCaCCUQHtk3gYtxcOAgdrFTtpUH9TsvDGELILDYZS6Zx5OlGmNNjHV5r2pZOGHkJd9Ou9zuBaoXea2XqJxcASAibkq0U5HcLttRcIRRJXA3eCDstsn4nnhf3C0OsydlcrNgVEcw1eEpDBYYzliFVyZGO3G6yRMYpYQqAxzzIb9uD2ClK92xGu8vsu4JiZVYQOIR4UPAzslXGgWrFJuYpX/BaDhhZ9YmO5HHnO9cBmjDWIUZnGEGMKKAMjSMWM/GLc9K07z5ySa3g5cBfGUec36RhOp/Qhr0l4DDjig6+30jo2kzrDMpYiloKtN3S9jM0GEx6uvUgwQiC3jjl7sJlAUvdeFGASMegaYAbjBOKkXOC6zyfenzbsgKGDtSk77pNH0em0X4U59ymlBDNb/x93OuM9e2B8v1ezctLlU+VpQCUdfDrhR0EBju+HoztgyXrKFrNJAb8N7AVerFbsNGdW1KlBldWblRZtzQjSWr0T1tnzZZwSnHCJYecLDdWm0cmDLkDuEpyN84PHrueYhiCZqzRe7qGEGHskfQN4EtdDczaUwisG2yTeAC4NCxQnVqHJAykoW1qvx7J7D1vrFbfzKgYc3Q3jqwgkK1omPJtzrbpVNmyjoU+D3S60GAgf+RsRVVzihISodjrQz7QRqX5CS52FQuAkB+74AwgCYhxz3SOI/w48e84xEtKuWOMqiVf7fszSgVdcMFAaadvGvmzqLAL2VoelF8LKDS0o4auG/R3oubOQhKQO7AZ+DHYZaHj1VYSv/QTCoW64e9p2ZcmTdXlK5iDDo0uQq/ud2YPtK1rDMlYg1gG3C92J6+FbJWkiUXUI49g0fUyqT6Oju6FyCBp1xzRpDd9H3LRbavdDlsdgxaVQnoDRJQwFIUv8e5h3CKvATQaHBPuBHwGPyAnXH/Z9bY0ztyZ2Hqb/LHFJyqexeacpu++Np4X991rFdpVGVPdOeMnDS9cDdwB3Cy4EVsgFvWHzOcycUHBst9s/UQPieqLi74GchRIsvQgWr4GRJZQVMOH6NLVBcI0Zd0tsQfYPMp4xaZ+Xv4nnEDgMYaxGdhnovYZd5QP2FYIycnBIi9H0CQsmD4v9WxxMuVHz/lqzPBE6P04hLL8EFq2F4UWUg4BFwGpJ5s/lVZh9EOk1k30PeA60o1axytmMQEhUTkd8cLoGuEPoDjNWyrVpLJEo+SSYzCyI6lJtElWn0JEdUDnmErEWe8Ztj+5SwZVmAr+OKy6BiTUUh8YpKWARToKiqUd4LfA+zA6a9JzgfmArPvg+mwMvDxssmqtkrRa6ENl7QFdiWiaxFGmx2r2DoRmqVYx6RUHlGBx4xZ2bKPJyJ0mAobddJodoKA874qSRxTC0iHKhBIiVfi0joAbcZsZhSXuAHyEeAfaas19VH3jFb5Lwcaemi6Uzowa1GVp04FnQwaTDFNVh0RrnIOx7yUO6Mqo8lqF5lFVFktz8SkPw5Nfhnn+PFHgCDQel2+P1YqKFrBxZG6utrqA0y1lUN+xQyqgeKpuhbd7OmXGNXNUv2PEYDnoUz21eLQBlxjNqVrcue08LGDGJeN5nZA6fLT00Xqx6v2HfE7oaGFu5icLRXY7MgTjjqs0SR/YerVJwSjMoFBxT3PrNpxwqv4VIMmyt0PuAd4KWAYXnvwsn9kBh2AdbiYSMguw9ZDmEBWlYYRDA9Em48RNQGsF8Bv55w74o9BQwea42G/uK9VKMd/pLpLD9UUceFMeJimsW2ZC3k7k2NW7/OwyhVoer7mtVD48Y/ELwiMGxs60vzjvBR4FHzPRRibXLLyJ8+UdQVDfra0dCRanANNnlnti3Bc+K63/e7Exm2I2yz6RvQHwAuA7Xj7oCKGEUzEzH9ki7nnb9ZvUZUZtsp4El91xl7TPY/LPp/Fvk/r7jCfeZSyMExSEYWUq49AJYezWURhkSjAnO8z2TlyN+GVfF+GdgW61iB4EzQSgigxHE5YIr6YAWLVyiTk7ce0RtSNQITgT7DsPeK9c/uNoHNGGjZsGe58S+F6FyTMxMtvddEHgnO0ggSWLH4rz7eff34XGCRavh/BsJl11EUTDspR/Wx7EuCAL7qeDbPpk82SuZnOg3WgRcZuKXZboDcbHQBK5vK6xOou1PwOGtjvG1ekItMfkg8M1cSthq7+tEMex5Ac8OTFAchuUXE55/A4wsoSQYQlrt/DFdLdiC+BLGs7WK7QGqZ5u99s94WLAO2Ih4j5ldKekiYGUzyDIjqJ5Ee7fAkTdg8rCoTfk+Wm87ms86CNqFguZzjyP3ZQa7nnbBa3mYIBiGJWsJ198AE6spyfVirpBUxwXf90i8giMMeg5jl68c1s+WtUzsuwmDCwQ3Yvolw86XtM5V4ylghHGMpg6jHU87v6E2CdVJtRi7FTqm3KY/1qwPBkpoyPo/owi2P+6+H5YIysMwupxg+SWwciMMjzOEGPOaiht8gu6XDZ6Q8SNgm4m9c0lmLFTA1dFEmzxkChLaOCQ2Ukafl6WqIk2I1lX3OeHduJEmV88glbB8/7UZrAUB1Cvw4vfgivdTMGOtxMcxXpU4Xq1YtPBVLoUd+bS4e17Nz2YxmaQaXVGBLUwPl3fOliC73evHFPa+6BrJ4zj1zGaZV1Zlp6O6NQTnb26RFrxhsi/J9DrirBGaLY8oqlVsSuhFMw5JXLTkPAr1io+hrMX135kBTwCF09TRSiREFbrMceVIR7jWUfg816ot5jK8dwAfkcv0lnc8DbufgtKYO9t51dyO/4s7q4ydrfvtlwYBNGbgotu6WTCFfgEcPwcZCUmxEy4y7CKhkUbVdHS3KJW7K65dJBCWCHjTSbPUiOqwdD0MjTmHE3hW8DXQzrNYPDoCDvtKy5WjyyhJqFZJyEBYZ09bco0skVxpBmRN9l3Jn+1Db47DgrgM+DBwC9iloCU+uAinjqBXfgLHd4vqpHfwCi64Ko34zx50JgM71qOZx/evKyTsnszBSquTzhF/5acwuggtWU9hw10USqOUcOQ4azwp02247Pv3gddqFTtxBggTHMRSlH/xWYqKE9s7We4N2n2hloQlp86Jmas+RNNw0e2wfjOx75MLvPbdmMR1oN/CuMk7j8NAYfo4evabcHKviBuuaqUQSsOppKUS/Za+c65QTPgADZe4O/AalMfQedehS+6gJFgaBFwPOg8HPfszGY9VK3Y8y7dpVbVccHw78HHBVYgVGGUD7X8Z7XjMBelNGxsW2hXzJEtxk4lZaifCQo84aHamVU/Ajsdg+6Mwugyddx2F9TdSCAJKnkn6fOACxE+BfwRePFPkZn1WAUsGSwSXAb9qsFlwgaTxZnBaOYpefwgOvwHTx9wzLvhOvEIJ4kI33UGLxTqx31RwSVrUuT/qJ2H/C7DnWRiaQBNrCM+/nnDZhVaUNCyxDLgA7DKhVxDfBnsStO1sWMv2vrMLQJuBXzVjo8Q6oSGMgkGw/2XY9qjzmepePzEsORtWHErsNTqlTJptHFHCdhH4o1RsFxEkVww4tt2xJL/0AxhZhJZeTLjhTsLyKEUcMcdaYVcY3In0qOAbBi9XK3ZkIYPY+UEKk5e6dWf5k4xuSgVhzX1Vn3GLuulueO5bni463RsUJ1CuqWBGGZWYOHaZ3p1PwWX3QhAyEkd2WRDyS8Bu0M5qxaYXKugShL6pNEzrB3UxLlr+eqUrWrLOit986yR+GmOYzpMYrs+gynEoltpaX7JunZ5WBSforNZlUfNLjiVu3WaX9QVOIp4FXkBnZaWhSeaxG7hi0RrCD/xfTM4haff/5pI65PYk+h+2Vuq74b7MxLlXbfEGdRy4CfQJf/kPV47CS9+H4rBz2tXLRmTsqcygLEHgENdg0fnObni4yn6wH4N+bLC/fG6SZLQr1sYI4lLJVRL3PCcHDytmV3Asy37H3cFssic3CKE6DZe/z58XYx/iBwavuoZjztY+QpOrrr8I3BSEDL/nPxEq8N+RgSXOojISebmELiZMzSVteDviz/hpC7aGgfMMu1Xo476qtQxUNrNw30ti6wMwddAHWUV37uLmJKNUFTmr4knC1id1MtPeYuCSagLq07DrGfe1eB267D0UF62l4B37pQaXCK4z7BuCR0A7fbb4tNvBmWM+DghmI8DP8CNS9iaa8T2ASX/JObrXA78H3OL6UChUp9Dz33ZVjiarpULvMMYpVFB6XlEG8y8Oil0cccHX6w/A7ufg2o8QLF7HMK7yMmoQShbK9FCtYh3JJr+HRnGBw0eBe4CNHpJcOLITnv+Wq9qWh52ja56ILClM30GMldeC4P/esFZlwfWATsLLP4bXH4K1VxJsutfKQkXfG7gG4yLg88AT1YqdeDMJNRJw7Q1y4ubvA64RLMYoGejAq+j1B+HkvvZzLgy17zKzTouQTuhk7clkEBYnqs8UoFh0LNyHX4d9L8LQhLTuWnTpHZSCgMVIY8B6jMskPQf8pcHztYod8RVme5PIfBYBV3nf4EbBpXjmxkYNbfkBHHrDndfCkA+whhOavVE207fRjWxL2i6SzV3J1ycC4vq0SwjvfgYWrUEb76K4ZD0FSUNy5/kC4DIZ/2TiZwZvLFS1azYdrqC5UyxWBzNd1lOMM2BpcfpCV+fJXXctvPEoVA57wc7UYe6A5/Vi8GvOywdoj/0t3PJpgiDUMlwT58PAERaot8NPKVSBIaAgErTwSSIFS8zLsterK8u6AHBCb2zLwCpkE6Bg73MuS2sJqmRTtrBsizhY7bl2ZQF9aTeKYcMdzgE2Y6dk35Rpj6fgPBudshPAU4adJ9PSoKAkJNS6Aq7++qyFOgpeVWCbpyW1c1ArY8STZPyOC7oYjRrowc87w9aSG1COjVAnGUnXZZ4K8q3JWbwUbvpkB0nGQ0j/gPFGefSsrbywgHDCxcCtwHKMcO+LPqNq3bIFSkE4M3vnrBPiAq6/ZGIljC4FYBqxFXhYDkoYn8XrUweOgT1hcIPQZFAgbF8aMoJ5nkV3vl1SyagidsqYMS382W5C1tz5so/5Pq0N3nkuHHwdXvyemD7snJQkJL8Dip66c3qexSh1B2UgTZL3e1h2Ff+TB+Dhv4RFa9EVv0RhYhVjcoHXMqH1wM+Brxo863t2Tuv+UZBAb2QkP3u0hpOGlMa+2uO/URBaG8e2OQj0MRwx0BIg3PogbP2ZcxrDknMWk5D9dL9glq6llI0oiRv+4JdcAPjIX8Dqq9A1H6YgsURwuyFc2kWP1Cp20pPIBH6/bAY+jdm7kNZgDEUNgsf+Do5ud5W3kg/SW4Tv6apflt9l7cRsZk9/c+64NSGGHY/D3pfEtR8hWLreJxPEvWDjQn8i48F00HiGNbSW+haU38HsGr9eY4hg9/Pw6k9h5jgUyu4rjrN9uLRNtQx0Vi//2WLvA3rfqllNLI26JObrD8Cup2DVZQSX3UspLFDAVQ7XACtlfNNkPwW97s+cncl+bmCNYe+Q6ROIG/EBaxwTvPQD2PO8u2OKQ1AcbZMS0ct25aDa0rYrthw/IgE7lJz9kmDqEDzy164vd9N7CFdtpKmxOIZYLexy0N8Bz88G3V3QClcTCpju++mAKqibHANl63Alxw2/Cj/5b1AqtHGYeRA3ZSxkx3tGrhx+aBuc2A0T6yibcangkxLbgOML2MslT0epRl2dBjwFt+wQybUewsLq7mebZ3WrKOecXedZG8N9rziYSbPpsKvaEOcw9VlO/xaukXbZegc/AGYkdhh6XWL6bOyjKY+oVqvYQYyvSDyHGI2iJgmbzFEFzIfRUgIrRChAEAZN54/955wGlzEksQn4bRyEaJEZ4UN/6T5pHCRWJMqxERmMl716OANz2dM7frPF5HQceAjZZ0HPny2Meac5WSBkozJdhhiPIoLje529sziDsIcUMqAPmxqEUJuCy29p0cAflvgFsMveJPpz5kYRXzH0iFxibSKqUSDEQndbNU6BDzZoNNF3oRrAMcQBLTD7bbMqIbjBsH8rdBM4+FcUETz5FacvVh5x/ZGxta1LEjHROk9JQp84w9anz2Jer25KLNNiiPy/C0MwdQAe/DNYdSW65kMUw5BxxJXAShxc589ATyyE09KPn5KEE1oW/6DlIEws1e/YBlcuAX45CHRjs0pkRvjIX8GxXT47H7vG/q6jlpK8yUqodmXuk/OK24WwwoiDmj16Am7+TUIfdL0DJ8NSM3jc63aNADdh/FvELbiKePHobvTUVyCuerhpnJB3sW65HzT7vJKi4Vm23mI396DoyCMe+YLT9LvyAxQcW51u84nOBvBwrWInzpTv0OqPhDXI3on062A3IS0CCtMn0VNfdnDL4pA7c5bou8pbL2UlDpPnjx7+IKn+0ZQPVii7Oex6Cva+AOs3E2y820qYlrpnzWoPh/w74JkzATFMJPgvBD4k9GHE5U4mgXDHk/Dqz1zSICj5BEIjpeWavvsttV5kcAv0Y7viziAu2e+lwCUcahV48u9h6flw/a9ZWBrWuINxazmwErPPSXrCJwQapy3gch9WnSKZSScp7pUuSmVHYrrgc2YwvBjWXeUi3+JwDlwxsZjKoPRNQ9+KJXjiK3DXvwePG77MsKuFtlUrVj9Vo99aET+HRt3PJG3gUz0pWeQUWetlZBi0OWfDbQzTFYgJM4KT+3yfkaWEe+ktXp3ZQ+f/Xp+B9Te17oMDOMaqszrI8BTxO0GHMYIwaLXNm7+45p1fDTtXLDaolM8twcci2Hmg+zDe0YTUPP01mDnkLUrcVhZsZsZFpw3ItBfqvsCEh7hNwTv/FRSHHD25wWOCz2J66iyFrp6mCpdGDJsQKhzb6frZgrFu+5e0K2Y9RH/TPbaxc4zWXAG0mf8eMDj6VtDPKY2oUa3YIeBRjCAstq50Q0SnQiyYor+LgJmFPNu+cpwMtu70VZTCgVfhuX90VYPSiIMLis7e52SPdZpgKl3BmpOtp5thNNlb3axkFEfg4Bb4yetwzUcIVl7KkM+634NpFPE/BA9VK3ZswfdSs9Jo2fCjZi+I0nDJnPVq3uMe7hXiyEk+iKuCDEUNggf+HGpHXcAZR6mANHkWs4IvMtgx8+aVeG3UgKDskskP/yXc+tsWygWDtwMnBScNdsq4BvHvELd7eFe47VHY8n3fGxN4Ra0cXdWsyptZtt/V4UfEKRhrhh0qjbpg4eRBh0KSI0+4DWMGMWPwODB1hipbQya7SOhDQh9y8EuNA+Fz/+RgZ8WiD7QSyY20D5terzQRWp4/GOcQdWWdxVbvn/+ZoOj+fO1+2P+auPlTBOVRB4nEMQWvBv478FitYpOnK+hq9muZI5H5IPARYCPGaBxb8PjfiSNvON9exTb6pau/OMMPsESvvOUx7c7XdtGZqCwMu4r9z/9/4soPEKy5kiG/hveYGBH8D5z9mvddWOhxuQsIuggvLLVRlP/DWTS8TWOWXvRrPwJ7X3IGRSkh3lYjM4myoRIClqTKsp4ZpnIcXvkJbLqbAnCe0K/7BvsnfdRvC5dZ8xx4yg4YLc7ReyFn88WnTjpsqOwZ5MqVo6hacdF8GnttPYRosw5Fc/MGHi6w4lLvnJntQXpcxrHSqM72bHi9WrFJqVNfW6fEwJ/WusHK5xCBgyfJWC50D/ABT01deuMh2PeCcwQ7sP9ZMhJ5ez4VjFkiM1+dhA13O5ibZxt9RfA1g8cRJ8rnNklGMhM7bLJm83aw65mEvEbceffEeb2X1qbQJe7s9QoCB/UYXwNBoaW7tQVsn1DjrbJWTXKcDPsZL2Dwy0I6MAkY4U0Y/1rSnZ5yPHzu27DrSRwxin9GyaxfFsMiGb25eXdQlq3vqobRfc8mz6oCTxseOKf08b9xxDaXv4+CI27iHR51geD+asVOno4AvsnUqZy+tVw/IkNzMgHHlRmjnpmuWJ1GP/9j32+RQoxg3etlqeCjw4Gczb9Jz8uzGQYFOLkHHv0rccun3Rqb2S2SXhJsBT4F3IaxGBE8+w0XPJRG28F68jlm9d532eQe85qLfxM3XIXj+C548HPwjt8jlFhksnfKNIPsRLViL5x2ch5jyBxT48cN+7DQpRgjUWTBw38pJve64LQRt8lVSEK1ydBZjTOgmNaN2uooWszB7yJOkUbgApnpI/DT/y9c/WG09mrKwGqDd3lh5T86zUFXyQdbn8G4F3ExxvDUUYKH/lxENZckiBrde765nnFa6ilDggjl6PKequ1K7v/AqTE/9VU4+Bpc82EKGIsl3ZbIi/zCV2HjBQm4fK9AkjulLVxKCudL9iImFyJZUZEyglJzCPkr3w9Pf93pgGRdjR0ZlqDT2HexmPjS6+sPwMZ3gQJGopjLwpC7ZbYbaXetYvOmI/XhVdzq2/FkCU3YZQf9tXUbtEzSjCyM6ilEWxJlpDIQHNnRGeimDaYyBJpnm5cZTKyC0Dlnk0gvgR1Ebw3n7K2qeP8mk2TcAPwqniTj5AHH/FMedRo/UoamGbMQZZDKZiUcx6gKq69s9QjWzNgjx8j0E6FDpbfPMwwQE75vbjEQHNvjAq446k5SYdkwoTwhdoudM1+vwvnXgO9/PyD4KejQ2Q4nzKp0vZV6InGVrRuBf4u4oxlsPfb3cOgV51TVG/l9jq17NuO8ZcH4mcXWJ228yIb8ZoqYm4MalkbhjYfh+F645TMWCi2WuAWjjpjWac66W1bAmb7nUo5cZgXQ/b3QJMeKGvDT/+YgzlHQmVxN96L2XK+8OacdzCz/Bl+xLMKhrbD1AbjkdkqSzgM+aXAUcZlwwdbjX3KVx+KI0y7sgBunEUc9bATeRqT9rqTPNSspUjK5VoKp/fDM1+G6j1EQWoq4Sehu4EC1YvtO1x1dq9iQYRd7MpqPCl0KDE8eRQ98VhC5IKFJPGMZNjVduUoWGrLghllncTa/q8t/zmKNbrSJSp76Bzi8Da7+IAXfUnK7j8/+Kw5uuqBoEC9mvFro/Zi9F+liYOjEAfTwn7v7qZmUyLuDmusZz2K7lKPPOR/blVehNHPPvDgCe5+DyUNw2+/4KqzrnY6ASeAJ3y9pc7vE58BO2BRtS/ZyJQ1InDA+zb/HcWcQYnRF+5Fc/0V0/mYYXeYyeMlNFid+PtlYaLPMS5569dG/BUQQBKwA3oPYhGUqWJ9Kf0XHnJPziuMMg5tcoyi1dqkq4LycY7ksh3eSgwMvJ5oH41RAl6pcJudlqWdqCVmAWhWWXdR2zgzuBx21Be5rGIyzwiEcw7Fz/T5wHcZofQY98Oc+C1hPnUXrthEdjfrWub9bPxO14YjWgKHlcP2vtFgfj0n2MPBt0O7SOcxImGNlRsxRb4/HEUHlSAqVmYaKZWShzTr7cZM9L0SOdWutD7hkHAK2AFOD5MTpzbQDVxr2b3DsaC7Y+js49LJr8G4hP1JJveYzjBI9JRa3/8yy9SRtvSVsvXUGD62fzWJYs25HJflzUcM5LUd2wAOfE16zctzErcAfAJf73pmFZ0WKU5CkjD3f/LxJopHWfZe8D9u7PjSDBz7vRaPpDrZaP5sVtPU4i3GveZE9r+ZrSyMu4VWdAowRM9soxwq3HCg8+TXY/yKEwx59kGEj6HdeZKxh3E2W1kUCkbD1Tf/GzPl5KsHuZx2ToReSXgd8AONqOdKP0wWLP1/oYzj426XA8Il96P4/ccE0YQImmmdT8/ZW2ueN5+93xXHKv00Hc4k/G34/7HgMHv9SCwq7WPAOjN8BrvDMpwuJuhgHbjHsg0gXAEP7X0X3/5mju29EiXOSWgNL6Lh1FFNybJelbJfNZrvy1qvHnm+eszhyohvHd8MDfwZmTo4FuAXjD4Arvd1mIQOuoBWUWPZm64oW40TEmjAexN3G0P9tCng5anASsNs+4xx5kWOwkg8ryjAa1vn+hSHY/4rj+ZcoxzGbQL9uYj0w7KlAmaceTpgOSi3OmFfGJdDV0JckJYmztbHmcOcUcE2zl3imovDkId9cn7pkkoY8a16twNASDfhxe44X3Niijj4qeM1geuCcnXNjGLjaG5rbcEKGwc//BwQe4pLuTcxyEDqqKalkQ9JGxOYl58twx++3SDJOGDwE+pwPAqbfZs9A5hRGVgClkwdQo9pNHJS+aLKC3jynPGrA0KJWxbqCgyYdP+dIX85C4XCw+4Ru9NXL8Im/h4M+2IobGaQOdN+3reAozjh3ebY+CYGLE7Y+Ttn75mujbuck04nx+ykstfuNcGidRZjdBLwPscpnyBeWNMO6ES/Jezjt8FmGw9bsQ01WFJ/6B6g0+6DjhDOc9G9SJDX9nMW0b5U7rwybGsXOsX3yyy6pLIdoGQHC7Y/B3me8VECSCirD8Z11Xll+FykHOcfWk3aM4/Z6RXVHAPPaz2HmZOuuuQbxCeA8TzG+0JTlKzDdi9O12wAMH9+HHvisIxWLolRFJiNRBRnkbjmJDouzz6LlBOLJINUy9m/PQKHhiFX2PQ9PfqUddOGCro+CnV+tWGmBchvDiKuBTwpdgTFSOYYe+xsHf67VE8yXvRIjlkq45qxXLz/CMs5i13pFGc8xKwHRfI4e+npyPzz8hdZaNuHRH0PMeS2DWVY0bFXILeV0Nz9kRnBBj01C3LFQEcZ+4B/CAq+YMTO8BFZthNpMqlrUyMnKWLeh66Bk9QbpoS/4KqUY99oKlwPjMkqnEHS1RmnIrItAxDKi8jh/vTo21yn0b7nKto0DVwGL4whNH+uM9pOGI45zMgDpiyqBh7XIwUbK4wDUEYcMJjVwzjjHtJ9KBhcD/wJ4hzfehUf+CqpHO8ldMp2HPBvRIyERANUZuO23IQiIcY3gj8nptTwNTL0dSDIyDHLoMfk6vM3RcsepDGpe4ql53pNJsI4MbpMOfnWrmnjIxM+AQcX6dFaOjXGkzaB34xj9Cs98w2nuhEOdZyezEhInnqN1OtVZ928/tj5NaR533tmdBFppBErUmXg0n/Q8tBVe+iEARaSVBneDXYMxtqBBl5dVsawqQzIhOostagau9ar79sHXHdFDUO7+ecuq1Ofc9R1ziTr9m1nnlWVTYyeee/A1mDrSQl7p2G545hs+2IqyA4Z+50XcO7Hd4QDP0R80c+iIQhEe/ivwubYJ4EpcNX/Uw9kXEqlxA+JjzWBr8iC6/384PzGKUomrOJVwZhabOpufGucHqZnrFWcEWXFGsiNhI+KGI4DY/TS8+vPmmWMN4h6D2wWLTtXnrVWsKGw9rlfwZmA8NoJf/IkLtuqNjPVKJRI6bBc9/AIS1ea818adCaEOZvUc25W2qc2fjRPnyyKXNDr8Ojz/Hb+WsEJwl8HNgnG/rxYQUghqwg/SE+qKHDOyRx2GuTNKNVwT/BawH0ocBKKbP+XpMqPObEIevC0JN0yWrpvRclCEyYOw8wmQKFnMxQafATZ5/YJ5b7644cxRE0eaO684Na+stYrbwZbFnX1zc8+GM2TGhcBwrULQqKYqk9adIcjM/qU2cdP4RA0XcPnqwxHBIxo4Z+dc9l2wWnAXcCdiJVB84QdOtT0sZ+x3Szn0/diIONEnKkfRet3HYGwZICrA88BfAg8bnCy9DUgyMkZRjnmqDOjQ6502kSw7QvbllJWJBqjXYc1VLQ6g44JXPMvmIIlyekYJcQnQFA4fOrYbtj/uKd/rPXoOLPt7cQoGmA7Q0hIvmfd1Bmwn67z2NS8vYloacbTQJw8AxrDgaky/aeIi78Sclh6urKqXWQ8/InVvD7mEIk9+2VVimo3/uf5NDx8oXfGxNMFG1lqn2xMybGocOy2+F77dfo9H/qo93zjOgX5atohxel5xD78rPS+boz/Yej/Byb3w+v0tp/ZCjA+BrV6w1g8HAbsC+C2cPtlobRr9/E/a8LcuX806A+ku+nbr7s3rtb+aflecrtLk+YMZkENyXtNhB3wf0kvfdz1dXpR8g+9Zu0YwMt9A1kMJx0DXYTSr8oWH/8KJNLekKiwbAZcFre3Ym+RAfXv5qXSeszjOgTzn2a6M1ze/16i7xMXrDzixZr+Wl8iJiV/sobALF3AloQpx+kPlGJms8n0XdM7lY2LgMOgnwMtmTCuAy97tHK9mH1Zzk2ZdAskeqKx5xZFbsGf+qaV9MCLYRGzvAFsGFOe6+Tw/SBRjVSf4q67Se8e8rM/1ijPKncyzyd45Z+HRXa50b3TPK68nIDcYpC1quGhNiw7+GNgzuApXY+BHnTMkGYuAO3AkGZcC5f1b4LWftvtKujDsqaxVMhOYue8Te16BO/Pn3wDrrm6JR+8AvicnXH7s7ej8+2zkMLDe92SG08c9RDh1sZPVX0B3ZjvZf9FMogQhLLugWeGyKYPKoGJ92s5XAddnc5fBNcC4xejRv4bycJtqvcshScFH03cjGYFWF9w0uS9SRAlZAXvWnZQ5LzLm5X+2EbnMt69iuH4uuNyTwIwuBMokM7hKQ4riFPyITnhtsloof9G//GOoT/ok+ixJo461yVgvy5hX+iymbWocd1cp05W0pvaoxfD0Nxyza2z9QdQ6bETGvLLWa9Z59QggOnyJxLoXhxzFuZkjkTHYCFq9EAG5g37ZWowPmSN+mjAjfODP3HPOg8XPZlPpYVN7+qmpynCmP5h1FnvY+rSNiCMYGoGH/xoaNdrVPeO3zLWblObbsmKy84CPIC4Aytsfd1XWsNgZVM9qI6xzf2X1WeZ97sxicEZAl9ZMm4vtaj6vhpfjePRvIWo019KuAe4GlvcLfQ16xhSOgU9NY0UWLtxysNKW0UxqqdKe+zPG9XG9YtjfCHYCjUvfBcNLXaBAOliLM0qFs8xLnvHsCd9MaDGrCPR+0EY5Z2aeZWvvAKZgHv3Oq8vwxRlrNE9NZsmVOo9s9/CjKHte1mNexN14fQH1Giy5oDXNGdAhjNrbtPpwLgZbYxjXGfYJXP/WSK2CHv977xBGCdhQnJ1ty2pk7QVfog6LzoPrPtqCtR0GfmbwbWDv248ko2OUgbXAEAaVY21x1swqV95FntFEbLHDq5cnoDTs+2qlrXJ9XDY4EaepuuVEQu+VIzcqPPllqE+1m8jznmNmtSTOvxutyaDmab7iustE47/imicwSNAlZ7IbZiTg+pqXb5yPcfTVTWiOxHnAB81pdS1MwBXlVHEsw+mKUsFDMpCNXf/Gjsdg6/3u71lQwnQveSahQkbPThaJSda8sghAyLizm4QY938e9jznKl7NoB2b3UYs+Lzi3j5O5ryAmROw/TF5GJyd13RoT6XvqFaxgmAc6XrEnfLQ3af+ASqHPEFT1N1TNCebGnfb1KROjIBC4J3MZoIL55c1z6aUuhfjbubtuc6r3nCK7fd/tt3PZdj1Mm4xWDRXOG+tYoGcfMUGMycAHsfohe8lKsDMbb2SaLSsgLwZhQSeFr9Ra9svq4HVoVF1fwa01zLXdvVrU5M9ZT4Qi6cdVNclAbTG4N3AeVh/SYFCHgxaWODaQzsbB/Ou3zQdbYf6MwkKUZFFeR5hTEp60WQvWkNrggKLbv0U+tF/cTTxLb58Eu1NSqnK95hX3HAZlF3PwtX3QWmMobjBRhX4ENg20HS1YjaHDLp1kdenyUN6zCtLnTwTZzpPynrPDB8I11wfBJ2Bb8e81Jk16BCZy6AxbWbDV1zcfHZWMakmDZyzc6GvxGBYcB3iD4VuASaiiOBH/8WzITUyBHb7OItddPGpfV8cdSQZvmp6HONBxBcFr5RGVH27PhPXt2XjcUObggLj9aqpOilKQ90QiCYtf5LKOVduIvH6qAHDw61A94iMJ00cX+iAy++v4rn0fOaqF+SrOUuBd5uxQWJo+jjsfMY5LXHkIfWWLeaZpjxPU0uTENyV18WqVdxtPrwUSiUHs59Y7V47ud85LI0aTB11wVeh6HqvuujO03tL2dA9sijYY3cHb38ErnwfBAWGzbhQsgtB23wIeOpswRmCu73mhbop3Zs/O3004XdkUZ5niEgbOWcxmv0snqpNPbm7XYHJFDTOkuaJejxH69aEmq+tz12vxH4uleGNh+DCmy0UWgrcaNhXhfafYnLjYoxPIQfdPbwddjzufMuoTqaIbmu9Arro8XtJ+ASBD4Kr/q4MXOWnNAxh4H+ff32jCjUv8RyG7nUKU0GsOqsBfc+rKd4dwLEdrp9rw50t+YAPyPVDn6xW3NPs0/cNMZYj3SuxDqPw/HegMe1kmMxSdsJytPJS6y11SxMEnqm4WnWfdWjCwSSbtml0mVvrmSl3TqMG1KehesL9vuKQ+7k4zpApmE2GKWNerSTME3DZvTCymCEZlyBuMbG9VrHGbEnhQg/LFSRJ7M2D6FKBUofTZBlOVJbYWEdAIcywWGjGYKfQF1XgfDOuWbSOoRWXuApNoZwQ6aO3OnrH5ZCcl3/NLz4L9/wHFBRYhHED0kaD/XIGP5qHBqasF040Y706hKMtn0Vs/qQZlJpZw2N7HbwgyNEewDKem7Kpf5PZguIQBtQs1qEg5PSKFA7GmaykbDL4TTndicVA+ODnIK6AFdrV3C6ncJY932Uj/D4KA1cxfde/bZNkAI/ilN2fexsyEmaKmCu080DlRo0Ay9fYIkXNHCiV1FEnbEihu6w9YYbX1HN08FpA/S0vnD0EjGveiIKz7bnQqFbs2FyCLkHBXJb9nRIrgPDJL7s+kqTsSUcQEXlHLvmMleHA0HbGLILGjEuMnX8TrNwIpRGLJVnGPRcAQX2G4Mgbro9s3xb3FmG5fXa7znmWTlTqjkve17EXSH7u23DthyhIrAP9MsaLtYpNn3IVO0E61aEjNcu8yAGVNP2NLh1RyxdtJ3nerFNLCfJ/R1qEeM7+Tcb8O+Y1myaROoO9ZJWz73n16Q9mzYvYeSzH98KJ/WJiFUUzW+qF3sP59iEbLJJxs8EVgjEz9PjfOqRGVO8xL+suHHS8JmVTg8Al9qsVl9hYdTksv8Sdv9IocVj0SXph/jCFFku1KYLje2HnU65HaPqoDxbCTqmBLC2zdKIhSOtg+vkXR+DF78NFtxiFskbN2CRxG7BLTtIn7pudWywxs8sljZoR7HrKVVTz+hG7gsNk1SRDl06Bq7o3cGt33mZYsQHKI8QKOjhUkzkS54fHFkwfl3Y+A3ufdXupWHLWLY67dbnybEQzcLSMYDEM4OmvOsFu39d+F/Bj4Oi8KlxZV4TFXYFSh7HPNUQZIniZor4i9hCWl8Hut1jnKWD17b9H8M3/NeVIZFRkOi1RQrk6FcEWynB0t2OBWn0F5djskkD6XcE+4LlaxaI5wOLkpAATpiNp8DMyPnE6w2TZFS+zU0gtu2B5tAmTrE8lVMqzPkGWKHUPoxp4YcviMDEwGYS8BEwOCDPOAYpqs3WSfhnXu7UcKDzxZXcRFIf9PrFupffcymkPG2E+q1etwC2fcRhpoGLwDPBXEk8Bk29PRkKy4N9DQHBsl2g0XJnIckSNk/a2aQu7sulx+zE1PJucHw1gUkaEWMhK3QhOw+0KxFAcddw/cUYiK2vEqUs2q8gx2++wWXhgbZYEWzOTXUccFfyiVrE9/QQLvuF8VOJyg/OA0uQhOLjVZcCTfVhB0DmbLoe8lelLZdvkbP7idXDDJ2B8Jc0Aqwaa8Y7BpAPxYhgFYAyxpDjE6KrLKa66nLA6iZ79R9j7ossqxzmZdUvNS8mkaqo6Evtert3PwjUfIpDrK9mIWAzsYgEC/FwfpMe8cv2IPvwbqV3ViKOEALy1g44g9OsWtO/XtMBrlwtpvf0bbG5+V6aNSGRoMQfViqJ2QKemTEfo2NoUtDW58tYreQfMdV6Gc2jfeBSu/SAFSUvNEV28Vq1YY67VZKAoOB94v8SaJpRw5rgjppl1XtZtUy3pkCcEj6tTsOQ8uPIDsPwSQyhGNPzZm/Fn7gQwgyiAFilkdGiC0aEJCqs2UjAIDr4Kz30LTux3flack3zvmFfc29bHsYMMP/VVcdOnKPi1uJsGj1LgqO+Xnr0yb4wgLpa0DCjsfRGqJ908k/59MIuNIEPguVnVqlVg9eVw7UdheFHSdjEDnMQ4gagl7oLAFxgWKdDikSUUN91FceNdhEe3w9Nfd9TuhaHueWQlE5JJh6x9EBbhwFY3z9IIJTPWSKww2DbbOhbmVKpPZbbIiKa7SsfpDEeQG0zEwDTGPqR/DkKujyMWBQVGL70dtvzYMQbFUUbGJnlQ4nY3VrJa0zosDSgNweNfgfv+rxAEGgU2AjcCuzDqtYpV+w+6/PWTRbmaXose80oHk11MY3PrvynjICtlMxTXfQ+XdWbtiPPnlee6NBu0h8Zbz6EK7DaY0aDfg7cyMYPBUsTtYO8TOg8o7XgCtj0Kw2NtytzYMtTiyTBgcSrbG7dPTPPMNibhkjthzeV+LxlvSHwVuB84MegJ7GyqBTixzyU9WtX0oPOSTfdYoG5HKM1cVq/B+Ar/eI0GItLCB/MrkX4Dp+U2EoTpK63vq0hnySOJ5EhdIuAHvtIV9ZEhXg68R653qfjst7xTZBnCsam7oaNCaZ1Mtuah3tEMrL8JNv9qq0d6Gjhgxg6J7cATYM8bOgZmksYxLje4UcYmYC1iZXmM4Zs+RXhsD3rgf3jnW2QmX5P7K90v2GUjBNXjLqO/fjNFsBWgTRivVytWPxVinLjhHMuWn2FzmBd92q5E0BYEDjpW96xw42scLHR8jatYVqcdZDOqOaevWnF3cVju7i1ZsHnl+F1pGyF8/0vNVVPGVjmShaDkqt1B0b3fif2uUnpiv9PKKvjgq8O5T8zLUq0kc50XARx61ZX1EYuFXQ/8DHR8ntWtWwzbKDRcn3FQwiZd/pzm1Un25vZ8AEEEwRDc+AlYfZk/c1LNJTZsr6HjmO2V9JLBNhmHkI2ALgE2mNkGpKUSqwSLVm6gdM//TPDi9xyJSBgm7PUp2PqwBDufhas/BEPjXiS7oJsN3hAc7FN7djGOdGQZRuHln7hkTJqsIp7FRrReo3Y/ZBg4COY1H4GLb2uBXSuGHcS0y9uuZz36Yr9hNaf0RBFY5ZN5NxiskVgnWLZ0PeV3/3uCx78Iu19wlcMW+2tOkiCZ9FIqbdcU7iaCF38A132Eog9ebxW8Wq1YTx3awpxINSybHUWp5iGRkT1SqvMpw40qjahRq1gF42XgK0HI+cBFV91HuP0Jh3cNwu6ouKtkHadu5dS8gsDhPJ/6Klz/cUIfoX7Mv+/JfqL9jGyDssgy0g29HZWvjPVqGpxTQFQUcD04qzyzWRBHnbj+LvrejHlZ1ry8AY0are4+J5Bq7EBMvc1JDd7aekCO/e4m0G8CV2EMnzwETZKMqJHa0xmZ1a7yfJaNaDpF3jFcfhlcfZ8Bqhvsx2k//RQ4UB7sp5Sj6jyQxnQqRIkSx1kZ1cY45cxlJFIUwIpLW781Oj3zZwhsnaQLLGakOkUgWRfku9MBkp+f5dahzIRkneiHjrtBbenodGRnQoEDtZNRSBXZiAAMhsZV93foRuB+uex11IfTMm7GeonhOEKHX/cVpEZ2D0walpWGxSSfYW0KLrwNNv+K2xkmOy70LPATiZ84R4XjMp2QaHi+3QLiJcFPcBDHW4D3eNjQisVrGLrnfyH40f/hghnLmVfmvaduGxGbg/lsewjWb6YAWgW8C3jEVwGiU6luiRyYPr3n1a/tQt45nHGpzXWbYcMdMLYCC8KkrG8K7mQEU0fQ8//kqoZh4IKaJPMzyvFvZptXNIvflbQRgdvqM5OwaJ1jhL3oHTA0ZubD1az1D80Ipg6j578N+7c4ZsSOA9XHvLo+W8p2NWFxJ/dDo0ZQKDNusS4nsBHNPdESekf8bkmrm2gNeVkbWf/z6kIn+WDLajC2Dm7/l1AoEgM1xFGMrcATiB+D7ZQ0BUzJmDZRFSr4/T4qaRHY+cDdZrpBYhMwdsX7KZx3Hfrpf/MaYXF30Jfuy+vQTFM3vLwgeObrcMunKUhag3EP4sfmCKpmbVUxMYLZFZLG44hg8gAEhc6qaBbixeKMQkTi3wpcMuIdvw+rNzm3BOMo4hmhHyEeBDsMOm7Oztbkn6DfciXBMyb7R6HVBu8Fu03iCqGJm36DMPoC7H/BaemRITqdabvS/Vz+sxRLcODl1h5bBrzT4FvAgV72q9BjdYOO+8ayjWs6NZlkFcmCpZlylKdJwFnECeAF4BWLWamA8Vt/0xFoDC9KEWjklNTTmaFkBS6OHHzj9Yfgmg9CWGLIjMsRv+IzlifpDx6npDB0svkz7zJKfj+OU78ljzp/Hk32UcRIGFKwyDGaFcsZmRxlX0jpizxdh2xBJhwcpY44zAL2egzGmWUkNMc6dD3wO8BmjPEoIvj5n7gG+yjKqUEEKWOkzoRH7lkE5Fnx3vHbLabPYzIeRXwJeL00d+jIOdy/1UL+tHRBAiX08ZIwr7i7h6KjDzMjsGmaoULJ9WS6S8Oqp6OQJJeqCbf8mPC5b6DCqGat5Lu9pXybis9zJnttgqwqvbovT2tD5lu/Y7YsZMFVLD78/6BUHGaxGZfKZayDPoSOhxEXIpYB4bZHHRSpPJrtoLR0GZN3cAYCQQHEVVhzdSLYMo5Iuh/4LPCSdwbqQFwa7cjC1qsVqwHH5WB9bwCPSbwPeD9i09A4o3f/R/T9/90Hh3F30GLqDepMBhAqwJFdEDdQUGAY4xKTjZ7qnmvdm8ruD+k5L/Xh33gPq151QcpV9xlh2IKO1YBj3lGcMSxwvYoqARMSS8eWUbr1MxTq0+iJL7s+k8JwIuhKQbLT57prXimEUS68slmRCx1gOBiCW34Tzru+WZGhAaoCh4DjHlbcTI+XgSUSy8aWU771MxSmj6MHPgdTBzuo1Xr6XXn94EpVxsyTSRzdCSsuJUQ23P0ufUF3hyW72NB6wVBtGvY873yhZhI6z0/NtakJFs+4Cksuhjv/VasaM4nZ60j3I/4Rs22gg3IJ/NjnhkwtUjOmBYcwAtBryF6Q2IDxGbDrkdZOrGboXf8O/fS/OChb1EjA9VLzUgqun/XZgiLsfr5lc4YMWyN0vj/zfdy5VgSWAOXj+13QPjTWGeB1MBFmtBGk56UAGhW3F5vBlhm7BQ8AfwVsMTgiFPkiez3dZlCrWN1cEHYQV0V8A2f7fseM2yUW3/oZwp/8ERzf5dahozjSr+1qBt+CkwehchRGllA0s0VIhdlQXoV+s0Zx3MmLn5tdyigdim5GJcuJAUsjalQrdgJ4WdjnFWgVcOWyixladjEc2+X6sJJORdYFbdaNwU4emKYxu/+z8K5/SyCYcAQabMLYW63YiXlBG5qO0BznlYUXPRWAnsxpLNRnUBylDEYOU0sa755lxJv/NbKs4/8GWj1vTep3fLB1NfCHwDuBRQbBP/8f0Jjy3oX1rio3L4A4yneYk/olgcBCuOc/tvz94wYPSvwp8CwDkoysokrczMk2Ex6x5STCLIesKKNZ3RJcq0HoCDMssleCgiYRjdPVPxfI2fFSKdUTom7HLV39yroTLZPxgJ6YRVnOzyacl1b+UG2ETBh69qwpKA5TApswlzyeLXAuSrYYdLNgOUZh19N+DeLsqkwXwVIGA675z2Ih3PIbLefviMQvgP+OY5ycynJUaDMtRkBUq1gdqBucEDoMHMEJM18xvJiRDXfBlh+2IVlZ9iCrh0fpnqjQMYrtfQnWXU0IDAuVFwIuanFn6JtbMcqYV687uxlshUNw1793FS2XOqJixg5kOwTPIJ4A7fLfK/gqyw3AO8y4QGJNcZiRWz9D+OjfwK6n2v0lyb6cfmxqB6lF3LtzUbi+k8Xnw7v+NYQFYqCOOGFmOyTtAX4OPA6c9AR5IY7g5QbgNjMukVg7PMHw3f+B4Mf/BaYOtO+JdM98l981i0g11k7k7XnOVd3lsNSFuSJ9BMtA93r5geIL33EnI+kP9dptWTa1leyPoTAKd/xBqx52FPQo0tcMe1hoB9IM0IsToJZgbq0JTeJQHoeA+4APAxcvWsXIVfc5RFarpytjXpZRqU3v+Thys33hu7D5Vyj4yt+dwHPVivUlci+507X7uYSd7GG7mGVezWe++VdbiaJDEt8Dvgg8j9OD7HkX+e8117OGgx8exWwaEWK6HZi49TME3/6/Q7GQ/ayzbETLv0lDZSN49Rdw7YdAUgkY9Zpx9fkGXEoC3CyLsSZ9+ON2xKgg9SDUqZXR400brsqkLWCPgM7DKN32WwTf+d98Bl35DY9dBtZSfVOeTSYswv5X3MZZdzVlxCUYv4PYJ3ipWrGTs2zA5vqIHP2tvucVdBrNU6lwAVJoISiIGs5sGt1l/yxGpi49kSDDmJvDqft/D4Ktt+4oCTsf04dRSzE+fPRvYPKAcyyIMzKAymcgNetOsiRtRhC4Jtt7/zMUm5pP8KzgLzCeRAOSjB7w7gIQxI22NggpOQ5lyG5YkjAg5xm2ow41zHTMOQCnb8S4bG0UJYQyyUnwBN1JvSw4a1pstst2ZfSUZK2Xshi0EvOKzPe07IOx5chVABRiBLWKKW//OtCiRn2CYyKOCQ5vbxMuWAYRgmWRQ6WeY1MwfNPdraD5pMGDMv4E8ThiqjyivgTp/dzrtYpFwOtg3wYNmbFY4oIr3k9x2yOOBtrSPUc99lcXCiZ21ZY9z8O6qwkQI2CrQVtqFavN1wZETf2jOCNQ72deGbartSciKIzDe/8zhA4+Nm3GPsFziH8Ueh7XC3MM1+DffMcSjgjoexI3GvZ+TDdLLL35NwhnTsLR19sMsOYjnX5tapd/k9EXLrl+rUXnw93/3pqogkmM1xGPC75qsAc4LFfhilLzfw74gcSdwH0mrglg/J7/E8H3/neXnIss3x9s7tOOIEbdtgucTQgKMD3ZemHRCyGHvc5XKpkSIhabcYXEmMVo93NttuteNiJvXsngodGA9/1HkFzCENP9iD81eFqu16xvTVL/eSIgqlbspFtrVQQxxq8jLrjkdkoHXnWQOAqdsOK52Hozxyi49yWn7iNYBFxtsFju+fc9ju/0ydNZbFfPeckxEi692M0LqEg8C3wJeM5gaq6FD7/uca1iJ0CPC/7UxJjgpuFFjKzcBAdfdj1tMLvtyvJvMBc/HNvZiqMmgEuBl6sVq+bNOZjTDZk+RCQEACO6hPLiRgqYl3ASbPYFmwF2g34AbDWz2shiuPR2h/Xskpqey7yi9s8UhlzmwI9RYBPGdcDiZpUoJ4MStIKtVE9LWkQ4Pa94tnnl8XbNjRm+2DQdafHpzArabPNKxlttiuKGr0Y0NCDM4C0GUysAy4j1LsR78A38z3/HiX0WhvOJWywDL5gWze7qn/AY7+pJuPrDjs3Jn/EtwFeAxxEnByQZPTqgnOOjjkshTgnLZzHAxjkaLanXhUU5Vzg4/YLHQaq61mteXbYrzrGpcW/b1epXjXPERDPEL3vNq16djQwx+3ozYwlQOrEP6pXueSVFOfuZl8yRMFzxATctM3YBX0U8Y47lszHX51MaUVwa0QxoJ/DPTcZQCVt3rSOD6IBcWY/qQIaNsMhVCk/ua/VBjIEuMcdkGXJqFeF8GF7cp+2ybsXNuAF3/wcIS0SIk8BTEl9A/L+A72C8YLAXR/ZTLY+o5vUDJ82xID8LfF3GHwkewDgGRLf/ngu2As3BpiZFpbP2fIbfZYK7/rWHcJsdAx4y2R8b/BHSQ4KXPXnCdHr+uM/1LNhXDPtTwRMmTkrEt/8u1OuJxMEc/BtLncU40f12bFdbE6Np++gfvTEMXCLZcqCw7yWoHM7oX8+wEbnzop3c2PguRxyGmAaeR/bXvjJ4qDSimfneY+URRZ6teyuuJ+gRH8A3bvpUQvou7mHrZzuLcmtxZLu3R7BCsMYcdHQWaHubF7WZQM20XXH/84ojWOz8gTrYXuBb5mCEU6dCoFMaUd2f0+cE3zfjIBBdcnsbJTIX25W2X0EAk20i+BGckH1P+xX00XRoLSXzrMMed9O9W4Z4XJdmTNxXlDpj2OsGP1agg0B83a84+uio5h5Ux7ysz3klDlEYQuUIvPCdVmPoGsTHMS4zMVGrWKGPNWo5Ac1A0zLmRdS5DlnBWd7mnPOdY27ecWSteUWnMq9UABmEHS7MYPCWghMW5EgybibgYz4zUz6yA176vj9f9bbxjBPGPY7bl1R6z0eN/ItLgmga1l0Ll93TNK7sA/4Zp2FxaD6O4dtxTB70di8radLofC6tZ5gKyJqXYhy34eKhP9Nh0OrfOE2xvp9PnD+v9Feu7Yq7ndJetit9h8WNjPdM7fnMeZnrM2nfAab+4Qfuztj1bL4jnfsc0/NysHFWXOxJDGAasRXsBeDkqTgsfswArwBfNGMbULvi/W3x1lwbYfk2olU5CF0fhMUmYBHYlXKZ4vBU4IRxPI95RdlJIvOwyWoFbvyk67XDOcTPGnwB7O/NBVKHETM+SLF0BcPTmU8bHAQ9jvhTxKPAVFiE9ZvbAriWsLFRVpDiYWEW9/ZvSPQzVqfg6g+6rDwwhfQoxn8Ffcc/38nSiOqlETWy5u8JsaZBe0A/IeZzYM8jZiZWw7KLHQkS9Pa7uhLlOXtegtpkq+IQgJXnQABV8kyg94BWYhS2/Mh99vT5YRY70XUWI8cjcNV9reTGHhcY6XHgxAKcN0ojMrlE9hbgC4Y9BlQKRbjgpnZ1uW8bkdrzUeSC+1d/7myXYAVws2BxL39XdGhgWb3aXUWO52FTo4YjBfHXwkknDXVqwVZiNDwhyAPATqC25rJ2H1/fNiLyBaRU1W76iGvbAcbiiKsMG5e5SuwpV7jixASyGlItI8uavhyaHyaO+2sWFzoieBDYEtVd5vUdn4badLvRsrU41j0vs/yvZma0OAIv/tCzp4mRqGGbTNwDrDAoN/tdMvWuXERb6CIHSW02Ep8/b140H3ieVtk80nwWu2LogszLvzY2pz42j+zuYJwdvVtjGNcb9rtgNwKj9Sr68X9xhiiK5qZvk1VpSO+vqAaLL4Tbfgd8iH8UeBj4R4ztPpM6GH2MeqX77DYDp17wgbyEWAAMTzgWRN/TMSmblwj8vJnlsubVQcmcZ7ust+3q5YD0s17pfd7RVN9uu1eGjOus4/heKBad8xMk1Bybuk5B4ILgIP3lv6fABVkWJzPE7BF8S2iXLQCRUWlEsTltvDcEu4Fqadj18MaN7OfY00bQ6UPUKlCdUgCMmulSw0ab0MyF3l8955XhuLa+VYdlF8H6G1rsabuAr8n4MWinoFIeUTQb1K0VeImT5gK2r5mxA6hddm8bDtlVWcuYV0+/K1W5jetuf1zyTmv2De0Evm7iacHhrCCxF9xUcATZo0I/whGxNDbc4aQlmGVeHWexh+1KwSILoGH128dlyLBRn0gciY3g2G5H9oLNf14KXN/hede3zuqkHFT0Z8CBhWRpbp078bzQP/rArnHtR3w6Yp62vvkVFOHgq2BGiJMQusklPWbVJ4y9XYmbyYg4YVPnPC+fjG3Um629GjO4CBirVay4EGspIwLb7+nkJ4OQuDzu7W7Y1sgLgk472/q/IGGjE33FBd+3WJ/xgWtgY7ORuwT9VUvyL7g4an+l8dJN5yut+dJvIFEeUQ3jCI6x8C/CAq8C1ZWXO0hSfSYby5qcl2X0oLSi1kQPRBzB/X/msilBwDLBncI2KqdEKCeLUygUKDe/HzU6DWNX8Bmn5pWXmYsXqNUesNg650VGNiw5L+vOIsdpY28D/CBvXSjhMHA14g8w3QKaMCP88f/H7ZgoCQdJfKUDqeZX1Ejse8vRu4kdK9ld/xPI9fwd88HWZ4EXETODJzO3EpFl2dSkzYm6qz/E2c9QLUauFvWozVEbi3k1cc0yr1Zlq5dNtd62y+Ls3tquhFyUXclPJvOSwVrUZ9KwG5LTdiNrFedo1KsOoldrfs34r4qrTNSnO7+q/v9rFffvWhVWXdHUULPjwIsLmCFuJkgOIn7YdLAnVnk9G3WuV6aNiHKeo8/SH9/TqhIOa45sdD331VzmleHfNDfJTAWu/xXH5mdwFPGQwU8Rezx8zOYMdYITcr2r24DqyBJYtNqRscw2rySJWabflfBvJLc/rvpl53qacQLsaYPHBMfmGSTUTXLoBBcw1tdc4Xp+40Z/88pLrFgCfu7/HXp44GpgxBwpwWzg61Bo1IwxoLD3eZg54QLaOO5mg47zbET6PoucI37l+1tMejtM9hXg9f4Y/pgzvNAzZj8l8TpQKZQckUhUS/hyUf973qydKJk6ClOHfUBrTBhzJibptqN92NT0vCTHSIl7tmuBj8vsGmCiVrFytWLhqVQLTdQwHQR+hnEIEQ0vcpXCRs3b1Yqzq/VKt62dmUrZ5sTfZ07CvpdQN+UGpyZ8nIQHGp2MOplsMxnVMfms3JyKIqKOcdJkWyQ9HjVYG4aU3v3vCL76n1yjXZIEoue80g1xcVtboTQEe15wZAFjK1WOIzYEoX7dZ4NeqVZsMusCM7OCpFZ2J4upxaxTdDitf9WtG9Muy55SWk9qicxmuVBxnEPkkZediNpihxoACd+K1a2ywQbgE02qVHBUqZP7HHmxxd3ysnkJgHT2TOo+i0Hg8P2/9L9CEBD7Ru2HcIyETwJTA5KMuTLi5PRW0u3kNNntMvtSfImmHsHMsdZDLMo0bqLkM8r104YrJIfdSt0VpmTTslIXfF+2K3kv5FAXJtnt8tarY+7xfNgmFXnnrP7O3yeIqghlB7Zm7ZnmsS0212J4ETFQRTpuMKUFrE6WRxTVKnYceNLMjko6f9EaCruegqFydwIgU28npQNnzfsngoNbYdWm/hyWvq69Xrarx7wstRea7I+L1sDS9YCj8X4J+HvBVtfjNu/hINXiQRyJysjIEsITex1lO9ZjXv36N766NTQGa64EoCrxKvC3zUBvPpWXFhMctg9pC3C5RHl0GcHU/hSzbZ7flThrUg7sMPJE6mjIYLnI76lPMoECoxhXypNAbX/Mw6UT/is9Kq95PmpUg6WXOIZOYEaw0+BVjEpp9PT0HgtqBjtl/JPBxRLDF95EcfezUC51kqz1ZbussyVo2+Nw1fsJEOVEcaHew4SFnk00lFzrQSuKUDYks9e8TL7athWihhEWNIKx2cQfCL4AvCrjQK1ilSaxCGBz8Rm8/ZoSvGyyI0K1O/6QoDGTnJvNxsyYSXJrDRiacGyfEg1biIDL6IxKO6hSrf/4qUVJHHeUHtXrF3gx5JMybUd8PSxwmZmNl0Y1ctFN8MYjUB5rZ3NmnVdOw7/k4Bk//WO4739DQcgYcDmuLL0HmK5WjETQFWPEnqWGWjUhuJhgauyiJrZugcI8rmM7dTdUQSCnlzrXec2S1kjASQIG460QbBWBVYL3AndKLAUKT38DDrwEpbG2A5+k8lUvYagshp+EpkUQugzQjZ+CsWWt3ocXTXxR8LjBZHlAkjHnMboCJvd0spd1OBNkwnJyn6O8Y+YvRyEnmH7aK3V5varJz2Hd2oAtzZl52K6W7xFnMxOmqc7zNBTnU/tz8i02DdqKsahYYqhYSmNJWiQB84lhj+EqF8dPAwghMmxKqAbYsgs6K5OzQpAtX6y5MdN8BnPxJmZJDMezfJ8c/aUEy1+TIOHi25taVXbU0MMytp5qVV7OqT0GPAp8HFiz9CLC3c9CmIbTqg29mot/I7m1XXtNS37jhMEzQq95Ygw7paqn6ZAT9uWdiMUTqwiO73SES5lCjDn0/WnWaskxHtZ8dbc8TkDMMCJQD2/R69yFiCXArYglGMHR3V53qU+pHUswXLZsbOAgky4xQN2M/YIfCO2308jUXBpRvVqxScTTmO0HXbD6coqFYtuGSX0kgFI2NY6dv3t4a8uHGze4VMbL1YrVM4sLbVbuEFxPnEUJEF2WTbX+5mV1ePDz4o5/SSix1NC7zWytpC0m+x7oNTnq/aMY1VrFzMthNfoJwAwawo7J9CowUSwzUix3lEXjOR7g9P04abBXWBXlz6Uwi9xkt/ixtasc6bOUvqi6aHtpQz9srodbVDBeRnxH0vnA+bf9FuHu51yUSZDQK+kxr3QQ05xX1HCH8theeP0BuPh2inHEBUHIp4G9clS7Uznr5NdY2cEJc5yXnXKwZUiuxS/In1eeTey1Xi1RoMiTjEAZLLQFyE4OxukZviQ/4fq1dB9wAVDe8zy89F0oj3dWSyxHxLuXrk2XZQ5c0/OGu2HDHS3NkV3AP8nBCY8tIOSJcxxC2EG8XS4nHK4437c06/2sks6EBI0aKhUI4gajQYHQTmODZrq3qu/9lbyDNA9bn6PdmIYP9VwvzdvJjr2T+hXgMYOy7wNufojGfJAnODHVhmEngUdA+8unRzg8NpfZjwvlRJUqnsd6WfvnonqStH9he7by5tXLdiX9mziCi28DRMNM+wU/MnGgvDD9Og3ghBk1CSZW5zin1l78ufhdChx9+YZ3NefPHsm+C9p/qhC40oji2pTNANswphC2/EJ44yGvKWa9/cFkK0cekqpRh/q0VB6fW7O4YcMW67wgZKReJZg86Pq3srSWsvxUEogkUg04F93S0t06hPSUwfHTdNaS6xSBHZNjDL26NMpQeRzVpjqrtX3Z+sT3Qk9a4xT8tBi4EnE/zs+NcmQtWr8hKLr9VSj2ZjPOW/fkawpl2P0sPPFl2PyrhILFSNcDGzBtNmOvAj0Hdj/SHsOqQscxTiKqtUobm+MLZx2ag972HkZ8FXjCjOFUYqvfgCv2qbEQCJztNZCmXPVb+7wkgJ0SpNASMICmUFnexs06bM1AqymMPFccZrVidYkjwEMGd1nMsiBg/OZPwM//DIZG/YOd57yaNcLyKDzxD3DxOyAIGQEuI+YdBLZdqFarWFwaUTO6brIUBnkZs7TOVha/v2UIwWXSlc7lzomtoVDWFG0jowEdtUXd+poX7WbzJiWyIDBkA1r4szfYajESot8CrsIYqRxDv/gzRxgTNeiEZfXpoHRUWNSZJY6mYemFcOO/aDkWRzAeR3wf2LuQDca8LYSPXcO6lxoqNjHyHZeZOiFbvZ6hpdiWnOMsPP3yYrDimSDEsR5kBnlznpdNTdv61Hrlwt9y5sU8olF/j50QPIB4SgvOOaQmGU399CBZVfeMX7WwyHAcJ6TBZlmvLB0bS8rHeKS6YRFSVJ5v9cUyIKjKJ0JRBny1CXUqyJHJjK8CX9U4TMAhLeD6mnOmp0FRebTbN+ra8+oOS/P8G5lDLixe59najMNIuwQzCwLjdoozdbC6EGMr+ve7rJkostRZTD3DKJrPtBQSMAoU9r/i2EQLpQwfaA42oslOOLKEJrHQEScOfvqJhbzo/TG5auitwPj4KoqHXvXiP3E3icqsZ9H78JUjLuERFhkx42LJhtVn4mPpOtjxKASlTuhgurWgn3lFERSHYOvP4MCrcMX7CM7fzFAgShITEpc66K3uMWMacQwnJfMCsMugClaXadqT0kx5Efe2uXFkUA8inpK6kHU2D5IEJaAJdTkW0qleqJ1Cb92XDi37TnZCo1uNr19Gs3nQnpdHFFUdjvMVwV8rYI0Zl6+/ieKS78CJ/T7Snsu8rBsfHRRcKfuBz8Ltf0BoZqsU6P3A0xjHEbWW6LwSFcBYrUbWLD5/64cJS53K4acQwpj5Cldp2Mn2pMk7kqXlXs50nnr4iX0dSaGQweAsZSQcBduM6Q8QtwETBsH3/5/OoYjiHvoTGfQ6mTChxOVkQNCAkeXwnv/Uarg/jnE/4nMGW8oDRsK5PENhFCQK3l6HhYK7oMKwGxJsvXrusgKyhE2IGibQqAIuMxjTaYYVpmHqmfNKCJGSEihtJtj6sqmW07fTS2Be7Z9PzyuOmBe9g7/HTuLgtacaiCuDmLaeqGqHideot0PXOr55FdaiJ7SsNl08i9UJKQx6QEIzRHnl7c+xPR1vdUrJu9Z8lEEN1ue8Wk5gHYYWt3pPTwQBz4Ad98mPBTviPkiuDY8zFMeoSdTSsqmWAZfULAkMz/xWHIWw4Hpng4AXMTtuWsj5WwSaBBqFsuuxsj5YIc162y5xauRhkgUgjqbFeeeR8DFz4ryeCTQCjgo9hjGJCBaKTW8W534a2Quemp/RpbC/AWGQY7962K7mng9CRzx38qCCxWsZEqwzGNLsSbJYgrVXwZP/0A0RbRZlrIdNzfIjotj1kU8dcAR2o4th9ZUEG+6itHQ9RYkhYIVr41HD9z6eAKYxa2A6YQFvCJ4E22roGFgkVBc2jem4Of+9lqa5XwAIdgTYbC0ShXnh7RNZoA5nXRmYUetu3GP+FrUpCvcy8DzYeaAld/879LX/7HOzUe95ZTZnJr4fN1xT5BuPwU2fhNKYhqI6l4cF/arJdoImaxWrW0ZVqJdwGtYZE2fOK6fxdT7rFAZMA1FQdJmZeCanshin5qXs8n6SwjMIWlSYLiNutsyk0ulqsB+MeY8h4DJMvw/cBiw2I/zR/xuqx51YKnF//YLJ/q5ehDpBAPUG/PL/AgqIvEF8DPFnwFNaAEeTt3Wxy2U14waEpR5nNc8ZzYAhNZ2KqK6mhs0Snzs9IyNvXrl3SSpQVD821TK+P4tDl7SX6fcwa2kazZd9LJpnAiVZXCv49Go7X2sMOZY2hoFhzIq4YD3wAVNJXbQATuHMBRJZlsDtC8FaMxtH2RnwDhIX5Vef0qNxmtMv85qX71MeXe7geLjK3qOYjkk0Fqh0YRKxoeNAVB7HSkMoCJzzmXmeLcNFyPG7rA5L1gJqyXA8htx7LZwau6qGHQbNFIY8TCvLj0meYetxVk/dQgooN9Mhh17LoNRTzrPPsREKXPC9aG1bfgnH2rnWHDFHfAYMf9FgtVCpBeer+zvc5mC70m0lPnm+eC1hwjb0euR1c2egtmidlYbH1RFczdumJiyRAeUR52Nuewi23g9jy9Hi8wmXXUR40S0wPIEFBYaBNYBJMn9OrwPeDZoUzJipgdlhC/S6xJOC7ea0BWOMSROTalcqYxJB2Okg8yrkZc7MJcCDVmo0zldgVg5sLY8YIt1oqz4jDM82UjHYKfiypIvMuG54CcPrN8OOJ6A0msia9ppXr4Ze3/D/4z+C9/+fUVhgArhB6BqM3YhjzcyhmUkS5eGEMGcOhryV2ZttXpq/8RE0MGZM7JcxDcRBQNjU+Jh1XjZL07PH/sb1FpxyDHQJ8EytYtWBeC1nDSMhxlrE+wy7WdISoPDwF+DQqxCOdDcr56kJ9YJaJf8/DGFmEu79Tw6K47P4TwGfxzESTg4YCU8FfudsTRB069Z0NP3nJU56wDviOux5CTatOO1EOJrLvLIcI2mOd9As5A2z7fk8OExYbHHi2dzoo+ZXrfZ3smQEiBKuej1q0iheKgZRljGOWO+dkSVmTOAy12WD1QYlsMAxbzkuPi+nE5NfvQnBSkirvGaWZtPbyuuASPaF6nTRX85lXln9qr762YbJ2RRoB2K6tABEP6URWa1iMcaMGYckZlRwCJuuxHafe76LXCZ2FS4X2lFBvG4wvbC9s9YMQGJhxJF6+lWznsVT2xTCKCPW4hj3guqU8+U6yHDmMa/YnBYbUDBjrWR/CJo+Y1qF7nyP+CJDsVjKbznp16aaJ6/bt8UJb8+27uakGisK7AXQNUGgkaUXEBx81YW3p2pTO3C23osMSlAIoD4Fe5+FnU/C89+EQhmNryIsjRGuvARWbIAl51MqlhnGEYIZEEsYUl2uL+0DYNMYNVAF2RaZnkM8b9gJwSSmY4hpoFGrWLTQ/kphPnz7XQ57nBEk9IL0pakjZ6MqTLG21Cp2DLPnkX4osQ5Yd8e/Ivz7f5MBOeljXl0bIXaY34Ovwu6nYd11lHBibJ9CvAI816rMOugexVIbdpkllDmf9ZoPcUZpRHG1YlWZHUCqCUwFv4HDWeZlebzDKaHUAKYnHZWmpDKydXLUrQPGwrMESmiwCNmdQh+QtAYovfwTeOMBl5SIGxnH03rjrHs5n0EI0yfgsvfB6k0tqMx24NueietEacBIuCDu5KLViX5Yy68GSbPDmZuwujCAyb0d1L/h6f4keVntjv1l3cx2mYnqHBrktA0zm9+eT85LPrQqlFvvVgditLBZUS/+W/CWuyxsqaFRiWGwNaANoA2YbQANI0IPdQ+9wzmKVPCQ79AHZeXO7rfWzduH0rCQf4/CUDcr72zOVNa9aKdRc6Af25U3r2Qfij9NDd+oHy3gNBuIaYy9GFMYcRwRhEGGTucc/Yhmr7wKHQ+5JiOuVUwLtk9NEVg1WeWxrOpcP/5Nsnpn86obBebozdc4dIepPiPCghfnZXb/JndeEUysav3IKGhTf2dmoQVBnM++9KIM57wP29XxOs/M3ZjuWIpeKx8hOQ1N417EsvM3U9r1LAyPp/oz52hTe/nikUcxBCVHGNVkOj+x2zFH7n3W7fXCECoOoaXrCIaXwsqNsGQ9TKxmKAwZQywHmdQUHdDViPeAHZHphIlX5GQaXgEOAQed/AELFngV5poxIo2PVztz1TLhYbs/KG0sFHZdhjYvDQvpMMYvELfFDZYGBcau+zA88rcwsjhB7mF9zCvo1rExc9DCh74Av3ItuEuOjcBtBrsExzGLGhHThYLqcazsTWXdjEKWMa+WMnySnETzVtaOkWYcla2rPESRU8a2LOYjtR2vDqhRYl7JzxaHUD8B9YqC0ihjxNpEwKgGAddZ07cluBb0Kzhpg6HJg/DYF12pvlGn3RCch2OfBdra0R8TQDTjsmQ3/RrgGNMOCP3YsB+C9pUHJBkL4UbWAVt+qUt6tHT8etAuz5q19Oe7ief3SaQC2Lg13bXTMOK4iXrvg8Jb2T0dyf4b4s4orFkFtCjVwxbMf88nXxeWYGJVK+SowoIHWiWDomCJYcsF54PeKbjKjEVyVa0JYFTSeJpR2IwALKhPi1oF1add9blRRXEDDm/zSZc4cddkBMFK927GDkp5Yr9bg17ETj0ThtZFJW0JoutT21cxWHCK8/J+QvD/b++/oyS7zvNe+PfsU1WdJ+eINMAg50AABJjBTDGKEmVLVg7L15aXr+1l+fPn71pXupbD9bWvlSlTiZJoSswRBIlAAETOcRAGYXKe6a7urq467/fHPqdqn1Onqqt7unsGUJ+1emEwofutffZ+9xue93lKzDdUrG4wjqjlRb2ni7uUg9SmQNG43uoSRC7bHZ/j2VKHcCmltuU06grjriDxyYDXCubUgmKSPJMe6rY3ki5QGRgGorgOJ/Yns/0BD13PdgVrXuqHx74MI2vAGjhcK9Yp7LwXzZfmGVJdscSEXEDeEgeaia717scO+oJP1xnU6TpMqZ9sND1n1O38JQiz8aSQegRonH0jPPylYh8+I5/aS/HE5WJn+Rg9fY/W8DII+5/32p8v3OX/+cAIKvWh5Ztxw2tg69WeEbTST7/vhmkroi64BLObkHYBjwLfwXjNxL5a1WpzQfRV6nEAEaR2ocl8FVGtzZLXj2irJugkKUmrNo7YYfB5V2IzcM72WyjtuNtTXTYPGdPYlauahna5ElSPwP2fh2s/Q4RXO/+o4CngsSRNqTVztbRirA50mGqtn+XtCoIjafYEuYkjBJhIsNss3wIn9iQOIMfCE9KihPbl7VIOdmZAbRxVhqiYb+FWFnnhT4tkaxi4Evhl4BpguF5D3/m/vLh3XLTvVTAG7dpFN9tEOJOAX3UYXAs3/VpmqPh+4Augl+abNvfN/CTQIzOYtFh7FTFZGbCySbJu/jSAHWUSjCJYTcKacPi1JpxwKegywbOTVavN7fvzDnhg2M/HlAc7B5hmOVa20B91mDlVQICQBm6KYHK0pfeU8cG5GWXncvNiBeuVJhmlvjQJ1lFhUycLkEsSrSgZXN8gf9/cJHSDma2RWAcsTbpMDogsRpOjuOP7Pa1y7QQceg1q4547buxociKV6yolsynO5QK8gtlmFQRILkpm2HLrUyTUG0oPWDgP7grmmueic5oEkhZ38V2hXS5b8CSwNe3zzite1KcnmQIIyhFJpHZR4LuV02IKCYzKME/gzc5YYeXsSmnWu8FI1b3rPIPHxXUGXYmoNu6V3TI6ZuTsirvYFVKol2HfM7D7Cb8n1IXpMvRdzgVnLySXKVoPtcY6LF/8yP3dUsV/hX+vyC4r8PWhXbFg9GBO4rd74zkGjiN2AVUX0X/Wdej52xJfHhfEByqwq4j1NY07iyDk+Rlags9QD76f81+VvuzPmhiFPU9B/RF46ls+WR1ehVtzDu6s6ymtPItKFDGAtAI4y+ACeS23RwVfBXbWxmwfYvJkkDql3jiJ1Xyh01Yj4/a5kMKkdQ6IITBOSDxj8FxyOS294RfQN/5djga0iBhAvWG6+4bhhTvgyo9DyeNDzwV7v8F+FKxGp4pEtyJaJ7s0Z5opCK8035hKnK+md2TTrpd80LH/BT/MmMBU+mYp2Ln4zFHF0WBAcCHw88AN+IHe6Nb/5ElTrNSF4SpX2W4jKlC2O5oWX0ry9Arv/zdNcc1jBvcIfhd4Qh7fv/icJC2wYFQRzwDXVIYY6h9G6YBxx/eYdH5M7ZXGZh3TWpostdHmXObKJFn/tuDw3AVkTWr7yXNuIjrnpnn3F8IoIdyjX4Ynvx7M+ObWqogFsdN6NYO2yACNSbwCqtpJDM8nMOABYRuEzjL4hGC7mW2UtEpSH0bJQEdeQ689CHufgyN7IB5PutZAKQEgRsk8UN9A8Oq76OnNZNapIyGJCwp3cUHXIncvhl32uY76Mz/f5UYirB0u1nZf5wux/lep6Ov8d+vjbFF22vvaZbs0YfF2AaQdoo7yDa4AwtfD/pKbOZu1PFF9SY5BUJTIDbQKMLn16jkeTN5F1Oc7XZnmgbJ7ThQLqveE/bGg+NEL0VCeDCbOvn/r4OvDxNwEY8dayap8Z11dWTWN/YhvY1yMGLnyk1Reuif47JZb1hwsPPQRnezqOU5VMZKjGcOS7f5WBgPax8Pw0g99J6wygrZcis59B5UVWynLE46tArYZdolMDyK+Cjxdq9rYbLtdpRkVJuNi9plCNWs6M9/NEp+br/zWa1U7Djwn7A8NrRNcumIz/WdcBa885Bc33ZQZB9zNLitAzcbwg/8G7/4XODNWSHproonwcnhjZ4YyrUPyZO0EIp2qqSfPgUQDYQNLPbygrFa1c1Z2BZWccuRn3M66DocYweOmn0+IMxZndRY+Ku9Hdgbo02bcKN91LN31+3D4RV99ao73qvN7z1wS1qEIkARJUQSTVbjlX0GpggFjhj0i9KcYjyBGF/fCXOlwMSlP2DMuyQaWwdiBnM+wDgXaIt45l4WBu8h38ydOoP4R+iy29Tj6NJfhsDGBbAdowLABBVeqnazUe37SyIc4g4gzgRGXT6asBz+rdkHU1OIognKlmUAeNj+z2JhlV6vPYKmwC0GfBi4SdjZoiYd3Eo0eRE9+A/Y+BaOHEy2OJKly/VAZaOkapVXvRj3b7Sg88+rQ0VOPa2Vdpk26BdVz3dnKg2isBx79HuxaSIof5VAnXdfL2nU7M7/nFnKyKDvtFn4VxhE97i+btVwcfYDqNVMLbtRlvXq1qwjuqawP7kgzH08Td4XJPzOLU6c7Rnlfnxs/yYC6gH5ZZ5mfBF02ZvAYsueFNruIymUfhfv/3M9yNeod4oi8T+1kV697ng5zu13iG8tR45cGWuM0L98HL94Dq89Gl/4YpbXb09lZLTNxjmAb8OfAw7Wq7a8MamJOEq6E8b2eplgppDAckNU0OhAZbGruQ87VpGySdI2CnpbZD5G2YKy98Zdwr/1qDr8fT2NXFyaXyqCvJh57HZZuoq8xxXlRmZ8B/iQdS03n05oQBGPa9QqrAXm7UgaZuYAqbLocHvlb34JtshXO0q5QXPTIa5BUkFeCXYX0qHk2mEUIGQva3SoDK4XeCtwksQYoP3Mr7LwP+kdysxbWA7JXBa384Py6MkyegCs/DavPATzV6nOgvzb4kbRIkjHHHa4q4iWM44jGwFKiY693pgXOBL6uw5BylL38GnXY8zSceS1CKgsGbI409hKyo93A/2teiFuWNTyeu/UyJzRgcA5mvyHp7LhBmbQqPIP16hSINWcHIDZsVF4XxmaRbA0AZwhuAH0UuBxYhqmCcDvvgye/4WdRLPbioP3DreSq6ZPz5zacCe7m6+MOwZH1hv5vI5i3Dn4jLy+TCnc3Tk5vqbBLIDpTvvRiV5wrMPsBQM179pXOGEZBDB/Y0k06ofA9xvPFStJGnOHrMqmCmrWji9pmlWz68Z783uplpsxkfRjLQZX6pJrzbFiX9ZqhXfmu43R7PpyNtOlo0aeJn2d1FnO+nrzXjZtoACHK5rXFuhGrTMl4zaQvA+cBA+e9nb69T8Gex3wBKPM5Z2qXzSB+ngPflf7dqOIbCcd2wW3/BVadia74cUqrzmLId7xsiaGVCcTwm7Wq7Zxp0lXqUUU3iz21AirPXtTlw0Ft5jTp2o/4pmGXgUbkGL7k/fDQ38Lg0lbG3YtdRVU6w190P/gf8GO/jaIyg8A56WbzEiY5X6MWpKfTenVia5kLTQrD6kjHgfrgMvpwAV55Fna1rU0pCQIMJ7EEdInBEsHexRB54Z5E4HQJ2DWgTwJnA317n4MHPg8Dw37/d9zznarA+codWcmE2hhsuRbOf1dTbHUf2J1CPzQ4tCgPMKdxWIxRQxwybEIoXnkm7H7c31cdlZM6aBAWzXPFCa3/7mfgzGuJBMsM2y60o1a1uaLCnpis2qtqTaOcfEG7w/B8QoMu5HXfGlMFBBA9rlc+WHeW6DN5myeFDiRFJpshhHBQcDHYJ0A3JXfKCBDtfACe+joced3fPeX+1jxPG1GFOrAzuiCo6kSr38u9OEMfYd2iHc1t0XXaVlcH1E2bCSpm5DU7New4ViQUG7cTyUwXdy2I+UGHy3qQE8n8Pr2dxRkYE4ENAJFzWRiwphE3ns4ZSZ2ZnQtnZAs4DsIkuJf3OBO7pvP1CklXyCY8ZsSJpNC0gyFJl2sUeBTsMdBqYOVNv0bpm/8exnYnWpExbVDmnu2aQZw6I99VNBMWfP+GtaCHx3bBt38bzroBveWnKQktlbgCPyffB/xtrWovzwReWOrKdZe3Nz9wH7cu6zzO2E5u8HGmDmoS9AzY5yU2A2dd9GFKz90Fk8ez2hYzsiu4oF0Jju/xl+CFH6RkxkaJTzovhhx1esOZSkgjWC91Xi+dHKGITVatIXQUr310UVSmf3gV0cSR4MIpsqvDgHSnC6161A9cjqyhbMZKiZG5qogvPjMiybgM9FNgl2IamqqhO/479A95dsqwK9kT8aw6SzhIEE/C0s1w4y8AvhN+BLgX9LcYr/QNLZJkzNPTAJ/4LN8E9bpnqikKiJu+qxuEO6c5FJXhxO7kXhDrZHof4kfA0bnqQM1W9HeWdOpK77F6LSFS6AA1y6xX3BmShvPr7qJmKlMF9gNTvVIHJ/YNCa4AfhV0HbAao69eM3f7fxe7HvedrL4l/uw2Gl2gfeoOR8/7+k4+fa58RE/zyOrAWnyyT5TcZ3F3u2w6u9zCxC69yOY01zwqiLtU/B6dOGXt+E7Meb3ur5T4YPbJrkcdjR7y0ABTb3HXtAl8rz51BmeROCE0dHNgl/W453NwxNwsm6kH0d/KoKYmq/Yy6LMYQ4gbJZa//98Qfes34fjupNPVmJ1dFDBGWlxQQJnp3sr5Luvg6+uJH+gbhJ0/hP3Pwi3/GjcwwhBiO/BRjFHE39Wqtq/XArPr5QSpQ1UsZfhBrYW1gGazsGvk5t6ZJTHHCaEnDdsRNxgD7J3/m2drSn9WT3a5Vls/40Tq0DcET3yjOezXB2x0ntWkN7bH4LOHLde4MbcVvwQOOopnUzwBMLjCBwpd32Py7vLvsajSm/6bVx/211wyM3QhMJx0XRafBSDJAC4BfsmMG0HLDNw3/i3EtUR7JG6XQSh6j+FZ7ghJSSpObgBu+Zfg1dntOHA38EfAk4iJxbczb7FMQ75jE6+7wHc90kHrtvfYy7xs7iJ0JTi6Fxp1UzL/tJGEeOUNuFxlYE1SiWT0ULbY1HW9uswryXy3bHhN62awmZIoGP3AxRi/DLwVP/86sP9F3Fd+Qxx6AQaX+1slbhSQUzD7mWgFrGkW+Pf058zYR8yBXXOe2MzVeoV7Q/Pf6+oV2ZKJI4J3FsdzDM+chR5NZn9ZK77pZNd0cdfs4iL/k+tTWf/YXCPL0sH3ZNdMfGrcey8u/byNDvHzjO06mT0/Q4kmwTjGo4jP+oIrh+VovO//A8vPgvqYR010xS/0ul7pyE5ub4WssZ2QC/mvns5bGjvVoTQItePwtX8NY4dxGAPAeYgPgV0JDCdFtLlIuDpMjlouQ1SxvovlhSs19wOzlUHFgkmDnUL/00U8b8bkss1eG2hyLEuP3GaX62JbnGXOqU/CXb8HCGfGUpxPMrCEs3C64eICWIfUZb1muR7mZ2peBo4D9bXnJPocXcgy2jamFdgV0MJX+j0VcZJwrgW7SdiKRAtj8ZlvkgzYBvbjwLWSD4zv+j2oHvIigQSUuBbnKo8KKtUqqMwV7OPIeX2LD/xbKJWJfVKvh4A/wHdTR+damX3xyVQea8ABYKIygI2soZ1eezYzHEGAWhuDHXcqBZusBi4zWPJGKqKY9z9LgUvThPH43lzCcDLrFcPqs3Nwe3qGAFc8uY39JOJGPBNW+Zlb4Tu/DfGUTxFDHcmZ2NULwYUCgoY83GfGPmIO7WKO2P3mxK7857P573dpJnbRotsOoW5W5OsX7OCpFUf0Ypd6i7tmu5JL1xlR1MJqZWKbfHzTi11zfRath7grDuB2bn7s0knE3YgTwI+AzxrcAxyRaNzyL2DbO33sTQsRcPLrlSOWCeUQ8nu+m++yHtcrTejS2+/r/w4mqzhgCLgC9NPA+Uk8dhIJl+XyTisIwHs51MGH00wd4gwHy/Esac8a3B037BBG/Pb/DfqX5ERCyQ3kWc6umHCYMEugMQSvPOgpJSVKccOGgZJcwQUZfK/CQ92J7jM+eeUMeTjqhJnVATZdkaXp7GSXprEr/PdRCQ6+DPWaZ583YzNo5SKskPme26oA6wXvj2O9wye7lB/6X/DqA555p1NFse09Fu35grPpIpgYg2v/oRcWR4wDTxv21waPGouMhMyjFhdQMziMcQ9wEGis2AL1WgffZbNwoDFUSvDK/WERhVvA1momjLanfubNGSyJYy7H/9dNVb2/yqzPLNZLSVy5YksoRm29QglLPgHUdaC3pMnWiz+EBz/vIcBNQeiTeI9tX0W+XtPfQaLz95oru05JYtDLetkptm06u+KCuZcuscT8duaktrk3dRdab8YiPcRdPftIJXNIvtgcg4jjoKs1DdnbtHbN11ns1S6bR7tOgkMBDzm/R/BZkqQLmLr609gH/h0Mr4aJEwlSNOpOLtLrenXb82HHK2wWzLoQkSDcDFADvvc7XgoBWIrZlQYfRqxNyMs4eVp4a9+4vUIEMqK/NhfVCzrOBkxWbUJoL2bfikq6yGKWyjF82Yfh3j9NEq8iZntrbWjroULgSnDb/wMf/P+BnG/quih4sRYkmD1onMi1frboPtw9w6euhDhj2Xr6KkN+4zTpgKf5/i7qMnCaUFlOVT2s8KzrqACbgGsEL8+VMvc8k01E+RnMghlr65UcqwPUtT6XXZ/JqkWCpSauEbzPOTYDfbufgme/63XjGjl9DrkC5QHrvbrsIpgahXPfAee8NdHigF3AV2S6HXG44mdzFp/5DcFGEY+bcUSivmYbpZfubjEVnrS/MD/9cPAl38kv9dGHsSmZi30lOdNvlA5mxbOn0jd+BE0cg76RbPBis1yjygAsWeu13804JPXm5wz6BOdhfAwl5DZPw91/5G1r1OeQTyKvLzYNM6NcZxaw1LnNtV02D+QZNttzYLnRG1uwQ60QspuJIYrsYvr3aGRFrReUFr6H+KanuGsW79HAZEwA+4DJ6boqRfHNjOPBOT6LEIiv56Q9jPmxK/hmDkMmNA1LYVvSNVm1wzJ+iNfdrAJXI9Yt20j/B/4Pome/Dy98H47sgnKfZzluE3c+2fWyDtwDc3SWreH3zNFX4Z4/gRt+jhLSSiWalQYHa1XrGu+VupTy3LQvqksbRi7HCBRieueJPadvUI1a1caQnjbsryRtBLad+05KT3wHJo/5wXDlq0AWEMtoeode6oNDL8POH8EZ1yWB8HgBrJLp2aHCXqNzLczxHCAuTH6o73HgYjn6l20kOvxCMt0wC7vy6xU3oFzxFfGzriOStBrj7SZuFxxaEIFIZjX/1Ief71gDVHJJ0lRB57TX6ncpm9PYmNDLiQOaO5IM41KJf2hwkYzB0cPG9/+rqPRlk63MLEKODSlf+VSXczw1DqvPh2t+ygDVDQ4L7jO4VWL36ZxYv5keGQ2TjXo9K9nWq+GBvwrmEeZiHkbQqMGzt8FF76dsYhPoQ8J2gMZP1zOdO7MlwVL5GUfteoomL2I8A19f9DQanhI+KvsEWI4XZVSnm3/w1U9bA/qgwaWCocYUuuP3fJGkWZWd45kmozsVdTPYdAFc3NrZiOfDrpTI4JR2uIriT5ujAsZ82DXd3JsLSD+ihSL6kKbdG13iCJvLWT4R45MuS85o9+k7lyUYmWk8OJdnse0dqiVaPJ92zWHsfQyvT3sCeL/BzYLzgSXb30H5vLdbtOMOseMOL7EUN3zypVLxmet5vdSuXdeWyM3ResUNKA3BC3d4huYVWxkAzgU+IOM1xK5uhclSzzNcocZCjv6yNVjaykrbKittuhbz5pymlBBoIJ6JG6x3EUtv/gX0jd/ydI9xIyeSFrTezVoEEt2SrsogPPg3sPUa//dDco6uFPPWmicLbWj+TNfO3jTLQuAUcATsPtAtwOp124n2PgWVcjbZyrAjqkBvwgLwaSKenCbQpT7Y9QRMjkLfMH0GWwTbMHYmIsh2GsLx1gI/BdxMogk0DSHLjGH4QE3oGYz/NFm1l/tOsgOUJFtDwOWIXzS4WjASG+7W/yjKZa+xpoLZDEVZ/LMlxzludKCWDrFZMQythnf/c5KGOkfB7gb9CfD8bMT/Fp+Ty7slHQAm+4bpH1mDRg/kZpPs5JT7yn3w0j1w0fuRYCSO2S6nDQa7J6veU/adph3NtAMMXJt0uNy+Z6DSl/jWuI2Vq/f1EtgUrDgjZYzkqOBRxLEemBfLoA3AVako+Z1/kPBOluh4t55sgJciJpoBXC6ASZkbw7kWuVZRJhzgV2694pMhhyiYQTrliY3NM5lHr5lVD3YV3tnBfe0SUeyF7HAZ2TnvTvFN8zPEuULRHHU8zahLxKWKIacmPb5TOztr065gJqiNfEStTqNOds/n3mHIxBeiwZq/dtnkwzqcxZPZc/Xa3HEpTFZtTPAEsFdmdyN9JklIzpK05Ny3UTr3bUSjh9CO78OuJ+HYbj+76kq+gG+BFIIK6N/zNPjhXgvnBTNkdCpgZJzt7FLD8xf86HPw/v8vEbACuDK5b/aeJKTQv1WpQyKSU45OnagVtbuTioub6mGI7uSghePyhBF/4SK2mnHhqm30n3kNvPaoh4SEgmqKctSUyk23FTAbuhJUj8CjX4LLP55t/dLlIpEKKC/zIndqXYYns/lrYzYB2mXGqES87WZ48uue/CDucrE0gzcrJvtQKUuWIoMnvg5XfZqyxCbgIyZ7GjR6uokge3NtKXC90NXAoD/I1kXWfMYVPyRqQGyyAfkVbZzkOR8QbAd+BuOtKUnGd38HJg+D6wPXKFBy79Bql/N4ykwlyLXv1UYDPvCvQKKBJ2C5V+gPgEc1R527xWdGcg9HGjF3RxGXAkPrL6b8/K1QqiRnski412YAsZAXgDz6Orz+GGy6hD7nOMvgXYKdwG6bQ5HieTjfJYOVguuBlUDp0KsewoK8384MTPfg65ssjoKJWlPo2/Ai7zsNJvq60AIn2P4VeEbCM4D+gzvh9UdgYIm/wKOo+1nsZlfbAFvKyFZPiJLihMq+kgSd8j/P9XuYfUZjqGhoPG6ZY2p1vSdHC+yy3sYNmgngXDMWR7n5+FnYRS5JPVVdrRCV0HZHq4NIfV7+ZmHPHqn2lXWwKxMAR8l+LDiLzQ6dZsxWXcfD2uJSn8wlHSzrJBBcYJeLcnDXZM+Xh32gHSdCf7HNXJC7FwbRrsX+eJquzQzRY7KE7XZuO13jBq8jHRL2Gugc4BNxzNnO2XrQquGVVC7/JKXLP2nR6EHplfth3/MwdtjruzZqLZ4AuQSZFrXOhXUoTOXjmzhHeqcCVlBjZj4CgSpwcCcc2gkrz6BkxlqJs4CX8DOEM+1wNY+rdRMxzOwPy4nthQKJucRrPh1ZMjg5BjwH9qO4wcYo0pq3/jLui//MZ9P5yk8R33+e3URqx/I/9z249MegMhx8H+tN5b7oMihal5Mg6zHDqkJHgNrAUvqHVsDE8UDEWr3R0xYmZUFFfOd9cOWnkBzDwAWgCwW7a1U7cpqRKURCA2YsQwwceZ2+7/1H6BtSa9jXvGJqNx2HQjhm5N398Bp4xz9N5kjmYKdPVq0i2Ah80Ixr0wr5g38FB3d4uYK4kQvSNI3Aa3ghWiCsqVZBYfIEvPN/h8GlzeDyUeBPMB40caJvkSRjoZOJKYNjUcRDZhyVsO3vgOe/799XXC9gjVU75KIt4VAwlJ3sm/4BePrbsOlSHLBCcAN17qHEUbzkBKejVAJ+Tmq9GeskytWjnrWz0h9U02fo68P1UhnOuDpBxhuTyKpi2m6fM1gm41rEaiB66G981y21KXxHFhIH9GpXMq8TT8Jkzc/1LVkN/Stg5RYYXglrt0O5Hyv1m5X7PNJKIjYsVpHuZof4TFi05ylx2//tSaQs7r6/QmhUkXDpnD5xkLCGQa4VBKsJuiVNCjQTHbH5IilMkg4XB3eRuscRRXf2KcGVKKQo7GCXeoy7bFZrbwYN5zgONKIKDCz39OQ2y/gmvROnqnD1Z+DM65rd7cb8sBGcsvS+Bkygk9dITFBNfrwHvQDsBnveOa0D3QBca2arJa0DrRxeReXC9+MufL+fZ5yaxJ3YC68/CuPHfVJTH/e/rk/4InCUJGGolZSFSVhafGzO6Vm2yRIWA5Sb0zI6dF1z8X+pBI/+Lbzzn1GS727dgNmDSKPA5KwhhYXBpzpXxdqybWtPVubTkSWtzUnBbkxfjkqcC7xFMHzJR+D+P2sNUBc6M+WYUgocb5p1T5yAh/4Gzn17kGwVDQG63j5zoTOY5ak2iIUOIe7CY2kH115A6cXbvbYA1vul0mneK60Ejh+FF34I226igocVfgx4Ed9enjiNhIIHDc6VWAq4XY/5Sq2U1byxLjoY3a7MeBKG12X8eBmjNN0wZTdmM/PV8RuA90tsASov3QvPfgcqS5Jh+6j3G6lozyvYey7yydbFH4L1233OZ8ZOiW8AD+GTrUWSjFOTdNUNjkkcBGojq6kMr4HJIy3doLaEKh/9lzpUTS2bWOx7Do7ugmUbGQC7hJJ+xmCfjGeSKvLplmxVwNYCH5K0GaPy7PeSTk83Yd7Q17vO6+UEQ8thaBUAU8iOJRX1Hoo8LDFYK6iMHYEDL0LfQLFgZ+YdTmdXcl7rk14fbP0FsPFS2HoV9A1jucAw9vZqDJiUUcOYkDSOl1WJuyED8F32M0ArSn1EcaMLGYGyRVgVyE0YuUr1XLL7FczFRFF7cbgTfLPNrgXQ4UrnnNQFUtrr/E4K71uIbKA5w+Wml/3pODeuDvt+hum2jEkTBwWTki9G1k4kxVCbeXxDoJs6cbyZbI0Crxt2tIdiyxvjVvFIpJcMjggaczEKknyPqcmqjeJn2V8XvGjY1yStSmKaa8xYLlkFtARYWu5j2YqtRCu2Zk5f1JiC8SO4Ay/6JGz0EBx53RPBjR9vaQFHJSiVPRIrhUfL2ufEVOB7XLkYGZKPyy328f/Bl8FinCKGge0mDemkWQrnoNJjubZf0N3RfCRfLQINHjP4E8EG4Nzz3uZpeI++nsBwbBo16kYwp+aCP07alZUheOUBmJrwc11pZt1GSjAbtqWTX4PaZNWOCe434xMSmy/+IOy4s1ncm5VdRc69bxge/Ts450aQY9jMLpV0E7Brsmr7TpMAPTJYJ+MjeOhjZf+LvqXexA2rYPDSckIK1hlSO9WApevmMEE0RiSuAj6VYKEHju+D+//Ud1Xj+snPKuSFPutV2HCx79wms4AHJe4wuFVwoFdV9cVn7mGFtarF8jS89wEXAQNnXkP02Jf9GbQgOLekDpv6LuUKOG2YdteqNDcaUC7Dj/4c3vuviJLL8BLBdSb21Ko2dRrugz5gM+gSYAnC7X7Sd7c60mMrq1UXrleoKYR8QrNkQxNee0ToYeB4t0RlsmoV83OiFyRV0NKzt2WZxrrdQc0AtBFArIKiiYs8vG/lmXD9z8HwqmaSVU+qrIeAQ2bUk6Bq1Bo850rsN9kBoT14aHDVhy4dA60+gzMx/rnEkqkaUUjh3exiuRyCLJf4h4GL5otNPc4WA4uKTBkNzoIhe7VTUGlB2kbT2DWjRZsH+Z0OUKvGTIf6ut1BzY5EY+b2m5gUvI4nsmmU+4kadShFPUoSdoLpluHQq81VPWrwJaHvJ+f/TZB0WUMwgfcHk3Mdiycdr6lktv2AwctJ8vUVpDJoyLBtQpfFMRdKDEs4r4ClAYmRUoXhkbX0jaxFZ13fUiazGFWP4Ub3eVji6D44fhCO7/GJWLkEpf4EKhpnoYT52dXCoRIVQ/PloFaFAy/Bmm1UzGwYqXQyM1yNtD7VFI2MFx4bfBIBytSkZ055EngKn3Qte9evm77wT2cGDs63HuPAuTRieO2RHPQjyr2gU7RgXo/Ljkg6CNSGVlBZsRlG9/bedevJsTuojcKDX4CrP01Z0gbD3if0uGCsVrUTpxJamHa3BGfjvwbjGA6+6N9VUeKifDAGHSlMwwtu/QVN563ZAgqTiv0Qsssx/RziahJms2/9lq+uxHO9t+Thtks3wdv/iQUkGdwLfAHfsayx+Jxqn3ZIcCfGBxBrz3830ZPf7NAJ7+K7rFMrI/FdqsD+Z+Hp78EF76KMh7X+mPw++NGpPtP5Ygpmq5FuMWOrRN+eZ+DIa9A/PAM9onC91FovOahNwIaLvMs3s8OS7kuIM6a6nGEHtgR0BbAMQ7ufDGbueqD6Djsx+ars5Bhsuxmu+UxTO3PczPYDuxF7he4BHpYYNawBariI0STwmTSoyohNNBIsSxFDt4D+ZFy3DmhqvL0LlHYCjOnZxMzmF+kilxPenYld8am5r9tsDCDf6Z9LpyUiTYWzoyepAK2ZF/pNRoyoIn8mV54N+58/OYKJtJtx9DXAcIhhwRbD9oN26k1xJypBRBHPF9FZ2vGqVU3yupI1of2Jj4lAzwE/lLMh+VsoAg0CW4Dz4gbnyrFGUEJUkgLbsBwjQ8sZGFpOtHZ74sGNqNHAHXgBnv8B7HvGwxHL/YmQMQUEHNZ5Li+EH4bSDU7w2kOwZhtIiqY7BaWuW1e5mkU6f2XtTE/SzKoHC+U4+gZVq1XtFbA/NdiI6YrKkAbOuMZ3ppqshZ10LUq5tmKvLEMp8YXatUGmcyTNy0InT1aVwAoPA3eDbQf1b7qS0lNf9QyD1ujdrjxMNO+U+kbghTvh4g9A/wgDQpcCP5+Itj5Uq1r1VAVoBiWwLUKfQnYGqPLs9zwktH+k+9xdk1glNwOQD36c86LDK7b6ZMWwSfz6z8bkAeB80C+auF6w1Izo1v/kmdIskTcotGuW0FWH/763/GuQ1ACOYdwH/CHiccH4orjxaQEAqRm2X2gXcG65n8r6C2Hfkz5Jalbr1I4sYAbwJgQDy+DxL8O2G6HczyDGFYhfBMYMHknOtHHqocLDSB467jtJ0ZPfgL7+FtFDJ9/VLJCpy32Fn4s67+3N35oA9gPdmVi9rs2wNbjARYzUa7jR/Tl0xSzskiCuwYozk2TLF9aOCj0u6fvAXea7W0cMjsloqJW1xSnvsKBeGdJ0lPYyqMgLipQAxg4mkMYAKtFzEpXci3IdZCxO4nGlbHdNmsG+TwlHotPswLsud5C6a3ItSJyVSiKEMzJudndQJv6ZfQIXmxFLsPoseKoRxDazHeuIYOwQNBq4qMSAYRuF+vHwu6mFgk0nMf58cE+awKbz5bWqueRYuTm4x9JuPGrNxY2mfir5ORF+LOUORTYEVJI6diWR2bgAONeMLcCARAljBLEqKjG0bjvldecR1adw9/wx7HoUyoN+DCNkqrAZjDq5gNwkdp48I8in+oGok45ZbyyFyfBZKjCWJ8qYQeu5yb4XlVjIYLsq9JTga3HMRkVsvuHniPY8lWSppfZ5LYW7Ik8xOQ1WMO/oMuvWgeK1yFk6NzcJ52TVDgt+aKYPSKy/+L2Udnzfn5jGTOky1cLjW34AEQ9DuuN34ZZ/SZRUdG9EdgJ0wuC5UxGgJQHZEtAFZrZd0pABO273cxSFleYcS2R6AXR6j2ngMbwC+kdkwLiTds5m1iXR7Nls6EPyQtLLgdI9n4WjO70ORApdFdPYNR3jTvIeSyWo1eC9/7KpMTRm8ICZ/YmTHjYYWyTJOG1GnGPQQcStZpwvMXjphyl/63HoLwf7OfBdnfb4tL4r8kCzO38P3vnrRIglZlwl8THgOMaOUz3PFTB4/jRwAcbAoVfh0EteM6spA9LJdwVkBSkldD6wjWuwfIv/fsCEpP0G4+ptBjrC+Yv4yOv+sq8MBIW+Xu1qZGdN6lNw0y8mS2B2FHE78FngGYODCXlUXRCHOmGz8L8Rfvb1bMEgoMOvJRo6BQXFrvODUa5AVZpbxmJFybhOnKXR7rbv88LP6f9HpeAO0MKrHxXZ1YQLW4//dgEtVtQiMCCe2R2UZ1uUy+wLS9AW1ps/sAZQBTXWbfdQa+d6RzxK7VwDruRnvXc/BZsvpYRpJeIM4MUFlL8ZkLHBxGAw/DCHRTwdqVXtUFECmcRQUTLisMawvrlmXBE2DtplMCnfbUtpWKoGx5WdoHd+0phHwAYR/Ul5qg9xDnADxrkG6yQ2lCoM3/SrRM/eCo992TcbGlPJ/Vjgu4pm9eXakRClPk/oQSj/YVinIlap54Mf5fR86MBK1EvA3qaALhkzU7eeKVLKa1Jxr4t4pxmr5Bi+4pOeS79vSdLpUbHzD7HzIQa06HKJomJHl5H9CtarUZ/+wpkDuYUpww5K2gtMuBL9m6+AV+/3VVuL2+3qqRpYoLemChx9BR7+IlzxCUqIlWa6XmKn7/jo5VrVJhaqUzJZtQivX3WpwU9IOguoPH87nNjr56CKqoYu6nDoAjasfAW8XoNN5wFQxziMeAQ4bqLR1+O+TiikV2N6l8R7gfVA+clvwc77PY20xe0kGZ3s6olHuwxTY3DZx2HZxqR6H/O8HH8jp/uAE3pTsDG9OZ6+QTVqY3Yc8bDEK8DGFVsorzwTxvbn/HSU1SbJ7PUcU6FzQfUuvEEG4eAL8MTX4OIPUZZYC7xHcBTxxVrVXpq20zO/IuZbDT6CTwSXINyPPue7SIXohQ6+CyWSGXHrHKUwrskJWH9hcraxfZi+hzjYK0W+krLt6090KYxMZ1fAKBrXYcVmGFqZnFfpKcFnMe5DjAmm5tDHloStBL0NsQYo1UY9y6K5LBSvLfEKLr4oKkhsojnWigq6VHEjYCfrYFca2BcRl7iFTljyP78Lm3NeDJdTNE+KWSO0vOlvZvPOcvDUTMI7o2+nccTrQLXcb31L1smNH0xaODZzEpN0vctl2PUIbL60KX/zIfyoyth8C8LXqtZn2DZJ/0SwLcEyMIfcngfAvmzom5NVO9w3qFoBq/0gsutA/1Boyxz3gmug5w37L0LPVwa7J9gJXHvCF72koGYVCZ4H+xHSShmXAh9JioTLt7+bUvU47PhBEvvWi+/GZkE7KAAUncWo7CU3km56CRg2zarDZeZlIqchEgouiAz+OZeIKOdIToFzGAdebMBfR2IjsO3sGyg/9304vs9X6wp7npYVk5VrwfDyh9eVequBhWKTK7bC4VfmfQkaQvuAr5mxTWLwog9QeflevwEsZ5fFM8PI55W4y0OeLn/lmbD1SvoktmB8TJIM+zLo5cmqjc83kUYigjoEXGnYrwi9BRi2GJ75NgyMQCM36N3U/7AePj/ZoKxeh7Oua26Nw4KHDY7lnVc3RkJgCXAF4uP4qn3f0T3w+FdgcFnCSKje7Zq2dF3ylLdnXA/b35kk58ZuOfsucA8ejtpg8TmtHhMNYftAj5pxoWDw4g/i7vhdv6/TYDPsQDd9l2Xds4XMhQV7q9HwbF/PfAfWnQ+rz6EPOAvjEwk87cuClxaykNJiJWQ98G7B+xEbgPLjX/ED000Sox59V0ZYM4XOJ/9f6ocL3pXOb+mgxEOCo5UuZzsNSpPZCJ+tjfnEYyY+tWmXa7El1iYzAswHgduAZ0yM9upvZvCUQWsxzkYMNeq+w5VSLjd9jhJh6SKB3m5SMHOcNGQEn1OsVFwgHOxmBLtLaBzm/s5yuYQ7KgV09b3cQacw8UqWJkO2IpfA03uwq9uenylxWKJVWMPfvfcC14KWDK7CHd/jz3DqF5mhXWa+m7HvueZs9jCexGq9wWvzmXBNVi0yWCrT9cB1iK09E9719tQ9g6DWAGXrfAKi2FjuHBfi5+CjObZhROhc4LXpWJ2TP7P8THkCu5wQGjU/x/qKzF6W9Mtm3Cix/IqPUXrlAWhMBmfIFTRTeukUt5L4CA8nHFSXdSlNn/kmKUcHfKPyQ44uSLwKoARKwJoh6YQWQDYiufRORPA48IQZ6yWWve3X0Nf+bQsfnSEEsSy0sMlaVSq4L6xFQYkViyZaTkAYQfVwO6xQAYRzDiviY4gnJF4Gtg4t93Mf+5/1gpgZYeMocHpxZ4hDJ2caN3wb/8G/hJVnwPAKBhDnGnxCaBj4KvBUrWpj84V/biVbdhXolzHdSKJfdff/9ElGVEn0TvKxpnWhUO/U/ZX/zKvO9OfejKOIY+qNNro1h2JcjvgF4FKMwdo4+v5/hv6h1rzDTOwqSrxSJyPnr8olG+Han2oGb0clHgJ9zTyN6+SpntFZfDrOph4E+w7iBtCKjRczsHwzVA/kOg/5GRfLM14H7OgF9MhKkq7yANz+3+G9/wZGVtOPOAfjUxJLgC8BT01WbWy+CynJWekHNgFvNfio4Eyg/+huePY2fxYb9c4Q4U6+Kz+b7MoeTrj2Ap/A4eEu+ww71gsltLWI0SNAU7UEpmmdA7te7DI14Y0xcBTjHsQhzXHg54tAtsrQO4EtMiq7HvUESX0jWbvSzpLl9aC0gDPcBZIevdp1ygkpcolpr3Z1K7Kdys/U0S61BLg77fmc3Z4/VGY2TaiYxDonEE8YHBPEWy6D1x/2CZdyBCltdnXxESYYO+I1R8+8jrJhm0DvEbazVrXX5ou1VeAMW4v0Xjxx0cDt/wOd2JvEota9CxpOW1ncGnEBmJqE9/zvREMrKJlZaTqWL+cjwEq9RuXbv0nkAvbHJh+A69JHczm7YuhfDu/6dSK8/M3FwENAbTZQzVQDDM+KWANqSPfjyVQccDNi2frzYeePPHojLZir1I4AaXZrO8CkDZisNlFHLsmpNG1xpW2YTcFloiDhCL6cWhs4/Ioif7G7pJuVqkSH8IHMxl44uNI48DLw5xLPAJODK+CMazwOM1UlV4fEMv3zJvSm4M+i4M9CNpO0MtmEUyZZ82TVX+qulCivl1q/nmOoRR3YC9xjZgeAxlWf9oGUy+tnBBjqFFoX/joNEsKvtrMV+33w3d+GEwdwGAOCczF+3LBfB641WFmrWn8C+5uzynciFLwMuNrgVzFullgFlJ78locFlPqLLyQXaKGE8wnhe2xbq4TlcP0F4BwxMOocz8kYtZ5x5wwAFyN+wYy3AEsN3Hd+J3EfLnve2uxSgV1J4h4FZ9ElMxPNJHEp3PIvmwxnx4C7wP4AeBqYWEy2TuunBnpd8FhCcBJf8XGYHG8v1qSzs1LBn7kWhCoTjOT2V5xAKG79DzB6yARJ0gWfwPhnmJ83nKxaJelAzXlXK4AInw98BvglweXA4OQo+t5/9kxUKOu70tmStFrZzXeF6xVFPnG7/GNJQcLYj/gBqGc4Yfg06sF5LGV9ajjn3M2uKCnGrTqj+a4aiBMY9TmHYxsjiYi996HCPX9nO9V+SNIgtQexzhUEu+3JkeZrDmpau+jiU+c3x0qRRG3z293OYjdfn9/zCy7pVBRH5O2KeosjZtv9NxiTMQ7Em6/wHXoxjV3TxDdmft8/c2uqradVYG9NfNHwPPk857smOguzLUD/1CTa9wzUxmD8iNdAHT/a+vXEUZg85nXDJk5k/2zyRPL7x6B23LMSDyxNUGzqoYDk/N91kTF+AsaP+e81cdT/rIkT/tfjRwvsOg6Tx5Offzz5/eNw8CWwhkX4WfVrDVbNBedlZVBWGdSUwQngYWF/BrwO1JZvys3QdvARzbPoAsbQoAtmJCRmPd4EpV6hxWnAHaqBdzsgKSyjTbeIohmuBZp7qFoMjGH2LNKtjQabI8fGa34K9/pjgd6WtVeZCkV/OyjUK2DFKiScCLVwSkkC6+ZmWGsaOukjgrskvQNYO7SCofUXwsHnW+xmHVvrBXNrUvHaNFm08Anorf8Bbv7HuJVn0I/YiGkIMSLj70w8IGNnrWpVfDeoMUuBYGdQMigLNhp2mdBnhK5LOlvRjjvhia/C4JJWtyikDu74bq370LUT1GO49CM+sTXjALK7hY72Asfz+GzOBPs0xlskLQeL7vwDMX7IV7LbVNJ7sKuoctpM/p3X77nlX4OLMKBq2COCz4Ie8215XOLweRMQTaiAIan+Bk8oa76Ioi8DlyCWrD2PwTXb4NhrrW5WJx/Vad83fXOR/o/z/uo7vyVu/sdo1Rm+02RiCdgA6C+EPWJoV61qE3ia4XgOgv9KcraXgm039BMYN0lswuhv1HG3/WcoqZUFZXRVulCrt/n6gLAirsPIOli+MREAl70i9ICM45Wh6QMUf+Rae2zsgIdalErZu7SjDwqr7cF7NPM09cHbKZuINLcIgWHEZQY/L7gIo//YPjj0otefjBvd7e7oU22ambWT7KoUaepMa5fL+lS5U9AdSorYeZKxtrhA07RDSgs/f9acngptLmB8poDJsiiOONkELCFgeA24JCrRv3wLOvpKwexz3i662+UqfgTl8KuwYgv98kzCP43nCHisVrXxOb5TKoadIfQpk7YIyjvuSPZKORz6KRDFtqysQIZROelIjaxqQoMbiInp4pUEoIaLxOByLyrdkSOnm11Jx9k5sEmonhBDy6iYsaHRsE2lSDsTe2yOYv8q6DXDRoViVwmaGnGB/6CDj7Dc+PMMc5nSNIN0U6SasMqx5EyDz5UKtKiK3or83xCy+Q5+Ekz9JNJ+4PtRxFvMWC7H8IXvg8f+LgeTUAdYnwU4cRW0/tVBMM0K4mNrT9JSZez5oJPG443vNOMciS3X/yzRV/9N0t3tlHAlmzK27tu/KAGNkzmh7/9nuOB9cOH7KUksB65LqFWfNtkXQc8D+4Djtao1EgjoVLc9keB1y8mP7JOxCrHV4P1CN+JnoEaA6KnvwNPfgIGlLV2d5loHavJ5hsrwv520uGwKlm2AkTXeLIk9oBcR1engVSlJhoybkW5ArAZKT3xdHHgqCWymssK1vdpVNJRsSUdz8gTc+MswuBySRHc/6IHkzJ8BFr+5WlvKb8sqxmucYoa9OZlNNV5GPJzM2PTd+AtEX/sNX42N4w4zQSmkNO7gu4KqUJ4kyOSFRG//r3D++9GF76GcdJSv99VJ3S/4CmY7kfbXqjbVy3kumNFKWapKBivk9ViuBn0AuEy+kFI+fgB9/z8md1Jwgaa+qwibPx0jXPrvJ6tw0QeTDrCH7P0IPxsw625SipKIrTe72hLmZM7n6K7m3xkAtgEv4Onq63M0+3ox8I9kvAWxxIS793OteefCWWzLzpxlfKradZZidda+ORkYW1uwbtmZxrCo2rbnF1g4uBObc5Fd0xKUhUnsqbDfOicv6cjFdILGaezYjTSEafVjdcjEbYIrgeFzbqB8z3Neky+OZ28XQP8A3P/ncMtvIKER4BqDj+G7ajuSWVabiyITHmZ3pZldJGkYQy/f689guhc6Ff7ziYHlaPvjGizfmtyHYgx4CRgrGoPwqDcawPGk0GcjK+HA4YQr0Hr0Xfk5S3lv9eKdcMmHKUtsLpX0ccNeEaom/myutOLSnq/yyII239UpHgyKdmHXudd9WpoZd07WsVkBU1umpRwEtJmL2zhlQsDJYOUk8Jzg8/IDiGdvfxell+/1M1VRuYeOQVCBEdNcnMlLi61YqyukcG5m2ZpX0dTvS7wFWFnuZ8kZ18KLd3gNqQw7C9mAPpxR6yQcWSyK4dkAn/6Orwy95WeJShVGJJ1r2AaMbYKdiNuARw07IXQMOFqr2niqGZMr3AhjULDcxBKZrQG9A7g2ETdehdFnhrvvL+DVB6FvMBeA5thnQqfUdc8HnsxFMDEGF9/QZDA7CLo70ehp9EZXz7UmPpnY3bf7KXj2Vqgk5AeuPHO78rpq6XuLSr6df+ZNsPGSjB9YL/hx4H0JyQpvMi51BWd6Aj/L+TuTVXtlvmeOFkAIea/gS4gLgJH+JQyfdSO8fE9wpgvQB7JAZ3Aa35WBf5nnGi/3wZNfhWOvwnU/S+SkpRKX4BOjSxEPYnzLxH7BQYNjtapH+qcim+EZCYonSi7IPmHLQasFVxj2QUzbJNYn9OTRa4/AfX+WVErzgXSvvqu4EAixL6Jse1uzc71b0vcMDvb1OHtqzYkr/wOGV8P4oZYfagZ7BS3YTj7VzHfIJk+AJ7RgPfApme1Cun+yaidms6eTRKsEDCfJ1j/E7K1Iy4Ho8S/D8dcLmF05OZ+6YPNRLieHYdPYtdAuMO22dIEyFsVd5ORZ0hl6FzE/ik3TaFiFviLUv5r2LM5O7LhTR2NU8JQZ+yXO2Hwl5f7/lUgr0Dnu6smuCE7s8yRCF9ziz5/ggwYTSfH4hcmqTcxWRDgpNvUBKwy7UegfIM4EKjvu8j+7LzmDXc+PWlqd+c8nB/WGH6dJ3tuELxQzWYRIqAwqrvm4+QDYGKixfCulPc9AudI57uhqVzJLVhmC1x+Hiz+MBCNmXIp0ucHeWtVOWucsIR1ZIrg4KQy6Y7u7+IiUSErTN5UigRtqvofYfPNoZglXchk2MExqhiqZZCmsCIaiYXIdqjVhMOjmjhBiln5tCo/rfNrgWYtZ6xxL3/or6Fv/HsqlIDDvojztomxiGWp1FQkdu/wwbAfYglxrjmt+RFN5SfA1MztD0rbLP0559+NeiZtudLgKWJHilgaUNP0FZvju0uGX4Vv/Hs59Ozr37ZSFliaB4lkGF2B2WNIRsEdAjyQduUlrG19Vv4mzBdcA5xpaKbEejwOuAKWDr8D9f+rxw31DxRTRLlfliJUVg85fHCFUJQ2Slq6Hs2/0CZeZdsnr4Rzq5iiSZGsIuAzjpyQuxhicmkD3fc7Tv8cJx2nakgkvg+nsKqxAy5NkbL4arvl0W3jZnwTK8ZtVLZjsLOcJr93xpvhoE8DzwHcxzkCcccWnKO19BurVghzDzdx3KafXpyTB6V8K+56B7/4WXPZx3LrzGcDoQywDnWVwA3529A7BQwajwsaFxvD6KhPJgS4LhjHrMzEoqR/YiGcWvcxgi9AGfDenNDWB7v8L2PVYcraTam+vvisvYFkUwE5V4bJPNH30qMSLwF7lmLFm8pQHAqSItSB2TbZTsvDyQp9qnvDn4MtJQSZi0IyrEL8oIxY8XKvaWJIXx9OgBJx5JKbDGDTP9HiRjB9HXIu0EijvvN9TKfct6UC1nyPICu+1Tj41H0fM9yEJ7bKkD5KhgrbcHN0Cjz5IhiupDUaYt4v8HdShO3sqRjeipDMV0+XdKseumPsMxXGExTPE/TTAjkq8ALpAon/jZb47lJDfzM6u5JxWBuHpb/m57eWb6QPOkPFxpCHgSwbPYZyoVa3eK3Q91bpKRMY3G3aN0M8YXCFjqBHD09/2XTpTSz+2a1KQI1+zOPGVDRhcCqvOapJ8HUdMTMPobwY1TFMStvEyePZ7yZyr9ei7cvIB6b+pHoCX74OzrqUisRXj44h95n3ZUaA20+Q1EIoeBi4x+JgSmZ0jiY5gG8FOvivXyP6dtkICXss1YeGJk7vYZtPhsl7b3GngTQe8aDjoOZ2+xAJCcWoGrwr7M5zWAZcOr6J/06Ww+4mEvaTRofIZVAvCICSlVQ+T08KEKlRRtx5BUHNYEU828AOIZwxb75yWveVn0e3/1VcvO16oloMZ5uADmcpyAQa6UU/azzE8+TV48S7YfBVu+zuolAcoCwaQtiSQgIuBD+NniRphGzqpAJRkDCJWCoYQ5cRZRUdf85pBB573VK6l/hYTTWhXup/TS6vZGo6C90d7RSxkfKuNwZU/AfLCoqMSL+Hpuqd6YFm7BPhVxI3AUjPcd/+DPx+NOHepuqzkQje7mhBJK8YJVw/DPX/sf4ZTUxg2/eRRR7FrFevCWdzb/KHUu2hnL38vP/tSZFdmbs1gYCVc8UnqhkWdAQ9vuC5XvVa1Q8DtiOvAVggtu/GXcN/97aQj0ZjGd0U5aGqPvssafv6zNgp3/T6sPhMu/BBu9dkMAOsTspoLgIvMOAyMx6a9zvEU8Jp8MlY3bLXQJqSN1rDzcIxINgxaBSxVUkSp19CjX4TXHvb29idd4JBdFeviu5STfSiYcfNXJyzbClt9BXgSeBH4X8CeXmUSalUTRoRUSmsmpXJCKJRnrXW5eYJOdqlVtIxr8MDn4dp/QCSxzDyMOjLZX4GexUO0T6RdxYI1cfjgbhmwCnGO4H1mdjHS2UmnK3r1IXjkiz7IjBvtHUErmI/qxae6xLHP5T3n1KLyz9jlcgyv+blp6zBHtDAgvAZgluA4FAW08NZ9Bq3r7PcCQwpD4oGwoNP1LHbY89JJr38DtB/4BsYViKWXfoTKKw8mCWFjdnalBsXmyXl+8N/g3f+iydp6psFHZZwp8XcmnvKMphxNzqAlaJ2pXFc/9ah9wHLBVsw+JOmtwPkyhgzcbf/Jjy8oyjU/ut2LufgmnfFrjHvm1QRlMCrH0zJGTdPtGGv4ZoUayzf47pTiJPnr0Xcphyu0hvctT3wNzrgSXIkRg+vAJPQ3wAMGr09WrZaiInoZNUnymyWYXYL0S3h46WBjCo6+5otWzdhFxTNo6T4IpS4I8pm44b9PQjgyCTqRFLpmlnAlGyNOxpVMaSgWZyLf1qF37TCONtiAsgx9nNohehNUgaeE3WaxNkhsvO6ncV/5Dd8JyGDOg06dc8XMdc1Dat27Pnm4gnWA6M1jdaoG7BT6W2AzcPGqMxnYdDXsfjRJUBod7Mph8a3RZWaoIIBOoW+VYa/0veM2j99dsQWtOpvylispD67AXEQ/sDZ02W25RZIkNKbQkdfRqw/5ge7j+/zPLw+0REzzduWDess520yy3QmKZLD6HNh8eTJQDy8K/g60d5qgLMIz8XzAjCsllgHRPf/TdxldOdELKRju7ckul9WbCYPLqAQn9niHo3AesxOdsMte9FYAF5G1V4rNcuQwuYC4E/Y5A4NsBIlBQceljaLVyDJRWcuhmvlsfHg9vHkZC9kB9pegNYgrlq5n8Owb4eV7oTzcmt8r9F0Bbr15NuIefVdC19c3DEd3wx3/ryeZ2HAR0VlvJeobog8YkNgMNOSHoa8HxjCqiFioP+n49rtIw/5uksMoGejoLrTjB7DnSU9lXO73e6JJ3BDYZfQAHbTOs4+lsp/duuYzID+7dRx4AngWGDsZEpDKoNfri/qLAzlcB7sKfGq5H15/DJZvgnPfTkk+aXobpq2J/MdtwGOGVUFT/j63tEcSSfSBbfSBiK4wY6PEekkjGGUz3ENfhJ33elmK+lRvvr4nnxrPcy7gWoiSXn296J1tbL46XCAUeV8VzpAU2qVsbNX2d3RK4qqsb+5gV2bPh2RsNjf2JxC4anInvwKcXRmksmYbHH6pgAK8k12NDmcxOUWR4Pv/BW78JVh5Bv2CjYjlyYz8y8APks7+8aCzf8KgIaMsMQI2ZGhAxhrETYZdI+ncdCwijnHf+y8wdjAR6220E5hlYMhqJ9zJ8BKUoBbDee9IodK2V9L3kxnV+jQx8yjSE8ClEgPLNuMOv5gkL3TxXcomNm1/z4FrwJ1/ADf/mkWSlicFpLUYd0t8DdiV6JuOdiwi+W9fkUc6rZNxGdKHDa5KCkvRPZ/L5S657mbbmpay0VzYU6o3WozXyd+qapYdrsK5LLn2JKONUcZ1wBiH9MQRnGIdm8Zk1apCe4Bb5bjGjOWKGL74Q/DwF5PWrXWZ4Soq4OTgAPlOgyuge8/rQTQpvDVvFfF4smonEkdwZ4JBXn/tZyjdugfqx6FRbg/Ei2CgqaikUUDqkH/3rlVlSdekNOgD4yOvwP4d8NS3oTKMymWikQ1E/UMt6tZ0WeO6/+/4ERg9AI0a1Kp+zUoV/94acVJ9d50deIbylc4VubBS1MTuVmBiFK7+TKBfBY/2HpTZEMYFSuYjHv4C7H2qhc12rke7Chhz2vTf4mwCVOr3ZbXQc8SN9oSlIzQ4b06c6+wqVxVKznte0y6OC6qKuW8ex7nEbCZ25YLqSBnn+KZ6kq79KKZHTdyOsUli0xWfonRkF4zta+kHKu/Hu80G5giE8olu6LvMPIvXwIA/m89+D56/HfqXoBVbKK3ZDqvPhsogfVHZliQRZpx02gS4uG6aHEO1qrT7aTj6iheGnzjhoStRpaWd0g06VeRTCyiOPYFOznc3JmHzlR4qnMBPnwK+AOyardaOJWqpGy6F535AoTxK6FNj6+xPMwP8Q/DkNz098yUfJpJYogSiDVzoNbo0mcA3x5O3OghWQeoHDeAH85dLlDFKZrjXHvbfd2o06SImM0Hd7Gqj0e7S5Ojml08qaYkonH+bkV1hRLXQow9Rd/bFrr4+nAd0c6vl2TEAF3EiRxA32axLOd/iCogq1D2OaDLIndzeaCRd3u8DFwFD13yG6Fv/J1QqvvBhM7Qr37ZJacPv+j044y1wyYcoO8eIxHnAVuACMzsIGgO9injW4BXBqIllgjMxXQC2xmCp0DqhZUm3q3TwFXjgL2BqrMVWrCgQ6qXDDGqHuKtJ8rUJVmwBYErSfvNog67C9T4Z02G8tNAtkladcz2Ve5+HcpSslWvXNuvEmtx2GEtwdCf88PfFDb9A5BwjiIuQrSfW1TheENwNPOWLSMRAXcgSxEpJ/pZbZXC94BrDtghtSEiAoie/5SHw5YEOCXc0vVaVcg2HlWdmAEST3TpwpWmyrdhntYZzalZHQ0hAN1iQnS6Cgt2HK8fNE2j8tbyo3Dln30D5hR96coGolHMEuQq7aK/2ZjoQKQ2udXAgFghGx3OrRzGdcOpk1XYJvoxxDuImiaU3/4pF3/4tUSonkZDLVr07Cux2YXHMdF1ya2UNf0hVgb6+1s+ZmvCHL00E8rToTXx1ouvRNxzMo8Qtpz1bu4ou25RV0pU8pfqWK2FoRTMoexzsC4Ze75s+KIsMlRN2sejgS/DiPZ6uPo672BXnoLu5Fr26DFoTZ+E0mQsxZOahnbXHBZd9kV0Wcs2mLfooZ1f496ygA6cOHRUVn5mmXUXw5lzAHbKlJe/UhGLD3mxJV702ZnsE30gJNIBlN/8a0bd/M3iHRb4rbsnzNqGGgfxAp257mrzFcasIlUBUKQ/6/6+Nwe7H4ZWHm4Gi6x9Rc59HQUA2NSEatQRSm5BDyCVBv7WgViH9d8dLsQffFeV8hBO4EbjmJwxQ3WC/4A7gWfOIiNkEpg3QKFBftp5K1JcV3i06rxHFZ1G5Krbh12bn/T6Q2Hw17pwbra/cpzJiEIgTuHMj+QpxJml4EcUN3OhBtONO2PeUT3DL/UlFPZjXLbQr9KmuGDrUfA8F3bC5LL6G/slCWOAM7Ao7AQswA2UBLqY1U6wcXFBZwWapcyG4OQu4wP7HuQ5QwgRiGMct2tHp4gi5kyfQSLpcxxD34Rn41vWPMLz5Ctj1cLK3FUCS1Xt8k9nDSef61ftgzxOw+XLctrfj+oYoAQOSNiVn7zLg7cmcT10e9jaAWCI/bFECIjPcsd3oyW/AgR1Q6WvvyPUcd+V8vRxMVOGaDzWZV49hPCJxZLr57WQ9J5Lk7AhQ33CxVQaW+lTMQiQOOWbbIDFUEVmOef/u+uDITvjWb8I1P4VbfTb9oHU4VgLn4XW6jmKaSlAdJ8yX1kfARoAyopx0uFZIykDRdz7Umudv+h9XXAhSiMZxBRDf5Hxuvaqlh6hpIJnTdbjiNAZzBTo+bZAlFSi8Mw0t/Kl/UqrLJxBPxjHrnGPZjT+PvvMfEsbCYJOEKt10U7S3nLBa1H29nALIpmCBRBd99Vb8CZ4t76q+YS254lOe9rRZ2Sx6j9auTxDH2fZsZkjZOqjQBzd4HMAYo0ry39L011VsnQOuubKrWQBPdNOGV8HVPwEtSnVuB+1QzzSm1nTx+571nTmiDmud7q1g72W6j8omRUVHvuOAbQEktg1q1mW92uxSB7s6uKFp7UqgQWE3rCn0WQo6j9PY1Smh481HDjIBPAP8IZ7J7/pSmeG3/1Pcrb+TzOEUUEu7BDJuBcPChb4rB9+KCvZtE8riIBqAkmudJZsK9PoClEQUgUs7sMF8jSXTz+FZn84uue6+KwxcLengTI7BzT8HkmLghOAR4FvAvlmxWQoTdgL0OLA9KtG/bB2uejA5K9blLFr2LDXRIbnPFDe8/6jX4Lnb4IW7xNJVuIFVuOVbYGAEogpW6TfiuqjVoDGJxo95xrPqITh+wCfGTj4Q7RsuECYOCZLyPrXUTtrTUXfTAsh08s7nhfEvJcqgs+8yl+3Kx3EueaB4PnS+E5eoFPjURo5oy3VnFo1KQRIpFpaYqMvPi3r19Y22+MiyilMzyman8AnCd804Q+KsKz5Oac+TrfcelTvbFSYuebvCsxjHPlmIG/DCD+GlH8HIGrR8E6V151NatgnKAwy4yJZKTUEgmUFcx02OoYMvwcEX4dBLMHrQn+lQ7y4s5IfkKZk4c7r4JoZlG2HdeQBMxvCyE9+eAfNqLLNjSM8BFwj1b7oM99JdvsCG9WCXFfuISC1tWhp+JnjlFjjjBqKNFxKVKlR8ckrs5aS8lmayN0oJQ0CzN23mi0gv3gmvPeZnXvuHPJdA3qcyTTzYnJsLfITMy+os32SApiSOG1abMUthrvIS0Ink2tm0M7h0rExblt0vKnG6VIXjWtUmkzbv551jE3D50Er6N1wEe57y7ceQAavTkGK+6pFW1l3Untm3iV66oEuQtjbdgnz2UeBh4GvAGmDb5svoO7bHs1KlQ+l0SDLD9mroLPMzaFK7AGkIWW0OdhYwB2Ld5wK7CRZaMpEax8WXfydhwNCuMAgqlfwsw02/BmrpUjyKn5c4MCPIkae+Jip5uFHYYepqV6Dc20yIyIp35qthGfx0l/Ui7IaF0I58VXqB7XIBHbKU7RZnhoOL7LJiyDtvUmjhpD/Tjwi+aB4qdtHQCoau+kl48PM+mG7Ui6FhYXcLm8Z3TePrKRK8TAbOG+F7DKBQdEmMwuHvnuxyPfitsGtdha1XwqozAF84edawv5HpecTkLN/FlNBhxAOGvUfS6jXbcS/cnsyYNqYhSnJZVsW2fW/Zc1cZ9H74xEE4shtee6ipOygFLZ7m0XOt+7h/uDWHYblOShtEz7XE46OoQCTWOhdYw+/t5lhg2DnfHU2LmNPZFfoLU7Z7oAVrE1kD8ziYZvCnbJeuqReZi7s6+dQUxj3/kEhZqPvWhBTmGCAz9/U059FFRY7a4tm8jATFdAS4S+J6YK2LWHrZRxNfOBKgH3qwqy2+KTiLlUH//+OHfUHj5fua3VKBovxYiTV8scSmfPIXlYOOvhUzf+eLZRm7VGyXi6A2Djf+ZLO7ddTBQ5i9JqnWc4NCOgh824xrJJZd9AEqrz6UEC9Z9izGcYFdAXIiTdDyV5EJKgNwbDc8+NfweAX6luCWrMENr/EF78ogVAb9p6vXoF5D1SNeeqhehdFDMHEsEXLsB/W3qPTbfGoBMq8wHgwS3kYd1mwD+YTvKGaPS4zaTGe4ku9bt5YPalKVu1LninIzIHLtwZlRvFE5LSR6mgQaTxvcJmMzsOGaz+C++ZuBkCDt81iFg4lBhb0T21rzpXc5UFogGNJk1Q6A/UDo/ATPv+ai91Fq1OCVH/k5K2sUkBcUQXQqCezHdaC07bJeqfp4IVlHMMBatF6d4KtKcPFpFTVf+cknhnlSCMlXrsx8FX/8uGcl7BvC8HvmUeBPktmtyZlWv9PIICoFA9y92FXq0h0K16vDPFbH9VJr1qdoBlHKdg3yf5ZCPDu+xxDmNUu72pLh3CxMm10umf/BJ8xv9qcZZJjdLmktflj4zE2XUKmNwxNfzhZSuvquoiDEtYtuFnUC1GHGpqTiznm3PT+tj+jBp3baW+ndNbIBrvx00LU27hR6GDE6WyHT5F2MAS/IdBhR33YTpRfuaEF/uu75ADXR03rFCW4w8tXxjsRMYbBuuc70dHY5X4HedImfoR070D7jmpHaiNvPcfrHjTnW5Ey73s37xgpijy52RaX2Dv9CCh7nxzScgHIC5ZzGp1JwFhdIfqc9Igyh/66YF6CoQNZch5JPPOTmpEZWA1427CuKdTaO7Zsvp2/3k3DgOT932kznprGrVM4KaHc9i2qxJLugEx9b9ue5qAVzS99j3Oksdtg3pXICyevkIxxYDdadD0vWNQtKOzC+ZtI+9SiWnsz/jwMvIV4Fzo5KVM65EZ6/DcpDAZQ/glLUssuKuvgUN2zSPKNUhnLy+/UqHHgB9j4bdMkNybXPrKXxVNp1y8dOIROvFbHY5si9Qrtc0kEen4IL3tMkHtkv6S48qcfULCGFLe2DNElqJlZxDmrQgaK0iFVdC+zIeiXQAHYLbkVci9kyF2n4wlv88HBlYJp5gKCKn//9FMKTZ2VzpQ5tTM2fDlenea5a1XYAfw4sBd4OrLz0I0SjB+HISz7patSD6lMOOtTEnecG8jtVmYvWqzkP0shR+KbrVe4MmSta+za7mIFdOedQLvtka/u7YEvCSojZTqSvAI8YjPXNVl1eOTpd621/pU4/jjusV6UzG1j+e2XWJbdemaDaOkhF5NcwgXKGFaHm9+8itltoVxH7Ui925V6xcwuvS3MqBZFrVdtl2LeEzsDDC9eddS1la8DT32jBC7u9x+beyr1HV+pyFtXdR4TwovxcZtuet2Kdp9BHhJdtJ5/aRkecZfelPAJv/8dNmuRjGA8ivgLsPlnhzQS2fgI4ANQqA/SvPMsLRqtUbBc539UG41YH32XFkCgrOIth0bDX9WpKCDi45CNedDrGF6NkxXZl9ABznyGe6zhAWehSETtlV7tcSxftlMQoif1W8G4DzFEbkVD+3xSQycQL0uAPfEm3s9jJ1zehkK4V2M4RkucE8BCO+w1bK7Tqms9Q+u5/hMZE8exOoV20oG9d76BcHGGBTq0rEK5OibLMdbkXmcanqoB9L+3gmydCu/onU71Q2y/pdsQLCVnGjDTOBLsN+6pnY9S5299Dec/TMHksGJZIYeIBg7A6FPLC+MbIji2lJGkkBf1SX3ZRiqCgRsH4jmU7wBbIVOC6k+O1ncUYNpwHS9YAnnhkn2GvCnVdSzdTPHR6uF3Zf4Wt9xQz76LOw9U4Ts1EZw9JFzBuHkby16DXgKkzr4ORtcmQnQsY11zuKyeWqKjFmOQSMcAUehEG165cEAQupCBk6xk33635fYzvA4eBxg0/54Vya1VfbSh6j67UYkTK/1n4edvWSrmLwXVfr3R/Fa6XC5xPgV2uF7s62BaVfCt+29vh/Pf4A2ZwEOleg9uBwzOc76iDWuSuytlVtKeK1ivQtcuvV+qswvmr/FkM1yvtTKVwh3S9Cn9+0ZrlLvgmVKnoPXaAEhXZ5QrsCj97V7uCr/Dz/D16JoWeAz4H/CCZNZw6+3q49ONQm2hVAgvfY+4sOtf+DovEtQt9RBScxXRWUbn3mLcj/z6jArtKgV2ui+Br0Z5PznYsuPlXwUU0ECeAhxF/CjydEOKcbPk/NjgEfN+MfUD98o/C1FTAwJqzK+9TXa6g1dGvuvZ3mPrCtrOYO8M9rVfZz0JsudKTatQnWwlOV7vyYsJufpj0XO6OmLFdtIL9hdMLbQVoHe/G4LylX8rN9bkC5FDymWwhBO2lrF3hnV1kV6GPKLXeYbAvUtiincQZnBJ6lYb9Neg+sOMS8c2/6tkKM3dKN7uiACLf5W7u9h5V8A7DtXK9xjcFPlUF8U1UhqkavOWnwUUYMIZ4CviuzXQMohUrj4IelvQUcFzQuP7nPMy4VGn3XW33fxADONeC/4Y5RN7Xh8WhIjbi5he52axg5jtcp4xPne4rjCUiP1Zy+SebTfr9wH1Ch2yaPep6nYWMSgFrj7It68wwr7ItvXDxwr93OgY+fYNqyM/kPIJ41IxRwK76VALpKAUrplxilWM6aR4ol61EhWuU4uVDMWhFLVjEQiallUGZYMwHG/ZHwL14JprGpT8GZ17vmQOjKOsAij6fi5pwgDaYm6Kkpavs77tS9mAWrVf+Z6Tr3zxYuUOR6ar0YleUtctFvprSmIQzrofz392EGx0U3JV0BF9MIAuzfkpl83blxYtLyVfUXgFtdkBzmidtw9LKFgjSC6NtvYJ/k/4dF+7FvF1R+zo22+0FdpGHEvdoV/gzZmVXAIU+3aDMC3Gmk4ThCeCPMX5gZvuBqS1XwDX/wF8cGZ8eBcGmKxZZLQpImmcxak+kXC4RT/99VA7+fuhTS+1nMROk5PaF8sl06JvVwa6E6KMRw1t/qTkLUDV41LDPAfcl8g42J/eKcRzxgMROoDa0EjZemgiZ5oK9sBgR3jFROXdjK7fni3xqPmko6haHPlC575ezK5LXULzwfa0zGZUKfGoHu1wnXz+X4ruBr++6Xh18V9ueX8gGV9TBrlyhOgwE80F40R24IB0u5dh/1fLnYVIexjeFRZJwP7qTI83IjcmME+kxwZ8begJR7R+B637axzalcg92pWtbbi82hWe1LV7pxaeSW69uPjXqzS4XeW3P7e+G5ZsBDyV8XuhvDHaImc+mJk9N8DLwOcMeBcb7R+Dcd3gKe5eLE6MybazCYRyXj8cya+Xaz3fY/W8mUsomVMoldcq9JxclTQRXXPRt8xFBwemMa2FgqW9UyI+T3IonHqmdRMLV2uRpa83lM1JlFyd04lHgwDIZd6nVbsZOuxCoJtNO4C8lP5czvNrrxzSmkiphKXvJNNm1Su1UsoVV+yK4oIIWup0a2GUSXIyCHgD7f5JNtB+oX/wBOO89XnQ0Ci60sEKbPzzpzEV6IPKwoLaAQDkRbeXoedUBOhLuxRb2u2PFu5NdyiUzLoLJUVh3MVx4S4aR8AfA7xk8KhifqRCqdeDtU5BM5PdQWzLTpVPlogI8f/D7mm691FsSHc515tcxQ+ubvqsOdqnArihnV3Of5QKOTslX3i7jlHSNT5ekawx4DPGHkr5rxm5gcu252Nv/qa9IRs5DUKX2TlWb73J0pdAOg8GonAS5HfaXcgEJ6sFHdAk0UQE0O79nyh4iHA3Au/85LFmbBGPGC4IvCt0JHJ2t5laHiK8OvA7cYdg+oH7lJz0jowuCqELfpR58qrr71LDaSxQUDzusVx6JkQ7z12pw7T9Iv781fbV6tCtThJmHAkhRgOyKfP10vusUFWdCXz+dT20rTITnJsqz/M1bspXtnqn9ngpHKDr5iKiUSyY0L8sfJyRX9wu+ihdEnlxzjofa1caDDnDeLpftSLXt+U53UFQQD6odidO2XsoVjdXBRxT4vvTPShWIp2DNdjjnrR6ZA+wxuA3j3pPxcUnMMwY8LvRNYBcwde7bYMPlvkidIqLydhV1tYsaFBlUkzq8h3xhKt+ZirrEN8om91HB3RZ2EXFgdehfCRd/KIkHjT2JztvOXgrvpWniwjgVkkpZ1MJgL8+wFDLruJyqdIb1rHFaQ3sMMY7xHLIfxLE2O7Hhyk/hbvu/E6x0nGMjpAtbWvIXYtpnwBRQ0uZ1kE7VnFuCdx4zdH8wSPk2YNW2GymtOQf96HPJPZvTd2pjDszNHeXXq43ZTNl/Hse5y1PtjsuCwcZU/R1rZ3bK/Jjp7HIe8zw16Q/WliubydZhPITw982zwM26Au4Zrm1KKZzEBSw/XdZLHdarYR1YL/Oin9ZquzuXxTaH7G8hFtq53FCpurB05mxoTNHGcNrNLijQn7FiVkrl54A6Ad+D7/H3LeEKBp3HBI8BfyQxCrwDOGNghIG3/xNz9/+lOPq6h4nFcSGPWlvSU/QeQ6HqZjEkN8OQ3ytSlz1Pu65h85haawatVx8RRf7SLC2Bt/4yRCUaSRfwecTXwG4F7ZuDua2imbqDwK0yXYVY5iKWXfOT6O4/aklwhOQf+eShk0/t5Sw2v0Wc6/xbgSRG6CPUqu7Wx+Gs62HJ+tZ3zFSEC/SJuvr6edC6SucrCoWMZ3IHKVNdnz9InmW/t6KCwlDOrka9PbjPxxHtBVBrGDLNT8LVCAvz3ewq9PUUdLmzhYbMzziJBAEgnqzaPuC7wGbBALBp/QVUrvo0PPTXCYFF0flxufmp3P6a1neFlPJqjakUakAF8aDlfSotvTVc8d3o+qBRhVXnwlU/HsYvdq/Ql4Bd03VjZki4diVe+2rlFR8netjg4PMQ9bdo2BXoxHXyXa4Tm3VurrKwax/KBFlOszXUuc29x5DQQ50Yk12LgO3mX2kxVJvscaE7gEO9JK+lro5Arcq9XI4txXVZnPzBi7IbptOc1+lSEa5VrYbYD7rVOa4BlrkSw+e+A577ng9KUgY45Qcr1fr8YeASlXyA0KYFZLmANKw0ulNKlT+G16D5fbAY4zqk9UvX0v/OXzf3wF+JY695FhijgAkmKhBVLUoY1M5UkzLJqKAuZxQEVR0Cbad2QogMm12cG6xOqUynQH1w8y/A4DIsqQwdwsMs/wjf2ZoTuJE/H2p2fZuaK1aQYLn2wdB0vUodSAyK1guXa20H4qCZ9xhlz3ibsHfRe8ztg1KlWP+q0C61O1IXOM28LlRGEFrtlyHqTPf79+1JiIHGgCfARoVeNezHJF3gSlpy3U9b9NxtYuf9iSZcUFBrBm7WJanNUzqrHY4RDjnn2WrD91jkU4vYrFwXH5FhrQqGn2tVWLfd4++TOtgJg8cEXwC+B3p1rpOt4JnEeMHE3wjWAZcu38zAJT8GT3/TswrWpwKNuU4+NUgg1e0s5tYrKiKrUQefmpN3aIzD6u1NWDVJABw1yQ2iVvFtWl+fYw6MyvMDzevkIzrdF5liV9LhKEULS5gRVuc72VUq9+Drw/GEhTLfmbmSlNEq7dXXk/X188kS2TeoWm3MXkR8HqwCeh+wYd35VG78FfTQX4HqXovT4ixzZOi7Qg2/wvtanfdX2jXpRCiSiQeLfCpZkenQLlfysL7V2+GKTzTP6hHgbtAfAc8keo1zspaTVXse+EOMCuJmYMUVnyB6+O/gwDNQGsju1bhD2p6H8IVsoZ3Y0S2fb8jH2YUJXRS8r/BeItcYyhUHFHmsX6MBN/0KRCViYBR4SA39GRE7eh0r6aXD1dQ/CCtgGSp42i9XyzEVdt1cp2OXy2Nbnwe+EMe2wTlt23ol5Vcf8notrpwVJAyFoc0S+GE5q2sjddCnCGhd066Mi07tvEmSeCZJl/4b4iXgvYhzSxWNvOVnzL1wl9h5b+I8KrluRl6gNKeTo9x6KQjWQh2gvBBvKrAaF2j9WFyAb6dVCWpjEoqCXZ5UaBs1WHk2XPZxcCIGJsx4XeKHwJ8ZPCSozlWylcHtW7HoaRhshVXwkGoW13m98kOmTgXBnAuqQFawXgVaWl3tirO6cj3ZlUv4XDDP1cmuJgQ1zomyu6xdLpnZWSCa5NOZLn4M9LwX9dUew35C6FrQ0vPeSWnzlejhL8DYIc/MGsfZCmE++FPuDlBRkBjur0YHNtvQD+beY0jNm8JLLNcNygczCnyES35uDFz547D2vGYQcgx4GOzPQbcb7D3Zqm8PPvWEzB5A+gGwCtiy5Qoq9Ul4/nteIy2Os76p7Swqy6YXdnxFNulxrr2AE95bzbNIu5RCWrRojMOqc+CKT3n9HhP1lBjNuQK2YmtPjIt8BObpzuZah4vc/iryEeH9EPqIUMrGlfw9nx+vWAhIYdzIaQXlfWre1yf+rXkWs3egITXAGiY1+ubw7srarlZhPic+nqE5p1282YWz7Y1wlt3mJxASEwZPC30ueePvBjYuXcvATb+Gu/uPYfwI9A221jPju8jGMmkmYR3im1SvrhmPKPdvcj41Twuf8akKpIpCu5zPKSbHYcs1cP67mqQORwQ/BH43KaKPzWn84mdfH5L4H4lffRuw8oqPUXri67DniURzMA60HfMJTtRiU21+RpdjKibr65vEF53iiJzPdAXs2ZlYvCBOjSq+N1gegbf8o+as7zieUOmvLOKBhPuAk024sotaylErBjSwUiLYFRdQ2YaVxsABn64drkyXCw4Zdr9zesjM1klafuUn0Q//GCpRjvoz52BWbIFjuwqqtEn3Jt00zc2ndijOqQ4Og07Xk2DHQK8ZfFziCtCyc95KaetV6JG/9Z+13OcZv1KHktdwKqI8dx2qDpaWQoLLJrwkXUGFVzm9mibEs6CKGF5UpRJMjXsRxEs/ASu3QtKCPwE8I/FV8/Nsz89dZ0sm75za9VQCDHfes6WC4Zm2vAtKRwXrJbIChHma1MwcXJSDlKldDNB1mD8kd3FkKnxRKxALBcR7sssFzriDXc2Ko7WvVyZg//vd6EpnuiZrVdsFfFemfYifN+MKifWDSxm88RdxL90Nr9zv91Spz1f3mvCLnO9K90ze54dnsXknRMU6R5YLvPLJmFNBoUrZIkUYoDbpmxv+bC/bBFd92ij1yZJq5EHgIWL7czndYz0MPM8ZtHDMdgN/B6wEbgHWn/UWKpUheOYbPjix9E5lmrPoOtOdF/oIS84i7T4i0zVLvvfUGKy5AC7/aCp6ynHBbmADhp8EK/JdBR3Rtg6bmwckRwgpLPD1TtPblWE2bBWfGwGJ9FzXd5vf15RNvKyTT41bCW4TOq/sWXQtFFLC8jcviZZ5kK7M53XyyRIBRD1JNvK+vtBH5CGGBRJFcxjjVc0Hzp8VHDK4RWJ7qczITb+Ce/LrsPfJRDQ3SsZCcn7JOlHB06EwmisAtPmu3Hr16lORR+ZQ8SQgS9c3YZhHgbsxfhfxADA605nzXovzBg8Kfi95ezcDKy/+IKVVZ3pppVLJ097nP6vRXaYiA/PrkDhh7V3FTH7SoWPajC0s1wxI/mxyDFadCVf9ZLMAXwWeA76KcZfk2bznJOFScohAmWqmc7mWX4pnLbU+WHNmokDDo9E4/emZ06RL6BXgrxBnAVcMLmdg1Zlw7HWf/caNnG5RWO1LxGczGb1y1ds4h5+Pc8OxnBZJ17ihl/GVkpeAn8a4ErGpPMDgNT9FdHwPeu42OLo7gSRFwdxHToQyP6+W6TZZUGnIw5qU664GV1WzMxi2gdWq4KbvKQMZSWyMG7DpMtj+nibMaBLYn9Dk/7XgRzL2ISbnrjJk5oELxE4F8Kew++faZYoUtWtuxJY9Z+E/inI6Lc3L0ILB0QDG16zC5YMQutgVBgNBpy4OupZp98E62ZX+XoBPb54ttcMTM3Yl56vZKc3pQkkzKTH9vdDpOoS4Hzgm8XbgFsTFwNKzrqe09Rrcs9+Dgzv8lRJFwXssgHzkNYLSedeQRVAkZ9E6yIaQe/fhe4xyc4VhxZPs0LRLKr3DK+HSj8KqsyCRYhjDs2vdAfwt0pO+20eDhYOOTRg8K0/XX8bP063bdAmVoRXosS/59S71eQ2aNt9V5COiHn1Eo73zRM6nSh6tUJ/yRElbr2p2BA8Z3Cs/x/rziCGJiuvku2j3EXlNMaK51ZuMSkng6bqs13R2Zdn+UkDi1DwlLNmALClGx3m7gmIa5tk1M6yy5Dq87TNo87i/1T7DpfZENp1RDsdzMz4iJCzJprY2Hx3GNOkCPZPCrIEfR1wpWHLxh4jOugE98VXf8U/nW+O4fYYy47sKOi8KUCX5IntRfJMSR1mc1dwK45vmPo1hYgyWb4IrfhyiyCNz8DHLg4I/QDyYaIXG84mIShBAv5tMJd0gtHr9hZRXbDU98gVxYr8vKBHo+YYFWMvNw2X2VCNHklEQD4bxTZiMZcgyQq1XskUpyRfqpib8HNxlH4UNF2UQEY8Dfwt8F/F6ZVAzYnks9YwtDqhhM5lmFFTKAmhXBp8fB4QZCtr+HeWRT5+ka7JqVRnPSbrVYrbIseHSDxPd+XtZrH1e9PPIawEbo2WD4GYSFlbg0l8nB9W5Vgv6NKmK15Kh7wcMDgluAD4AnA+sWrKegat/imj/DnjhDhg74rHmKSTDcvMZdBguFdkkIA3+XZQFAGeCbMvpc8W5Axm8p/T9xHV/glad6alM+4eI8YOQo3iaz7sEX0t+fbQyNIeMZR3YCRW1D54XrpeKhUSjclN9vb3KnYoRB92J5iWQS6amk22Y1q6co3POr3dmYDVuF0kOYRcKKIV7tivqQDCiAsHYxadFpmE8idiDJ9X4jBmXSWyOygxe+F5K9XfhdvwA9j7rRULLScU3vTBDlENT5qKAyjefLBWJdefJUArfY95HJNXiKJmBnJqEvmWw/b2w5jyQNYsoh3y3ni8BPzR4BTGhBZ7wawV6PImfCZ0A3g1sWL6R/pt+FffkN+DgS0kAXskGeb2cxfzcDIEfbAY6OYhT5PyAe70Gyzb6YKM84GdYDQ4L7pHZHyBVgZ8MWRPzXapefJfwP29Oi6/Kzi21oSCmsUsBdMvPmtuCOY204JWn7M/ACNNiYaXdp7aRDrlM7d/AEtDfnDe5IpAkeV3RdAY7JMwJOkJpPNi803MoizSh8LGDFiK2mahVbafBcWF7DH5W6DJg3dByBq79adyep+Gle6B2HMqVHPxZnWn9lTuLyhU4lNzZmaTZsix6bT41ub8dXktxZC1c9ilYsqaZWI8ZPCvZ90Bfx3fxRucr2eqQdP13wUEzu0nS1r4hDV37s7i9T8GO2z3qoNwPlu/i5u/vsEgf+C4VrJeC+dbCmeEw1o5aSX1YgImnPLRp/cVw/i1GFCkOZvgfMuwvhO412DcbRESpC1NfcwkU0sIHbcAQ69xcGFqQhUybP0+n6ehMp3QaPYIpxEHgdjluAlZEFYa2Xg2vPACVwWK2xlIUDAKGkKZS0v2Jc7SWuWz+VJJmTNPtGhU8a2KffAfo3cD1wAXAyjXbKK/Zhju2B730Qzixz1/gKYU8CpjMKB5GzRMkpOuF2quh6UCjggpHeOFm5nlq3pZyP6w9H865GSr9zUSratheoceBv8TsSZP2CibnlB66U5CQaEKkzicMFKzoeFgWPtis8EbZf29RDjsfOqQk2YqUJVGSCi7wwJnl8fdtxBS5WU8FXavUeVoUXCwB3DhfgCgKlJqENQWBRie74sSG+RjQ5w0+1wWM16q2NyGQ2IO4AuMDJrZLbC6VGTj/3ZTOfQfu9Udg95NQPRzoLQaV65gsO1SzcpsjQUkLJWFRyfJ7gGIyjDDwSIsG9brvyIysgjNvgJVnNJmkaiY7IvSiwX2Cr5qHBh8W1CuD89+16M4GyxOCzybQn3ciznURQ5d8mFL1KNpxOxx+1X/GKNUwzHX2KIDJKedT87NemfWTF0al5OdXt90MA0uawVsVeFVwP/BnoCcM2wqKFchNhN2ypo8gC+9r8/XR3GtdNbsqOd8Vzn1Yp5Ajx4YaN8CVtQDz4vLxlgxF8kmxCmZVC3xqyMiW+voUDpVKa2R+zjzfY1HJQ/DiekGnglzxVQG7sLIzxmnCtVBIqKTjfwD0Q8EB4F3AuxHnC5ZtuIDK+gtw+56FF++B8aM+8YoqWRZUqf0OysDhlIXHK5i9ayIHaCcYccEYT1z3HejBNXD+dWn3nnpSVDpg2FNCf4PpXsRuYKIyz8lWQdL1KOi4xA7gA4iLBMvWX0Bl7Xbcrsfh9YegejzbmDAKkFA5uJ+5giQqTNRyc6/hKEsmsY9bSdpUzb/L1dtg+7stScRVB6oYL5m4W/C/ZHoScbxvljFhqbtmgTVCwgxXRMOsgM660TowlmtxZ6Am5YD5RW8I/rBJ4AXgS3HMJuc486y3UN71RNDNIxf8pawolqvcKFcdJgfPIas74JfNQ890GnCtJQd3wjsnjgGvAbcbfATsaqEtwIql66lc/gmiRh134AXY8yQc3+cdRaolYeSghi7rjJsXoLLrlT9kKZRVtJTaU+hMo+4TvKjiK0EbL/WHyrlWooWxG7FD6Ad4QeMdSFVBYyECssaUr/g04gIscg6qZxQw8BUEDOnnD6UKMoPz+a5r3KHZbLmaSEGgEgYBbUNSloU3ZezKBdnMxq4uNZvQLkX+EEcDi0lWF4rfUXl8+m4TjwJXAe834xyJjVGJwa1XU95ytbnxI9LOB+Do6zB5otUxKZezoj8KBvzbhKoLurRtM1pB0B4Fc1txI+mOOBhaAevO92QYlcHmuZ4CDpvxstDDYN8UegGxV1Cb9yLKTGZkjaeBYyZ7UqZPIi4E1g4uY+DSH6NUG0Mv3weHX8mudVQK/GYRi2Mok0FrZjL1j/Wa/z7Dq2DFVthyNZTKzfWbBPbhiaO+btjdoBclpkKisXrN+y5czkcUyDI0i2yBj4jrUBmZuzWtjbeg7Fbku2i3tcguydPgT44tHArHTExNevvrU7PwqS4Ly6+N+yJjUtCaF074cG3ihlGr+hkuq2cJd8h1ukJyLBeQP4QdvqkJMFu4YnxyHk/gheL3YPYQ4iNmulziLMHSdedTXrsdd3wfeuV+7/8ak0FMk08C4gAO6NrXoC2+CeDaYdemPuV/Tt8grDobzrqxyaDcSGZSD+F9911CtyYyF8c5BUWloIP/fCKl8wTYR0HXIs5wEcObL6e86TJzx/dKL98Dx/a21jHUEozjIJ+IW3OYITQ6Mz+aZjWW7ZyGHTRLk9aG/1kjq3xHa8MF4CJiTzDDOH5W9WnEV4XdD3oFnVzyWppW+NjrRPgAKD+oHH4WZQVrVUTrm26wxtzitheIQOMIcK9z3GjYaknLLnwvevKbyVB5HLDvxD4Lz+PCmy1PtSgq8wORqAXxSqq/TTiAnUaTb5VB1WtVaxjsEhyU8SrSFvw8wnXARsTqqMzwuvMprdtO1GiYju+R9j4Nxw/AxPFkRmEqoQ8PZj/STlizAxIF+yzYbk2digRKV49bDEcDS2FwJaw/H5ZuMItKsiSYqAOjZrYP6UV5Qoz7DF6TrzTXFsRJmQ9utl5FY8P5OCV8ppbcjJIVl6+zdewOQkXW/D7dmaVsRgHBG9euTCu5YfOlq/PG73Y1JqtWl+927TZ4GNlFmN5tcLbEBqFVg8spX/AeHJirjckd2gn7dsD4YR+k1mst6E1axU0Tg9iyMw0hE2EUsHSlTG3p3FfdvJ+oDEL/El84WbMNyv3ESeBRTy7Kg8CuhDnruxgvI+1L/qxxqrpaXSBN47WqvSLTYcQLwM2G3Qw6R7C+MkTfee+gZIarjaGDL8H+HTBxwjPmNqayHQUpS8VusV/zKAlkSoOeDXHdebD6nEySVU9mP/YCLyJuB+4yeEXoaBLYlWhJSzau/JTFmJrndUZnMfEFSZHoZM9kDDTe8jNEUWQn5yOSxbMYyoPNoHbe/IU5YkEclWlc/4+ISmXa2X8K/Gg3nyoZjSnoX6o4ITtpzGO61QDioWWq3/yrlKISPfv6zn5eNKaM/hE1gFiivoDncWKyanskHQd7RWJbUni6XGKjxIql66hc8iGiuGE6ult6/bHA9021WASVJFBp/GzWXiSMnI8XG1Mt9A8GtSQuGlwKazbD+gthZBUm1/R3U8B+vOjug8DXk1/vT2KY+FQX5iertgc4qkT0HewWM10gsVnS8qXrqVz2MaJG3XTk9SQ23Av1CY9aiJzvNISCybEFerg5ApZ0vVPUQ9r4Se+TUsXPkA2s9wnW6rMhKmeKdGMG+2TsxM9p3ePXVHOSvE6TcFkMqiti6uZfmxeHM5WkX/YGSLomki7XXwmdCVy4YiuVm35l3n/8lKB2OgaIyeZrANVa1V4F9iZr9BXDLhS6HuNcxBrEqqik4eWbKS3fjANc3EBTE+j4HnTioGc6bNT8wahN+CuuYVmihrDdHA34xCqFii3dAMNrYNlGs8qAzEXN2rqBppL5rEMY+008K+lOw541aY88IcjUgjkp05SJg4LdUYmRaGmbikdYIrbpqosUI6B7rk5OM5Cs4v99I9qFARPCDoKm/p7Lc3VNvGpVO4JxAunVZPh6LX5283ozVgqWI62oDDGw/kKi9RcSYbipSXR0F6oehsOvtaqJcS2pWjey5zqkOqYEUZ+/aKMEVj28Epaug8HV2NDy5IIk81UFDphxQOJl4AE8Y9Ze4FCiOdM4lQFIj5Cmo/ih7F2JmOZ1eIrljcAqieV9w/RvvIRo4yW+5tSoo8YUjB9DU1WoTxnxlJo+slSGqGK4khhYhlUGIPGLqW/0c6vGQYODEq8nidbDSTHtiILgrVY15H3pAWB3/4jKxR2gac9i3hdMCfYnfnrGja3Enj2Dyyh19x09+a687HAV2Cdscs67LaIhrAo6KLF3aAXlwL7c5F5PPlUFilCh/TbHeMi6xBFgL8IGlxNlqdSmQ+W0vaugdK80kd6LOGpQX2AJjVHQS8Aez1BsZxh6q3znfxNilStpZMUWSiu24MCiRk06cQCNH4Ejuzy1fKPuI+nJalIYpjUjiLw4cNn5QogrweAyWLresyYv24CVKhjKJFlHkzn63Qn5zw+BXUGiVT8NpUhewtiPeFziLLAbQFeDbUJaGZU1vOpMyqvOTPzaFG78GBrdB/te9F30OPbxYWMsgFTH7YLIrt+vacX5u2TpehhZCX1LzYZXilJf0/e1/B8cMLN9kl4Au92kp4Hd8iiuOYsLC71HrWrCK3BfDfwasLW9J3PyP8+8k30R7P8AvTSPgpNz8tSqVsLYguxnQTcAw/Pd7zZjSuIZ4P8CXj7d12iyalHCyDyCsRyxHDgH7CpMFwEjiBFgEBhJ9lk5t47OkilCM4jjLN1PqEEhYbnqYypUPIk/LFXMxpIKxdPmA8fnMDsMOoKoJpWL+gLuIwFLMLsWabuZDeXQ6vE0ALpZnesetOdm+v3egHZZQ9JUUhz4HnDkdA7ETwOfp2TMwhlUBCsMlguWYlyCuMKMLRJLgGXJl9FaBwAABctJREFUV78nKCY/qeuBvBhxQ0kFnCYLrnPWnLQXKjoDU0lwPQYcB46b2YSklzHuQzwOdtjQccGR5H6JT6eOVo9rXsYomVgKtlpoDXAxcBnGVsQAMJSs82Cw1p1oYcLgvZ6s3wRQNaMq8Txe1P0ZsGOGDss4jpjK+8Va1Ryezv69wFozK2VBwj2fReUQHrUEwvhd4FCvZ7JWNWewSvAhYJWZlYNAvzFLvxJlSmNiHNgB3A0cm8v9NFm1irAzMb3DsFXZCTsmevCxKiDGL4ViIRKjwFPAj4Djc2V/shf6DTtb6K3AMr8fMusfz9DPK/QdgtjP0NttoJ0sZFE0+zmj5LwtM1gt2AZca8aFwBLBUsTS4DyG1C0Cubjh4U1xQoDg0TzqFMcQwAUnE4TVYYwDiMfwBA6vCu3DOIKH+jZOZ183WbUoIZDtB5YDqw3Ol3GVwXb53xtBDCWxYX/uLBbHhUl1Sc6SJFbd4sIpPNIhvT/GJO1I2FefAjuK6ZCJ0WTGN5578G3nTTYCrDesb27GF9v6y7FgAtOrlSGNv0Euwz5grcGSlJ1njn+EawdDaNzg9b5Bjb5RgobgcEUYA8iWGQwLDQAbgK1x3bYrYiOwUkorpZSTr6htLSy3X33VJx0WbXg3ZnVMR8zY7RzPJBTQuw0bFzqBDySqKYQlqeafqvUZSpJ2lzuLiwnA/Iqap931I6dTNfCNkHwFwVxkMCJYatCfXJbnGVyMsRFYI1mpSbhrRIhKcK5dwZvxlVwPtZ3CaCRn3Px5teOY9krs9MkBOw2b8MKbOiZ/iTbwSdbUG3290+JV4g+HZYyYbMD7UNsEWhfX2aSI1WBlSSUMl5mL9j6zYV4raQIfSLwGvArsNWxSaMw87Ge0l/WrVa1ksFJNBaA508moCw7P9EwG9pTnyI+6gmR1zDzT25zfF7UxG0gKk6WCgHu2tofr4CH0nha8MQ/JSAVYUVCUt1lSubsC+w9XBjVxOhSfgEjGUBDTjABnY1xosAlYK19UTs9HGagkPlAFUFjLxTH+3ZtVDfYj7QUeEzxn2HH54vGx9O+/0e6w5B6JgBLGIGKJX0eGDM4UbMPsHPMjKgPNOBL6ut4frfX0nSujhoeiGlA3syOYDkvsxjcxXjQYTYSbj6b3x3zGheq1ujmP0U/8RqtCJsHyvJJMFygsNk5VcjBXyZd5yHaEqBgMyhgyWZ932JL8hTOE0YdsENRnHTurFgul1e5RYNJDDsxAU8ImDY3KwymChAw7XdYxqc4uKkNxSthH7c0QlJ8mna/w7I4g+g0qAQ11BWMo6cz0G1YugrMLNQybEqomVcgx8xXeuNmdRJPJn1UNJhSc6wQSbG/itVbQgek3GBT04dfTtVPPZKYbzCey1jBUlfeJ6drOeP0mq1ZhfiBItdl2iubZX9Tnq7OyEPfAfNr/Rl//OYppBn3x1PoN9YFFTd/nu/5DQJ9leIM9T4JgCuMY8p1ng2QiXQ1BDQ8FPZ7EOildRPxmQGbkYumkOM8g2KD54rzD+76kOG0D5jtfnXi864lvqyZfo631pO7Xkxpo1KCqbFxYWxDph8Vn8TllzqodmJ7+fpRwWLoOOzduYshbTihMWFNdwfiNmqguPovPGzUByw2YKCmchOdaBWc6VRtpyM9G12mRbIYM02mCEL8ZE6wZdr/CgR3R0vZtG/AJfr+RrKX9fV2/xWfxma+YpkBKqpQUpDr5vTiNY4pm9f8+xTH5Zkbg9yPzoyrd48LWejZkNEw0cs2R9O6wU8HguJhwLT6na8uZGZJ3LD6Lz+KzeKYXn8Vn8Vl83nC+b9HnLd4hi8/is/gsPovP4rP4LD6Lz+Kz+Cw+i8/is/gsPovP4rP4LD6Lz+Kz+Cw+i8/is/gsPovP4rP4LD6Lz+Kz+Cw+i8/is/gsPovP4rP4LD6Lz+Kz+Cw+i8/is/gsPovP4rP4LD6Lz+Kz+Cw+i8/is/gsPovP4nPaPf9/bkNkgJE7nA8AAAAASUVORK5CYII="
 _NCZ_WORDMARK_H = 23                      # height in the top bar (logical pixels)
@@ -7606,7 +9540,7 @@ def _ncz_wordmark_pixmap(accent, light, dpr=2.0):
     key = (str(accent).lower(), bool(light), dpr)
     if key in _ncz_wordmark_cache:
         return _ncz_wordmark_cache[key]
-    import colorsys
+    import colorsys    # lazy: saves memory/startup until used
     src = QImage.fromData(base64.b64decode(_NCZ_WORDMARK_B64))
     if src.isNull():
         return None
@@ -7659,8 +9593,8 @@ def set_windows_taskbar_identity(window):
     if not sys.platform.startswith("win"):
         return
     try:
-        from win32com.propsys import propsys, pscon
-        import pythoncom
+        from win32com.propsys import propsys, pscon    # lazy: saves memory/startup until used
+        import pythoncom    # lazy: saves memory/startup until used
         target, args, _workdir = get_launch_command()
         command = subprocess.list2cmdline([target] + list(args))
         icon = prepare_shortcut_icon()
@@ -7675,7 +9609,7 @@ def set_windows_taskbar_identity(window):
         if icon:
             put(pscon.PKEY_AppUserModel_RelaunchIconResource, f"{icon},0")
         store.Commit()
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
 
 UPDATE_URL_WIN = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/NCZ%20Games%20Launcher.exe"
@@ -7696,7 +9630,7 @@ def _launcher_update_url():
                     k, _, v = line.strip().partition("=")
                     if k in ("ID", "ID_LIKE"):
                         ids.update(v.strip().strip('"').lower().split())
-        except OSError:
+        except OSError:    # expected: file may not exist yet or be unreadable
             pass
         if ids & {"arch", "manjaro", "endeavouros", "cachyos", "garuda", "artix"}:
             return UPDATE_URL_ARCH
@@ -7710,7 +9644,7 @@ def _demo_py_present():
     return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py"))
 
 
-# ---------------------------------------------------------------- Terms and Conditions (shown once per terms version)
+# ── Terms and Conditions (shown once per terms version) ──
 TERMS_VERSION = "2026-10-31"          # bump this to show the terms again to everyone
 TERMS_TEXT = 'NCZ LAUNCHER\n\nTERMS AND CONDITIONS\n\nLast Updated: October 31, 2026\n\nWelcome to NCZ LAUNCHER. By downloading, installing, accessing, or using NCZ LAUNCHER, you agree to comply with the following Terms and Conditions. If you do not agree to these terms, you must not use the launcher.\n\n1. ELIGIBILITY AND ACCESS RESTRICTIONS\n\n1.1 NCZ Membership Requirement\n\nNCZ LAUNCHER is exclusively intended for authorized members of NCZ. If you are not a member of NCZ, you are strictly prohibited from downloading, accessing, or using the launcher.\n\n1.2 FHA Restriction\n\nIndividuals who are members of, affiliated with, or otherwise associated with FHA are strictly prohibited from using NCZ LAUNCHER. This restriction applies regardless of whether the individual is also a member of NCZ, unless explicit written authorization is granted by NCZ leadership.\n\n1.3 Authorized Users Only\n\nAccess to NCZ LAUNCHER is a privilege, not a right. NCZ reserves the right to verify membership, restrict access, suspend accounts, or revoke access from any individual who does not meet the eligibility requirements.\n\n1.4 No Unauthorized Distribution\n\nUsers may not distribute, share, upload, sell, or otherwise provide NCZ LAUNCHER or its restricted access credentials to unauthorized individuals, including non-NCZ members and FHA affiliates.\n\n2. ACCEPTABLE USE\n\nBy using NCZ LAUNCHER, you agree to:\n\n* Use the launcher only for its intended purposes.\n* Follow all applicable NCZ rules, policies, and instructions.\n* Respect the privacy and security of other users.\n* Refrain from exploiting bugs, vulnerabilities, or technical issues for unauthorized purposes.\n* Avoid using the launcher to harass, threaten, impersonate, or harm other individuals.\n* Refrain from attempting to bypass membership verification or access restrictions.\n\n3. PROHIBITED ACTIVITIES\n\nThe following activities are strictly prohibited:\n\n* Using NCZ LAUNCHER without authorized NCZ membership.\n* Accessing or attempting to access restricted features without permission.\n* Circumventing security measures or membership verification systems.\n* Modifying, reverse-engineering, or redistributing the launcher without authorization.\n* Introducing malware, malicious code, or other harmful software.\n* Impersonating NCZ leadership, staff, or authorized members.\n* Sharing confidential NCZ materials with unauthorized individuals.\n* Using the launcher in violation of applicable laws or third-party platform rules.\n\n4. SECURITY AND PRIVACY\n\nUsers are responsible for maintaining the confidentiality of their login credentials and any other information used to access NCZ LAUNCHER.\n\nYou must promptly report suspected unauthorized access, security vulnerabilities, or misuse of the launcher to the appropriate NCZ administrators.\n\nNCZ LAUNCHER should not be used to collect, disclose, or distribute another person’s private information without proper authorization.\n\n5. INTELLECTUAL PROPERTY\n\nUnless otherwise stated, NCZ LAUNCHER, including its branding, logos, design, original code, and associated materials, is the property of its respective owners.\n\nUsers may not copy, modify, reproduce, redistribute, or commercially exploit these materials without prior authorization from the relevant rights holder.\n\n6. SUSPENSION AND TERMINATION\n\nNCZ reserves the right to suspend, restrict, or permanently revoke access to NCZ LAUNCHER if a user:\n\n* Violates these Terms and Conditions.\n* Is found to be ineligible for access.\n* Is affiliated with FHA in violation of Section 1.2.\n* Shares the launcher with unauthorized individuals.\n* Attempts to bypass security restrictions.\n* Engages in conduct that compromises the security or integrity of NCZ LAUNCHER.\n\nDepending on the circumstances, NCZ administrators may issue a warning, temporarily suspend access, or permanently revoke access without prior notice.\n\n7. AVAILABILITY AND UPDATES\n\nNCZ LAUNCHER is provided on an as-available basis. Features may be modified, updated, temporarily disabled, or discontinued at any time.\n\nNCZ does not guarantee uninterrupted operation, compatibility with every device, or freedom from technical errors.\n\nUsers may be required to install updates to continue using the launcher.\n\n8. DISCLAIMER OF WARRANTIES\n\nTo the extent permitted by applicable law, NCZ LAUNCHER is provided “as is” and “as available,” without guarantees that it will always function correctly, remain available, or meet every user’s requirements.\n\nNothing in these terms excludes any rights or protections that cannot legally be excluded.\n\n9. LIMITATION OF LIABILITY\n\nTo the extent permitted by applicable law, NCZ and the individuals responsible for maintaining NCZ LAUNCHER shall not be liable for indirect or consequential losses arising from the use or inability to use the launcher.\n\nThis section does not exclude liability where such exclusion is prohibited by applicable law.\n\n10. CHANGES TO THESE TERMS\n\nNCZ reserves the right to modify these Terms and Conditions when necessary.\n\nUpdated terms may be published alongside the launcher or communicated through official NCZ channels. Continued use of NCZ LAUNCHER following the effective date of an update constitutes acceptance of the revised terms, to the extent permitted by applicable law.\n\n11. CONTACT AND SUPPORT\n\nQuestions, concerns, or reports regarding NCZ LAUNCHER should be directed to an authorized NCZ administrator through the appropriate official communication channels.\n\n12. ACCEPTANCE OF TERMS\n\nBy installing, launching, or using NCZ LAUNCHER, you acknowledge that you have read, understood, and agreed to these Terms and Conditions.\n\nIf you are not a member of NCZ, you are not permitted to use NCZ LAUNCHER.\n\nIf you are affiliated with FHA, you are not permitted to use NCZ LAUNCHER unless explicitly authorized in writing by NCZ leadership.\n\nUnauthorized access or distribution may result in immediate revocation of access.\n\nNCZ LAUNCHER\nAuthorized access. Restricted distribution. NCZ members only'
 
@@ -7730,7 +9664,7 @@ def record_terms_accepted():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": TERMS_VERSION}, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 class TermsDialog(QDialog):
@@ -7796,7 +9730,7 @@ def _ncz_build_main_window(app, launch_title="", hidden=False):
         try:
             lite.hide()
             lite.deleteLater()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
     _ncz_after_window_created(app, window, launch_title)     # game from a Wine/Proton shortcut
     _acct_watch_start(window)
@@ -7851,7 +9785,7 @@ def _ncz_lite_services(app):
         def work():
             try:
                 _lite_publish_presence()
-            except Exception:
+            except Exception:    # expected: Discord or the controller may not be there
                 pass
         threading.Thread(target=work, daemon=True).start()
 
@@ -7880,14 +9814,14 @@ def _ncz_lite_services(app):
         elif sys.platform.startswith("linux"):
             app._ncz_lite_hook = _start_shift_q_hook_linux(keys.shift_q.emit)
     except Exception:
-        pass
+        _log_exc("_ncz_lite_services")
 
     def stop():
         app._ncz_lite_active = False
         timer.stop()
         try:
             _playing_listeners.remove(publish)
-        except ValueError:
+        except ValueError:    # expected: missing or odd value: the default is fine
             pass
     app._ncz_lite_stop = stop
 
@@ -7925,7 +9859,7 @@ def _ncz_start_lite_tray(app):
                     try:
                         if cloud_configured() and load_account() is not None:
                             cloud_publish_offline()
-                    except Exception:
+                    except Exception:    # expected: offline or the server did not answer
                         pass
                 t = threading.Thread(target=off, daemon=True)
                 t.start()
@@ -7942,28 +9876,28 @@ def _ncz_start_lite_tray(app):
         try:
             _ncz_lite_services(app)
         except Exception:
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             traceback.print_exc()
         return True
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
         return False
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
-        import ncz_gm
+        import ncz_gm    # lazy: saves memory/startup until used
         sys.exit(ncz_gm.main(sys.argv[2:], launcher=sys.modules[__name__]))
-    import traceback
+    import traceback    # lazy: saves memory/startup until used
     sys.excepthook = lambda *a: traceback.print_exception(*a)  # PyQt6 aborts on unhandled slot errors otherwise
     _ban_check_startup()                 # banned (or still locked out after logging out): crash before anything opens
     if sys.platform.startswith("win"):
         # Without its own AppUserModelID, Windows groups the window under python.exe and shows Python's icon.
         try:
-            import ctypes
+            import ctypes    # lazy: saves memory/startup until used
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NCZ.GamesLauncher")
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
     _prefer_xwayland()
     if _HAS_WEBENGINE:      # lets QtWebEngine be imported after the QApplication exists (it's only loaded when NCZFront opens)
@@ -7972,7 +9906,7 @@ def main():
     app.setApplicationName("NCZ Games Launcher")
     if "--friends" in sys.argv:          # toggles the friends panel of the running launcher, then exits
         try:
-            from PyQt6.QtNetwork import QLocalSocket
+            from PyQt6.QtNetwork import QLocalSocket    # lazy: saves memory/startup until used
             sock = QLocalSocket()
             sock.connectToServer(_instance_name())
             if sock.waitForConnected(800):
@@ -7980,7 +9914,7 @@ def main():
                 sock.flush()
                 sock.waitForBytesWritten(800)
                 sock.disconnectFromServer()
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
         sys.exit(0)
     _launch_title = _ncz_launch_arg()    # a game's desktop shortcut: `main.py --launch-game <title>`
@@ -7995,7 +9929,7 @@ def main():
     if not got_lock:
         if _game_exe:                    # the launcher is already open (or starting): the game is running, nothing else to do
             try:
-                from PyQt6.QtNetwork import QLocalSocket
+                from PyQt6.QtNetwork import QLocalSocket    # lazy: saves memory/startup until used
                 sock = QLocalSocket()
                 sock.connectToServer(_instance_name())
                 if sock.waitForConnected(800):
@@ -8003,7 +9937,7 @@ def main():
                     sock.flush()
                     sock.waitForBytesWritten(800)
                     sock.disconnectFromServer()
-            except Exception:
+            except Exception:    # expected: optional module may be missing
                 pass
             sys.exit(0)
         if "--startup" in sys.argv:
@@ -8023,9 +9957,9 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     try:                                         # in-game / desktop toasts show the launcher's current icon
-        import overlay as _overlay_icon_mod
+        import overlay as _overlay_icon_mod    # lazy: saves memory/startup until used
         _overlay_icon_mod.set_icon_provider(lambda: asset_path("icon.png"))
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     set_accent(_saved_accent)
     apply_dark_mode(load_launcher_settings().get("dark_mode", "system"))
@@ -8037,7 +9971,7 @@ def main():
     try:
         app.styleHints().colorSchemeChanged.connect(on_system_color_scheme_changed)
     except Exception:
-        pass
+        _log_exc("main")
 
     if not ensure_terms_accepted():
         sys.exit(0)
@@ -8058,7 +9992,7 @@ def main():
                 if getattr(app, "_ncz_main_window", None) is None and load_account() is not None:
                     _ncz_ensure_window(app, hidden=True)
             except Exception:
-                import traceback
+                import traceback    # lazy: saves memory/startup until used
                 traceback.print_exc()
         QTimer.singleShot(3000, _build_for_toasts)
         sys.exit(app.exec())
@@ -8138,7 +10072,7 @@ def get_steam_download_link(appid):
                 size = 0
             if isinstance(link, str) and link.strip():
                 return link.strip(), size
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return None, 0
 
@@ -8153,36 +10087,7 @@ def _rebuild_steam_card_in_place(self, appid, title_text, cover_path):
         if pos is not None:
             self.cards.insert(min(idx, len(self.cards) - 1), self.cards.pop(pos))
 
-def _change_steam_game_cover(self, appid):
-    path, _filter = QFileDialog.getOpenFileName(
-        self, "Choose Custom Cover", os.path.expanduser("~"),
-        "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
-    )
-    if not path:
-        return
-    saved_cover = path
-    try:
-        os.makedirs(get_library_cover_dir(), exist_ok=True)
-        saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
-        shutil.copyfile(path, saved_cover)
-    except Exception:
-        pass
-    games = load_steam_library()
-    for g in games:
-        if g["appid"] == appid:
-            g["cover"] = saved_cover
-    save_steam_library(games)
-    old_card = self.steam_cards.get(appid)
-    if old_card:
-        title_text = ""
-        for card, title in self.cards:
-            if card is old_card:
-                title_text = title
-                break
-        _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
-        self.apply_filter()
 
-AdaptiveApp.change_steam_game_cover = _change_steam_game_cover
 
 def _fetch_library_cover_bytes(appid, title):
     """Fresh cover for a library game: SteamGridDB if there's an API key and the game is on it, else Steam's own CDN."""
@@ -8204,67 +10109,10 @@ def _fetch_library_cover_bytes(appid, title):
             return data
     return None
 
-def _refresh_steam_game_cover(self, appid):
-    busy = self.__dict__.setdefault("_cover_refreshing", set())
-    workers = self.__dict__.setdefault("_cover_refresh_workers", set())
-    if appid in busy:
-        return
-    title_text = next((g["title"] for g in load_steam_library() if g["appid"] == appid), "")
-    busy.add(appid)
 
-    def fail(message):
-        QMessageBox.warning(self, "Refresh Cover", message)
 
-    def finished(data):
-        busy.discard(appid)
-        workers.discard(worker)
-        if not data or not QPixmap().loadFromData(data):
-            fail("Couldn't find a new cover for this game (no connection?).")
-            return
-        try:
-            os.makedirs(get_library_cover_dir(), exist_ok=True)
-            saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
-            with open(saved_cover, "wb") as f:
-                f.write(data)
-        except Exception as e:
-            fail(f"Couldn't save the new cover: {e}")
-            return
-        games = load_steam_library()
-        for g in games:
-            if g["appid"] == appid:
-                g["cover"] = saved_cover
-        save_steam_library(games)
-        if appid in self.steam_cards:
-            _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
-            self.apply_filter()
 
-    def failed(message):
-        busy.discard(appid)
-        workers.discard(worker)
-        fail(message)
 
-    worker = TaskWorker(lambda: _fetch_library_cover_bytes(appid, title_text))
-    worker.done.connect(finished)
-    worker.failed.connect(failed)
-    workers.add(worker)
-    worker.start()
-
-AdaptiveApp.refresh_steam_game_cover = _refresh_steam_game_cover
-
-_original_init = AdaptiveApp.__init__
-
-def _patched_init(self):
-    _original_init(self)
-    self.downloads_page = DownloadsPage()
-    self.pages.addWidget(self.downloads_page)
-    
-    downloads_btn = self.make_nav_button("Downloads", checkable=True)
-    self.nav_group.addButton(downloads_btn, 6)
-    
-    sidebar_layout = self.nav_group.button(0).parent().layout()
-    sidebar_layout.insertWidget(2, downloads_btn)
-
-AdaptiveApp.__init__ = _patched_init
 
 def sanitize_folder_name(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
@@ -8272,6 +10120,7 @@ def sanitize_folder_name(name):
 def _safe_installed_game_dir(title):
     return installed_game_dir(sanitize_folder_name(title))
 
+# kept: used at import time before the later definition at line 10690
 def find_best_game_exe(root, title):
     if not os.path.isdir(root):
         return None
@@ -8339,7 +10188,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
                 try:
                     b.setParent(None)
                     b.deleteLater()
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
 
         def _show_update_button():
@@ -8397,7 +10246,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
             
             try:
                 btn_play.clicked.disconnect()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
             if installed:
@@ -8483,7 +10332,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
             copy_action = menu.addAction("Copy Game ID")
             copy_action.triggered.connect(lambda _c=False, a=appid: QApplication.clipboard().setText(str(a)))
 
-AdaptiveApp.create_steam_card = _patched_create_steam_card
+AdaptiveApp.create_steam_card = _patched_create_steam_card    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
 _original_store_card_init = StoreCard.__init__
 
@@ -8531,12 +10380,12 @@ def _patched_get_steam_download_link(appid):
                     local_path = os.path.join(get_library_cover_dir(), f"{appid}.img")
                     with open(local_path, 'wb') as f:
                         f.write(img_data)
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
 
             if isinstance(link, str) and link.strip():
                 return link.strip(), size
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return _original_get_steam_download_link(appid)
 
@@ -8565,13 +10414,13 @@ def _patched_build_library_page(self):
                             os.makedirs(get_library_cover_dir(), exist_ok=True)
                             with open(local_cover, 'wb') as f:
                                 f.write(img_data)
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
 
     threading.Thread(target=fetch_missing_covers, daemon=True).start()
     return widget
 
-AdaptiveApp.build_library_page = _patched_build_library_page
+AdaptiveApp.build_library_page = _patched_build_library_page    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
 COMPAT_CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "steam_compat_config.json"))
 
@@ -8582,7 +10431,7 @@ def load_compat_config():
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
     return {}
 
@@ -8590,7 +10439,7 @@ def save_compat_config(config):
     try:
         with open(COMPAT_CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def get_available_compatibility_tools():
@@ -8610,7 +10459,7 @@ def get_available_compatibility_tools():
                         proton_bin = os.path.join(full_path, "proton")
                         if os.path.exists(proton_bin):
                             tools[entry] = proton_bin
-            except Exception:
+            except Exception:    # expected: file may not exist yet or be unreadable
                 pass
     for name, wine_bin in wine_installed_builds().items():
         tools[f"{name} (Wine)"] = wine_bin
@@ -8640,7 +10489,7 @@ class GameDownloadWorker(QThread):
         if self._response:
             try:
                 self._response.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     # run() is _new_game_worker_run, assigned further down
@@ -8742,7 +10591,7 @@ class DownloadCard(QFrame):
                     isinstance(lay.itemAt(i).widget(), DownloadCard) for i in range(lay.count())):
                 page.empty_label.show()
         except Exception:
-            pass
+            _log_exc("clear_card")
 
     def toggle_pause(self):
         if not hasattr(self.worker, "pause"):
@@ -8763,7 +10612,7 @@ class DownloadCard(QFrame):
         if os.path.exists(dest_path):
             try:
                 os.remove(dest_path)
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         self.setParent(None)
         self.deleteLater()
@@ -8772,12 +10621,10 @@ class DownloadCard(QFrame):
         self.status_label.setText(message)
 
     def on_progress(self, downloaded, total, speed):
-        dl_mb = downloaded / (1024 * 1024)
         speed_str = f"{speed / 1024:.1f} KB/s" if speed < 1024 * 1024 else f"{speed / (1024 * 1024):.2f} MB/s"
 
         if total > 0:
             percent = int((downloaded / total) * 100)
-            total_mb = total / (1024 * 1024)
             self.progress_bar.setValue(percent)
             self.status_label.setText(f"{percent}%")
             self.info_label.setText(f"Speed: {speed_str} | {_fmt_size(downloaded)} / {_fmt_size(total)}")
@@ -8797,7 +10644,7 @@ class DownloadCard(QFrame):
         self.clear_btn.show()
         try:
             self.action_btn.clicked.disconnect()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
         self.action_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(GAMES_DIR)))
 
@@ -8816,7 +10663,7 @@ class DownloadCard(QFrame):
         self.clear_btn.show()
         try:
             self.action_btn.clicked.disconnect()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
         self.action_btn.clicked.connect(lambda: QApplication.clipboard().setText(error_msg))
 
@@ -8928,26 +10775,7 @@ class AddCustomGameDialog(QDialog):
         }
         self.accept()
 
-def _open_add_custom_game_dialog(self):
-    dlg = AddCustomGameDialog(self)
-    if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_data:
-        data = dlg.result_data
-        saved_cover = data["cover_path"]
-        if saved_cover and os.path.exists(saved_cover):
-            try:
-                os.makedirs(get_library_cover_dir(), exist_ok=True)
-                dest_cover = os.path.join(get_library_cover_dir(), f"{data['id']}.img")
-                shutil.copyfile(saved_cover, dest_cover)
-                data["cover_path"] = dest_cover
-            except Exception:
-                pass
-        games = load_custom_games()
-        games.append(data)
-        save_custom_games(games)
-        self.create_custom_card(data["id"], data["title"], data["exe_path"], data["cover_path"], data["compat_tool"])
-        self.apply_filter()
 
-AdaptiveApp.open_add_custom_game_dialog = _open_add_custom_game_dialog
 
 def _custom_tool(game_id, fallback=""):
     """The compatibility tool currently saved for a custom game (it can change after the card was built)."""
@@ -8956,108 +10784,7 @@ def _custom_tool(game_id, fallback=""):
             return g.get("compat_tool", "")
     return fallback
 
-def _patched_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
-    card = QFrame(self.grid_container)
-    card.setObjectName("GameCard")
-    card.setFixedWidth(COVER_W + 18)
-    layout = QVBoxLayout(card)
-    layout.setContentsMargins(8, 8, 8, 10)
-    layout.setSpacing(0)
 
-    cover = QLabel()
-    cover.setFixedSize(COVER_W, COVER_H)
-    cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    pix = self.get_rounded_pixmap(cover_path, COVER_W, COVER_H, 8) if cover_path and os.path.exists(cover_path) else None
-    if pix:
-        cover.setPixmap(pix)
-    else:
-        cover.setObjectName("CoverPlaceholder")
-        cover.setText("No\nCover")
-    layout.addWidget(cover)
-    layout.addSpacing(10)
-
-    title = QLabel(title_text)
-    title.setObjectName("CardTitle")
-    title.setWordWrap(True)
-    title.setFixedHeight(38)
-    title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    layout.addWidget(title)
-
-    status = QLabel("Custom game")
-    status.setObjectName("CardStatus")
-    layout.addWidget(status)
-    layout.addSpacing(12)
-
-    actions = QHBoxLayout()
-    actions.setSpacing(6)
-    btn_play = QPushButton("Launch")
-    btn_play.setObjectName("Primary")
-    btn_play.setFixedHeight(38)
-    btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def launch_custom():
-        if not os.path.exists(exe_path):
-            QMessageBox.warning(self, "Launch Error", f"Executable not found:\n{exe_path}")
-            return
-        if sys.platform.startswith("win"):
-            try:
-                subprocess.Popen([exe_path] + launch_args_for(f"custom-{game_id}"), cwd=os.path.dirname(exe_path))
-            except Exception as e:
-                QMessageBox.warning(self, "Launch Game", f"Couldn't launch game: {e}")
-        elif sys.platform.startswith("linux"):
-            _launch_exe(self, exe_path, _custom_tool(game_id, compat_tool), _d3d_for(f"custom-{game_id}"),
-                        launch_args_for(f"custom-{game_id}"))
-
-    btn_play.clicked.connect(launch_custom)
-
-    more_btn = QPushButton("\u2022\u2022\u2022")
-    more_btn.setObjectName("MoreButton")
-    more_btn.setFixedSize(42, 38)
-    more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    menu = QMenu(more_btn)
-    more_btn.setMenu(menu)
-
-    def remove_custom_game():
-        games = [g for g in load_custom_games() if g.get("id") != game_id]
-        save_custom_games(games)
-        card.hide()
-        card.setParent(None)
-        card.deleteLater()
-        self.cards = [(c, t) for c, t in self.cards if c is not card]
-        self.apply_filter()
-
-    def switch_custom_tool():
-        games = load_custom_games()
-        entry = next((g for g in games if g.get("id") == game_id), None)
-        if entry is None:
-            return
-        picked = prompt_compat_tool(self, entry.get("compat_tool", ""), _d3d_for(f"custom-{game_id}"))
-        if picked is None:
-            return
-        entry["compat_tool"], d3d = picked
-        save_custom_games(games)
-        save_game_d3d(f"custom-{game_id}", d3d)
-        QMessageBox.information(self, "Compatibility Tool", "Compatibility settings updated for this game.")
-
-    if sys.platform.startswith("linux"):
-        menu.addAction("Switch Compatibility Tool").triggered.connect(switch_custom_tool)
-    menu.addAction("Remove from Library").triggered.connect(remove_custom_game)
-    menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(os.path.dirname(exe_path)))
-    menu.addAction("Install Common Redist").triggered.connect(
-        lambda _c=False: install_redist_for_game(
-            self, lambda: os.path.dirname(exe_path), os.path.basename(os.path.dirname(exe_path)) or "this game",
-            lambda: (exe_path, _custom_tool(game_id, compat_tool))))
-
-    actions.addWidget(btn_play, 1)
-    actions.addWidget(more_btn)
-    layout.addLayout(actions)
-
-    if not hasattr(self, "custom_cards"):
-        self.custom_cards = {}
-    self.custom_cards[game_id] = card
-    self.cards.append((card, title_text))
-
-AdaptiveApp.create_custom_card = _patched_create_custom_card
 
 class CompatToolDialog(QDialog):
     def __init__(self, current_tool, tools_dict, parent=None, current_d3d=""):
@@ -9135,7 +10862,7 @@ def find_existing_archive(prefixes):
             return os.path.join(DOWNLOAD_DIR, f)
     return None
 
-# ---------------------------------------------------------------- finding archive tools (7-Zip / WinRAR aren't on PATH on Windows)
+# ── finding archive tools (7-Zip / WinRAR aren't on PATH on Windows) ──
 _ARCHIVE_DIR_RE = re.compile(r"7-?zip|7z|winrar|rarlab|roshal|unrar|peazip|nanazip|bandizip|p7zip", re.I)
 _ARCHIVE_APP_RE = re.compile(r"7-?zip|winrar|unrar|peazip|nanazip|bandizip", re.I)
 _TOOL_CACHE = {}        # names -> (time found, [paths])
@@ -9186,7 +10913,7 @@ def _windows_tool_folders():
             folders.append(os.path.join(sc, "apps", app, "current"))
     choco = env("ChocolateyInstall") or os.path.join(env("ProgramData") or "C:\\ProgramData", "chocolatey")
     folders.append(os.path.join(choco, "bin"))
-    import glob
+    import glob    # lazy: saves memory/startup until used
     for pattern in (os.path.join(choco, "lib", "*7zip*", "tools"), os.path.join(choco, "lib", "*winrar*", "tools"),
                     os.path.join(choco, "lib", "*unrar*", "tools"), os.path.join(choco, "lib", "*peazip*", "tools"),
                     os.path.join(local, "Microsoft", "WinGet", "Packages", "*7zip*"),
@@ -9196,11 +10923,11 @@ def _windows_tool_folders():
         try:
             folders += glob.glob(pattern)
         except Exception:
-            pass
+            _log_exc("_windows_tool_folders")
     folders += [os.path.join(local, "Microsoft", "WinGet", "Links"), os.path.join(local, "Microsoft", "WindowsApps")]
     # the registry: install keys, App Paths, uninstall entries and file associations
     try:
-        import winreg
+        import winreg    # lazy: optional module: the except below handles it missing
         views = (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0))
         value_names = ("Path64", "Path", "exe64", "exe32", "InstallLocation", "InstallDir", "InstallPath")
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
@@ -9218,7 +10945,7 @@ def _windows_tool_folders():
                                 if d:
                                     folders.append(d)
                     except OSError:
-                        pass
+                        _log_exc("_windows_tool_folders")
             apps = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
             for exe in ("WinRAR.exe", "UnRAR.exe", "Rar.exe", "7zFM.exe", "7z.exe", "7zG.exe", "PeaZip.exe", "NanaZip.exe", "Bandizip.exe"):
                 for view in views:
@@ -9232,7 +10959,7 @@ def _windows_tool_folders():
                                 if d:
                                     folders.append(d)
                     except OSError:
-                        pass
+                        _log_exc("_windows_tool_folders")
             # Add/Remove Programs entries that look like an archiver
             unin = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
             for sub in (unin, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
@@ -9263,7 +10990,7 @@ def _windows_tool_folders():
                             except OSError:
                                 continue
                 except OSError:
-                    pass
+                    _log_exc("_windows_tool_folders")
         for cls in (r"WinRAR\shell\open\command", r"7-Zip.7z\shell\open\command", r"7-Zip.zip\shell\open\command",
                     r"WinRAR.RAR\shell\open\command", r"WinRAR.ZIP\shell\open\command",
                     r"Applications\7zFM.exe\shell\open\command", r"Applications\WinRAR.exe\shell\open\command"):
@@ -9273,8 +11000,8 @@ def _windows_tool_folders():
                     if d:
                         folders.append(d)
             except OSError:
-                pass
-    except ImportError:
+                _log_exc("_windows_tool_folders")
+    except ImportError:    # expected: optional module may be missing
         pass
     # last resort: look at what's actually inside the install roots (odd names like "7-Zip 24.09" or "RARLAB\\WinRAR"),
     # two levels deep at most so this stays quick
@@ -9298,7 +11025,7 @@ def _windows_tool_folders():
                                     if e2.is_dir(follow_symlinks=False):
                                         folders.append(e2.path)
                         except OSError:
-                            pass
+                            _log_exc("_windows_tool_folders")
         except OSError:
             continue
     return folders
@@ -9312,7 +11039,7 @@ def _tool_folders(force=False):
         try:
             folders.append(getter())
         except Exception:
-            pass
+            _log_exc("_tool_folders")
     for base in (ASSETS_DIR, os.path.join(SCRIPT_DIR, "tools"), SCRIPT_DIR):
         folders.append(base)
         for sub in ("7z", "7-Zip", "7zip", "WinRAR", "unrar", "tools", "bin"):
@@ -9321,7 +11048,7 @@ def _tool_folders(force=False):
         try:
             folders += _windows_tool_folders()
         except Exception:
-            pass
+            _log_exc("_tool_folders")
     else:
         home = os.path.expanduser("~")
         folders += ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", "/snap/bin",
@@ -9346,7 +11073,7 @@ def find_all_tools(*names, refresh=False):
     key = tuple(n.lower() for n in names)
     hit = _TOOL_CACHE.get(key)
     if not refresh and hit and (hit[1] or time.time() - hit[0] < _TOOL_MISS_TTL):
-        return [p for p in hit[1] if os.path.isfile(p)] or ([] if hit[1] else [])
+        return [p for p in hit[1] if os.path.isfile(p)] or []
     found, seen = [], set()
 
     def add(path):
@@ -9479,14 +11206,14 @@ def extract_archive(dest_path, extract_dir):
             with open(dest_path, 'rb') as f:
                 if f.read(7).startswith(b'Rar!\x1a\x07'):
                     is_rar = True
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
 
     if is_rar:
         if _extract_with_tools(dest_path, extract_dir):
             return
         try:  # last resort: the rarfile package, pointed at whatever extractor we found
-            import rarfile
+            import rarfile    # lazy: saves memory/startup until used
             for attr, names in (("UNRAR_TOOL", ("unrar", "UnRAR")), ("SEVENZIP_TOOL", ("7z", "7za", "7zz")),
                                 ("UNAR_TOOL", ("unar",)), ("BSDTAR_TOOL", ("bsdtar", "tar"))):
                 found = find_tool(*names)
@@ -9501,7 +11228,7 @@ def extract_archive(dest_path, extract_dir):
             with rarfile.RarFile(dest_path) as rf:
                 rf.extractall(extract_dir)
             return
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
         if sys.platform.startswith("win"):
             hint = "Install 7-Zip (7-zip.org) or WinRAR, then try again. If it's already installed, reinstall it so it's registered."
@@ -9517,72 +11244,9 @@ def extract_archive(dest_path, extract_dir):
 
     raise ValueError("Downloaded file is neither a valid ZIP nor a supported RAR archive.")
 
-# --- Update install triggers to check for existing .rar archives ---
-def _patched_start_ae_install(self):
-    existing_archive = find_existing_archive(("five nights at ncz ae", "fnancz_ae", "fnanczae"))
-    version_url = GAME_INFO["ae"]["version_url"]
-    linux_cmd = GAME_INFO["ae"]["linux_cmd"]
-    cover_path = asset_path("fnanczaecover.png")
 
-    existing_zip_path = None
-    if existing_archive:
-        file_name = os.path.basename(existing_archive)
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = existing_archive
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(existing_archive)
-                except Exception:
-                    pass
-        else:
-            return
 
-    card_widget = GameDownloadCard("ae", AE_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ae_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
 
-AdaptiveApp.start_ae_install = _patched_start_ae_install
-
-def _patched_start_ncz2_install(self):
-    existing_archive = find_existing_archive(("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"))
-    version_url = GAME_INFO["ncz2"]["version_url"]
-    linux_cmd = GAME_INFO["ncz2"]["linux_cmd"]
-    cover_path = asset_path("fnancz2cover.png")
-
-    existing_zip_path = None
-    if existing_archive:
-        file_name = os.path.basename(existing_archive)
-        dlg = ExistingFileDialog(file_name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.choice == "use":
-                existing_zip_path = existing_archive
-            elif dlg.choice == "overwrite":
-                try:
-                    os.remove(existing_archive)
-                except Exception:
-                    pass
-        else:
-            return
-
-    card_widget = GameDownloadCard("ncz2", NCZ2_GAME_NAME, version_url, linux_cmd, 0, cover_path, self, existing_zip_path=existing_zip_path)
-    
-    def on_dl_finished(_path):
-        self.update_ncz2_button_state()
-    card_widget.worker.finished.connect(on_dl_finished)
-    
-    self.downloads_page.add_download_card(card_widget)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp.start_ncz2_install = _patched_start_ncz2_install
 
 class FirebaseDownloadWorker(QThread):
     progress = pyqtSignal(object, object, float)
@@ -9604,7 +11268,7 @@ class FirebaseDownloadWorker(QThread):
         if self._response:
             try:
                 self._response.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     # run() is assigned further down (FirebaseDownloadWorker.run = ...)
@@ -9645,7 +11309,7 @@ def _new_fb_run(self):
                 head_req = urllib.request.Request(self.download_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(head_req, timeout=10, context=_NCZ_SSL_CTX) as head_resp:
                     total_size = int(head_resp.headers.get('Content-Length', 0))
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
 
         if self._is_cancelled:
@@ -9662,7 +11326,7 @@ def _new_fb_run(self):
             if dest_path and os.path.exists(dest_path):
                 try:
                     os.remove(dest_path)
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
             self.failed.emit("CANCELLED")
             return
@@ -9702,7 +11366,7 @@ PW_HEADLESS = True                                     # True hides the browser;
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
 
-# ---------------------------------------------------------------- "Ask every time": pick the server in a popup for each download
+# ── "Ask every time": pick the server in a popup for each download ──
 PW_SERVER_NAMES = {"1": ("SteamRIP", "direct download"), "2": ("FitGirl", "repacked torrent"),
                    "3": ("AnkerGames", "direct download after a captcha")}
 
@@ -9785,12 +11449,13 @@ class _ServerAsker(QObject):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 box["v"] = dlg.chosen
         except Exception:
-            pass
+            _log_exc("_show")
         finally:
             ev.set()
 
 _PW_ASKER = _ServerAsker()
 
+# kept: used at import time before the later definition at line 31965
 def _pw_ask_server(worker):
     """Called from the download thread: shows the popup in the GUI thread and waits for the pick."""
     box, ev = {"v": ""}, threading.Event()
@@ -9819,6 +11484,7 @@ PW_SLUG_OVERRIDES_3 = (
 
 _pw_tls = threading.local()      # the server picked in the "Ask every time" popup, per download thread
 
+# kept: used at import time before the later definition at line 31959
 def pw_server():
     v = getattr(_pw_tls, "server", None)
     if v in ("1", "2", "3"):
@@ -9874,7 +11540,7 @@ def _pw_wait_captcha(self, pg):
     try:
         pg.bring_to_front()
     except Exception:
-        pass
+        _log_exc("_pw_wait_captcha")
     deadline = time.time() + 600
     while _pw_captcha_shown(pg):
         if self._is_cancelled:
@@ -9954,14 +11620,14 @@ def _pw_guard(context, page):
                     pg.go_back()
                 else:
                     pg.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         pg.on("framenavigated", on_nav)
         if pg is not page and not ok(pg.url):  # popup that was already on a bad site
             state["blocked"].append(pg.url)
             try:
                 pg.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
     watch(page)
     context.on("page", watch)
@@ -9991,7 +11657,7 @@ def _pw_visible_labels(pg):
                 t = (el.inner_text() or el.get_attribute("value") or "").strip().replace("\n", " ")
                 if t:
                     out.append(t[:30])
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     return out[:10]
 
@@ -10036,7 +11702,7 @@ def _pw_is_ncz(title):
 def _pw_find_link(self, start_url):
     """Returns (download_url, headers) copied from the browser."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright    # lazy: optional module: the except below handles it missing
     except ImportError:
         raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
     with sync_playwright() as p:
@@ -10143,7 +11809,7 @@ def _pw_find_link(self, start_url):
                         try:
                             btn.click()
                         except Exception:
-                            pass
+                            _log_exc("_pw_find_link")
                 if "d" not in got:
                     raise RuntimeError("The download didn't start.")
                 download = got["d"]
@@ -10155,7 +11821,7 @@ def _pw_find_link(self, start_url):
             cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(url))
             try:
                 download.cancel()  # the launcher downloads it itself
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             headers = {"User-Agent": PW_USER_AGENT, "Referer": target.url}
             if cookies:
@@ -10164,7 +11830,7 @@ def _pw_find_link(self, start_url):
         finally:
             browser.close()
 
-# ---------------------------------------------------------------- build numbers (server 1 update check)
+# ── build numbers (server 1 update check) ──
 _BUILD_RX = re.compile(r"\(?\bbuild\s*#?\s*([0-9][\w.\-]*)", re.IGNORECASE)
 
 def parse_build(text):
@@ -10232,7 +11898,7 @@ def fetch_site_build(title, server="1"):
     except Exception:
         return ""
 
-# ---------------------------------------------------------------- server 3: Download, Download, then your own browser on a redirect / new tab
+# ── server 3: Download, Download, then your own browser on a redirect / new tab ──
 class _PwRedirect(Exception):
     """The site redirected us off itself or opened a new tab (captcha / verification). args[0] is that page."""
 
@@ -10247,7 +11913,7 @@ def _pw_s3_dismiss(pg):
             pg.wait_for_timeout(500)
             return True
     except Exception:
-        pass
+        _log_exc("_pw_s3_dismiss")
     return False
 
 def _pw_s3_press_download(pg, exact=False):
@@ -10275,7 +11941,7 @@ def _pw_s3_attempt(self, start_url):
     game page (a redirect, or a new tab), _PwRedirect is raised with that page (it is then finished in the user's
     own browser).
     If a download starts right in the hidden browser instead, returns (download_url, headers)."""
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright    # lazy: saves memory/startup until used
     got = {}
 
     def norm(url):
@@ -10320,7 +11986,7 @@ def _pw_s3_attempt(self, start_url):
                         if moved(page.url):
                             return page.url
                 except Exception:
-                    pass
+                    _log_exc("find_redirect")
                 for pg in list(context.pages):
                     if pg is page or pg.is_closed() or not moved(pg.url):   # still about:blank / original page: skip
                         continue
@@ -10328,7 +11994,7 @@ def _pw_s3_attempt(self, start_url):
                         pg.wait_for_load_state("domcontentloaded", timeout=8000)
                         pg.wait_for_timeout(1500)
                     except Exception:
-                        pass
+                        _log_exc("find_redirect")
                     if not pg.is_closed() and moved(pg.url):
                         return pg.url
                 return ""
@@ -10389,7 +12055,7 @@ def _pw_s3_attempt(self, start_url):
             cookies = "; ".join(f"{c['name']}={c['value']}" for c in src.context.cookies(url))
             try:
                 download.cancel()      # the launcher downloads it itself
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             headers = {"User-Agent": PW_USER_AGENT, "Referer": src.url or start_url}
             if cookies:
@@ -10405,8 +12071,8 @@ _PW_ARCHIVE_EXT = (".zip", ".rar", ".7z")
 
 def _win_downloads_dir():
     try:
-        import ctypes
-        from ctypes import wintypes
+        import ctypes    # lazy: saves memory/startup until used
+        from ctypes import wintypes    # lazy: saves memory/startup until used
         class GUID(ctypes.Structure):
             _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
                         ("Data4", ctypes.c_ubyte * 8)]
@@ -10416,7 +12082,7 @@ def _win_downloads_dir():
             path = buf.value
             ctypes.windll.ole32.CoTaskMemFree(buf)
             return path or ""
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     return ""
 
@@ -10446,9 +12112,9 @@ def _pw_list_files(dirs):
                             st = e.stat()
                             out[e.path] = (st.st_size, st.st_mtime)
                     except OSError:
-                        pass
+                        _log_exc("_pw_list_files")
         except OSError:
-            pass
+            _log_exc("_pw_list_files")
     return out
 
 def _pw_s3_browser_handoff(self, url, wait_minutes=30):
@@ -10542,7 +12208,7 @@ def _pw_adopt_local_file(path):
         if os.stat(path).st_dev == os.stat(DOWNLOAD_DIR).st_dev:
             os.replace(path, dest)
             return dest
-    except OSError:
+    except OSError:    # expected: cleanup that may already be done
         pass
     return path
 
@@ -10565,7 +12231,7 @@ def _pw_real_browser_exe():
     return next((c for c in cands if c and os.path.isfile(c)), "")
 
 def _pw_free_port():
-    import socket
+    import socket    # lazy: saves memory/startup until used
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         return sk.getsockname()[1]
@@ -10573,7 +12239,7 @@ def _pw_free_port():
 class _MiniWS:
     """Tiny WebSocket client (no extra package needed), just enough to talk to Chrome's DevTools port."""
     def __init__(self, host, port, path):
-        import socket, base64 as _b64
+        import socket, base64 as _b64    # lazy: saves memory/startup until used
         self.sock = socket.create_connection((host, port), timeout=10)
         key = _b64.b64encode(os.urandom(16)).decode()
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -10614,7 +12280,7 @@ class _MiniWS:
 
     def recv(self, timeout=1.0):
         """Next text message, or None if nothing arrived within timeout."""
-        import select
+        import select    # lazy: saves memory/startup until used
         if not self.buf and not select.select([self.sock], [], [], timeout)[0]:
             return None
         msg = b""
@@ -10639,7 +12305,7 @@ class _MiniWS:
     def close(self):
         try:
             self.sock.close()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
 def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
@@ -10717,7 +12383,7 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
                 pages = [t for t in json.loads(r.read().decode()) if t.get("type") == "page" and str(t.get("url", "")).startswith("http")]
             if pages:
                 ref = pages[-1]["url"]
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         host = (urllib.parse.urlparse(dl_url).hostname or "").lower()
         path = urllib.parse.urlparse(dl_url).path or "/"
@@ -10736,7 +12402,7 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
             ws.close()
         try:
             proc.terminate()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
 def _pw_find_link_s3(self, start_url):
@@ -10780,7 +12446,7 @@ def _pw_scan_magnet(page):
 def _pw_find_magnet(self, start_url):
     """Server 2: opens the game page in the hidden browser, presses [magnet], returns the magnet link."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright    # lazy: optional module: the except below handles it missing
     except ImportError:
         raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
     with sync_playwright() as p:
@@ -10815,7 +12481,7 @@ def _fb_torrent(self, magnet):
     """Downloads a magnet link with libtorrent into <downloads>/<title>.torrent (re-running resumes it).
     Returns (staging_dir, content_path)."""
     try:
-        import libtorrent as lt
+        import libtorrent as lt    # lazy: optional module: the except below handles it missing
     except ImportError:
         raise RuntimeError("libtorrent isn't installed. Run: pip install libtorrent")
     stage = os.path.join(DOWNLOAD_DIR, sanitize_folder_name(self.title) + ".torrent")
@@ -10859,7 +12525,7 @@ def _fb_torrent(self, magnet):
             if handle is not None:
                 ses.remove_torrent(handle)   # no seeding
         except Exception:
-            pass
+            _log_exc("_fb_torrent")
         del ses
 
 def _find_setup_exe(folder):
@@ -10878,22 +12544,8 @@ def _find_setup_exe(folder):
                     best = (key, os.path.join(root, f))
     return best[1] if best else None
 
-def _run_setup_exe(exe):
-    """Starts the installer (directly on Windows, through wine on Linux). Returns True if it was started."""
-    try:
-        cwd = os.path.dirname(exe)
-        if sys.platform.startswith("win"):
-            os.startfile(exe)
-            return True
-        found = find_wine()
-        if not found:
-            return False
-        launch_wine(found[0], exe, cwd)
-        return True
-    except Exception:
-        return False
 
-# ---------------------------------------------------------------- server 2: run setup.exe, find where it installed, find the game .exe
+# ── server 2: run setup.exe, find where it installed, find the game .exe ──
 def installed_exes_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "installed_exes.json")
 
@@ -10927,7 +12579,7 @@ def find_best_game_exe(root, title):
         if exe and os.path.isfile(exe):
             return exe
     except Exception:
-        pass
+        _log_exc("find_best_game_exe")
     return _find_best_game_exe_orig(root, title)
 
 def installed_exe_for(title):
@@ -10958,7 +12610,7 @@ def locate_installed_game(parent, title, start=""):
     try:
         invalidate_library_roots()
     except Exception:
-        pass
+        _log_exc("locate_installed_game")
     return True
 
 _SETUP_BAD_EXE = ("unins", "uninstall", "crash", "redist", "dxsetup", "dxwebsetup", "setup", "install", "updater",
@@ -10998,7 +12650,7 @@ def _too_broad(p):
     try:
         broad += library_roots()
     except Exception:
-        pass
+        _log_exc("_too_broad")
     if os.environ.get("LOCALAPPDATA"):
         broad.append(os.path.join(os.environ["LOCALAPPDATA"], "Programs"))
     return any(b and _norm(b) == n for b in broad)
@@ -11034,7 +12686,7 @@ def _uninstall_snapshot():
     if not sys.platform.startswith("win"):
         return out
     try:
-        import winreg
+        import winreg    # lazy: optional module: the except below handles it missing
     except ImportError:
         return out
     path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
@@ -11060,10 +12712,10 @@ def _uninstall_snapshot():
                             try:
                                 d[v] = str(winreg.QueryValueEx(sub, v)[0])
                             except OSError:
-                                pass
+                                _log_exc("_uninstall_snapshot")
                         out[(int(hive), flag, name)] = d
                 except OSError:
-                    pass
+                    _log_exc("_uninstall_snapshot")
     return out
 
 def _uninstall_entry_dir(d):
@@ -11089,13 +12741,13 @@ def _watch_roots():
         if os.environ.get("LOCALAPPDATA"):
             roots.append((os.path.join(os.environ["LOCALAPPDATA"], "Programs"), 2))
         try:
-            import ctypes
+            import ctypes    # lazy: saves memory/startup until used
             mask = ctypes.windll.kernel32.GetLogicalDrives()
             for i in range(26):
                 drv = chr(65 + i) + ":\\"
                 if mask & (1 << i) and ctypes.windll.kernel32.GetDriveTypeW(drv) == 3:   # fixed drives only
                     roots.append((drv, 1))
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
     else:
         c = os.path.join(_wine_prefix(), "drive_c")
@@ -11103,7 +12755,7 @@ def _watch_roots():
     try:
         roots += [(r, 1) for r in library_roots()]
     except Exception:
-        pass
+        _log_exc("_watch_roots")
     return roots
 
 def _dir_snapshot(roots):
@@ -11118,9 +12770,9 @@ def _dir_snapshot(roots):
                             if depth > 1:
                                 walk(e.path, depth - 1)
                     except OSError:
-                        pass
+                        _log_exc("walk")
         except OSError:
-            pass
+            _log_exc("walk")
     for r, d in roots:
         walk(r, d)
     return seen
@@ -11135,8 +12787,8 @@ def _start_setup(exe):
         except OSError as e:
             if getattr(e, "winerror", 0) != 740:        # 740 = needs elevation
                 raise
-        import ctypes
-        from ctypes import wintypes
+        import ctypes    # lazy: saves memory/startup until used
+        from ctypes import wintypes    # lazy: saves memory/startup until used
         class SEI(ctypes.Structure):
             _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG), ("hwnd", wintypes.HWND),
                         ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
@@ -11169,7 +12821,7 @@ def _run_setup_and_find_install(worker, setup_exe, title):
     Returns (started, install_dir, game_exe)."""
     setup_dir = os.path.dirname(setup_exe)
     try:
-        import psutil
+        import psutil    # lazy: saves memory/startup until used
     except Exception:
         psutil = None
     reg_before = _uninstall_snapshot()
@@ -11186,7 +12838,7 @@ def _run_setup_and_find_install(worker, setup_exe, title):
         known, idle = {}, 0
         try:
             known[pid] = psutil.Process(pid)
-        except Exception:
+        except Exception:    # expected: the process may already have exited
             pass
         while idle < 3:                 # ~2s with nothing alive = the installer is really done
             if getattr(worker, "_is_cancelled", False):
@@ -11203,7 +12855,7 @@ def _run_setup_and_find_install(worker, setup_exe, title):
                         d = os.path.dirname(f.path)
                         if d not in observed and not _ignored_install_path(d, setup_dir):
                             observed.append(d)
-                except Exception:
+                except Exception:    # expected: the process may already have exited
                     pass
             idle = 0 if alive else idle + 1
             time.sleep(0.7)
@@ -11244,7 +12896,7 @@ def _delete_folder_async(path):
         try:
             os.chmod(p, 0o700)
             func(p)
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
     threading.Thread(target=lambda: shutil.rmtree(path, onerror=onerr), daemon=True).start()
 
@@ -11321,13 +12973,13 @@ def _fb_pw_run(self):
             try:
                 record_installed_build(self.title, getattr(self, "_pw_build", "") or "")
             except Exception:
-                pass
+                _log_exc("_fb_pw_run")
         elif pw_server() == "3":
             try:
                 ver = getattr(self, "_pw_build", "") or fetch_site_build(self.title, "3").removeprefix(S3_BUILD_PREFIX)
                 if ver:
                     record_installed_build(self.title, S3_BUILD_PREFIX + ver)
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
         self.finished.emit(dest_path)
     except Exception as e:
@@ -11338,13 +12990,13 @@ def _fb_pw_run(self):
             return
         msg = str(e)
         try:  # keep the full traceback so customers can send it over
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             log = os.path.join(os.path.dirname(get_launcher_settings_path()), "download_error.log")
             with open(log, "a", encoding="utf-8") as f:
                 f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} | {self.title} | Python {sys.version.split()[0]}\n")
                 f.write(traceback.format_exc() + "\n")
             msg += f"\n\nFull details saved to:\n{log}"
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
         self.failed.emit(msg)
 
@@ -11399,7 +13051,7 @@ def _card_on_finished_setup(self, path):
         try:
             invalidate_library_roots()
         except Exception:
-            pass
+            _log_exc("_card_on_finished_setup")
 DownloadCard.on_finished = _card_on_finished_setup
 
 
@@ -11417,7 +13069,7 @@ def _new_game_worker_run(self):
             if downloaded_here and dest_path and os.path.exists(dest_path):
                 try:
                     os.remove(dest_path)
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
             self.failed.emit("CANCELLED")
             return
@@ -11436,7 +13088,7 @@ def _new_game_worker_run(self):
             if downloaded_here:
                 try:
                     os.remove(dest_path)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
         elif sys.platform.startswith("linux") and self.linux_cmd:
             self.status_update.emit("Linux Conversion Script Running...\nPlease complete installation in the new terminal window.")
@@ -11607,36 +13259,14 @@ class SteamStorePickerDialog(QDialog):
                 saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
                 shutil.copyfile(cover_path, saved_cover)
             except Exception:
-                pass
+                _log_exc("on_card_clicked")
 
         cfg_dlg = AddExistingGameConfigDialog(appid, title, saved_cover, self)
         if cfg_dlg.exec() == QDialog.DialogCode.Accepted and cfg_dlg.result_data:
             self.selected_game = cfg_dlg.result_data
             self.accept()
 
-def _open_add_existing_game_dialog(self):
-    dlg = SteamStorePickerDialog(self)
-    if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_game:
-        data = dlg.selected_game
-        appid = data["appid"]
-        title = data["title"]
-        cover_path = data["cover"]
-        exe_path = data["exe_path"]
-        compat_tool = data["compat_tool"]
 
-        games = [g for g in load_steam_library() if g["appid"] != appid]
-        games.append({"appid": appid, "title": title, "cover": cover_path, "exe_path": exe_path})
-        save_steam_library(games)
-
-        if compat_tool:
-            compat_config = load_compat_config()
-            compat_config[str(appid)] = compat_tool
-            save_compat_config(compat_config)
-
-        self.create_steam_card(appid, title, cover_path)
-        self.apply_filter()
-
-AdaptiveApp.open_add_existing_game_dialog = _open_add_existing_game_dialog
 
 AdaptiveApp._original_create_steam_card_compat = AdaptiveApp.create_steam_card
 
@@ -11661,7 +13291,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
 
             try:
                 btn_play.clicked.disconnect()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
             def launch_existing_game():
@@ -11690,7 +13320,7 @@ def _patched_create_steam_card_combined(self, appid, title_text, cover_path):
 
                     menu.addAction("Switch Compatibility Tool").triggered.connect(open_compat_dialog)
 
-AdaptiveApp.create_steam_card = _patched_create_steam_card_combined
+AdaptiveApp.create_steam_card = _patched_create_steam_card_combined    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
 # Every custom-card patch before this one was removed; wrap the plain library page.
 AdaptiveApp._true_original_build_library_page = AdaptiveApp.build_library_page
@@ -11745,9 +13375,9 @@ def _unified_build_library_page(self):
     self.apply_filter()
     return widget
 
-AdaptiveApp.build_library_page = _unified_build_library_page
+AdaptiveApp.build_library_page = _unified_build_library_page    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
-# ================================================================ friends system
+# ── friends system ──
 import secrets as _secrets
 
 FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -11770,7 +13400,7 @@ def friend_code_cached():
             data = json.load(f)
         if data.get("uid") == acct["uid"]:
             return str(data.get("code") or "")
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return ""
 
@@ -11832,7 +13462,27 @@ def friends_library_titles():
             titles.append(t)
     return [pretty_game_name(t) for t in titles]
 
+_NOT_A_GAME_EXE = re.compile(r"^(setup|install|installer|unins\w*|uninstall\w*|vc_?redist\w*|dxsetup|dxwebsetup|dotnet\w*|"
+                             r"7z\w*|7-?zip\w*|nanazip\w*|peazip\w*|winrar|unrar|rar|unar|bsdtar|tar|unzip|msiexec|"
+                             r"explorer|cmd|powershell|pwsh|wget|curl|xdg-open)(\.exe|\.sh|\.bat|\.cmd)?$", re.I)
+_ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".part", ".tar", ".gz", ".xz", ".zst", ".torrent")
+
+def _is_not_a_game_launch(args):
+    """setup.exe / extractors / anything that just touches an archive is not 'playing' a game."""
+    try:
+        first = next((a for a in args if isinstance(a, str) and a), "")
+        if _NOT_A_GAME_EXE.match(re.split(r"[\\/]", first.strip('"'))[-1]):
+            return True
+        for a in args:
+            if isinstance(a, str) and a.lower().strip('"').endswith(_ARCHIVE_EXTS):
+                return True
+    except Exception:
+        pass
+    return False
+
 def _game_name_for_args(args):
+    if _is_not_a_game_launch(args):
+        return None
     known = {}
     try:
         fan = load_fan_library()
@@ -11894,7 +13544,7 @@ def _watch_game(name, proc, folder, t0):
     """Blocks until the game is really over. Unlike proc.wait() this survives a launcher/stub that starts the real
     .exe and quits: any process started by the game (even after its parent died), or started from the game's folder
     after the launch, keeps the game counted as running. Over once nothing is left for _TRACK_GRACE seconds."""
-    import psutil
+    import psutil    # lazy: saves memory/startup until used
     me = os.getpid()
     fol = (folder + os.sep) if folder else None
     members = {}
@@ -11902,7 +13552,7 @@ def _watch_game(name, proc, folder, t0):
     rejected = {}                 # pid -> create_time of processes already checked and found unrelated
     try:
         members[proc.pid] = psutil.Process(proc.pid)
-    except psutil.Error:
+    except psutil.Error:    # expected: the process may already have exited
         pass
     _tracked_members[name] = members
 
@@ -11928,7 +13578,7 @@ def _watch_game(name, proc, folder, t0):
                 if p_.is_running() and p_.status() != psutil.STATUS_ZOMBIE:
                     alive[pid] = p_
                     stack.append(p_)
-            except psutil.Error:
+            except psutil.Error:    # expected: the process may already have exited
                 pass
         while stack:                                   # everything the game started
             p_ = stack.pop()
@@ -11953,7 +13603,7 @@ def _watch_game(name, proc, folder, t0):
                         ever.add(pid)
                         continue
                 rejected[pid] = ct
-        except Exception:
+        except Exception:    # expected: the process may already have exited
             pass
         members.clear()
         members.update(alive)
@@ -11965,14 +13615,14 @@ def _watch_game(name, proc, folder, t0):
             try:
                 proc.poll()                            # also reaps the original process
             except Exception:
-                pass
+                _log_exc("_watch_game")
             try:
                 ok = refresh()
             except Exception:
                 ok = proc.poll() is None
             if ok:
                 gone_at = None
-                time.sleep(1.0)
+                time.sleep(1.0 if time.time() - t0 < 60 else 3.0)     # every process on the PC is scanned: 1 s only at first
             else:
                 if gone_at is None:
                     gone_at = time.time()
@@ -11983,6 +13633,7 @@ def _watch_game(name, proc, folder, t0):
         if _tracked_members.get(name) is members:
             del _tracked_members[name]
 
+# kept: used at import time before the later definition at line 26355
 def _track_playing(name, proc, folder=None):
     name = pretty_game_name(name)
     _running[name] = proc
@@ -12002,7 +13653,7 @@ def _track_playing(name, proc, folder=None):
         except Exception:
             try:
                 proc.wait()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         if _running.get(name) is proc:
             del _running[name]
@@ -12024,7 +13675,7 @@ class _TrackedPopen(_RealPopen):
                 if name:
                     _track_playing(name, self, _game_folder_for(args, k.get("cwd")))
         except Exception:
-            pass
+            _log_exc("__init__")
 
 subprocess.Popen = _TrackedPopen
 
@@ -12082,7 +13733,7 @@ def library_cover_paths():
     NCZ games (assets folder), store games + Add Existing Game, and custom games."""
     out = {}
     for name, fname in ((AE_GAME_NAME, "fnanczaecover.png"), (NCZ2_GAME_NAME, "fnancz2cover.png"),
-                        (NCZTR_GAME_NAME, "fnancz-tr.png"), ("NCZFront", "nczfront-cover.png")):
+                        ("NCZFront", "nczfront-cover.png")):
         path = asset_path(fname)
         if os.path.exists(path):
             out[pretty_game_name(name)] = path
@@ -12127,7 +13778,7 @@ def workshop_mods_for_game(appid):
             if d["appid"] == appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"])):
                 out.append({"id": str(d["id"]), "title": str(d.get("title") or "")[:120]})
     except Exception:
-        pass
+        _log_exc("workshop_mods_for_game")
     return out
 
 def workshop_parse_mods(raw):
@@ -12153,7 +13804,7 @@ def cloud_publish_presence():
             return
         try:
             cloud_autoset_country()
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         token, uid = get_id_token()
         username, avatar = load_profile_cache()
@@ -12190,7 +13841,7 @@ def cloud_publish_presence():
             if isinstance(srv, (int, float)) and srv > 0:
                 _clock_skew["ms"] = srv - (t0 + (time.time() * 1000 - t0) / 2)
         except Exception:
-            pass
+            _log_exc("cloud_publish_presence")
         if full:
             try:
                 cloud_publish_covers(token, uid)
@@ -12333,11 +13984,15 @@ def cloud_fetch_last_messages(friend_ids):
                 if isinstance(data[k], dict):
                     return fid, (k, data[k])
             return fid, ("", None)       # fetched fine, the chat is just empty (a failed fetch returns None below)
-        except CloudError:
+        except CloudError:    # expected: offline or timed out
             pass
         return fid, None
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return {f: v for f, v in ex.map(one, friend_ids) if v}
+    global _msg_pool
+    if _msg_pool is None:               # one pool for the 2 s poll (it made a new 6-thread pool every time); its threads
+        _msg_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ncz-msgs")    # keep their HTTPS connections
+    return {f: v for f, v in _msg_pool.map(one, friend_ids) if v}
+
+_msg_pool = None
 
 CHAT_MAX_ATTACH = 4
 CHAT_IMAGE_MAX_SIDE = 4096                  # only used when a pasted/odd-format image has to be re-encoded
@@ -12364,7 +14019,7 @@ def chat_media_dir():
     os.makedirs(path, exist_ok=True)
     return path
 
-# ---- Steam game invites: a chat message whose text is a marker + a small json (works with the existing chat storage).
+# ── Steam game invites: a chat message whose text is a marker + a small json (works with the existing chat storage).
 # Accepting one opens the steam:// link, which is exactly what Steam itself does: Steam starts the game (if it isn't
 # running) and hands it the join info.
 INVITE_MARK = "::ncz-invite::"
@@ -12421,7 +14076,7 @@ def parse_invite(text):
         return None
     return {"game": game, "link": link, "appid": appid, "key": key}
 
-# ---- automatic invites: the game being played, its cover and (when Steam knows it) the join link are all found for you.
+# ── automatic invites: the game being played, its cover and (when Steam knows it) the join link are all found for you.
 import weakref as _weakref
 
 def _steam_appid_for_title(title):
@@ -12445,10 +14100,10 @@ def _steam_root_dirs():
     dirs = []
     if sys.platform.startswith("win"):
         try:
-            import winreg
+            import winreg    # lazy: saves memory/startup until used
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
                 dirs.append(winreg.QueryValueEx(k, "SteamPath")[0])
-        except Exception:
+        except Exception:    # expected: optional module may be missing
             pass
         for env in ("ProgramFiles(x86)", "ProgramFiles"):
             base = os.environ.get(env)
@@ -12501,15 +14156,17 @@ def steam_profile_join(sid):
             m = re.search(r"steam://(?:joinlobby|connect)/[A-Za-z0-9.:/_+\-]{1,120}", page)
             if m:
                 out["link"] = normalize_steam_join(m.group(0))
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
     out.setdefault("link", "")
     return out if out.get("name") or out.get("appid") else {}
 
 _invite_debug = []
 def _invite_log(msg):
-    print("invite: " + msg)
+    _ncz_log("invite: " + msg)
     _invite_debug.append(msg)
+    if len(_invite_debug) > 300:            # it grew with every invite line for as long as the launcher ran
+        del _invite_debug[:-300]
 
 def steam_webapi_join(sid):
     """Steam Web API (needs the free key in settings + public 'Game details'): the lobby/server you're in right now
@@ -12558,7 +14215,7 @@ def _steam_lib_dirs():
         try:
             with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
                 libs += [p.replace("\\\\", "\\") for p in re.findall(r'"path"\s*"([^"]+)"', f.read())]
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
     out = []
     for d in libs:
@@ -12614,7 +14271,7 @@ def running_steam_appids():
     ids = []
     if sys.platform.startswith("win"):
         try:
-            import winreg
+            import winreg    # lazy: saves memory/startup until used
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
                 v = int(winreg.QueryValueEx(k, "RunningAppID")[0])
                 if v:
@@ -12632,8 +14289,8 @@ def running_steam_appids():
                             if sub.isdigit() and int(winreg.QueryValueEx(sk, "Running")[0]) and int(sub) not in ids:
                                 ids.append(int(sub))
                     except Exception:
-                        pass
-        except Exception:
+                        _log_exc("running_steam_appids")
+        except Exception:    # expected: optional module may be missing
             pass
     else:
         home = os.path.expanduser("~")
@@ -12651,54 +14308,6 @@ def running_steam_appids():
                     ids.append(int(aid))
     return ids
 
-def _appid_from_game_folder(folder):
-    """AppID of a game the launcher started itself (not Steam): steam_appid.txt next to the game, or the Steam library
-    folder it lives in (steamapps/common/<installdir> -> its appmanifest)."""
-    if not folder or not os.path.isdir(folder):
-        return 0
-    base = os.path.abspath(folder)
-    for root, dirs, files in os.walk(base):
-        if root[len(base):].count(os.sep) >= 2:
-            dirs[:] = []
-        if "steam_appid.txt" in files:
-            try:
-                with open(os.path.join(root, "steam_appid.txt"), encoding="utf-8", errors="replace") as f:
-                    t = f.read().strip()
-                if t.isdigit() and int(t):
-                    return int(t)
-            except OSError:
-                pass
-    parts = base.replace("\\", "/").split("/")
-    if "steamapps" in parts and "common" in parts:
-        i = parts.index("common")
-        if i + 1 < len(parts):
-            steamapps, inst = "/".join(parts[:i]), parts[i + 1]
-            try:
-                for fn in os.listdir(steamapps):
-                    m = re.fullmatch(r"appmanifest_(\d+)\.acf", fn)
-                    if not m:
-                        continue
-                    with open(os.path.join(steamapps, fn), encoding="utf-8", errors="replace") as f:
-                        im = re.search(r'"installdir"\s*"([^"]*)"', f.read())
-                    if im and im.group(1).casefold() == inst.casefold():
-                        return int(m.group(1))
-            except OSError:
-                pass
-    return 0
-
-def _steam_name_for_appid(appid):
-    for lib in _steam_lib_dirs():
-        try:
-            with open(os.path.join(lib, "steamapps", f"appmanifest_{appid}.acf"), encoding="utf-8", errors="replace") as f:
-                m = re.search(r'"name"\s*"([^"]+)"', f.read())
-        except OSError:
-            continue
-        if m:
-            return pretty_game_name(m.group(1))[:60]
-    for g in load_steam_library():
-        if g.get("appid") == appid and g.get("title"):
-            return pretty_game_name(g["title"])
-    return ""
 
 def steam_join_via_steamworks(appid, sid, timeout=15):
     """Asks the Steam client (through the game's own steam_api library, in a throw-away helper process) for the game's
@@ -12742,7 +14351,7 @@ def detect_invite_info():
     return {"game": game, "appid": appid, "link": link}
 
 
-# ---- accepting an invite: if the invite's game (matched by NAME) isn't running, start it from this launcher's own
+# ── accepting an invite: if the invite's game (matched by NAME) isn't running, start it from this launcher's own
 # library card, wait 3 s, then accept the invite
 INVITE_JOIN_DELAY_MS = 3000
 INVITE_JOIN_MAX_RETRIES = 10     # extra 3 s rounds to wait for the game / a failed open before joining anyway
@@ -12849,7 +14458,7 @@ def _invite_on_store_result(link, game, hit):
         try:
             win.add_steam_game(appid, title, cover)
         except Exception as e:
-            print(f"invite: couldn't add {title} to the library: {e}")
+            _ncz_log(f"invite: couldn't add {title} to the library: {e}")
     _invite_proceed(link, game, on_state)
 
 def _invite_add_from_store(link, game, on_state):
@@ -12908,7 +14517,7 @@ def accept_invite(link, game="", on_state=None):
 def _accept_invite_from_overlay(link):
     accept_invite(link)
 
-# ---- invite cover art: own library first, then the Steam cover (cached), then the sender's published covers
+# ── invite cover art: own library first, then the Steam cover (cached), then the sender's published covers
 INVITE_COVER_W, INVITE_COVER_H = 72, 96
 
 def _invite_cover_dir():
@@ -13007,7 +14616,7 @@ def chat_preview(m):
     tag = f"[{tag}]" if len(atts) == 1 else f"[{len(atts)} attachments]"
     return f"{text} {tag}" if text else tag
 
-# ---- preparing files for sending (runs on a worker thread, so only QImage here, never QPixmap)
+# ── preparing files for sending (runs on a worker thread, so only QImage here, never QPixmap) ──
 def _encode_qimage(img):
     """Shrinks / re-encodes a QImage until it fits the size cap. Returns (bytes, mime, ext, w, h)."""
     if img.isNull():
@@ -13071,7 +14680,7 @@ def prepare_attachment(path):
         return prepare_attachment_image(img, name)
     raise ValueError(f"{name}: only images and videos can be attached.")
 
-# ---- where a downloaded attachment lives on disk (the id/extension come from the other person's data, so they're validated)
+# ── where a downloaded attachment lives on disk (the id/extension come from the other person's data, so they're validated)
 def _att_cache_path(att):
     aid = str(att.get("id", ""))
     if not _ATT_ID_RE.match(aid):
@@ -13087,6 +14696,7 @@ def _att_cache_path(att):
         ext = ext if ext in (".png", ".jpg", ".webp") else ".jpg"
     return os.path.join(chat_media_dir(), aid + ext)
 
+# kept: used at import time before the later definition at line 26794
 def cloud_fetch_media(other, att):
     """Downloads one attachment (once; later calls hit the disk cache) and returns its file path."""
     path = _att_cache_path(att)
@@ -13182,7 +14792,7 @@ def _friend_avatar_file(uid, photo):
         f.write(raw)
     return path
 
-# ---------------------------------------------------------------- chat: Twemoji, picker, message rows
+# ── chat: Twemoji, picker, message rows ──
 # Apple emoji art (iamcal/emoji-data). Files there are named like '1f44d.png' / '2764-fe0f.png' (FE0F kept), so several
 # spellings of a code are tried. Twemoji is only the last resort when an emoji isn't in the Apple set.
 APPLE_EMOJI_URLS = (
@@ -13233,7 +14843,7 @@ EMOJI_CATEGORIES = [
     ("Flags", "\U0001F3C1", _FLAGS_ITEMS),
 ]
 
-# ---- the full emoji list (names + search keywords) from iamcal/emoji-data, cached on disk; the short built-in list
+# ── the full emoji list (names + search keywords) from iamcal/emoji-data, cached on disk; the short built-in list
 # above is only used until it has been downloaded (or when offline)
 EMOJI_CATALOG_URLS = (
     "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/emoji.json",
@@ -13269,7 +14879,7 @@ def _prefetch_emoji_catalog():
     try:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 30 * 86400:
             return
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     if _emoji_catalog_fetching:
         return
@@ -13287,7 +14897,7 @@ def _prefetch_emoji_catalog():
                         os.replace(path + ".part", path)
                         _emoji_catalog_mem = None
                         break
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
         finally:
             _emoji_catalog_fetching = False
@@ -13304,9 +14914,9 @@ def emoji_catalog():
         if isinstance(rows, list) and len(rows) > 1000:
             _emoji_catalog_mem = rows
             return rows
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
-    import unicodedata
+    import unicodedata    # lazy: saves memory/startup until used
     rows = []
     for name, _icon, items in EMOJI_CATEGORIES:
         for ch in items.split():
@@ -13318,14 +14928,14 @@ def emoji_catalog():
     return rows
 
 
-# ---- flags are searchable by country name (the downloaded list only has codes like "flag-eg")
+# ── flags are searchable by country name (the downloaded list only has codes like "flag-eg") ──
 _FLAG_NAMES_RAW = "AC:Ascension Island|AD:Andorra|AE:United Arab Emirates uae emirates|AF:Afghanistan|AG:Antigua & Barbuda antigua barbuda|AI:Anguilla|AL:Albania|AM:Armenia|AO:Angola|AQ:Antarctica|AR:Argentina|AS:American Samoa|AT:Austria|AU:Australia|AW:Aruba|AX:Åland Islands|AZ:Azerbaijan|BA:Bosnia & Herzegovina bosnia|BB:Barbados|BD:Bangladesh|BE:Belgium|BF:Burkina Faso|BG:Bulgaria|BH:Bahrain|BI:Burundi|BJ:Benin|BL:St. Barthélemy|BM:Bermuda|BN:Brunei|BO:Bolivia|BQ:Caribbean Netherlands|BR:Brazil|BS:Bahamas|BT:Bhutan|BV:Bouvet Island|BW:Botswana|BY:Belarus|BZ:Belize|CA:Canada|CC:Cocos (Keeling) Islands|CD:Congo - Kinshasa congo drc|CF:Central African Republic|CG:Congo - Brazzaville congo|CH:Switzerland|CI:Côte d’Ivoire ivory coast cote d'ivoire|CK:Cook Islands|CL:Chile|CM:Cameroon|CN:China|CO:Colombia|CP:Clipperton Island|CQ:Sark|CR:Costa Rica|CU:Cuba|CV:Cape Verde cape verde|CW:Curaçao|CX:Christmas Island|CY:Cyprus|CZ:Czechia czechia czech republic|DE:Germany|DG:Diego Garcia|DJ:Djibouti|DK:Denmark|DM:Dominica|DO:Dominican Republic|DZ:Algeria|EA:Ceuta & Melilla|EC:Ecuador|EE:Estonia|EG:Egypt|EH:Western Sahara|ER:Eritrea|ES:Spain|ET:Ethiopia|EU:European Union european union europe|EZ:Eurozone|FI:Finland|FJ:Fiji|FK:Falkland Islands|FM:Micronesia|FO:Faroe Islands|FR:France|GA:Gabon|GB:United Kingdom uk britain great britain england|GD:Grenada|GE:Georgia|GF:French Guiana|GG:Guernsey|GH:Ghana|GI:Gibraltar|GL:Greenland|GM:Gambia|GN:Guinea|GP:Guadeloupe|GQ:Equatorial Guinea|GR:Greece|GS:South Georgia & South Sandwich Islands|GT:Guatemala|GU:Guam|GW:Guinea-Bissau|GY:Guyana|HK:Hong Kong SAR China hong kong|HM:Heard & McDonald Islands|HN:Honduras|HR:Croatia|HT:Haiti|HU:Hungary|IC:Canary Islands|ID:Indonesia|IE:Ireland|IL:Israel|IM:Isle of Man|IN:India|IO:British Indian Ocean Territory|IQ:Iraq|IR:Iran|IS:Iceland|IT:Italy|JE:Jersey|JM:Jamaica|JO:Jordan|JP:Japan|KE:Kenya|KG:Kyrgyzstan|KH:Cambodia|KI:Kiribati|KM:Comoros|KN:St. Kitts & Nevis saint kitts nevis|KP:North Korea korea north korea|KR:South Korea korea south korea|KW:Kuwait|KY:Cayman Islands|KZ:Kazakhstan|LA:Laos|LB:Lebanon|LC:St. Lucia|LI:Liechtenstein|LK:Sri Lanka|LR:Liberia|LS:Lesotho|LT:Lithuania|LU:Luxembourg|LV:Latvia|LY:Libya|MA:Morocco|MC:Monaco|MD:Moldova|ME:Montenegro|MF:St. Martin|MG:Madagascar|MH:Marshall Islands|MK:North Macedonia macedonia|ML:Mali|MM:Myanmar (Burma) burma|MN:Mongolia|MO:Macao SAR China macao macau|MP:Northern Mariana Islands|MQ:Martinique|MR:Mauritania|MS:Montserrat|MT:Malta|MU:Mauritius|MV:Maldives|MW:Malawi|MX:Mexico|MY:Malaysia|MZ:Mozambique|NA:Namibia|NC:New Caledonia|NE:Niger|NF:Norfolk Island|NG:Nigeria|NI:Nicaragua|NL:Netherlands holland|NO:Norway|NP:Nepal|NR:Nauru|NU:Niue|NZ:New Zealand|OM:Oman|PA:Panama|PE:Peru|PF:French Polynesia|PG:Papua New Guinea|PH:Philippines|PK:Pakistan|PL:Poland|PM:St. Pierre & Miquelon|PN:Pitcairn Islands|PR:Puerto Rico|PS:Palestinian Territories palestine|PT:Portugal|PW:Palau|PY:Paraguay|QA:Qatar|RE:Réunion|RO:Romania|RS:Serbia|RU:Russia russia|RW:Rwanda|SA:Saudi Arabia|SB:Solomon Islands|SC:Seychelles|SD:Sudan|SE:Sweden|SG:Singapore|SH:St. Helena saint helena|SI:Slovenia|SJ:Svalbard & Jan Mayen|SK:Slovakia|SL:Sierra Leone|SM:San Marino|SN:Senegal|SO:Somalia|SR:Suriname|SS:South Sudan|ST:São Tomé & Príncipe sao tome principe|SV:El Salvador|SX:Sint Maarten|SY:Syria|SZ:Eswatini swaziland eswatini|TA:Tristan da Cunha|TC:Turks & Caicos Islands|TD:Chad|TF:French Southern Territories|TG:Togo|TH:Thailand|TJ:Tajikistan|TK:Tokelau|TL:Timor-Leste east timor|TM:Turkmenistan|TN:Tunisia|TO:Tonga|TR:Türkiye turkey turkiye|TT:Trinidad & Tobago trinidad tobago|TV:Tuvalu|TW:Taiwan taiwan|TZ:Tanzania|UA:Ukraine|UG:Uganda|UM:U.S. Outlying Islands|UN:United Nations united nations|US:United States usa america united states of america|UY:Uruguay|UZ:Uzbekistan|VA:Vatican City vatican holy see|VC:St. Vincent & Grenadines saint vincent grenadines|VE:Venezuela|VG:British Virgin Islands|VI:U.S. Virgin Islands|VN:Vietnam|VU:Vanuatu|WF:Wallis & Futuna|WS:Samoa|XK:Kosovo|YE:Yemen|YT:Mayotte|ZA:South Africa|ZM:Zambia|ZW:Zimbabwe"
 _FLAG_NAMES = None
 
 def _flag_names():
     global _FLAG_NAMES
     if _FLAG_NAMES is None:
-        import unicodedata
+        import unicodedata    # lazy: saves memory/startup until used
         out = {"GBENG": "england", "GBSCT": "scotland", "GBWLS": "wales"}
         for part in _FLAG_NAMES_RAW.split("|"):
             code, _, name = part.partition(":")
@@ -13414,7 +15024,7 @@ class _EmojiStore(QObject):
                             if blob[:4] == b"\x89PNG":
                                 data = blob
                                 break
-                        except Exception:
+                        except Exception:    # expected: offline or the server did not answer
                             pass
                     if data:
                         break
@@ -13425,7 +15035,7 @@ class _EmojiStore(QObject):
                             if blob[:4] == b"\x89PNG":
                                 data = blob
                                 break
-                        except Exception:
+                        except Exception:    # expected: offline or the server did not answer
                             pass
             if data:
                 try:
@@ -13460,13 +15070,13 @@ def emoji_store():
         try:
             _prefetch_emoji_catalog()
         except Exception:
-            pass
+            _log_exc("emoji_store")
     return _emoji_store_obj
 
 def _glyph_icon(kind, size=16, color=None):
     """Vector icon (plus / cross / dots) painted with the theme's button text colour. Used instead of text glyphs,
     which the global QPushButton padding squeezed out of small buttons (and some fonts lack)."""
-    from PyQt6.QtCore import QPointF
+    from PyQt6.QtCore import QPointF    # lazy: saves memory/startup until used
     c = QColor(color) if color else QColor(QApplication.palette().color(QPalette.ColorRole.ButtonText))
     s2 = size * 2
     pm = QPixmap(s2, s2)
@@ -13516,7 +15126,7 @@ def _emoji_button(ch, size, parent=None):
     emoji_store().bind(emoji_code(ch), put)
     return btn
 
-# ---- Apple emoji inside normal text (chat bubbles, reply quotes): the OS font would draw its own emoji otherwise
+# ── Apple emoji inside normal text (chat bubbles, reply quotes): the OS font would draw its own emoji otherwise
 _EL = (r"(?:[\U0001F1E6-\U0001F1FF]{2}"                                   # flag
        r"|[0-9#*]\uFE0F?\u20E3"                                           # keycap
        r"|(?:[\U0001F300-\U0001FAFF\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615\u2648-\u2653"
@@ -13731,7 +15341,7 @@ class _ChatInput(QTextEdit):
         self.setFixedHeight(max(self.fontMetrics().height(), self._img) + 18)
         self.textChanged.connect(self._on_changed)
 
-    # ---- the QLineEdit-style API the chat page uses
+    # ── the QLineEdit-style API the chat page uses ──
     def text(self):
         return _doc_text_with_emoji(self.document()).replace("\n", " ")
 
@@ -13746,7 +15356,7 @@ class _ChatInput(QTextEdit):
     def setMaxLength(self, n):
         self._max = int(n)
 
-    # ---- emoji -> images
+    # ── emoji -> images ──
     def _on_changed(self):
         if self._busy:
             return
@@ -13798,7 +15408,7 @@ class _ChatInput(QTextEdit):
             fmt.setProperty(_CI_PROP, ch)
             cur.insertImage(fmt)
 
-    # ---- clipboard: always plain one-line text, emoji kept as characters
+    # ── clipboard: always plain one-line text, emoji kept as characters ──
     def insertFromMimeData(self, source):
         if source.hasText():
             self.insertPlainText(source.text().replace("\r", " ").replace("\n", " "))
@@ -13983,13 +15593,13 @@ class _MsgRow(QWidget):
         try:
             self.bubble.setStyleSheet(self._bubble_base + "#ChatBubble{border:2px solid #ffd666;}")
             QTimer.singleShot(1200, self._unflash)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def _unflash(self):
         try:
             self.bubble.setStyleSheet(self._bubble_base)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def enterEvent(self, e):
@@ -14016,7 +15626,6 @@ class _MsgRow(QWidget):
             self._pick_reaction(self.bubble)
         elif a_copy is not None and act is a_copy:
             QApplication.clipboard().setText(text)
-
 
 
 def _msgrow_invite_card(self, inv, mine):
@@ -15257,7 +16866,7 @@ def _friends_invite_to_game(self):
         if uid != self.current_uid:
             return
         info = info or {}
-        game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "")
+        game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "") or clip     # the link you just copied: fallback
         if game and link:
             self._send_invite(uid, game, link, appid)
             return
@@ -15272,196 +16881,20 @@ def _friends_invite_to_game(self):
 
 FriendsPage.invite_to_game = _friends_invite_to_game
 
-_friends_prev_init = AdaptiveApp.__init__
 
-def _friends_init(self):
-    _friends_prev_init(self)
-    self.friends_page = FriendsPage()
-    self.pages.addWidget(self.friends_page)
-    idx = self.pages.indexOf(self.friends_page)
-    btn = self.make_nav_button("Friends", checkable=True)
-    self.nav_group.addButton(btn, idx)
-    self.nav_group.button(0).parent().layout().insertWidget(5, btn)
 
-    # friend code row in Settings
-    panel = QFrame()
-    panel.setObjectName("Panel")
-    pl = QHBoxLayout(panel)
-    pl.setContentsMargins(22, 18, 22, 18)
-    col = QVBoxLayout()
-    col.setSpacing(2)
-    t = QLabel("Friend code")
-    t.setObjectName("RowTitle")
-    d = QLabel("Share this so friends can add you in the Friends tab")
-    d.setObjectName("RowDesc")
-    col.addWidget(t)
-    col.addWidget(d)
-    code_lbl = QLabel(friend_code_cached() or "Open Friends tab once")
-    code_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    code_lbl.setStyleSheet("font-weight: bold; font-size: 16px;")
-    copy = QPushButton("Copy")
-    copy.clicked.connect(lambda: QApplication.clipboard().setText(friend_code_cached() or ""))
-    pl.addLayout(col, 1)
-    pl.addWidget(code_lbl)
-    pl.addSpacing(8)
-    pl.addWidget(copy)
-    lay = self.settings_page.layout()
-    lay.insertSpacing(3, 14)
-    lay.insertWidget(4, panel)
-    self.friends_page.code_ready.connect(code_lbl.setText)
-    self.account_page.account_changed.connect(
-        lambda: code_lbl.setText(friend_code_cached() or "Open Friends tab once"))
 
-AdaptiveApp.__init__ = _friends_init
-
-# ---------------------------------------------------------------- background + tray notifications
+# ── background + tray notifications ──
 from PyQt6.QtWidgets import QSystemTrayIcon, QStyle
 from PyQt6.QtGui import QAction
 
-_tray_prev_init = AdaptiveApp.__init__
-
-def _tray_init(self):
-    _tray_prev_init(self)
-    self._really_quit = False
-    self._tray = None
-    self._tray_hint_shown = False
-    app = QApplication.instance()
-
-    # The tray icon is optional. GNOME (without the AppIndicator extension) and some Wayland
-    # setups report "no system tray", but desktop notifications can still work through
-    # notify-send, so only the tray-specific parts are skipped when it's missing.
-    icon = self.windowIcon()
-    if icon.isNull():
-        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-    tray = None
-    if QSystemTrayIcon.isSystemTrayAvailable():
-        app.setQuitOnLastWindowClosed(False)
-        tray = QSystemTrayIcon(icon, self)
-        tray.setToolTip("NCZ Games Launcher")
-
-    def show_window():
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-
-    def show_friends():
-        show_window()
-        self.pages.setCurrentWidget(self.friends_page)
-        uid = self.friends_page.notify_uid
-        if uid and uid in self.friends_page.friends:
-            self.friends_page.open_friend(uid)
-        b = self.nav_group.button(self.pages.indexOf(self.friends_page))
-        if b:
-            b.setChecked(True)
-
-    if tray is not None:
-        menu = QMenu(self)
-        self._tray_menu = menu
-        open_act = QAction("Open launcher", menu)
-        quit_act = QAction("Quit", menu)
-        menu.addAction(open_act)
-        menu.addAction(quit_act)
-        tray.setContextMenu(menu)
-
-        def quit_app():
-            self._really_quit = True
-            tray.hide()
-            app.quit()
-
-        open_act.triggered.connect(show_window)
-        quit_act.triggered.connect(quit_app)
-        tray.activated.connect(lambda reason: show_window()
-                               if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-        tray.messageClicked.connect(show_friends)
-
-    has_ns = sys.platform.startswith("linux") and bool(shutil.which("notify-send"))
-    ns_actions = False
-    if has_ns:
-        try:
-            r = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=5)
-            ns_actions = "--action" in ((r.stdout or "") + (r.stderr or ""))
-        except Exception:
-            ns_actions = False
-
-    def friend_picture(uid):
-        d = self.friends_page.friends.get(uid) or self.friends_page.requests.get(uid) or {}
-        path = _friend_avatar_file(uid, d.get("photo")) if d.get("photo") else None
-        if not path:
-            return None, None
-        pix = CreditsPage.circular_pixmap(path, 128)
-        if pix:
-            round_path = path[:-4] + "_round.png"
-            if pix.save(round_path, "PNG"):
-                path = round_path
-            return path, QIcon(pix)
-        return path, QIcon(path)
-
-    def notify_send(title, msg, icon_path, uid):
-        args = ["notify-send", "-a", "NCZ Games Launcher", "-t", "5000"]
-        if ns_actions:
-            args += ["-A", "default=Open", "-w"]
-        if icon_path:
-            args += ["-i", icon_path]
-        args += ["--", title, msg]  # "--" so a message starting with "-" isn't read as an option
-        def work():
-            try:
-                p = _RealPopen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                try:
-                    out, _ = p.communicate(timeout=20)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    return
-                if ns_actions and out.strip() == "default":
-                    self.friends_page.notif_clicked.emit(uid)
-            except Exception:
-                pass
-        threading.Thread(target=work, daemon=True).start()
-
-    def notify(name, msg, uid):
-        self.friends_page.notify_uid = uid
-        return   # system notifications are muted for good: the overlay toasts replace them
-        try:
-            icon_path, pic = friend_picture(uid)
-        except Exception:
-            icon_path, pic = None, None
-        if has_ns:
-            fallback_icon = asset_path("icon.png")
-            notify_send(name, msg, icon_path or (fallback_icon if os.path.exists(fallback_icon) else None), uid)
-        elif tray is not None:
-            tray.showMessage(name, msg, pic or icon, 5000)
-
-    def on_clicked(uid):
-        self.friends_page.notify_uid = uid
-        show_friends()
-
-    self.friends_page.notif_clicked.connect(on_clicked)
-    self.friends_page.friend_event.connect(notify)
-    if tray is not None:
-        tray.show()
-    self._tray = tray
-
-
-def _tray_close_event(self, event):
-    tray = getattr(self, "_tray", None)
-    if getattr(self, "_really_quit", False):
-        event.accept()
-    elif tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
-        event.ignore()
-        self.hide()
-        self._tray_hint_shown = True     # no "still running in the background" popup (notifications muted)
-    else:
-        event.accept()
-        if tray is not None:             # closing the last window doesn't quit while a tray icon is in use
-            self._really_quit = True
-            tray.hide()
-            QTimer.singleShot(0, QApplication.quit)
-
-AdaptiveApp.__init__ = _tray_init
-AdaptiveApp.closeEvent = _tray_close_event
 
 
 
-# ---------------------------------------------------------------- Launch -> Stop while a game runs
+
+
+
+# ── Launch -> Stop while a game runs ──
 from PyQt6.QtCore import QEvent
 
 def stop_game(name):
@@ -15470,7 +16903,7 @@ def stop_game(name):
     if not proc or (proc.poll() is not None and not extra):
         return
     try:
-        import psutil
+        import psutil    # lazy: optional module: the except below handles it missing
         roots = [psutil.Process(proc.pid)] if proc.poll() is None else []
         roots += extra                      # processes the game handed off to
         found = {}
@@ -15478,24 +16911,24 @@ def stop_game(name):
             try:
                 for q_ in r_.children(recursive=True) + [r_]:
                     found[q_.pid] = q_
-            except Exception:
+            except Exception:    # expected: the process may already have exited
                 pass
         procs = list(found.values())
         for p_ in procs:
             try:
                 p_.terminate()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         _gone, alive = psutil.wait_procs(procs, timeout=3)
         for p_ in alive:
             try:
                 p_.kill()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         return
-    except ImportError:
+    except ImportError:    # expected: the process may already have exited
         pass
-    except Exception:
+    except Exception:    # expected: the process may already have exited
         pass
     if sys.platform.startswith("win"):
         _RealPopen(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -15505,14 +16938,14 @@ def stop_game(name):
             _RealPopen(["pkill", "-TERM", "-P", str(proc.pid)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
-            pass
+            _log_exc("stop_game")
         proc.terminate()
         def hard_kill():
             time.sleep(3)
             if proc.poll() is None:
                 try:
                     proc.kill()
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
         threading.Thread(target=hard_kill, daemon=True).start()
 
@@ -15534,48 +16967,11 @@ class _StopButtonFilter(QObject):
             return True
         return False
 
-_stop_prev_init = AdaptiveApp.__init__
-
-def _stop_init(self):
-    _stop_prev_init(self)
-    self._stop_filter = _StopButtonFilter(self)
-
-    def sync():
-        running = {n.lower(): n for n in list(_running)}
-        for card, title in list(self.cards):
-            try:
-                btn = card.findChild(QPushButton, "Primary")
-                if btn is None:
-                    continue
-                name = running.get(str(title).lower())
-                if name:
-                    if not btn.property("ncz_filter_on"):
-                        btn.installEventFilter(self._stop_filter)
-                        btn.setProperty("ncz_filter_on", True)
-                    if btn.property("ncz_running_name") != name:
-                        btn.setProperty("ncz_orig_text", btn.text())
-                        btn.setProperty("ncz_running_name", name)
-                    if btn.text() != "Stop":
-                        if btn.text() != btn.property("ncz_orig_text") and btn.text() != "Stop":
-                            btn.setProperty("ncz_orig_text", btn.text())
-                        btn.setText("Stop")
-                    btn.setEnabled(True)
-                elif btn.property("ncz_running_name"):
-                    btn.setProperty("ncz_running_name", "")
-                    if btn.text() == "Stop":
-                        btn.setText(btn.property("ncz_orig_text") or "Launch")
-            except RuntimeError:
-                continue  # card was deleted
-
-    self._stop_timer = QTimer(self)
-    self._stop_timer.setInterval(700)
-    self._stop_timer.timeout.connect(sync)
-    self._stop_timer.start()
-
-AdaptiveApp.__init__ = _stop_init
 
 
-# ---------------------------------------------------------------- self-update at launch
+
+
+# ── self-update at launch ──
 SELF_UPDATE_STABLE_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/main.py"
 SELF_UPDATE_NIGHTLY_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/nightly/main.py"
 NIGHTLY_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
@@ -15607,7 +17003,7 @@ def self_update_check():
     try:
         shutil.copy2(path, path + ".bak")
     except OSError:
-        pass
+        _log_exc("self_update_check")
     os.replace(tmp, path)
     return True
 
@@ -15681,7 +17077,7 @@ def companion_update_check():
             except OSError:                                       # e.g. the DLL is loaded in a running game
                 try:
                     os.remove(tmp)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
                 continue
             changed = True
@@ -15716,72 +17112,16 @@ def manual_update_check():
     try:
         updated = companion_update_check() or updated
     except Exception:
-        pass
+        _log_exc("manual_update_check")
     return "updated" if updated else "current"
 
-_selfupdate_prev_init = AdaptiveApp.__init__
-
-def _selfupdate_init(self):
-    _selfupdate_prev_init(self)
-    self._selfupdate_sig = _SelfUpdateSignal(self)
-    self._selfupdate_sig.updated.connect(lambda: show_updated_dialog(self))
-    def work():
-        if not load_launcher_settings().get("auto_update", True):
-            return                       # "Automatic Updates" is turned off in Settings
-        try:
-            updated = self_update_check()
-        except Exception:
-            updated = False
-        try:
-            updated = companion_update_check() or updated
-        except Exception:
-            pass
-        if updated:
-            self._selfupdate_sig.updated.emit()
-    QTimer.singleShot(1500, lambda: threading.Thread(target=work, daemon=True).start())
-
-AdaptiveApp.__init__ = _selfupdate_init
 
 
-# ---------------------------------------------------------------- full library for friends + NCZFront "playing"
-_lib_prev_init = AdaptiveApp.__init__
 
-def _lib_init(self):
-    _lib_prev_init(self)
-    def snap():
-        titles = []
-        for card, title in list(self.cards):
-            try:
-                card.objectName()  # raises if the card was deleted
-            except RuntimeError:
-                continue
-            t = pretty_game_name(title)
-            if t and t not in titles:
-                titles.append(t)
-        for card, title in list(getattr(self, "fan_lib_list", [])):
-            try:
-                card.objectName()
-            except RuntimeError:
-                continue
-            t = pretty_game_name(title)
-            if t and t not in titles:
-                titles.append(t)
-        covers = library_cover_paths()
-        if titles and (titles != _library_snapshot or covers != _library_covers):
-            first = not _library_snapshot
-            _library_snapshot[:] = titles
-            _library_covers.clear()
-            _library_covers.update(covers)
-            if not first:
-                for cb in _playing_listeners:
-                    cb()
-    self._lib_timer = QTimer(self)
-    self._lib_timer.setInterval(3000)
-    self._lib_timer.timeout.connect(snap)
-    self._lib_timer.start()
-    snap()
 
-AdaptiveApp.__init__ = _lib_init
+# ── full library for friends + NCZFront "playing" ──
+
+
 
 # NCZFront is a website, so there is no process to watch: count it as "playing" for 30 minutes after opening.
 _web_until = {"t": 0.0}
@@ -15803,49 +17143,20 @@ def _tracked_webbrowser_open(url, *a, **k):
                         cb()
             threading.Thread(target=expire, daemon=True).start()
     except Exception:
-        pass
+        _log_exc("_tracked_webbrowser_open")
     return result
 
 webbrowser.open = _tracked_webbrowser_open
 
-# ---------------------------------------------------------------- idle (minimized) + offline (quit) for friends
-_idle_prev_init = AdaptiveApp.__init__
+# ── idle (minimized) + offline (quit) for friends ──
 
-def _idle_init(self):
-    _idle_prev_init(self)
 
-    def refresh_state():
-        minimized = self.isMinimized() or not self.isVisible()
-        if minimized != _window_state["minimized"]:
-            _window_state["minimized"] = minimized
-            self.friends_page._playing_changed()  # publishes presence right away if signed in
 
-    self._state_timer = QTimer(self)
-    self._state_timer.setInterval(1000)
-    self._state_timer.timeout.connect(refresh_state)
-    self._state_timer.start()
-
-    def go_offline():
-        if not self.friends_page._signed_in():
-            return
-        def work():
-            try:
-                cloud_publish_offline()
-            except Exception:
-                pass
-        t = threading.Thread(target=work, daemon=True)
-        t.start()
-        t.join(3)  # don't hang the exit if the network is down
-
-    QApplication.instance().aboutToQuit.connect(go_offline)
-
-AdaptiveApp.__init__ = _idle_init
-
-# ---------------------------------------------------------------- Garry's Mod Addon Manager tab
+# ── Garry's Mod Addon Manager tab ──
 # Pure-Python port of "Gmod Alternate Addon Manager" (extract workshop addons + enable/disable).
 # The tab only appears while Garry's Mod is installed through the launcher.
 import struct as _struct
-import lzma as _lzma
+_lzma = _LazyModule("lzma")
 
 def find_gmod_root():
     """Return the folder that contains 'garrysmod/' for Garry's Mod installed via the launcher
@@ -15919,7 +17230,7 @@ def extract_gma(data, dest):
         parsed = json.loads(desc)
         if isinstance(parsed, dict):
             info = parsed
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     title = str(info.get("title") or name or "").strip()
     os.makedirs(dest, exist_ok=True)
@@ -16015,7 +17326,7 @@ class GmodAddonManagerPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtWidgets import QProgressBar, QSizePolicy
+        from PyQt6.QtWidgets import QProgressBar, QSizePolicy    # lazy: saves memory/startup until used
         self._QSizePolicy = QSizePolicy
         self.root = None
         self.worker = None
@@ -16059,7 +17370,7 @@ class GmodAddonManagerPage(QWidget):
         outer.addWidget(self.stack, 1)
         self.tab_group.idClicked.connect(self.stack.setCurrentIndex)
 
-        # ---------------- page 0: installed addons
+        # ── page 0: installed addons ──
         lib = QWidget()
         ll = QVBoxLayout(lib)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -16101,7 +17412,7 @@ class GmodAddonManagerPage(QWidget):
         self.empty_label.hide()
         self.stack.addWidget(lib)
 
-        # ---------------- page 1: install from workshop
+        # ── page 1: install from workshop ──
         inst = QWidget()
         il = QVBoxLayout(inst)
         il.setContentsMargins(0, 0, 0, 0)
@@ -16158,7 +17469,7 @@ class GmodAddonManagerPage(QWidget):
 
         self._apply_css()
 
-    # ---- styling (follows the launcher's light/dark theme)
+    # ── styling (follows the launcher's light/dark theme) ──
     def _apply_css(self):
         dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
         t = THEMES["dark" if dark else "light"]
@@ -16183,7 +17494,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
         super().showEvent(event)
         self._apply_css()
 
-    # ---- helpers
+    # ── helpers ──
     def addons_dir(self):
         return os.path.join(self.root, "garrysmod", "addons") if self.root else None
 
@@ -16195,7 +17506,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
             try:
                 os.makedirs(os.path.join(self.addons_dir(), "disabled"), exist_ok=True)
             except OSError:
-                pass
+                _log_exc("set_root")
         if changed:
             self.refresh_addons()
 
@@ -16242,7 +17553,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
         self.extract_btn.setText("Extract && Install addons")
         self.refresh_addons()
 
-    # ---- installed addons list
+    # ── installed addons list ──
     def _clean(self, name):
         return name[:-len(self.DISABLED_SUFFIX)] if name.endswith(self.DISABLED_SUFFIX) else name
 
@@ -16369,42 +17680,10 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
                 self.log(f"Couldn't move {r['name']}: {e}", "error")
         self.apply_addon_filter()
 
-_gmod_prev_init = AdaptiveApp.__init__
 
-def _gmod_init(self):
-    _gmod_prev_init(self)
-    self._gmod_root = None
-    ph = _lazy_page(self, "gmod_page", GmodAddonManagerPage, lambda gp: gp.set_root(self._gmod_root))
-    idx = self.pages.indexOf(ph)
-    self.gmod_btn = self.make_nav_button("Garry's Mod Addon Manager", checkable=True)
-    self.nav_group.addButton(self.gmod_btn, idx)
-    sidebar_layout = self.nav_group.button(0).parent().layout()
-    sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
-    self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 0px 10px; }")
-    self.gmod_btn.hide()
 
-    def refresh_gmod():
-        root = find_gmod_root()
-        self._gmod_root = root
-        self.gmod_btn.setVisible(bool(root))
-        if self.__dict__.get("gmod_page") is not None:       # not built yet: it gets the root when it is
-            self.gmod_page.set_root(root)
-        if not root and self.pages.currentWidget() is _lazy_slot(self, "gmod_page"):
-            self.nav_group.button(0).setChecked(True)
-            self.pages.setCurrentIndex(0)
 
-    refresh_gmod()
-    self._gmod_timer = QTimer(self)
-    self._gmod_timer.setInterval(4000)
-    self._gmod_timer.timeout.connect(refresh_gmod)
-    self._gmod_timer.start()
-    self.pages.currentChanged.connect(
-        lambda _i: self.gmod_page.refresh_addons()
-        if self.__dict__.get("gmod_page") is not None and self.pages.currentWidget() is self.gmod_page else None)
-
-AdaptiveApp.__init__ = _gmod_init
-
-# ---------------------------------------------------------------- Garry's Mod: "Apply Fix" menu item
+# ── Garry's Mod: "Apply Fix" menu item ──
 GMOD_FIX_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gm-fix.py"
 GMOD_FIX_NAME = "gm-fix.py"
 
@@ -16572,18 +17851,12 @@ def _gmodfix_create_steam_card(self, appid, title_text, cover_path):
         _add_gmod_fix_action(
             self, self.steam_cards.get(appid),
             lambda a=appid: any(g.get("appid") == a and g.get("exe_path") for g in load_steam_library()))
-AdaptiveApp.create_steam_card = _gmodfix_create_steam_card
+AdaptiveApp.create_steam_card = _gmodfix_create_steam_card    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
-_gmodfix_prev_custom_card = AdaptiveApp.create_custom_card
-def _gmodfix_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
-    _gmodfix_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
-    if _is_gmod_card(title_text):
-        _add_gmod_fix_action(self, getattr(self, "custom_cards", {}).get(game_id), lambda: True)
-AdaptiveApp.create_custom_card = _gmodfix_create_custom_card
 
-# ---------------------------------------------------------------- Steam Workshop tab
+# ── Steam Workshop tab ──
 import io as _io
-import tarfile as _tarfile
+_tarfile = _LazyModule("tarfile")
 
 STEAMCMD_WIN_URL = "https://client-update.steamstatic.com/installer/steamcmd.zip"
 STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
@@ -16663,7 +17936,7 @@ def ensure_steamcmd(status):
                 t.extractall(steamcmd_dir())
         try:
             os.chmod(exe, 0o755)
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
     if not os.path.exists(exe):
         raise RuntimeError("SteamCMD could not be extracted")
@@ -16795,7 +18068,7 @@ def _ws_dir_size(path):
         for n in names:
             try:
                 total += os.path.getsize(os.path.join(folder, n))
-            except OSError:
+            except OSError:    # expected: file may not exist yet or be unreadable
                 pass
     return total
 
@@ -16885,7 +18158,7 @@ class WorkshopFetchWorker(QThread):
                     with open(dump, "w", encoding="utf-8") as f:
                         f.write(page)
                 except OSError:
-                    pass
+                    _log_exc("run")
                 self.done.emit(self.token, [], f"Steam's page had no items I could read (saved a copy to {dump})")
                 return
             self.done.emit(self.token, items, "")
@@ -17139,7 +18412,7 @@ class WorkshopModshareWorker(QThread):
                 time.sleep(0.5)
         try:
             cloud_modshare_cancel_request(self.friend)
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         self.done.emit({}, err)
 
@@ -17299,7 +18572,7 @@ class WorkshopDepsWorker(QThread):
                     frontier.append(kid)
                 depth += 1
         except Exception:
-            pass
+            _log_exc("run")
         self.done.emit(self.item_id, found)
 
 class SteamCmdWorker(QThread):
@@ -17318,7 +18591,7 @@ class SteamCmdWorker(QThread):
         try:
             if self.proc:
                 self.proc.kill()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
     def run(self):
@@ -17356,7 +18629,7 @@ class SteamCmdWorker(QThread):
                 with open(ws_steamcmd_log_path(), "w", encoding="utf-8") as f:
                     f.write("\n".join(log))
             except OSError:
-                pass
+                _log_exc("run")
             if self._cancel:
                 self.finished_item.emit(False, "Cancelled")
             elif locate_workshop_item(self.appid, self.item_id):
@@ -17435,12 +18708,12 @@ class WorkshopCountWorker(QThread):
             r = (json.loads(raw.decode("utf-8", "replace")) or {}).get("response") or {}
             if "total" in r:
                 return int(r["total"])
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         return None
 
     def _fetch(self, p):
-        import html as _html_mod
+        import html as _html_mod    # lazy: saves memory/startup until used
         params = {"appid": self.appid, "searchtext": "", "childpublishedfileid": 0,
                   "browsesort": "mostrecent", "section": "readytouseitems", "p": p,
                   "numperpage": 30, "l": "english"}
@@ -17509,11 +18782,10 @@ class WorkshopBrowserWorker(QThread):
 
     def run(self):
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright    # lazy: optional module: the except below handles it missing
         except ImportError:
             self.failed.emit("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
             return
-        seen = set()
         try:
             with sync_playwright() as p:
                 os.makedirs(self.profile_dir, exist_ok=True)
@@ -17537,20 +18809,20 @@ class WorkshopBrowserWorker(QThread):
                             if isinstance(js, dict) and "success" in js and int(js["success"]) != 1:
                                 ok = False
                         except Exception:
-                            pass                      # not JSON: a 200 is good enough
+                            _log_exc("on_response")                      # not JSON: a 200 is good enough
                         if ok:
                             self.subscribed.emit(fid)
                         else:
                             self.status.emit("Steam didn't accept that subscribe. Log in to Steam in the browser window and try again.")
                     except Exception:
-                        pass
+                        _log_exc("on_response")
                 ctx.on("response", on_response)
 
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 try:
                     page.goto(self.url, timeout=60000)
                 except Exception:
-                    pass
+                    _log_exc("run")
                 while not self._stop and not state["closed"]:
                     if not ctx.pages:
                         break
@@ -17560,7 +18832,7 @@ class WorkshopBrowserWorker(QThread):
                         time.sleep(0.3)
                 try:
                     ctx.close()
-                except Exception:
+                except Exception:    # expected: cleanup that may already be done
                     pass
         except Exception as e:
             self.failed.emit(f"Couldn't start the browser: {e}")
@@ -17571,7 +18843,7 @@ class WorkshopPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtWidgets import QProgressBar, QSizePolicy
+        from PyQt6.QtWidgets import QProgressBar, QSizePolicy    # lazy: saves memory/startup until used
         self._QProgressBar, self._QSizePolicy = QProgressBar, QSizePolicy
         self.img = _WsImages()
         self.appid = None
@@ -17639,7 +18911,7 @@ class WorkshopPage(QWidget):
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
 
-        # ---------------- picker
+        # ── picker ──
         pick = QWidget()
         pl = QVBoxLayout(pick)
         pl.setContentsMargins(0, 0, 0, 0)
@@ -17663,7 +18935,7 @@ class WorkshopPage(QWidget):
         pl.addWidget(self.games_empty)
         self.stack.addWidget(pick)
 
-        # ---------------- game view
+        # ── game view ──
         gv = QWidget()
         gl = QVBoxLayout(gv)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -17753,7 +19025,7 @@ class WorkshopPage(QWidget):
         self.export_btn = QPushButton("Export list")
         self.export_btn.setObjectName("Primary")
         self.export_btn.clicked.connect(self.export_list)
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox    # lazy: saves memory/startup until used
         self.disable_others_cb = QCheckBox("Automatically disable other enabled mods")
         self.disable_others_cb.setCursor(Qt.CursorShape.PointingHandCursor)
         self.disable_others_cb.setToolTip("When someone imports this list, their other enabled mods "
@@ -17807,7 +19079,7 @@ class WorkshopPage(QWidget):
         self.login_edit.setText(ws_cfg_get("steam_login", ""))
         self.login_edit.editingFinished.connect(
             lambda: ws_cfg_set("steam_login", self.login_edit.text().strip() or None))
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox    # lazy: saves memory/startup until used
         self.deps_check = QCheckBox("Download required items")
         self.deps_check.setToolTip("When a mod needs other Workshop items (its 'Required items'), download the "
                                    "ones you don't have yet as well.")
@@ -17882,7 +19154,7 @@ class WorkshopPage(QWidget):
         self._rebuild_games()
         QApplication.instance().aboutToQuit.connect(self._shutdown)
 
-    # ------------------------------------------------------------ helpers
+    # ── helpers ──
     def _scroll(self):
         sc = QScrollArea()
         sc.setWidgetResizable(True)
@@ -17982,10 +19254,10 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             if self._browser is not None and self._browser.isRunning():
                 self._browser.stop()                 # closes the Workshop browser window
                 self._browser.wait(4000)
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
-    # ------------------------------------------------------------ game picker
+    # ── game picker ──
     def _rebuild_games(self):
         games = _ws_installed_games()
         if not hasattr(self, "_counting"):
@@ -18086,7 +19358,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self._rebuild_downloaded()
         self._refresh_tab_titles()
 
-    # ------------------------------------------------------------ browse
+    # ── browse ──
     def search(self, *_):
         if self.appid is None:
             return
@@ -18238,7 +19510,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 btn.setText("Download")
                 btn.setEnabled(True)
 
-    # ------------------------------------------------------------ lists (.nczlist import / export)
+    # ── lists (.nczlist import / export) ──
     def _card_clicked(self, it, from_button=False):
         if self.list_mode:
             if it["id"] in self.selected:
@@ -18454,7 +19726,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             line += f" {failed} couldn't be moved."
         return line
 
-    # ------------------------------------------------------------ sync with friend
+    # ── sync with friend ──
     def sync_with_friend(self):
         waiting = getattr(self, "_sync_wait", None)
         if waiting is not None and waiting.isRunning():     # second click while waiting = cancel
@@ -18585,7 +19857,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 lines.append(f"...and {len(errors) - 10} more")
         QMessageBox.information(self, "Sync with friend", "\n".join(lines))
 
-    # ------------------------------------------------------------ download by link
+    # ── download by link ──
     def download_by_link(self):
         text, ok = QInputDialog.getMultiLineText(
             self, "Download by Link", "Paste one or more Steam Workshop links (or item IDs):")
@@ -18633,7 +19905,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             lines.extend(errors)
         QMessageBox.information(self, "Download by Link", "\n".join(lines))
 
-    # ------------------------------------------------------------ queue
+    # ── queue ──
     def _refresh_tab_titles(self):
         active = sum(1 for q in self.queue if q["status"] in ("queued", "downloading"))
         self.tab_btns[1].setText(f"Queue ({active})" if active else "Queue")
@@ -18809,7 +20081,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             w["btn"].setVisible(bool(label))
             if label:
                 w["btn"].setText(label)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def _queue_action(self, e):
@@ -18833,7 +20105,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
         self.queue = [q for q in self.queue if q["status"] in ("queued", "downloading")]
         self._rebuild_queue()
 
-    # ------------------------------------------------------------ downloaded
+    # ── downloaded ──
     def _downloads_for_game(self):
         return [d for d in ws_load_downloads()
                 if d["appid"] == self.appid and os.path.isdir(workshop_item_dir(d["appid"], d["id"]))]
@@ -18964,7 +20236,7 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
                 lines.append(f"...and {len(problems) - 8} more.")
         QMessageBox.information(self, "Install all", "\n".join(lines))
 
-    # ------------------------------------------------------------ browser (subscribe -> queue)
+    # ── browser (subscribe -> queue) ──
     def open_in_browser(self):
         if self.appid is None or (self._browser is not None and self._browser.isRunning()):
             return
@@ -19025,22 +20297,10 @@ QLabel#WsPlaceholder {{ background: {t['input']}; border-radius: 8px; color: {t[
             self._refresh_card_states()
         QMessageBox.information(self, "Install to Garry's Mod", "\n".join(msgs[:-1][-5:] or msgs))
 
-_ws_prev_init = AdaptiveApp.__init__
 
-def _ws_init(self):
-    _ws_prev_init(self)
-    self.workshop_page = WorkshopPage()
-    self.pages.addWidget(self.workshop_page)
-    idx = self.pages.indexOf(self.workshop_page)
-    btn = self.make_nav_button("Steam Workshop", checkable=True)
-    self.nav_group.addButton(btn, idx)
-    layout = self.nav_group.button(0).parent().layout()
-    anchor = getattr(self, "gmod_btn", None) or self.nav_group.button(1)
-    layout.insertWidget(layout.indexOf(anchor), btn)
 
-AdaptiveApp.__init__ = _ws_init
 
-# ---------------------------------------------------------------- GE Proton tab (Linux only)
+# ── GE Proton tab (Linux only) ──
 
 GE_API = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=30"
 
@@ -19055,7 +20315,7 @@ def ge_installed_paths():
             for n in os.listdir(base):
                 if os.path.exists(os.path.join(base, n, "proton")):
                     found.setdefault(n, os.path.join(base, n))
-        except OSError:
+        except OSError:    # expected: file may not exist yet or be unreadable
             pass
     return found
 
@@ -19136,13 +20396,13 @@ class GeInstallWorker(QThread):
             if tmp and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
 
 class GeProtonPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtWidgets import QProgressBar
+        from PyQt6.QtWidgets import QProgressBar    # lazy: saves memory/startup until used
         self._QProgressBar = QProgressBar
         self.releases, self.workers, self.rows = [], {}, {}
         self.loaded = False
@@ -19196,7 +20456,7 @@ class GeProtonPage(QWidget):
         for w in list(self.workers.values()) + ([self.fetcher] if self.fetcher else []):
             try:
                 w.wait(1500)
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     def showEvent(self, event):
@@ -19308,7 +20568,7 @@ class GeProtonPage(QWidget):
         if row:
             try:
                 row["bar"].setValue(pct)
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
 
     def _on_result(self, name, ok, msg):
@@ -19327,21 +20587,10 @@ class GeProtonPage(QWidget):
         shutil.rmtree(path, ignore_errors=True)
         self.render_rows()
 
-_ge_prev_init = AdaptiveApp.__init__
 
-def _ge_init(self):
-    _ge_prev_init(self)
-    if not sys.platform.startswith("linux"):
-        return
-    ph = _lazy_page(self, "ge_page", GeProtonPage)
-    btn = self.make_nav_button("GE Proton", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(ph))
-    layout = self.nav_group.button(0).parent().layout()
-    layout.insertWidget(layout.indexOf(self.nav_group.button(1)), btn)
 
-AdaptiveApp.__init__ = _ge_init
 
-# ---------------------------------------------------------------- Wine tab (Linux only)
+# ── Wine tab (Linux only) ──
 # Plain Wine builds from Kron4ek's Wine-Builds. Installed builds show up in every game's
 # "Switch Compatibility Tool" picker next to the Proton tools.
 
@@ -19443,7 +20692,7 @@ class WineInstallWorker(QThread):
             if tmp and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
             if stage:
                 shutil.rmtree(stage, ignore_errors=True)
@@ -19514,7 +20763,7 @@ class WinePage(QWidget):
         for w in list(self.workers.values()) + ([self.fetcher] if self.fetcher else []):
             try:
                 w.wait(1500)
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     def showEvent(self, event):
@@ -19646,7 +20895,7 @@ class WinePage(QWidget):
         if row:
             try:
                 row["bar"].setValue(pct)
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
 
     def _on_result(self, name, ok, msg):
@@ -19666,24 +20915,10 @@ class WinePage(QWidget):
         shutil.rmtree(path, ignore_errors=True)
         self.render_rows()
 
-_wine_prev_init = AdaptiveApp.__init__
 
-def _wine_init(self):
-    _wine_prev_init(self)
-    if not sys.platform.startswith("linux"):
-        return
-    ph = _lazy_page(self, "wine_page", WinePage)
-    btn = self.make_nav_button("Wine", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(ph))
-    layout = self.nav_group.button(0).parent().layout()
-    ge_slot = _lazy_slot(self, "ge_page")              # hasattr(self, "ge_page") would build it
-    ge_btn = self.nav_group.button(self.pages.indexOf(ge_slot)) if ge_slot is not None else None
-    at = layout.indexOf(ge_btn) + 1 if ge_btn is not None else layout.indexOf(self.nav_group.button(1))
-    layout.insertWidget(at, btn)
 
-AdaptiveApp.__init__ = _wine_init
 
-# ---------------------------------------------------------------- H toggles the download browser window
+# ── H toggles the download browser window ──
 from PyQt6.QtCore import QObject as _QObject, QEvent as _QEvent, QRect as _QRect
 from PyQt6.QtWidgets import (QTextEdit as _QTextEdit, QPlainTextEdit as _QPlainTextEdit,
                              QAbstractSpinBox as _QAbstractSpinBox, QToolTip as _QToolTip)
@@ -19711,17 +20946,11 @@ class _PwHeadlessKey(_QObject):
             return True
         return False
 
-_pwh_prev_init = AdaptiveApp.__init__
-
-def _pwh_init(self):
-    _pwh_prev_init(self)
-    self._pw_key_filter = _PwHeadlessKey(self)
-    QApplication.instance().installEventFilter(self._pw_key_filter)
-
-AdaptiveApp.__init__ = _pwh_init
 
 
-# ---------------------------------------------------------------- Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store)
+
+
+# ── Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store) ──
 import csv as _csv
 
 def _fan_csv_path():
@@ -19731,7 +20960,7 @@ def _fan_csv_path():
         try:
             dirs.append(getter())
         except Exception:
-            pass
+            _log_exc("_fan_csv_path")
     dirs.append(os.path.dirname(os.path.abspath(__file__)))
     for d in dirs:
         for n in names:
@@ -19761,7 +20990,7 @@ def get_fan_categories():
                         if t and t.lower() not in known:
                             known.add(t.lower())
                             cats.append((t, t.lower()))
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
     return cats
 
@@ -19894,7 +21123,7 @@ def _fan_overview_via_browser(gid, timeout_s=90):
     """Last resort: opens the game's page in a headless Chromium (Playwright) and grabs the overview reply the page
     itself loads. Needs `pip install playwright` + `playwright install chromium`; returns {} when that isn't available."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright    # lazy: saves memory/startup until used
     except Exception:
         return {}
     box = {}
@@ -19908,7 +21137,7 @@ def _fan_overview_via_browser(gid, timeout_s=90):
                         if "/site-api/web/discover/games/overview/" in resp.url and resp.status == 200 and not box:
                             box.update(resp.json())
                     except Exception:
-                        pass
+                        _log_exc("on_response")
                 page.on("response", on_response)
                 page.goto(f"https://gamejolt.com/games/x/{gid}", wait_until="domcontentloaded", timeout=timeout_s * 1000)
                 for _ in range(timeout_s * 2):
@@ -19926,6 +21155,7 @@ def _fan_overview_via_browser(gid, timeout_s=90):
             merged.update(src)
     return merged
 
+# kept: used at import time before the later definition at line 40488
 def fetch_fan_overview(gid):
     """Game Jolt's own site api (the same one its pages use). Returns the page data as one dict.
     Retries when DNS/network hiccups ("Temporary failure in name resolution"), keeps a copy on disk so a page that
@@ -19938,7 +21168,7 @@ def fetch_fan_overview(gid):
             if time.time() - os.path.getmtime(cache_file) < max_age:
                 with open(cache_file, encoding="utf-8") as f:
                     return json.load(f)
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         return None
     hit = cached(6 * 3600)
@@ -19950,7 +21180,7 @@ def fetch_fan_overview(gid):
             os.makedirs(cache_dir, exist_ok=True)
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(merged, f)
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         return merged
     errors = []
@@ -19970,7 +21200,7 @@ def fetch_fan_overview(gid):
                         os.makedirs(cache_dir, exist_ok=True)
                         with open(cache_file, "w", encoding="utf-8") as f:
                             json.dump(merged, f)
-                    except Exception:
+                    except Exception:    # expected: file may not exist yet or be unreadable
                         pass
                     return merged
                 errors.append(f"{url}: empty reply, keys={list(data)[:8]}")
@@ -19985,7 +21215,7 @@ def fetch_fan_overview(gid):
         with open(os.path.join(_writable_dir(), "fan_debug.log"), "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} game {gid}: {_FAN_LAST_ERROR}\n")
     except Exception:
-        pass
+        _log_exc("fetch_fan_overview")
     raise RuntimeError(_FAN_LAST_ERROR)
 
 def _microdata(game):
@@ -20111,7 +21341,7 @@ class FanCoverLoader(CoverLoader):
         url = ""
         try:  # 1) Game Jolt's site api
             url = fan_cover_from_game(fetch_fan_overview(appid))
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         if not url:
             try:  # 2) the page's own preview image
@@ -20121,7 +21351,7 @@ class FanCoverLoader(CoverLoader):
                     if m:
                         url = html_lib.unescape(m.group(1))
                         break
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
         if url:
             try:
@@ -20130,7 +21360,7 @@ class FanCoverLoader(CoverLoader):
                     with open(path, "wb") as f:
                         f.write(data)
                     return path
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
         open(marker, "w").close()
         return ""
@@ -20159,13 +21389,13 @@ def fan_screenshot_urls(game, limit=6):
 
 def _fan_shot_bytes(url):
     """One screenshot as a small, low quality jpeg (cached on disk, so opening the page again is instant)."""
-    import hashlib
+    import hashlib    # lazy: saves memory/startup until used
     folder = get_fan_shots_dir()
     path = os.path.join(folder, hashlib.md5(url.encode("utf-8")).hexdigest()[:16] + "_v2.jpg")
     try:
         with open(path, "rb") as f:
             return f.read()
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     raw = _http_get(url, timeout=12)
     img = QImage()
@@ -20181,7 +21411,7 @@ def _fan_shot_bytes(url):
         with open(path, "wb") as f:
             f.write(data)
     except OSError:
-        pass
+        _log_exc("_fan_shot_bytes")
     return data
 
 def fetch_fan_screenshots(urls):
@@ -20243,7 +21473,7 @@ def fan_info(game):
             info["released"] = time.strftime("%B %d, %Y", time.localtime(posted)).replace(" 0", " ")
         if updated:
             info["updated"] = time.strftime("%B %d, %Y", time.localtime(updated)).replace(" 0", " ")
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     if posted:
         info["stats"].append((time.strftime("%Y", time.localtime(posted)), "Released"))
@@ -20272,7 +21502,7 @@ def fan_info(game):
             info["stats"].append((_fan_num(n), label))
     try:
         info["status"] = _FAN_STATUS.get(int(game.get("development_status")))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):    # expected: missing or odd value: the default is fine
         pass
     comp = game.get("compatibility")
     if isinstance(comp, dict):
@@ -20423,7 +21653,7 @@ class _FanShotViewer(QDialog):
                 try:
                     self._on_full(url, pm)
                 except Exception:
-                    pass
+                    _log_exc("_loaded")
         if url == self._urls[self._i]:
             self._render() if url in self._cache else self.img.setText("Couldn't load this screenshot.")
 
@@ -20580,7 +21810,7 @@ class FanDetailPage(StoreDetailPage):
             self._hero.setGeometry(0, 0, obj.width(), _FanHero.HEIGHT)
         return super().eventFilter(obj, ev)
 
-    # ---- small builders
+    # ── small builders ──
     def _chip(self, text, color=None):
         chip = QLabel(text)
         if color:
@@ -20666,7 +21896,7 @@ class FanDetailPage(StoreDetailPage):
                 desc, dev = fan_description(game), fan_developer(game)
                 shot_urls = fan_screenshot_urls(game)
                 info = fan_info(game)
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             if not desc:
                 try:
@@ -20677,7 +21907,7 @@ class FanDetailPage(StoreDetailPage):
                             desc = fan_clean_text(m.group(1))
                             if desc:
                                 break
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
             return (appid, desc, dev, shot_urls, info)
 
@@ -20706,12 +21936,12 @@ class FanDetailPage(StoreDetailPage):
                             p = ""
                     similar.append((g[0], g[1], p))
             except Exception:
-                pass
+                _log_exc("find_similar")
             return (appid, similar)
 
         self._find_similar = find_similar     # started once the details are in, so the two don't compete for the network
 
-    # ---- loading pulse, details panel, similar row
+    # ── loading pulse, details panel, similar row ──
     def _start_pulse(self):
         self._stop_pulse()
         eff = _FanOpacity(self.desc_label)
@@ -20729,12 +21959,12 @@ class FanDetailPage(StoreDetailPage):
         if self._pulse is not None:
             try:
                 self._pulse.stop()
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
             self._pulse = None
         try:
             self.desc_label.setGraphicsEffect(None)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def _fill_details(self, dev, info):
@@ -20877,7 +22107,7 @@ class FanDetailPage(StoreDetailPage):
         if self._shot_urls:
             _FanShotViewer(self._shot_urls, min(index, len(self._shot_urls) - 1), self.window()).exec()
 
-# ---------------------------------------------------------------- Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv)
+# ── Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv) ──
 GAMEJOLT_SCRAPER_URL = "https://github.com/justmm33/FNaNCZ-AE-Releases/raw/refs/heads/main/gamejolt_scraper.py"
 
 def _scraper_python():
@@ -20908,7 +22138,7 @@ class ScrapeWorker(QThread):
         if p is not None and p.poll() is None:
             try:
                 p.terminate()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     def run(self):
@@ -20973,7 +22203,7 @@ class ScrapeWorker(QThread):
                 return
             try:
                 os.remove(backup)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
             self.finished_ok.emit(True, "Done!")
         except Exception as e:
@@ -20986,13 +22216,13 @@ class ScrapeWorker(QThread):
             if had_csv and os.path.exists(backup):
                 shutil.copy2(backup, csv_path)
                 os.remove(backup)
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
 
 class ScrapeOptionsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtWidgets import QSpinBox
+        from PyQt6.QtWidgets import QSpinBox    # lazy: saves memory/startup until used
         self.setWindowTitle("Scrape Games")
         self.setMinimumWidth(400)
         lay = QVBoxLayout(self)
@@ -21310,7 +22540,7 @@ def _fan_links_set(self, value):
 
 FanGamesPage._links = property(_fan_links_get, _fan_links_set)       # {game id: link}, loaded when first read
 
-# ---------------------------------------------------------------- fan games in the Library (bottom section, horizontal cards)
+# ── fan games in the Library (bottom section, horizontal cards) ──
 def get_fan_library_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_library.json")
 
@@ -21322,156 +22552,18 @@ def load_fan_library():
     except Exception:
         return []
 
+# kept: used at import time before the later definition at line 26089
 def save_fan_library(games):
     path = get_fan_library_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(games, f, indent=4)
 
-def _fan_build_library_section(self):
-    self.fan_lib_cards = {}
-    self.fan_lib_list = []
-    self.fan_section = QWidget(self.grid_container)
-    lay = QVBoxLayout(self.fan_section)
-    lay.setContentsMargins(0, 16, 0, 0)
-    lay.setSpacing(12)
-    head = QLabel("Fan Games")
-    head.setStyleSheet("font-size: 16px; font-weight: bold;")
-    lay.addWidget(head)
-    holder = QWidget()
-    self.fan_grid = QGridLayout(holder)
-    self.fan_grid.setContentsMargins(0, 0, 0, 0)
-    self.fan_grid.setHorizontalSpacing(24)
-    self.fan_grid.setVerticalSpacing(24)
-    self.fan_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-    lay.addWidget(holder)
-    self.fan_section.hide()
-    for g in load_fan_library():
-        self._fan_create_library_card(g)
 
-def _fan_create_library_card(self, g):
-    gid, title_text, link = g["id"], g["title"], g.get("link", "")
-    cover_path = g.get("cover", "")
-    card = QFrame(self.fan_section)
-    card.setObjectName("GameCard")
-    card.setFixedWidth(FAN_CARD_W)
-    layout = QVBoxLayout(card)
-    layout.setContentsMargins(8, 8, 8, 10)
-    layout.setSpacing(0)
 
-    cover = QLabel()
-    cover.setFixedSize(FAN_COVER_W, FAN_COVER_H)
-    cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    pix = rounded_cover_pixmap(cover_path, FAN_COVER_W, FAN_COVER_H, 8) if cover_path and os.path.exists(cover_path) else None
-    if pix:
-        cover.setPixmap(pix)
-    else:
-        cover.setObjectName("CoverPlaceholder")
-        cover.setText("No\ncover")
-    layout.addWidget(cover)
-    layout.addSpacing(10)
 
-    title = QLabel(title_text)
-    title.setObjectName("CardTitle")
-    title.setWordWrap(True)
-    title.setFixedHeight(38)
-    title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    layout.addWidget(title)
 
-    status = QLabel("Fan game")
-    status.setObjectName("CardStatus")
-    layout.addWidget(status)
-    layout.addSpacing(12)
 
-    actions = QHBoxLayout()
-    actions.setSpacing(6)
-    btn_open = QPushButton("Install")
-    btn_open.setObjectName("Primary")
-    btn_open.setFixedHeight(38)
-    btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn_open.clicked.connect(lambda _c=False, i=gid, t=title_text, c=cover_path, u=link: self._fan_install(i, t, c, u))
-    card._fan_btn = btn_open
-    _fan_update_btn(btn_open, title_text)
-    more_btn = QPushButton("\u2022\u2022\u2022")
-    more_btn.setObjectName("MoreButton")
-    more_btn.setFixedSize(42, 38)
-    more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    menu = QMenu(more_btn)
-    more_btn.setMenu(menu)
-    menu.addAction("View Details").triggered.connect(lambda _c=False, i=gid: self._fan_view(i))
-    menu.addAction("Open on Game Jolt").triggered.connect(lambda _c=False, u=link: webbrowser.open(u))
-    if sys.platform.startswith("linux"):
-        menu.addAction("Switch Compatibility Tool").triggered.connect(lambda _c=False, i=gid: self._fan_compat_dialog(i))
-    menu.addAction("Open Game Location").triggered.connect(
-        lambda _c=False, i=gid, t=title_text: self._fan_open_location(i, t))
-    menu.addAction("Install Common Redist").triggered.connect(
-        lambda _c=False, i=gid, t=title_text: install_redist_for_game(
-            self, lambda: _fan_game_dir(i, t), t,
-            lambda: (_fan_installed_exe(t), load_compat_config().get(f"fan-{i}", ""))))
-    menu.addAction("Uninstall").triggered.connect(lambda _c=False, i=gid, t=title_text: self._fan_uninstall(i, t))
-    menu.addSeparator()
-    menu.addAction("Remove from Library").triggered.connect(lambda _c=False, i=gid: self._fan_remove(i))
-    actions.addWidget(btn_open, 1)
-    actions.addWidget(more_btn)
-    layout.addLayout(actions)
-
-    self.fan_lib_cards[gid] = card
-    self.fan_lib_list.append((card, title_text))
-
-def _fan_add(self, gid, title, cover_path):
-    if gid in self.fan_lib_cards:
-        return
-    link, tags = "", ()
-    for g in load_fan_games():
-        if g[0] == gid:
-            link, tags = g[2], g[3]
-            break
-    saved_cover = ""
-    if cover_path and os.path.exists(cover_path):
-        try:
-            os.makedirs(get_library_cover_dir(), exist_ok=True)
-            saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
-            shutil.copyfile(cover_path, saved_cover)
-        except Exception:
-            saved_cover = cover_path
-    entry = {"id": gid, "title": title, "link": link, "tags": sorted(tags), "cover": saved_cover}
-    save_fan_library([g for g in load_fan_library() if g["id"] != gid] + [entry])
-    self._fan_create_library_card(entry)
-    self.apply_filter()
-    self.fan_detail_page.set_in_library(True)
-
-def _fan_remove(self, gid):
-    card = self.fan_lib_cards.pop(gid, None)
-    if card is not None:
-        self.fan_lib_list = [(c, t) for c, t in self.fan_lib_list if c is not card]
-        card.hide()
-        card.setParent(None)
-        card.deleteLater()
-    save_fan_library([g for g in load_fan_library() if g["id"] != gid])
-    try:
-        os.remove(os.path.join(get_library_cover_dir(), f"fan-{gid}.img"))
-    except OSError:
-        pass
-    if self.__dict__.get("fan_detail_page") is not None and self.fan_detail_page._appid == gid:
-        self.fan_detail_page.set_in_library(False)
-    self.apply_filter()
-
-def _fan_view(self, gid):
-    g = next((x for x in load_fan_library() if x["id"] == gid), None)
-    if not g:
-        return
-    self.fan_detail_page.show_game(gid, g["title"], g.get("cover", ""), g.get("link", ""), tuple(g.get("tags", [])))
-    self.fan_detail_page.set_in_library(True)
-    btn = self.nav_group.button(self.pages.indexOf(_lazy_slot(self, "fan_page")))
-    if btn:
-        btn.setChecked(True)
-    self.pages.setCurrentWidget(self.fan_detail_page)
-
-AdaptiveApp._fan_build_library_section = _fan_build_library_section
-AdaptiveApp._fan_create_library_card = _fan_create_library_card
-AdaptiveApp._fan_add = _fan_add
-AdaptiveApp._fan_remove = _fan_remove
-AdaptiveApp._fan_view = _fan_view
 
 _fan_prev_apply_filter = AdaptiveApp.apply_filter
 
@@ -21515,64 +22607,10 @@ def _fan_apply_filter(self, text=""):
                              "No fan games yet. Add some from the Fan Games page.")
     self.empty_label.setVisible(shown == 0)
 
-AdaptiveApp.apply_filter = _fan_apply_filter
+AdaptiveApp.apply_filter = _fan_apply_filter    # kept as patch chain: two wrappers call the original inside a condition or twice
 
-_fan_prev_init = AdaptiveApp.__init__
 
-def _fan_init(self):
-    _fan_prev_init(self)
-    def wire_fan(fp):
-        fp.fan_selected.connect(open_fan_game)
-    def wire_fan_detail(dp):
-        dp.add_requested.connect(self._fan_add)
-        dp.open_cb = open_fan_game
-        dp.back_requested.connect(lambda: self.pages.setCurrentWidget(self.fan_page))
-    fan_ph = _lazy_page(self, "fan_page", FanGamesPage, wire_fan)
-    _lazy_page(self, "fan_detail_page", FanDetailPage, wire_fan_detail)
 
-    def open_fan_game(gid, title, cover):
-        link, tags = "", ()
-        for g in load_fan_games():
-            if g[0] == gid:
-                link, tags = g[2], g[3]
-                break
-        self.fan_detail_page.show_game(gid, title, cover, link, tags)
-        self.fan_detail_page.set_in_library(gid in self.fan_lib_cards)
-        self.pages.setCurrentWidget(self.fan_detail_page)
-
-    self._fan_build_library_section()
-    self.fan_section.layout().itemAt(0).widget().hide()      # the tab already says "Fan Games"
-    # Games / Fan Games switch under the Library header
-    self._lib_tab = "games"
-    tabs = QWidget()
-    tabs.setStyleSheet("QPushButton { padding: 6px 18px; border-radius: 8px; } "
-                       "QPushButton:checked { background: palette(highlight); color: " + _on_accent() + "; font-weight: bold; }")
-    tl = QHBoxLayout(tabs)
-    tl.setContentsMargins(0, 0, 0, 14)
-    tl.setSpacing(8)
-    group = QButtonGroup(tabs)
-    group.setExclusive(True)
-    for key, label in (("games", "Games"), ("fan", "Fan Games")):
-        b = QPushButton(label)
-        b.setCheckable(True)
-        b.setChecked(key == "games")
-        b.setCursor(Qt.CursorShape.PointingHandCursor)
-        group.addButton(b)
-        b.clicked.connect(lambda _c=False, k=key: (setattr(self, "_lib_tab", k),
-                                                   self.apply_filter(self.search_edit.text())))
-        tl.addWidget(b)
-    tl.addStretch()
-    self.library_tabs = tabs
-    self.search_edit.parentWidget().layout().insertWidget(2, tabs)
-    btn = self.make_nav_button("Fan Games", checkable=True)
-    self.nav_group.addButton(btn, self.pages.indexOf(fan_ph))
-    layout = self.nav_group.button(0).parent().layout()
-    i = layout.indexOf(self.nav_group.button(4))
-    i = i + 1 if i >= 0 else layout.indexOf(self.nav_group.button(1))
-    layout.insertWidget(i, btn)
-    self.apply_filter()
-
-AdaptiveApp.__init__ = _fan_init
 
 
 # --- Game Jolt fan games: Playwright finds the real build link, the launcher downloads + extracts it ---
@@ -21753,12 +22791,12 @@ def _gj_debug(msg):
         with open(os.path.join(_writable_dir(), "gj_build_debug.log"), "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
-        pass
+        _log_exc("_gj_debug")
 
 def _gj_find_link(self, game_url, gid=None):
     """Opens the Game Jolt page, opens the builds list, clicks the (Windows) build's Download and copies the link."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright    # lazy: optional module: the except below handles it missing
     except ImportError:
         raise RuntimeError("Playwright isn't installed. Run: pip install playwright && playwright install chromium")
     with sync_playwright() as p:
@@ -21900,7 +22938,7 @@ def _gj_find_link(self, game_url, gid=None):
                                 pg.locator("[data-gjwin]").first.click(timeout=5000)
                                 clicked = True
                                 self.status_update.emit("Waiting for the download to start (may play a video first)...")
-                    except Exception:
+                    except Exception:    # expected: offline or the server did not answer
                         pass
                 page.wait_for_timeout(400)
             if "d" not in got:
@@ -21910,7 +22948,7 @@ def _gj_find_link(self, game_url, gid=None):
             cookies = "; ".join(f"{c['name']}={c['value']}" for c in context.cookies(url))
             try:
                 download.cancel()  # the launcher downloads it itself
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             headers = {"User-Agent": PW_USER_AGENT, "Referer": game_url}
             if cookies:
@@ -21982,7 +23020,7 @@ class GameJoltBuildDialog(QDialog):
                 try:
                     bits.append(time.strftime("%b %d, %Y", time.localtime(float(b["added"]) / 1000)))
                 except Exception:
-                    pass
+                    _log_exc("__init__")
             lines = [f"<b>{html_lib.escape(str(name))}</b>" + ("  <i>(recommended)</i>" if i == 0 and b.get("primary") else ""),
                      f'<span style="color:{dim}">{" · ".join(bits)}</span>']
             if b.get("filename") and b.get("pkg"):
@@ -22074,39 +23112,13 @@ class GameJoltDownloadWorker(FirebaseDownloadWorker):
                 return
             self.failed.emit(str(e))
 
-def _fan_install(self, gid, title, cover_path, link):
-    exe = _fan_installed_exe(title)
-    if exe:  # already installed: this button is "Launch"
-        _launch_exe(self, exe, load_compat_config().get(f"fan-{gid}", ""), _d3d_for(f"fan-{gid}"),
-                    launch_args_for(f"fan-{gid}"))
-        return
-    if not link:
-        QMessageBox.warning(self, "Install", "This game has no Game Jolt link.")
-        return
-    cancelled, existing = _ask_existing_archive(self, title)
-    if cancelled:
-        return
-    worker = GameJoltDownloadWorker(title, link, gid, existing)
-    worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(self, w, builds))
-    worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
-    card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
-    self.downloads_page.add_download_card(card)
-    self.nav_group.button(6).setChecked(True)
-    self.pages.setCurrentWidget(self.downloads_page)
-
-AdaptiveApp._fan_install = _fan_install
-
-_gj_prev_init = AdaptiveApp.__init__
-
-def _gj_init(self):
-    _gj_prev_init(self)
-    _lazy_on_built(self, "fan_detail_page", lambda dp: setattr(dp, "install_cb", lambda i, t, c, u: self._fan_install(i, t, c, u)))
-
-AdaptiveApp.__init__ = _gj_init
 
 
 
-# ---- "use existing file or download again" for steam + Game Jolt installs ----
+
+
+
+# ── "use existing file or download again" for steam + Game Jolt installs ──
 def find_existing_archive_for_title(title):
     norm = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
     nt = norm(title)
@@ -22121,6 +23133,7 @@ def find_existing_archive_for_title(title):
             return os.path.join(DOWNLOAD_DIR, f)
     return None
 
+# kept: used at import time before the later definition at line 31990
 def _ask_existing_archive(parent, title):
     """(cancelled, path_to_reuse_or_None). Asks only when a matching zip/rar is already in the downloads folder."""
     existing = find_existing_archive_for_title(title)
@@ -22133,11 +23146,11 @@ def _ask_existing_archive(parent, title):
         return False, existing
     try:
         os.remove(existing)
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     return False, None
 
-# ======================= QoL: pausable downloads, exe icons, desktop shortcuts, fan-game launching =======================
+# ── QoL: pausable downloads, exe icons, desktop shortcuts, fan-game launching ──
 def _wk_get_cancel(self):
     while self.__dict__.get("_paused") and not self.__dict__.get("_cancel_flag"):
         time.sleep(0.2)   # paused: every download loop that checks _is_cancelled just waits here
@@ -22229,9 +23242,9 @@ def compat_data_dir_for(exe):
             ok = os.stat(pfx).st_uid == os.geteuid()
         if ok:
             return default
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
-    import hashlib
+    import hashlib    # lazy: saves memory/startup until used
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(game_dir)) or "game"
     tag = hashlib.md5(game_dir.encode("utf-8", "replace")).hexdigest()[:8]
     return os.path.expanduser(f"~/.local/share/NCZ_Games_Launcher/compat/{name}_{tag}")
@@ -22262,7 +23275,7 @@ def _watch_proton_start(app, proc, log_path):
             try:
                 with open(log_path, encoding="utf-8", errors="replace") as f:
                     tail = "".join(f.readlines()[-12:]).strip()
-            except OSError:
+            except OSError:    # expected: file may not exist yet or be unreadable
                 pass
             QMessageBox.warning(app, "Proton",
                                 f"The game closed right after starting (exit code {code}).\n\n"
@@ -22323,6 +23336,7 @@ class LaunchOptionsDialog(QDialog):
             return
         self.accept()
 
+# kept: used at import time before the later definition at line 24190
 def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
     if not exe or not os.path.exists(exe):
         QMessageBox.warning(app, "Launch Error", f"Executable not found:\n{exe}")
@@ -22361,9 +23375,9 @@ def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
     finally:
         _d3d_override["mode"] = ""
 
-# ---- icon of an .exe (reads the PE resource table; no extra libraries) ----
+# ── icon of an .exe (reads the PE resource table; no extra libraries) ──
 def extract_exe_icon_ico(exe_path):
-    import struct
+    import struct    # lazy: saves memory/startup until used
     try:
         with open(exe_path, "rb") as f:
             d = f.read()
@@ -22432,7 +23446,7 @@ def _exe_icon_png(exe, name):
     if not ico:
         return ""
     try:
-        from PyQt6.QtGui import QImage
+        from PyQt6.QtGui import QImage    # lazy: saves memory/startup until used
         img = QImage()
         if not img.loadFromData(ico):
             return ""
@@ -22443,13 +23457,14 @@ def _exe_icon_png(exe, name):
     except Exception:
         return ""
 
+# kept: used at import time before the later definition at line 51041
 def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", launch_args=None):
     """Desktop shortcut for one library game. It opens the launcher (or tells the running one) and the launcher starts
     the game: `main.py --launch-game <title>`. The launcher applies the game's compatibility tool and launch options itself."""
     if not exe or not os.path.exists(exe):
         QMessageBox.warning(app, "Desktop Shortcut", "Couldn't find the game's executable. Is it installed?")
         return
-    from PyQt6.QtCore import QStandardPaths
+    from PyQt6.QtCore import QStandardPaths    # lazy: saves memory/startup until used
     desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation) or os.path.expanduser("~/Desktop")
     os.makedirs(desktop, exist_ok=True)
     safe = sanitize_folder_name(title) or "Game"
@@ -22476,12 +23491,12 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
             try:  # GNOME: mark it trusted so it launches on double-click
                 subprocess.run(["gio", "set", target, "metadata::trusted", "true"], capture_output=True, timeout=5)
             except Exception:
-                pass
+                _log_exc("create_game_shortcut")
         QMessageBox.information(app, "Desktop Shortcut", f"Shortcut created:\n{target}")
     except Exception as e:
         QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
 
-# ---------------------------------------------------------------- winetricks for any game (Linux)
+# ── winetricks for any game (Linux) ──
 def _winetricks_env(app, exe, compat_tool):
     """(env, prefix, kind) for running winetricks inside the Wine/Proton prefix this game launches in.
     Proton games use the game's own Proton prefix and Proton's own wine (what protontricks does under the hood).
@@ -22561,6 +23576,7 @@ def _winetricks_target(app, key, exe_fn, tool_fn):
         return _ae_launch_info(key, name)
     return exe_fn(), tool_fn()
 
+# kept: used at import time before the later definition at line 31600
 def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
     more = card.findChild(QPushButton, "MoreButton") if card is not None else None
     if not more or not more.menu():
@@ -22579,18 +23595,6 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
         wt.triggered.connect(lambda _c=False: open_winetricks_for_game(app, title, *_winetricks_target(app, key, exe_fn, tool_fn)))
 
 # --- hook every kind of library card ---
-_sc_prev_game_card = AdaptiveApp.create_game_card
-def _sc_create_game_card(self, title_text, image_filename, game_id):
-    _sc_prev_game_card(self, title_text, image_filename, game_id)
-    if game_id in ("ae", "ncz2"):
-        name = AE_GAME_NAME if game_id == "ae" else NCZ2_GAME_NAME
-        known = "FNaNCZ AE.exe" if game_id == "ae" else "FNANCZ 2.exe"
-        def exe_fn(n=name, k=known):
-            d = installed_game_dir(n)
-            direct = os.path.join(d, k)
-            return direct if os.path.exists(direct) else _find_game_exe(d)
-        _add_shortcut_action(self, self.cards[-1][0], title_text, exe_fn, cover=image_filename, key=game_id)
-AdaptiveApp.create_game_card = _sc_create_game_card
 
 _sc_prev_steam_card = AdaptiveApp.create_steam_card
 def _sc_create_steam_card(self, appid, title_text, cover_path):
@@ -22602,18 +23606,11 @@ def _sc_create_steam_card(self, appid, title_text, cover_path):
         return _find_game_exe(_safe_installed_game_dir(title_text))
     _add_shortcut_action(self, self.steam_cards.get(appid), title_text, exe_fn,
                          lambda: load_compat_config().get(str(appid), ""), cover_path, key=str(appid))
-AdaptiveApp.create_steam_card = _sc_create_steam_card
+AdaptiveApp.create_steam_card = _sc_create_steam_card    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
-_sc_prev_custom_card = AdaptiveApp.create_custom_card
-def _sc_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
-    _sc_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
-    _add_shortcut_action(self, getattr(self, "custom_cards", {}).get(game_id), title_text,
-                         lambda: exe_path, lambda: _custom_tool(game_id, compat_tool), cover_path,
-                         key=f"custom-{game_id}")
-AdaptiveApp.create_custom_card = _sc_create_custom_card
 
-# ---------------------------------------------------------------- Add Existing Fan Game
-from PyQt6.QtWidgets import QListWidget as _FanListWidget, QListWidgetItem
+# ── Add Existing Fan Game ──
+from PyQt6.QtWidgets import QListWidget as _FanListWidget
 
 class AddExistingFanGameDialog(QDialog):
     """Pick a fan game from the list, then point it at the exe you already have."""
@@ -22704,144 +23701,14 @@ def _fan_game_dir(gid, title):
         return os.path.dirname(exe)
     return installed_game_dir(sanitize_folder_name(title))
 
-def _fan_open_location(self, gid, title):
-    entry = next((g for g in load_fan_library() if g["id"] == gid), None)
-    exe = entry.get("exe_path") if entry else ""
-    if exe and os.path.exists(exe):
-        folder = os.path.dirname(exe)
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(folder)
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-        except Exception as e:
-            QMessageBox.warning(self, "Open Game Location", f"Couldn't open the folder: {e}")
-        return
-    self.open_game_location(sanitize_folder_name(title))
 
-def _fan_add_existing(self):
-    dlg = AddExistingFanGameDialog(self)
-    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
-        return
-    d = dlg.result_data
-    gid, title, link, exe = d["id"], d["title"], d["link"], d["exe_path"]
-    if d["compat_tool"]:
-        cfg = load_compat_config()
-        cfg[f"fan-{gid}"] = d["compat_tool"]
-        save_compat_config(cfg)
-    lib = load_fan_library()
-    existing = next((g for g in lib if g["id"] == gid), None)
-    if existing is not None:               # already in the library: just link the exe
-        existing["exe_path"] = exe
-        save_fan_library(lib)
-        self._fan_refresh(gid)
-        QMessageBox.information(self, "Add Existing Fan Game",
-                                f"{title} was already in your library, so its executable was updated.")
-        return
-    saved_cover = ""
-    cached = os.path.join(get_fan_cover_dir(), f"{gid}.img")
-    if os.path.exists(cached):
-        try:
-            os.makedirs(get_library_cover_dir(), exist_ok=True)
-            saved_cover = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
-            shutil.copyfile(cached, saved_cover)
-        except Exception:
-            saved_cover = cached
-    entry = {"id": gid, "title": title, "link": link, "tags": d["tags"], "cover": saved_cover, "exe_path": exe}
-    save_fan_library(lib + [entry])
-    self._fan_create_library_card(entry)
-    if getattr(self.__dict__.get("fan_detail_page"), "_appid", None) == gid:
-        self.fan_detail_page.set_in_library(True)
-    # show it: switch the library to the Fan Games tab
-    self._lib_tab = "fan"
-    btns = self.library_tabs.findChildren(QPushButton) if hasattr(self, "library_tabs") else []
-    if len(btns) > 1:
-        btns[1].setChecked(True)
-    self.apply_filter(self.search_edit.text())
-    if saved_cover:
-        return
-    # no cover cached yet: fetch it from Game Jolt in the background
-    card = self.fan_lib_cards.get(gid)
-    label = card.findChildren(QLabel)[0] if card is not None else None
-    fan_loader = self.fan_page.loader       # on the GUI thread: reading fan_page may build the (lazy) page, a QWidget
-    worker = TaskWorker(lambda: fan_loader._fetch(gid, link, "", title))
-    if not hasattr(self, "_fan_cover_workers"):
-        self._fan_cover_workers = []
-    self._fan_cover_workers.append(worker)
 
-    def got(path):
-        if worker in self._fan_cover_workers:
-            self._fan_cover_workers.remove(worker)
-        if not path or not os.path.exists(path):
-            return
-        try:
-            os.makedirs(get_library_cover_dir(), exist_ok=True)
-            dest = os.path.join(get_library_cover_dir(), f"fan-{gid}.img")
-            shutil.copyfile(path, dest)
-            lib2 = load_fan_library()
-            for g in lib2:
-                if g["id"] == gid:
-                    g["cover"] = dest
-            save_fan_library(lib2)
-            pix = rounded_cover_pixmap(dest, FAN_COVER_W, FAN_COVER_H, 8)
-            if label is not None and pix:
-                label.setText("")
-                label.setPixmap(pix)
-                label.setStyleSheet("background: transparent; border: none;")
-        except (OSError, RuntimeError):
-            pass
-    worker.done.connect(got)
-    worker.failed.connect(lambda _m: None)
-    worker.start()
-
-AdaptiveApp._fan_open_location = _fan_open_location
-AdaptiveApp._fan_add_existing = _fan_add_existing
 
 # --- fan games: shortcut, compat tool, uninstall, button state ---
-_sc_prev_fan_card = AdaptiveApp._fan_create_library_card
-def _sc_fan_card(self, g):
-    _sc_prev_fan_card(self, g)
-    gid, title = g["id"], g["title"]
-    _add_shortcut_action(self, self.fan_lib_cards.get(gid), title, lambda: _fan_installed_exe(title),
-                         lambda: load_compat_config().get(f"fan-{gid}", ""), g.get("cover", ""),
-                         key=f"fan-{gid}")
-AdaptiveApp._fan_create_library_card = _sc_fan_card
 
-def _fan_compat_dialog(self, gid):
-    self.switch_compat_tool(f"fan-{gid}")
 
-def _fan_uninstall(self, gid, title):
-    lib = load_fan_library()
-    entry = next((g for g in lib if g["id"] == gid), None)
-    if entry and entry.get("exe_path"):
-        if QMessageBox.question(self, "Unlink", f"Unlink {title} from its existing files?\n"
-                                "Your game files won't be deleted.") != QMessageBox.StandardButton.Yes:
-            return
-        entry.pop("exe_path", None)
-        save_fan_library(lib)
-        self._fan_refresh(gid)
-        return
-    d = installed_game_dir(sanitize_folder_name(title))
-    if os.path.isdir(d):
-        if QMessageBox.question(self, "Uninstall", f"Delete the installed files for {title}?") != QMessageBox.StandardButton.Yes:
-            return
-        shutil.rmtree(d, ignore_errors=True)
-    self._fan_refresh(gid)
 
-def _fan_refresh(self, gid):
-    card = self.fan_lib_cards.get(gid)
-    btn = getattr(card, "_fan_btn", None)
-    if btn is not None:
-        g = next((x for x in load_fan_library() if x["id"] == gid), None)
-        if g:
-            _fan_update_btn(btn, g["title"])
-    dp = self.__dict__.get("fan_detail_page")
-    if dp is not None and dp._appid == gid:
-        _fan_update_btn(dp.steam_btn, dp._title)
 
-AdaptiveApp._fan_compat_dialog = _fan_compat_dialog
-AdaptiveApp._fan_uninstall = _fan_uninstall
-AdaptiveApp._fan_refresh = _fan_refresh
 
 _fan_prev_show_game = FanDetailPage.show_game
 def _fan_show_game(self, appid, title, *a, **k):
@@ -22849,9 +23716,9 @@ def _fan_show_game(self, appid, title, *a, **k):
     _fan_update_btn(self.steam_btn, title)
 FanDetailPage.show_game = _fan_show_game
 
-# ---------------------------------------------------------------- drag to reorder the library
+# ── drag to reorder the library ──
 # The three NCZ games stay first and can't be moved, and nothing can be dropped in front of them.
-from PyQt6.QtCore import QEvent as _QEvent, QMimeData as _QMimeData, QPoint as _QPoint, QRect as _QRect
+from PyQt6.QtCore import QPoint as _QPoint
 from PyQt6.QtWidgets import QAbstractButton as _QAB, QGraphicsOpacityEffect as _QGOE
 
 _CARD_MIME = "application/x-ncz-library-card"
@@ -22865,7 +23732,7 @@ def _load_library_order():
             d = json.load(f)
         if isinstance(d, dict):
             return d
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return {}
 
@@ -23022,7 +23889,7 @@ class _CardReorder(QObject):
         if self.card is not None:
             try:
                 self.card.setGraphicsEffect(None)
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
         self.card = None
         self.press = None
@@ -23047,7 +23914,7 @@ class _CardReorder(QObject):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-        except OSError:
+        except OSError:    # expected: file may not exist yet or be unreadable
             pass
 
 
@@ -23059,22 +23926,11 @@ def _apply_saved_order(lst, saved, keep_first=0):
     lst[:] = head + tail
 
 
-_reorder_prev_init = AdaptiveApp.__init__
 
-def _reorder_init(self):
-    _reorder_prev_init(self)
-    # the five NCZ games (AE, 2, The Return, Chess, NCZFront) are always the first five cards
-    self._fixed_cards = {id(c) for c, _t in self.cards[:5]}
-    saved = _load_library_order()
-    _apply_saved_order(self.cards, saved.get("main", []), keep_first=5)
-    _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
-    self._card_reorder = _CardReorder(self)
-    self.apply_filter()
 
-AdaptiveApp.__init__ = _reorder_init
 
  
-# ================================================================ Auto-Add Desktop Games
+# ── Auto-Add Desktop Games ──
 # "+" menu -> "Auto-Add Desktop Games": scans the Desktop for game shortcuts / exes / folders, matches them
 # against Steam to get covers (SteamGridDB first if you set a key, Steam's own art otherwise, then the exe's
 # own icon as a last resort), lets you untick anything that isn't a game, and adds the rest to the library.
@@ -23116,7 +23972,7 @@ def _desktop_dirs():
     try:
         dirs += _DeskStdPaths.standardLocations(_DeskStdPaths.StandardLocation.DesktopLocation)
     except Exception:
-        pass
+        _log_exc("_desktop_dirs")
     if sys.platform.startswith("win"):
         for root in (os.environ.get("USERPROFILE"), os.environ.get("PUBLIC")):
             if root:
@@ -23143,7 +23999,7 @@ def _desktop_dirs():
 def _desk_parse_lnk(path):
     """Reads a Windows .lnk file directly (MS-SHLLINK): (target, arguments, working dir), or None if unreadable.
     Target may be '' for shortcuts that only point at a shell item (Store apps etc.)."""
-    import struct
+    import struct    # lazy: saves memory/startup until used
     try:
         with open(path, "rb") as f:
             d = f.read()
@@ -23244,7 +24100,7 @@ def _resolve_lnks_powershell(paths):
     """Same thing through one PowerShell call (Windows only)."""
     if not paths or not sys.platform.startswith("win"):
         return {}
-    import tempfile
+    import tempfile    # lazy: saves memory/startup until used
     fd, tmp = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     data = []
@@ -23269,21 +24125,13 @@ def _resolve_lnks_powershell(paths):
     finally:
         try:
             os.remove(tmp)
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
     if isinstance(data, dict):
         data = [data]
     return {d["p"]: (d.get("t") or "", d.get("a") or "", d.get("w") or "")
             for d in data if isinstance(d, dict) and d.get("p")}
 
-def _desk_split_args(text):
-    text = (text or "").strip()
-    if not text:
-        return []
-    try:
-        return [t.strip('"') for t in shlex.split(text, posix=False)]
-    except ValueError:
-        return [text]
 
 def _desk_read_ini(path):
     """Key/value pairs of a .url / .desktop file (first occurrence of each key wins)."""
@@ -23294,7 +24142,7 @@ def _desk_read_ini(path):
                 if "=" in line and not line.lstrip().startswith(("#", ";", "[")):
                     k, v = line.split("=", 1)
                     out.setdefault(k.strip(), v.strip())
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     return out
 
@@ -23470,7 +24318,7 @@ def scan_desktop_games(dirs, known_titles, known_exes, known_urls, known_appids,
     found.sort(key=lambda c: (not c["likely"], c["title"].lower()))
     return found
 
-# ---- Qt part
+# ── Qt part ──
 def _desk_icon_cover(icon_source, title, out_path):
     """Last-resort cover: the exe's own icon centred on a dark 2:3 card with the title under it."""
     try:
@@ -23520,7 +24368,7 @@ def _desk_find_cover(cand, key, loader):
             if path:
                 return path
         except Exception:
-            pass
+            _log_exc("_desk_find_cover")
     if key:
         try:
             data = _desk_sgdb_search(cand["title"], key)
@@ -23531,7 +24379,7 @@ def _desk_find_cover(cand, key, loader):
                     f.write(data)
                 return out
         except Exception:
-            pass
+            _log_exc("_desk_find_cover")
     return ""
 
 class DesktopGamesDialog(QDialog):
@@ -23678,67 +24526,11 @@ def _desk_known(self):
             if g.get("exe_path"):
                 exes.add(_desk_norm_path(g["exe_path"]))
     except Exception:
-        pass
+        _log_exc("_desk_known")
     titles.discard("")
     return titles, exes, urls, appids
 
-def _auto_add_desktop_games(self):
-    dirs = _desktop_dirs()
-    if not dirs:
-        QMessageBox.information(self, "Auto-Add Desktop Games", "Couldn't find your Desktop folder.")
-        return
-    titles, exes, urls, appids = _desk_known(self)
-    ok, cands, error = BusyDialog(
-        "Scanning your desktop for games...",
-        lambda: scan_desktop_games(dirs, titles, exes, urls, appids), self).run()
-    if not ok:
-        QMessageBox.warning(self, "Auto-Add Desktop Games", f"The scan failed:\n\n{error}")
-        return
-    if not cands:
-        QMessageBox.information(self, "Auto-Add Desktop Games",
-                                "No new games found on your desktop.\n\nShortcuts (.lnk / .url / .desktop), "
-                                ".exe files and game folders are checked. Games already in your library are skipped.")
-        return
-    dlg = DesktopGamesDialog(cands, self)
-    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.chosen:
-        return
 
-    games = load_custom_games()
-    added = 0
-    stamp = int(time.time() * 1000)
-    for n, c in enumerate(dlg.chosen):
-        gid = f"custom_{stamp}_{n}"
-        cover = c.get("cover_path") or ""
-        if cover and os.path.exists(cover):
-            try:
-                os.makedirs(get_library_cover_dir(), exist_ok=True)
-                dest = os.path.join(get_library_cover_dir(), f"{gid}.img")
-                shutil.copyfile(cover, dest)
-                cover = dest
-            except Exception:
-                pass
-        entry = {"id": gid, "title": c["title"], "exe_path": c["exe_path"], "cover_path": cover, "compat_tool": ""}
-        if c.get("launch_file"):
-            try:
-                folder = os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_shortcuts")
-                os.makedirs(folder, exist_ok=True)
-                keep = os.path.join(folder, f"{gid}.lnk")
-                shutil.copyfile(c["launch_file"], keep)
-                c["launch_file"] = keep
-            except Exception:
-                pass
-        for k in ("launch_url", "launch_file", "launch_args", "launch_cmd", "workdir"):
-            if c.get(k):
-                entry[k] = c[k]
-        games.append(entry)
-        save_custom_games(games)  # saved per game so a crash half way doesn't lose the earlier ones
-        self.create_custom_card(gid, entry["title"], entry["exe_path"], cover, "")
-        added += 1
-    self.apply_filter()
-    QMessageBox.information(self, "Auto-Add Desktop Games",
-                            f"Added {added} game{'s' if added != 1 else ''} to your library.")
-
-AdaptiveApp.auto_add_desktop_games = _auto_add_desktop_games
 
 def _desk_launch(win, entry):
     """Launch for entries that aren't a plain exe: steam:// / epic:// links, shortcut arguments, .desktop Exec."""
@@ -23763,25 +24555,8 @@ def _desk_launch(win, entry):
     except Exception as e:
         QMessageBox.warning(win, "Launch Game", f"Couldn't launch game: {e}")
 
-_desk_prev_custom_card = AdaptiveApp.create_custom_card
 
-def _desk_create_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool):
-    _desk_prev_custom_card(self, game_id, title_text, exe_path, cover_path, compat_tool)
-    entry = next((g for g in load_custom_games() if g.get("id") == game_id), None)
-    if not entry or not (entry.get("launch_url") or entry.get("launch_file") or entry.get("launch_args")
-                         or entry.get("launch_cmd")):
-        return
-    card = getattr(self, "custom_cards", {}).get(game_id)
-    btn = card.findChild(QPushButton, "Primary") if card is not None else None
-    if btn is None:
-        return
-    try:
-        btn.clicked.disconnect()
-    except Exception:
-        pass
-    btn.clicked.connect(lambda _c=False, e=entry: _desk_launch(self, e))
 
-AdaptiveApp.create_custom_card = _desk_create_custom_card
 
 _desk_prev_build_library_page = AdaptiveApp.build_library_page
 
@@ -23796,11 +24571,10 @@ def _desk_build_library_page(self):
                     lambda _c=False: self.auto_add_desktop_games())
     return widget
 
-AdaptiveApp.build_library_page = _desk_build_library_page
+AdaptiveApp.build_library_page = _desk_build_library_page    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
 
-# ================================================================ frameless window: exit button + draggable top bar
-from PyQt6.QtCore import QEvent
+# ── frameless window: exit button + draggable top bar ──
 
 class _TitleBarDrag(QObject):
     """Makes the top nav bar act as the title bar: drag to move, double-click to maximize / restore."""
@@ -23921,99 +24695,11 @@ class _WindowStateWatcher(QObject):
             self._callback()
         return False
 
-_frameless_prev_init = AdaptiveApp.__init__
-
-def _frameless_init(self):
-    _frameless_prev_init(self)
-    self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)  # no OS title bar / border
-
-    bar = self.findChild(QFrame, "Sidebar")
-    if bar is None or bar.layout() is None:
-        return
-    _TitleBarDrag(self, bar)
-
-    exit_btn = QPushButton("\u2715")
-    exit_btn.setObjectName("ExitButton")
-    exit_btn.setToolTip("Close")
-    exit_btn.setFixedSize(40, 32)
-    exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    exit_btn.setStyleSheet(
-        "QPushButton { background: transparent; border: none; border-radius: 6px;"
-        " font-size: 15px; font-weight: bold; padding: 0; }"
-        "QPushButton:hover { background: #e5484d; color: #ffffff; }"
-        "QPushButton:pressed { background: #c93a3f; color: #ffffff; }")
-
-    def exit_launcher():
-        # With "Close button minimizes to tray" on, this hides the launcher to the tray (Quit is in the tray menu);
-        # otherwise it really quits.
-        tray = getattr(self, "_tray", None)
-        if tray is not None and tray.isVisible() and load_launcher_settings().get("close_to_tray", True):
-            self.close()
-            return
-        self._really_quit = True
-        if tray is not None:
-            tray.hide()
-        QApplication.instance().quit()
-
-    exit_btn.clicked.connect(exit_launcher)
-
-    min_btn = QPushButton("-")
-    min_btn.setObjectName("MinButton")
-    min_btn.setToolTip("Minimize")
-    min_btn.setFixedSize(40, 32)
-    min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    min_btn.setStyleSheet(
-        "QPushButton { background: transparent; border: none; border-radius: 6px;"
-        " font-size: 18px; font-weight: bold; padding: 0; }"
-        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
-        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
-    min_btn.clicked.connect(self.showMinimized)
-
-    max_btn = QPushButton()
-    max_btn.setObjectName("MaxButton")
-    max_btn.setFixedSize(40, 32)
-    max_btn.setIconSize(QSize(12, 12))
-    max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    max_btn.setStyleSheet(
-        "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
-        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
-        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
-
-    def refresh_max_btn():
-        maximized = self.isMaximized()
-        max_btn.setIcon(_caption_icon(maximized))
-        max_btn.setToolTip("Restore Down" if maximized else "Maximize")
-
-    max_btn.clicked.connect(lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
-    _WindowStateWatcher(self, refresh_max_btn)
-    refresh_max_btn()
-    _theme_listeners.append(refresh_max_btn)   # redraw the glyph when the theme changes
-
-    restart_btn = QPushButton()
-    restart_btn.setObjectName("RestartButton")
-    restart_btn.setToolTip("Restart launcher")
-    restart_btn.setFixedSize(40, 32)
-    restart_btn.setIconSize(QSize(12, 12))
-    restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    restart_btn.setStyleSheet(
-        "QPushButton { background: transparent; border: none; border-radius: 6px; padding: 0; }"
-        "QPushButton:hover { background: rgba(128, 128, 128, 0.25); }"
-        "QPushButton:pressed { background: rgba(128, 128, 128, 0.4); }")
-    restart_btn.clicked.connect(lambda: restart_launcher(self, use_demo=True))
-    restart_btn.setIcon(_restart_icon())
-    _theme_listeners.append(lambda: restart_btn.setIcon(_restart_icon()))   # redraw when the theme changes
-
-    bar.layout().addSpacing(8)
-    bar.layout().addWidget(restart_btn)
-    bar.layout().addSpacing(6)
-    bar.layout().addWidget(min_btn)
-    bar.layout().addWidget(max_btn)
-    bar.layout().addWidget(exit_btn)
-
-AdaptiveApp.__init__ = _frameless_init
 
 
-# ================================================================ in-game overlay (toast + settings)
+
+
+# ── in-game overlay (toast + settings) ──
 try:
     from overlay import overlay as _overlay
 except Exception:
@@ -24021,7 +24707,7 @@ except Exception:
 try:        # the toasts draw emoji as Apple pictures from the same cache the chat uses
     import overlay as _overlay_module
     _overlay_module.set_emoji_dir(os.path.dirname(emoji_store()._file("0")))
-except Exception:
+except Exception:    # expected: optional module may be missing
     pass
 
 OVERLAY_MODES = {
@@ -24039,7 +24725,7 @@ def get_overlay_mode():
             mode = json.load(f).get("mode")
         if mode in OVERLAY_MODES:
             return mode
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return "window"
 
@@ -24048,19 +24734,19 @@ def set_overlay_mode(mode):
         os.makedirs(os.path.dirname(_overlay_settings_path()), exist_ok=True)
         with open(_overlay_settings_path(), "w", encoding="utf-8") as f:
             json.dump({"mode": mode}, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _overlay_game_launched(exe):
     """In inject mode, puts the overlay DLL into the game we just started."""
     if _overlay is None or get_overlay_mode() != "inject":
         return
-    from overlay import inject_overlay
+    from overlay import inject_overlay    # lazy: saves memory/startup until used
     ok = inject_overlay(exe, asset_path("overlay_hook.dll"))
     _ov_log(f"in-game overlay in {os.path.basename(exe)}: {'LOADED' if ok else 'not loaded (yet)'}")
     if not ok and sys.platform.startswith("linux"):
         try:
-            from overlay import diagnose_linux
+            from overlay import diagnose_linux    # lazy: saves memory/startup until used
             _ov_log("   why: " + diagnose_linux(exe))
         except Exception as e:
             _ov_log(f"   (diagnose failed: {e!r})")
@@ -24088,7 +24774,7 @@ def _overlay_prepare_wine(app, exe, compat_tool, enable):
     """Before a Wine/Proton game starts: registers (enable) or removes the overlay DLL as an AppInit_DLL in its
     prefix. Wine loads AppInit_DLLs into every GUI process as user32 starts, which is the Linux stand-in for the
     Windows remote-thread injection. Returns the prefix when the DLL is set up, else None."""
-    import tempfile
+    import tempfile    # lazy: saves memory/startup until used
     target = _overlay_wine_target(app, exe, compat_tool)
     if target is None:
         return None
@@ -24118,7 +24804,7 @@ def _overlay_prepare_wine(app, exe, compat_tool, enable):
     try:
         with open(src, "rb") as a, open(dest, "rb") as b:
             same = a.read() == b.read()
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     if not (same and os.path.exists(marker)):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)       # first time per prefix takes a few seconds
@@ -24133,9 +24819,9 @@ def _overlay_prepare_wine(app, exe, compat_tool, enable):
         finally:
             QApplication.restoreOverrideCursor()
     try:
-        from overlay import register_wine_prefix
+        from overlay import register_wine_prefix    # lazy: saves memory/startup until used
         register_wine_prefix(exe, prefix)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     return prefix
 
@@ -24177,9 +24863,9 @@ _ov_invite_bridge = None
 
 def _overlay_invite_ready(name, game, avatar, cover, link):
     try:
-        import overlay as _ovm
+        import overlay as _ovm    # lazy: saves memory/startup until used
         _ovm.invite_accept_hook = _accept_invite_from_overlay
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     _overlay.set_mode("window")
     _overlay.notify_invite(name, game, link, avatar or None, cover or None)
@@ -24204,7 +24890,7 @@ def _overlay_show_invite(uid, name, inv, avatar):
         bridge.done.emit(name, inv["game"] or "a game", avatar or "", cover or "", inv["link"])
     threading.Thread(target=work, daemon=True).start()
 
-# ---- chess challenges: the chat message ("♟ X challenged you to a game of chess (5+3). Open NCZ Chess ...") shows up as
+# ── chess challenges: the chat message ("♟ X challenged you to a game of chess (5+3). Open NCZ Chess ...") shows up as
 # a toast with Accept / Decline. The game id isn't in the message, so it is looked up in chess/inbox (kind "invite").
 _CHESS_CHALLENGE_RE = re.compile(r"^\u265F\s+.+? challenged you to a game of chess(?:\s*\((.*?)\))?[.\s]")
 
@@ -24242,7 +24928,7 @@ def _chess_overlay_accept(gid, opp_uid="", name=""):
         win.open_chess()
         win.chess_page.accept_invite(gid, {"opp": name, "oppUid": opp_uid})
     except Exception as e:
-        print(f"chess: couldn't accept the challenge from the overlay: {e}")
+        _ncz_log(f"chess: couldn't accept the challenge from the overlay: {e}")
 
 def _chess_overlay_decline(gid, opp_uid="", name=""):
     def work():
@@ -24250,18 +24936,18 @@ def _chess_overlay_decline(gid, opp_uid="", name=""):
             token, uid = get_id_token()
             try:
                 _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"status": "declined"})
-            except CloudError:
+            except CloudError:    # expected: offline or timed out
                 pass
             _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
         except Exception as e:
-            print(f"chess: couldn't decline the challenge from the overlay: {e}")
+            _ncz_log(f"chess: couldn't decline the challenge from the overlay: {e}")
     threading.Thread(target=work, daemon=True).start()
 
 try:
     import overlay as _ovm_chess
     _ovm_chess.chess_accept_hook = _chess_overlay_accept
     _ovm_chess.chess_decline_hook = _chess_overlay_decline
-except Exception:
+except Exception:    # expected: optional module may be missing
     pass
 
 class _OvChessBridge(QObject):
@@ -24339,9 +25025,9 @@ def _overlay_friend_event(page, name, text, uid):
         if ch_tc is not None:
             if mode == "inject":                 # the injected in-game toast is text only, so the clickable one comes on top
                 try:
-                    from overlay import send_to_injected
+                    from overlay import send_to_injected    # lazy: saves memory/startup until used
                     send_to_injected(name, "chess", "challenged you to ")
-                except Exception:
+                except Exception:    # expected: optional module may be missing
                     pass
             _overlay_show_chess_invite(uid, name, ch_tc, _friend_avatar_file(uid, (page.friends.get(uid) or {}).get("photo")))
             return
@@ -24352,12 +25038,12 @@ def _overlay_friend_event(page, name, text, uid):
     if inv and hasattr(_overlay, "notify_invite"):
         if mode == "inject":                 # the injected in-game toast is text only, so the clickable one comes on top
             try:
-                from overlay import send_to_injected
+                from overlay import send_to_injected    # lazy: saves memory/startup until used
                 if inviter:
                     send_to_injected(inviter[1], inv.get("game") or "a game", "invited you to play ")
                 else:
                     send_to_injected(name, hl, prefix)
-            except Exception:
+            except Exception:    # expected: optional module may be missing
                 pass
         if inviter:
             _overlay_show_invite(inviter[0], inviter[1], inv, inviter[2])
@@ -24377,7 +25063,7 @@ def _overlay_friend_event(page, name, text, uid):
             else:
                 prefix, hl = ("sent a GIF" if att.get("k") == "gif" else "sent an image"), ""
     if mode == "inject":
-        from overlay import send_to_injected
+        from overlay import send_to_injected    # lazy: saves memory/startup until used
         if send_to_injected(name, hl, prefix):
             return                       # shown inside the game (text only)
     info = (page.friends.get(uid) or page.requests.get(uid) or {})
@@ -24407,7 +25093,7 @@ def _launch_exe(app, exe, compat_tool="", d3d="", args=None):
             pfx = _overlay_prepare_wine(app, exe, compat_tool, get_overlay_mode() == "inject")
             _ov_log(f"overlay mode={get_overlay_mode()}, wine prefix prepared: {pfx}")
         except Exception as e:
-            print(f"overlay: couldn't set up the Wine prefix: {e}")
+            _ncz_log(f"overlay: couldn't set up the Wine prefix: {e}")
             _ov_log(f"couldn't set up the Wine prefix: {e!r}")
     _ov_prev_launch_exe(app, exe, compat_tool, d3d, args)
     if exe and os.path.exists(exe):
@@ -24459,7 +25145,7 @@ def _ov_settings_init(self, *a, **k):
 SettingsPage.__init__ = _ov_settings_init
 
 
-# ================================================================ second instance with separate data (NCZ_PROFILE=name)
+# ── second instance with separate data (NCZ_PROFILE=name) ──
 _ncz_profile = re.sub(r"[^A-Za-z0-9_-]", "_", os.environ.get("NCZ_PROFILE", "").strip())
 if _ncz_profile:
     _ncz_base_settings_path = get_launcher_settings_path
@@ -24470,16 +25156,15 @@ if _ncz_profile:
         return os.path.join(f"{base}_{_ncz_profile}", "launcher.json")
 
 
-# ================================================================ friends overlay (Shift+Q while in a game)
-from PyQt6.QtWidgets import QSizeGrip, QListWidget, QListWidgetItem
+# ── friends overlay (Shift+Q while in a game) ──
+from PyQt6.QtWidgets import QSizeGrip
 from PyQt6.QtCore import QPointF
-from PyQt6.QtGui import QPen
 
 def _force_foreground_x11(winid):
     """Asks the window manager to focus our window the way a taskbar/pager would (a plain activateWindow() is
     ignored by focus-stealing prevention when the keypress that opened the panel went to the game)."""
     try:
-        from Xlib import display, X, protocol
+        from Xlib import display, X, protocol    # lazy: saves memory/startup until used
         d = display.Display()
         root = d.screen().root
         ev = protocol.event.ClientMessage(window=d.create_resource_object("window", int(winid)),
@@ -24489,7 +25174,7 @@ def _force_foreground_x11(winid):
         d.flush()
         d.close()
         return
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     xdotool = shutil.which("xdotool")
     if xdotool:
@@ -24497,7 +25182,7 @@ def _force_foreground_x11(winid):
             subprocess.Popen([xdotool, "windowactivate", str(int(winid))],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
-            pass
+            _log_exc("_force_foreground_x11")
 
 def _force_foreground(hwnd):
     if sys.platform.startswith("linux"):
@@ -24507,12 +25192,12 @@ def _force_foreground(hwnd):
     if not sys.platform.startswith("win"):
         return
     try:
-        import ctypes
+        import ctypes    # lazy: saves memory/startup until used
         u = ctypes.windll.user32
         u.keybd_event(0x12, 0, 0, 0)       # tap ALT so Windows lets us take focus from the game
         u.keybd_event(0x12, 0, 2, 0)
         u.SetForegroundWindow(hwnd)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
 
 class _FriendsDim(QWidget):
@@ -24538,7 +25223,7 @@ _FO_STOCK_ACCENT = "#a666ff"          # the stock purple the panel's shades were
 def _fo_tint(color):
     """Moves one of the panel's stock purple shades onto the launcher accent: same lightness, same
     saturation (scaled to the accent), hue taken from the accent. Stock purple in -> unchanged."""
-    import colorsys
+    import colorsys    # lazy: saves memory/startup until used
     acc = QColor(THEMES["dark"]["accent"])
     if not acc.isValid() or acc.name() == _FO_STOCK_ACCENT:
         return color
@@ -24871,13 +25556,13 @@ class _FriendsPanel(QWidget):
             try:
                 sig.emit(res)
             except Exception:
-                pass
+                _log_exc("work")
         threading.Thread(target=work, daemon=True).start()
 
     def refresh(self):
         self._bg(cloud_fetch_friends, self.got_friends)
 
-    # ---- friends list
+    # ── friends list ──
     def _fill_friends(self, friends):
         if friends is None:
             return
@@ -24935,7 +25620,7 @@ class _FriendsPanel(QWidget):
         self._fill_friends(self.friends)
         self.stack.setCurrentIndex(0)
 
-    # ---- chat
+    # ── chat ──
     def _open_chat(self, uid):
         d = self.friends.get(uid) or {}
         self.uid, self._sig = uid, None
@@ -24997,7 +25682,7 @@ class _FriendsPanel(QWidget):
         if stick:
             self._scroll_bottom()
 
-    # ---- what one chat message is drawn as: a game invite card, picture(s) with the caption, or a text bubble
+    # ── what one chat message is drawn as: a game invite card, picture(s) with the caption, or a text bubble
     def _text_bubble(self, text, mine):
         b = QLabel(text)
         b.setObjectName("Mine" if mine else "Theirs")
@@ -25103,7 +25788,7 @@ class _FriendsPanel(QWidget):
                     try:
                         self.got_media.emit((key, p))
                     except Exception:
-                        pass
+                        _log_exc("work")
                 threading.Thread(target=work, daemon=True).start()
         return lab
 
@@ -25172,12 +25857,12 @@ class _FriendsPanel(QWidget):
         def work():
             try:
                 cloud_send_message(uid, text)
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             QTimer.singleShot(0, self._load_chat)
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- game invite: same detection as the Friends page's "Invite to Game" button
+    # ── game invite: same detection as the Friends page's "Invite to Game" button ──
     def _note(self, text, ms=0):
         self._note_timer.stop()
         self.note.setText(text)
@@ -25223,7 +25908,7 @@ class _FriendsPanel(QWidget):
                 dlg.activateWindow()
                 _force_foreground(int(dlg.winId()))
             except Exception:
-                pass
+                _log_exc("front")
         QTimer.singleShot(0, front)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -25275,7 +25960,7 @@ def _ov_log(msg):
             os.remove(path)
         with open(path, "a", encoding="utf-8") as f:
             f.write(time.strftime("%H:%M:%S ") + str(msg) + "\n")
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 class _FriendsOverlay(QObject):
@@ -25307,7 +25992,7 @@ class _FriendsOverlay(QObject):
         if load_account() is None:
             return self._refuse("you are not logged in")
         if get_overlay_mode() == "inject":
-            from overlay import has_injected
+            from overlay import has_injected    # lazy: saves memory/startup until used
             if has_injected():
                 return self._refuse("the in-game overlay is active - press Shift+Q inside the game")
         self._verbose = False
@@ -25326,7 +26011,7 @@ class _FriendsOverlay(QObject):
             self.panel.refresh()
             _ov_log(f"friends panel shown (platform {QApplication.platformName()})")
         except Exception:
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             _ov_log("friends panel failed:\n" + traceback.format_exc())
             self.close()
 
@@ -25338,8 +26023,8 @@ class _FriendsOverlay(QObject):
 
 def _start_shift_q_hook(callback):
     """Windows low-level keyboard hook. Only listens (never blocks keys), so Shift+Q still types normally."""
-    import ctypes
-    from ctypes import wintypes
+    import ctypes    # lazy: saves memory/startup until used
+    from ctypes import wintypes    # lazy: saves memory/startup until used
     u = ctypes.WinDLL("user32", use_last_error=True)
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     class KBD(ctypes.Structure):
@@ -25376,9 +26061,9 @@ def _start_shift_q_hook(callback):
 def _start_shift_q_hook_linux(callback):
     """Linux (X11 / XWayland) Shift+Q listener via pynput (pip install pynput). Only listens, never blocks keys."""
     try:
-        from pynput import keyboard
+        from pynput import keyboard    # lazy: saves memory/startup until used
     except Exception as e:
-        print("Shift+Q overlay hotkey on Linux needs: pip install pynput")
+        _ncz_log("Shift+Q overlay hotkey on Linux needs: pip install pynput")
         _ov_log(f"pynput unavailable: {e!r}")
         return None
     state = {"shift": False, "q": False}
@@ -25429,10 +26114,10 @@ class _InjectBridge(QObject):
     @staticmethod
     def _dirs():
         try:
-            from overlay import injected_temp_dirs
+            from overlay import injected_temp_dirs    # lazy: saves memory/startup until used
             return injected_temp_dirs()       # Wine/Proton: the prefix Temp folder(s) of the injected games
         except Exception:
-            import tempfile
+            import tempfile    # lazy: saves memory/startup until used
             return [tempfile.gettempdir()]
 
     def _atomic_write(self, name, lines):
@@ -25442,7 +26127,7 @@ class _InjectBridge(QObject):
                 with open(path + ".tmp", "w", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
                 os.replace(path + ".tmp", path)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
 
     @staticmethod
@@ -25454,11 +26139,10 @@ class _InjectBridge(QObject):
             try:
                 fn()
             except Exception:
-                pass
+                _log_exc("work")
         threading.Thread(target=work, daemon=True).start()
 
     def _write_friends(self):
-        import time
         friends = cloud_fetch_friends() or {}
         rows = sorted(((_fo_status(d), uid, d) for uid, d in friends.items()), key=lambda r: r[0][2])
         lines = [str(time.time_ns())]
@@ -25468,7 +26152,6 @@ class _InjectBridge(QObject):
         self._atomic_write("ncz_friends.txt", lines)
 
     def _write_chat(self, uid):
-        import time
         res = cloud_get_messages(uid)
         me, msgs = res[0], res[1]
         lines = [str(time.time_ns()), uid]
@@ -25477,7 +26160,6 @@ class _InjectBridge(QObject):
         self._atomic_write("ncz_chat.txt", lines)
 
     def _load_chat(self, uid):
-        import time
         self._chat_t = time.time()
         self._bg(lambda: self._write_chat(uid))
 
@@ -25498,7 +26180,6 @@ class _InjectBridge(QObject):
             self._bg(work)
 
     def poll(self):
-        import time
         if get_overlay_mode() != "inject":
             return
         cmd = None
@@ -25524,14 +26205,14 @@ class _InjectBridge(QObject):
         elif self.chat_uid and time.time() - self._chat_t > 1.5:
             self._load_chat(self.chat_uid)     # keep the open chat fresh
 
-# ---------------------------------------------------------------- F9 screenshot hotkey (saved to <library>/Screenshots)
+# ── F9 screenshot hotkey (saved to <library>/Screenshots) ──
 def _screenshots_dir():
     return os.path.join(GAMES_DIR, "Screenshots")
 
 def _start_key_hook_win(vk, callback):
     """Windows low-level hook that only listens for one key (never blocks it)."""
-    import ctypes
-    from ctypes import wintypes
+    import ctypes    # lazy: saves memory/startup until used
+    from ctypes import wintypes    # lazy: saves memory/startup until used
     u = ctypes.WinDLL("user32", use_last_error=True)
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     class KBD(ctypes.Structure):
@@ -25567,7 +26248,7 @@ def _start_key_hook_win(vk, callback):
 
 def _start_f9_hook_linux(callback):
     try:
-        from pynput import keyboard
+        from pynput import keyboard    # lazy: saves memory/startup until used
     except Exception as e:
         _ov_log(f"pynput unavailable for F9: {e!r}")
         return None
@@ -25630,27 +26311,11 @@ class _ScreenshotTaker(QObject):
             _ov_log(f"screenshot failed: {e!r}")
             _show_screenshot_toast("Screenshot failed")
 
-_fo_prev_init = AdaptiveApp.__init__
-
-def _fo_init(self):
-    _fo_prev_init(self)
-    self._friends_overlay = _FriendsOverlay()
-    self._inject_bridge = _InjectBridge()
-    self._shot_taker = _ScreenshotTaker()
-    if sys.platform.startswith("win"):
-        self._kb_hook = _start_shift_q_hook(self._friends_overlay.toggle_req.emit)
-        self._f9_hook = _start_key_hook_win(0x78, self._shot_taker.req.emit)
-    elif sys.platform.startswith("linux"):
-        self._kb_hook = _start_shift_q_hook_linux(self._friends_overlay.toggle_req.emit)
-        self._f9_hook = _start_f9_hook_linux(self._shot_taker.req.emit)
-        if self._kb_hook is None and _overlay is not None and get_overlay_mode() != "off":
-            QTimer.singleShot(4000, lambda: _overlay.notify_playing(
-                "Shift+Q overlay", "pip install pynput", None, "needs: "))
-
-AdaptiveApp.__init__ = _fo_init
 
 
-# ================================================================ controller translator (Windows / XInput)
+
+
+# ── controller translator (Windows / XInput) ──
 def _controller_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "controller_settings.json")
 
@@ -25666,10 +26331,10 @@ def set_controller_enabled(on):
         os.makedirs(os.path.dirname(_controller_path()), exist_ok=True)
         with open(_controller_path(), "w", encoding="utf-8") as f:
             json.dump({"enabled": bool(on)}, f)
-    except Exception:
+    except Exception:    # expected: Discord or the controller may not be there
         pass
 
-from PyQt6.QtWidgets import QDialog, QSlider, QGridLayout
+from PyQt6.QtWidgets import QDialog, QSlider
 
 def _controller_profile_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "controller_profile.json")
@@ -25702,7 +26367,7 @@ class _ControllerRemapDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from controller_input import INPUTS, ACTIONS, DEFAULTS, DEFAULT_SPEED, read_profile, write_profile
+        from controller_input import INPUTS, ACTIONS, DEFAULTS, DEFAULT_SPEED, read_profile, write_profile    # lazy: saves memory/startup until used
         self._defaults, self._default_speed, self._write = DEFAULTS, DEFAULT_SPEED, write_profile
         self.path = _controller_profile_path()
         self.prof = read_profile(self.path)
@@ -25775,7 +26440,7 @@ class _ControllerRemapDialog(QDialog):
         try:
             self._write(self.path, self.prof)
         except Exception:
-            pass
+            _log_exc("_save")
 
     def _changed(self, iid, txt):
         self.prof[iid] = txt
@@ -25791,21 +26456,8 @@ class _ControllerRemapDialog(QDialog):
             cb.setCurrentText(self._defaults[iid])      # triggers _changed -> saves
         self.speed.setValue(self._default_speed)
 
-_ct_prev_init = AdaptiveApp.__init__
 
-def _ct_init(self):
-    _ct_prev_init(self)
-    try:
-        from controller_input import ControllerTranslator, AVAILABLE
-        if AVAILABLE:
-            self._controller = ControllerTranslator(
-                get_controller_enabled, lambda: bool(_now_playing["name"] or _running),
-                _controller_profile_path())
-            self._controller.start()
-    except Exception:
-        pass
 
-AdaptiveApp.__init__ = _ct_init
 
 _ct_prev_settings_init = SettingsPage.__init__
 
@@ -25851,9 +26503,9 @@ def _ct_settings_init(self, *a, **k):
 SettingsPage.__init__ = _ct_settings_init
 
 
-# ================================================================ library sort (A to Z) + Discord Rich Presence
+# ── library sort (A to Z) + Discord Rich Presence ──
 # Library sort: "Custom order" is whatever you dragged the cards into; "A to Z" sorts everything alphabetically
-# but the five NCZ games (AE, 2, The Return, Chess, NCZFront) always stay on top. Your dragged order is kept and comes back when you switch back.
+# but the three NCZ games always stay on top. Your dragged order is kept and comes back when you switch back.
 _lib_sort_cache = {"mode": None}
 
 def get_library_sort():
@@ -25869,7 +26521,7 @@ def set_library_sort(mode):
         st["library_sort"] = mode
         save_launcher_settings(st)
     except Exception:
-        pass
+        _log_exc("set_library_sort")
 
 _sort_prev_apply_filter = AdaptiveApp.apply_filter
 
@@ -25890,7 +26542,7 @@ def _sort_apply_filter(self, text=""):
         if fan is not None:
             fan[:] = orig_fan
 
-AdaptiveApp.apply_filter = _sort_apply_filter
+AdaptiveApp.apply_filter = _sort_apply_filter    # kept as patch chain: two wrappers call the original inside a condition or twice
 
 # dragging cards makes no sense while they're sorted A to Z
 _sort_prev_card_for = _CardReorder._card_for
@@ -25902,33 +26554,8 @@ def _sort_card_for(self, widget):
 
 _CardReorder._card_for = _sort_card_for
 
-_sort_prev_init = AdaptiveApp.__init__
 
-def _sort_init(self):
-    _sort_prev_init(self)
-    try:
-        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
-        idx = header.indexOf(self.search_edit)
-        if idx >= 0:
-            combo = QComboBox()
-            combo.setFixedHeight(36)
-            combo.setToolTip("Library order. A to Z keeps the NCZ games on top.")
-            combo.addItem("Custom order", "custom")
-            combo.addItem("A to Z", "az")
-            combo.setCurrentIndex(1 if get_library_sort() == "az" else 0)
 
-            def changed(_i):
-                set_library_sort(combo.currentData())
-                self.apply_filter(self.search_edit.text())
-
-            combo.currentIndexChanged.connect(changed)
-            header.insertWidget(idx, combo)
-            header.insertSpacing(idx + 1, 10)
-        self.apply_filter(self.search_edit.text())
-    except Exception:
-        pass
-
-AdaptiveApp.__init__ = _sort_init
 
 
 # Discord Rich Presence: shows the game you're playing (and for how long). Nothing is shown while no game is
@@ -25943,7 +26570,7 @@ def set_discord_rpc_enabled(on):
         st = load_launcher_settings()
         st["discord_rpc"] = bool(on)
         save_launcher_settings(st)
-    except Exception:
+    except Exception:    # expected: Discord or the controller may not be there
         pass
     _discord_rpc.poke()
 
@@ -26000,7 +26627,7 @@ class _DiscordRPC:
             path = os.path.join(os.path.dirname(get_launcher_settings_path()), "discord_rpc.log")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
-        except Exception:
+        except Exception:    # expected: Discord or the controller may not be there
             pass
 
     def poke(self):
@@ -26021,7 +26648,7 @@ class _DiscordRPC:
         if rpc is not None:
             try:
                 rpc.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
     def _connect(self):
@@ -26030,12 +26657,12 @@ class _DiscordRPC:
         if self._missing:
             return False
         try:
-            from pypresence import Presence
+            from pypresence import Presence    # lazy: saves memory/startup until used
         except Exception as e:
             self._missing = True
             self._log(f"pypresence is not installed for this Python ({sys.executable}): {e}. Run: pip install pypresence")
             return False
-        import asyncio
+        import asyncio    # lazy: saves memory/startup until used
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         rpc = Presence(DISCORD_APP_ID, loop=loop)
@@ -26113,7 +26740,7 @@ def _rpc_settings_init(self, *a, **k):
 SettingsPage.__init__ = _rpc_settings_init
 
 
-# ================================================================ FNaNCZ AE / 2 native launch on Linux
+# ── FNaNCZ AE / 2 native launch on Linux ──
 # They're native Linux games made by the conversion script, started through their run.sh. This looks for run.sh
 # anywhere inside the game folder (the script may put it in a subfolder), says so when it can't find it, and
 # warns with the game's own output if it quits right away. Output also goes to launch-<game>.log.
@@ -26164,23 +26791,11 @@ def _native_linux_launch(app, game_dir, game_id, title):
 
     QTimer.singleShot(4000, check)
 
-_native_prev_launch_ae = AdaptiveApp.launch_ae_game
-_native_prev_launch_ncz2 = AdaptiveApp.launch_ncz2_game
 
-def _native_launch_ae(self):
-    if sys.platform.startswith("linux"):
-        return _native_linux_launch(self, installed_game_dir(AE_GAME_NAME), "ae", AE_GAME_NAME)
-    return _native_prev_launch_ae(self)
 
-def _native_launch_ncz2(self):
-    if sys.platform.startswith("linux"):
-        return _native_linux_launch(self, installed_game_dir(NCZ2_GAME_NAME), "ncz2", NCZ2_GAME_NAME)
-    return _native_prev_launch_ncz2(self)
 
-AdaptiveApp.launch_ae_game = _native_launch_ae
-AdaptiveApp.launch_ncz2_game = _native_launch_ncz2
 
-# ================================================================ library duplicate-card fix + library saved to account
+# ── library duplicate-card fix + library saved to account ──
 def _drop_steam_card_widget(self, appid):
     """Removes a store card's widget only (library file and cover stay untouched)."""
     card = self.steam_cards.pop(appid, None)
@@ -26191,7 +26806,7 @@ def _drop_steam_card_widget(self, appid):
         card.hide()
         card.setParent(None)
         card.deleteLater()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
 
 # Adding a game as "existing" after it was added from the Store used to build a second card for the same appid and
@@ -26204,9 +26819,9 @@ def _lib_create_steam_card(self, appid, title_text, cover_path):
         _drop_steam_card_widget(self, appid)
     _lib_prev_create_steam_card(self, appid, title_text, cover_path)
 
-AdaptiveApp.create_steam_card = _lib_create_steam_card
+AdaptiveApp.create_steam_card = _lib_create_steam_card    # kept as patch chain: a replacement patch sits in the middle of the chain, so it is not a plain wrapper chain
 
-# ---- library <-> account (users/<uid>/library in the cloud)
+# ── library <-> account (users/<uid>/library in the cloud) ──
 _lib_lock = threading.RLock()
 _lib_timer = None
 _lib_suppress = False       # True while a cloud copy is being applied locally, so that doesn't push straight back
@@ -26221,7 +26836,7 @@ def _lib_load_state():
             data = json.load(f)
         if isinstance(data, dict):
             return data
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return {}
 
@@ -26230,7 +26845,7 @@ def _lib_save_state(state):
         os.makedirs(os.path.dirname(_lib_state_path()), exist_ok=True)
         with open(_lib_state_path(), "w", encoding="utf-8") as f:
             json.dump(state, f)
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
 
 def _lib_url(uid, token):
@@ -26265,7 +26880,7 @@ def _lib_push_bg():
     try:
         _lib_push_now()
     except Exception:
-        pass    # stays marked dirty; retried on the next change, launch or login
+        _log_exc("_lib_push_bg")    # stays marked dirty; retried on the next change, launch or login
 
 def _lib_schedule_push(delay=2.0):
     global _lib_timer
@@ -26312,7 +26927,7 @@ def _lib_download_cover(appid):
         data = _http_json(f"{FIREBASE_DB_URL.strip().rstrip('/')}/steam_links/{appid}.json", "GET")
         if isinstance(data, dict) and isinstance(data.get("cover_url"), str):
             urls.append(data["cover_url"])
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
     urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg")
@@ -26422,39 +27037,18 @@ def _lib_apply(self, result):
             if page is not None:
                 page.set_in_library(page._appid in self.steam_cards)
         except Exception:
-            pass
+            _log_exc("_lib_apply")
     finally:
         _lib_suppress = False
     if result.get("push"):
         _lib_mark_dirty()
 
-def _lib_sync_async(self):
-    global _lib_last_sync
-    if not cloud_configured() or load_account() is None:
-        return
-    worker = getattr(self, "_lib_worker", None)
-    if worker is not None and worker.isRunning():
-        return
-    if time.time() - _lib_last_sync < 20:
-        return
-    _lib_last_sync = time.time()
-    worker = TaskWorker(_lib_sync_worker)
-    worker.done.connect(lambda result: _lib_apply(self, result))
-    self._lib_worker = worker
-    worker.start()
 
-AdaptiveApp.sync_library = _lib_sync_async
 
-_acl_prev_init = AdaptiveApp.__init__
 
-def _acl_init(self):
-    _acl_prev_init(self)
-    self.account_page.account_changed.connect(self.sync_library)
-    QTimer.singleShot(1500, self.sync_library)
 
-AdaptiveApp.__init__ = _acl_init
 
-# ================================================================ playtime counter (saved to the account)
+# ── playtime counter (saved to the account) ──
 # Each PC only ever writes its own number (users/<uid>/playtime/<game>/dev/<this PC>), so two PCs never overwrite each
 # other; a game's total is the sum over all PCs.
 _pt_lock = threading.RLock()
@@ -26477,7 +27071,7 @@ def _pt_load():
             try:
                 with open(_pt_path(), encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
+            except Exception:    # expected: file may not exist yet or be unreadable
                 pass
             if not isinstance(data, dict):
                 data = {}
@@ -26496,7 +27090,7 @@ def _pt_save():
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(_pt_load(), f)
             os.replace(tmp, _pt_path())
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
 
 def _pt_add(title, seconds):
@@ -26564,12 +27158,13 @@ def _pt_session(name, proc):
 
 _pt_prev_track_playing = _track_playing
 
+# kept: used at import time before the later definition at line 47886
 def _track_playing(name, proc, folder=None):
     _pt_prev_track_playing(name, proc, folder)
     try:
         _pt_session(pretty_game_name(name), proc)
     except Exception:
-        pass
+        _log_exc("_track_playing")
 
 def _pt_url(uid, token):
     base = FIREBASE_DB_URL.strip().rstrip("/")
@@ -26614,7 +27209,7 @@ def _pt_sync_bg():
     try:
         _pt_sync_now()
     except Exception:
-        pass
+        _log_exc("_pt_sync_bg")
 
 def _pt_schedule_push(delay=20.0):
     global _pt_timer
@@ -26650,30 +27245,12 @@ def _pt_refresh_cards(self):
         except RuntimeError:
             continue
 
-def _pt_sync_async(self):
-    global _pt_last_sync
-    if time.time() - _pt_last_sync < 20:
-        return
-    _pt_last_sync = time.time()
-    threading.Thread(target=_pt_sync_bg, daemon=True).start()
 
-AdaptiveApp.sync_playtime = _pt_sync_async
 
-_pt_prev_init = AdaptiveApp.__init__
 
-def _pt_init(self):
-    _pt_prev_init(self)
-    self._pt_ui_timer = QTimer(self)
-    self._pt_ui_timer.setInterval(3000)
-    self._pt_ui_timer.timeout.connect(lambda: _pt_refresh_cards(self))
-    self._pt_ui_timer.start()
-    QTimer.singleShot(2500, lambda: _pt_refresh_cards(self))
-    self.account_page.account_changed.connect(self.sync_playtime)
-    QTimer.singleShot(3000, self.sync_playtime)
 
-AdaptiveApp.__init__ = _pt_init
 
-# ================================================================ group chats (Friends tab)
+# ── group chats (Friends tab) ──
 # Group chats live inside the Friends tab: a "Group chats" box on the friends list, and a chat page with a
 # Discord-style member list on the right. Roles: owner > admin > moderator > member.
 #   owner  : everything (rename, delete group, make admins, kick/ban/timeout anyone)
@@ -26681,9 +27258,7 @@ AdaptiveApp.__init__ = _pt_init
 #   mod    : add members, kick/ban/timeout plain members, delete messages
 #   member : chat (replies, reactions, images/videos, emoji, game invites)
 # Everything is also enforced by the database rules (see group-chat-rules.json), not just by this UI.
-from PyQt6.QtWidgets import (QMenu, QDialog, QLineEdit, QLabel, QPushButton, QFrame, QScrollArea, QVBoxLayout,
-                             QHBoxLayout, QWidget, QMessageBox, QInputDialog, QListWidget, QListWidgetItem,
-                             QApplication, QGridLayout, QFileDialog)
+from PyQt6.QtWidgets import QDialog, QLabel, QFrame, QScrollArea, QWidget
 
 GROUP_RANK = {"owner": 3, "admin": 2, "mod": 1, "member": 0}
 GROUP_ROLE_LABEL = {"owner": "Owner", "admin": "Admin", "mod": "Moderator", "member": "Member"}
@@ -26708,7 +27283,7 @@ def group_can_set_role(my_role, target_role, new_role):
     return my_role == "admin" and target_role in ("mod", "member") and new_role in ("mod", "member")
 
 
-# ---- cloud
+# ── cloud ──
 def _grp_clean(raw):
     meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
     members = raw.get("members") if isinstance(raw.get("members"), dict) else {}
@@ -26725,7 +27300,7 @@ def _grp_clean(raw):
 def _grp_drop_index(token, uid, gid):
     try:
         _http_json(_fdb(f"usergroups/{uid}/{gid}", token), "DELETE")
-    except CloudError:
+    except CloudError:    # expected: offline or timed out
         pass
 
 
@@ -26809,12 +27384,12 @@ def cloud_create_group(name, member_uids, icon=None):
     for m in list(member_uids)[:GROUP_MAX_MEMBERS - 1]:
         try:
             cloud_group_add_member(gid, m)
-        except CloudError:
+        except CloudError:    # expected: offline or timed out
             pass
     if icon:
         try:
             cloud_group_set_icon(gid, icon)
-        except CloudError:
+        except CloudError:    # expected: offline or timed out
             pass
     return gid
 
@@ -27009,7 +27584,7 @@ def cloud_fetch_media(other, att):
     return _grp_prev_fetch_media(other, att)
 
 
-# ---- message rows: sender name above other people's bubbles, delete for mods/authors, invite covers
+# ── message rows: sender name above other people's bubbles, delete for mods/authors, invite covers
 _grp_prev_msgrow_init = _MsgRow.__init__
 
 
@@ -27091,7 +27666,7 @@ def _grp_invite_card(self, inv, mine):
 _MsgRow._invite_card = _grp_invite_card
 
 
-# ---- small UI helpers
+# ── small UI helpers ──
 def _grp_avatar(label, path, letter, size):
     pic = CreditsPage.circular_pixmap(path, size * 2) if path else None
     if pic:
@@ -27107,7 +27682,7 @@ def _grp_name_of(p):
     return (p or {}).get("username") or "Unknown"
 
 
-# ---- group icons: stored in groups/<gid>/meta/icon as a base64 png (same format as profile pictures)
+# ── group icons: stored in groups/<gid>/meta/icon as a base64 png (same format as profile pictures)
 def _grp_cache_dir():
     path = os.path.join(os.path.dirname(get_launcher_settings_path()), "group_icons")
     os.makedirs(path, exist_ok=True)
@@ -27118,8 +27693,8 @@ def _grp_icon_file(gid, icon):
     """Writes a group's icon to disk (once per change) and returns the path, or None when it has none."""
     if not icon or not _GID_RE.match(str(gid)):
         return None
-    import zlib
-    import glob
+    import zlib    # lazy: saves memory/startup until used
+    import glob    # lazy: saves memory/startup until used
     raw = _decode_photo(icon)
     if not raw:
         return None
@@ -27130,7 +27705,7 @@ def _grp_icon_file(gid, icon):
         for old in glob.glob(os.path.join(folder, f"{gid}_*.png")):      # an older icon of this group
             try:
                 os.remove(old)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
         with open(path, "wb") as f:
             f.write(raw)
@@ -27457,7 +28032,7 @@ class _GroupBansDialog(QDialog):
         self._on_unban(uid, done)
 
 
-# ---- the group chat page
+# ── the group chat page ──
 class GroupChatPage(QWidget):
     _done = pyqtSignal(object, object, object)
 
@@ -28179,7 +28754,7 @@ class GroupChatPage(QWidget):
             if gid != self.gid:
                 return
             info = info or {}
-            game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "")
+            game, appid, link = info.get("game", ""), info.get("appid", 0), info.get("link", "") or clip     # the link you just copied: fallback
             if game and link:
                 self._send_invite(game, link, appid)
                 return
@@ -28193,7 +28768,7 @@ class GroupChatPage(QWidget):
         self._run(detect_invite_info, done, key="ginvite-detect")
 
 
-# ---- hook into the Friends tab
+# ── hook into the Friends tab ──
 def _grp_rebuild_rows(fp):
     lay = fp.grp_rows
     while lay.count():
@@ -28393,12 +28968,11 @@ def _grp_fp_refresh(self):
 FriendsPage.refresh = _grp_fp_refresh
 
 
-
-# ---------------------------------------------------------------- navbar: Downloads + Settings icon buttons, centred tabs, Credits inside Settings
+# ── navbar: Downloads + Settings icon buttons, centred tabs, Credits inside Settings ──
 def _nav_icon(kind):
     """Download-tray / gear glyph drawn in the nav colours (grey, white on hover / when selected), no font needed."""
-    import math
-    from PyQt6.QtGui import QPolygonF
+    import math    # lazy: saves memory/startup until used
+    from PyQt6.QtGui import QPolygonF    # lazy: saves memory/startup until used
     icon = QIcon()
     states = ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
               (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
@@ -28439,7 +29013,7 @@ def _nav_icon(kind):
 
 def _nav_tab_icon(kind):
     """Small line icon for a top-bar tab, drawn in the nav colours (grey; white on hover / when selected)."""
-    from PyQt6.QtGui import QPolygonF
+    from PyQt6.QtGui import QPolygonF    # lazy: saves memory/startup until used
     icon = QIcon()
     states = ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
               (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
@@ -28554,7 +29128,7 @@ class _NavCenterFilter(QObject):
             if not c.isVisible():
                 c.show()
             c.raise_()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
 class _VisibilityMirror(QObject):
@@ -28690,7 +29264,7 @@ def _rework_navbar(self):
                 gp = getattr(fp, "group_page", None)
                 if gp is not None and gp.gid and gp.isVisible():
                     fp.unread_clear("group:" + gp.gid)
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
         self._unread_timer = QTimer(self)
         self._unread_timer.setInterval(1000)
@@ -28714,12 +29288,12 @@ def _rework_navbar(self):
         else:
             content.addWidget(credits)
     except Exception:
-        pass
+        _log_exc("_rework_navbar")
 
     try:
         _polish_account_page(self.account_page)
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
     # always start in the Library
@@ -28728,19 +29302,10 @@ def _rework_navbar(self):
     if first is not None:
         first.setChecked(True)
 
-_nav_prev_init = AdaptiveApp.__init__
 
-def _nav_final_init(self):
-    _nav_prev_init(self)
-    try:
-        _rework_navbar(self)
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
-AdaptiveApp.__init__ = _nav_final_init
 
-# ================================================================ profiles (Steam-style: currently playing, library, country)
+# ── profiles (Steam-style: currently playing, library, country) ──
 # Opened by clicking a member in a group chat's member list; your own profile is shown in the Account tab.
 # What other people see lives in public/<uid>: username, photo, country, library, playing, and "ptime" (hours per game).
 PF_BLUE = "#3b82f6"
@@ -28767,7 +29332,7 @@ def _pf_last_played(ms):
         if ms > 0:
             return "Last played " + time.strftime("%d %b %Y", time.localtime(ms / 1000.0))
     except Exception:
-        pass
+        _log_exc("_pf_last_played")
     return ""
 
 def _pf_file_sig(path):
@@ -28792,7 +29357,7 @@ def profile_ptime_payload():
         for total, last, key, title in rows[:80]:
             out[key] = {"t": title[:80], "s": total, "l": last}
     except Exception:
-        pass
+        _log_exc("profile_ptime_payload")
     return out or None
 
 def profile_info_self():
@@ -28825,7 +29390,7 @@ def profile_info_self():
             if t:
                 ptime[t] = (_pt_total(t), int(g.get("last", 0)))
     except Exception:
-        pass
+        _log_exc("profile_info_self")
     return {"uid": acct.get("uid", ""), "name": name, "avatar": avatar, "country": load_profile_country(),
             "status": status, "color": color, "playing": playing, "titles": titles, "covers": covers,
             "ptime": ptime, "sub": acct.get("email", ""), "is_me": True}
@@ -28902,7 +29467,7 @@ class ProfileView(QWidget):
         body.setContentsMargins(0, 0, 10, 16)
         body.setSpacing(16)
 
-        # ---- header
+        # ── header ──
         self.header = QFrame()
         self.header.setObjectName("ProfileHeader")
         hl = QHBoxLayout(self.header)
@@ -28952,7 +29517,7 @@ class ProfileView(QWidget):
         hl.addWidget(self.action_btn, 0, Qt.AlignmentFlag.AlignTop)
         body.addWidget(self.header)
 
-        # ---- left column: currently in-game, recent activity, game collection
+        # ── left column: currently in-game, recent activity, game collection ──
         cols = QHBoxLayout()
         cols.setSpacing(16)
         left = QVBoxLayout()
@@ -28999,7 +29564,7 @@ class ProfileView(QWidget):
         body.addLayout(cols)
         body.addStretch()
 
-    # ---- small builders
+    # ── small builders ──
     @staticmethod
     def _card():
         card = QFrame()
@@ -29114,7 +29679,7 @@ class ProfileView(QWidget):
         h.addWidget(b, 1)
         return w
 
-    # ---- country flag (downloaded once, cached; a code badge is shown until it arrives)
+    # ── country flag (downloaded once, cached; a code badge is shown until it arrives) ──
     def _set_country(self, code):
         code = (code or "").upper()
         if code not in COUNTRIES:
@@ -29148,10 +29713,10 @@ class ProfileView(QWidget):
                 self.flag_lbl.setStyleSheet("")
                 self.flag_lbl.setText("")
                 self.flag_lbl.setPixmap(pix)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
-    # ---- fill
+    # ── fill ──
     def set_info(self, info):
         name = info.get("name") or "Unknown"
         color = info.get("color") or "#888888"
@@ -29264,7 +29829,7 @@ class ProfilePage(QWidget):
             try:
                 self.view.set_info(profile_info_from_public(uid, seed))
             except Exception:
-                pass
+                _log_exc("__init__")
         self.note.setText("Loading profile...")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -29295,17 +29860,17 @@ class ProfilePage(QWidget):
             self.note.setText("")
             self.view.set_info(info)
             self.name_known.emit(info.get("name") or "Profile")
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def _on_failed(self, message):
         self._loading = False
         try:
             self.note.setText(message or "Couldn't load this profile.")
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
-    # ---- Add Friend
+    # ── Add Friend ──
     def _load_relation(self):
         worker = TaskWorker(lambda: profile_relation(self.uid))
         worker.done.connect(self._on_relation)
@@ -29328,7 +29893,7 @@ class ProfilePage(QWidget):
             btn.setText(text)
             btn.setEnabled(enabled)
             btn.show()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def _add_friend(self):
@@ -29350,103 +29915,26 @@ class ProfilePage(QWidget):
                 fp = getattr(self.window(), "friends_page", None)
                 if fp is not None:
                     fp.refresh()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
         except Exception:
-            pass
+            _log_exc("_on_added")
 
     def _on_add_failed(self, message):
         try:
             self._relation = "friends" if "already friends" in (message or "") else "none"
             self._apply_action()
             self.note.setText(message or "Couldn't send the friend request.")
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
 
-# ---- profile tabs: a temporary tab in the top bar per opened profile, closed with the x next to it
-def _pf_open_tab(self, uid, seed=None):
-    acct = load_account() or {}
-    if uid == acct.get("uid"):                     # your own profile lives in the Account tab
-        self.open_account()
-        return
-    tabs = self.__dict__.setdefault("_profile_tabs", {})
-    if not self.__dict__.get("_pf_page_hook"):      # a profile tab disappears as soon as you switch to another page
-        self._pf_page_hook = True
-        self.pages.currentChanged.connect(lambda _i: self._pf_prune_tabs())
-    tab = tabs.get(uid)
-    if tab is None:
-        page = ProfilePage(uid, seed)
-        self.pages.addWidget(page)
-        seq = self.__dict__.get("_profile_tab_seq", 0) + 1
-        self._profile_tab_seq = seq
-        tab_id = 1000 + seq
-        label = (seed or {}).get("username") if isinstance(seed, dict) else None
-        btn = self.make_nav_button(str(label or "Profile")[:20], checkable=True)
-        _set_tab_icon(btn, "user")
-        close = QPushButton("\u00d7")
-        close.setFixedSize(20, 20)
-        close.setCursor(Qt.CursorShape.PointingHandCursor)
-        close.setToolTip("Close tab")
-        close.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 10px; font-size: 15px; }"
-                            " QPushButton:hover { background: rgba(128,128,128,0.30); }")
-        wrap = QWidget()
-        wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        hl = QHBoxLayout(wrap)
-        hl.setContentsMargins(0, 0, 6, 0)
-        hl.setSpacing(0)
-        hl.addWidget(btn)
-        hl.addWidget(close, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.nav_group.addButton(btn, tab_id)
-        self._nav_center_layout.addWidget(wrap)
-        page.name_known.connect(lambda n, b=btn: (b.setText(n[:20].upper()), b.setToolTip(n)))
-        close.clicked.connect(lambda _=False, u=uid: self._pf_close_tab(u))
-        tab = tabs[uid] = {"page": page, "wrap": wrap, "btn": btn, "id": tab_id}
-        QTimer.singleShot(0, lambda: self._nav_center_filter.place())
-    tab["btn"].setChecked(True)
-    self.pages.setCurrentWidget(tab["page"])
+# ── profile tabs: a temporary tab in the top bar per opened profile, closed with the x next to it
 
-def _pf_prune_tabs(self):
-    cur = self.pages.currentWidget()
-    for u, t in list(self.__dict__.get("_profile_tabs", {}).items()):
-        if t["page"] is not cur:
-            QTimer.singleShot(0, lambda u=u: self._pf_close_tab(u))
 
-def _pf_close_tab(self, uid):
-    tab = self.__dict__.get("_profile_tabs", {}).pop(uid, None)
-    if not tab:
-        return
-    was_current = self.pages.currentWidget() is tab["page"]
-    tab["page"].stop()
-    self.nav_group.removeButton(tab["btn"])
-    self._nav_center_layout.removeWidget(tab["wrap"])
-    tab["wrap"].hide()
-    tab["wrap"].deleteLater()
-    self.pages.removeWidget(tab["page"])
-    tab["page"].deleteLater()
-    QTimer.singleShot(0, lambda: self._nav_center_filter.place())
-    if was_current:
-        fp = getattr(self, "friends_page", None)
-        if fp is not None:
-            b = self.nav_group.button(self.pages.indexOf(fp))
-            if b is not None:
-                b.setChecked(True)
-            self.pages.setCurrentWidget(fp)
 
-_pf_orig_show_page = AdaptiveApp.show_page
 
-def _pf_show_page(self, index):
-    if index >= 1000:                              # a profile tab
-        for tab in self.__dict__.get("_profile_tabs", {}).values():
-            if tab["id"] == index:
-                self.pages.setCurrentWidget(tab["page"])
-        return
-    _pf_orig_show_page(self, index)
 
-AdaptiveApp.show_page = _pf_show_page
-AdaptiveApp.open_profile_tab = _pf_open_tab
-AdaptiveApp._pf_close_tab = _pf_close_tab
-AdaptiveApp._pf_prune_tabs = _pf_prune_tabs
 
 
 class CountryDialog(QDialog):
@@ -29504,7 +29992,7 @@ class CountryDialog(QDialog):
         return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
 
 
-# ================================================================ "New" UI theme
+# ── "New" UI theme ──
 # "New" theme = black -> grey like the sign-in window, white accent, always dark, navigation rail on the left.
 # The theme is read once at startup, so changing it in Settings needs a restart (keeps the session consistent).
 # Account themes: a theme can belong to specific accounts, and a "locked" one can't use any other theme.
@@ -29535,7 +30023,7 @@ def _raw_launcher_json():
 
 def _raw_setting(name):
     try:      # same mtime cache as load_launcher_settings (this ran 3 times per load_launcher_settings call)
-        import copy as _copy
+        import copy as _copy    # lazy: saves memory/startup until used
         return _copy.deepcopy(_cached_by_mtime("raw", get_launcher_settings_path(), _raw_launcher_json, copy=False).get(name))
     except Exception:
         return None
@@ -29580,7 +30068,7 @@ def _apply_default_account_themes():
         data["ui_defaults_applied"] = done + todo
         save_launcher_settings(data)
     except Exception:
-        pass
+        _log_exc("_apply_default_account_themes")
 
 def _active_theme_key():
     key = _locked_theme_key()
@@ -29606,7 +30094,7 @@ def _ui_read_style():
     choice = _raw_setting("ui_theme_choice")
     return choice if choice in ("sunset", "classic", "legacy") else "new"
 
-# ================================================================ Custom themes (made by the user)
+# ── Custom themes (made by the user) ──
 # A custom theme = a layout + 8 colours the user picks. Everything else (hover colours, input fields, disabled
 # colours, ...) is derived from those 8 colours.
 #   layout "classic": the Classic theme's layout - navigation bar across the top, flat colours.
@@ -29760,7 +30248,7 @@ QLabel#PaneHeader {{ color: {t['subtext']}; font-size: 11px; font-weight: bold; 
 
 _CT_FORBIDDEN_NAMES = set()
 
-# ---- unlocking: 8 hours on the launcher, or an admin override (Firebase: themeunlock/<uid> = true / false; missing = the 8 hour rule)
+# ── unlocking: 8 hours on the launcher, or an admin override (Firebase: themeunlock/<uid> = true / false; missing = the 8 hour rule)
 _CT_UNLOCK_SECONDS = 8 * 3600
 _ct_usage = {"data": None}
 
@@ -29773,7 +30261,7 @@ def _ct_usage_get():
         try:
             with open(_ct_usage_path(), encoding="utf-8") as f:
                 d = json.load(f)
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         d = d if isinstance(d, dict) else {}
         for k in ("seconds", "override"):
@@ -29789,7 +30277,7 @@ def _ct_usage_save():
         with open(path + ".part", "w", encoding="utf-8") as f:
             json.dump(_ct_usage_get(), f)
         os.replace(path + ".part", path)
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 def _ct_override(uid=None):
@@ -29846,12 +30334,12 @@ def _ct_start_tracker():
                             else:
                                 d["override"][uid] = ov
                         except Exception:
-                            pass                                        # offline: keep the last known value
+                            _log_exc("loop")                                        # offline: keep the last known value
                     if tick:
                         d["seconds"][uid] = int(d["seconds"].get(uid, 0)) + 60
                     _ct_usage_save()
             except Exception:
-                pass
+                _log_exc("loop")
             tick += 1
             time.sleep(60)
     threading.Thread(target=loop, daemon=True).start()
@@ -29863,7 +30351,7 @@ def _ct_forced_dark_mode():
         if e.get("custom"):
             return "off" if QColor(e["theme"]["bg"]).lightness() >= 128 else "on"
     except Exception:
-        pass
+        _log_exc("_ct_forced_dark_mode")
     return None
 
 def _ct_user_icon_file(tid):
@@ -29900,7 +30388,7 @@ def _ct_icon_path(tid, accent, user=False):
             for f in os.listdir(d):
                 if f.startswith(f"icon_custom_{tid}_") and f != name:
                     os.remove(os.path.join(d, f))
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
         return path
     except Exception:
@@ -29932,7 +30420,7 @@ def _ct_register_all():
                                          "QWidget#GridContainer { background: transparent; }\n")
             _ACCOUNT_THEMES["custom_" + str(tid)] = entry
         except Exception:
-            pass
+            _log_exc("_ct_register_all")
 
 def _ct_persist(themes, use_key=None):
     """Writes the custom themes to launcher.json; use_key (\"custom_<id>\") also makes that theme the chosen one."""
@@ -29946,7 +30434,7 @@ def _ct_persist(themes, use_key=None):
         for f in os.listdir(d):
             if f.startswith("icon_custom_") and f.endswith("_user.png") and f not in keep:
                 os.remove(os.path.join(d, f))
-    except OSError:
+    except OSError:    # expected: cleanup that may already be done
         pass
     chosen = s.get("ui_theme") or ""
     if use_key:
@@ -30085,7 +30573,7 @@ class _CtDialog(QDialog):
         else:
             self._new_theme()
 
-    # ---- UI
+    # ── UI ──
     def _build(self):
         root = QHBoxLayout(self)
         root.setSpacing(16)
@@ -30161,7 +30649,7 @@ class _CtDialog(QDialog):
             cg.addWidget(b, i % 4, i // 4)
         ev.addLayout(cg)
 
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox    # lazy: saves memory/startup until used
         self.grad_row = QWidget()
         gl = QHBoxLayout(self.grad_row)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -30285,7 +30773,7 @@ class _CtDialog(QDialog):
         t = self._cur()
         if t is None:
             return
-        from PyQt6.QtWidgets import QFileDialog
+        from PyQt6.QtWidgets import QFileDialog    # lazy: saves memory/startup until used
         path, _f = QFileDialog.getOpenFileName(self, "Choose an icon", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.ico)")
         if not path:
             return
@@ -30318,7 +30806,7 @@ class _CtDialog(QDialog):
         self.status.setText("Unsaved changes.")
         self._refresh_all()
 
-    # ---- editing
+    # ── editing ──
     def _on_name(self, text):
         t = self._cur()
         if t is None:
@@ -30340,7 +30828,7 @@ class _CtDialog(QDialog):
         t = self._cur()
         if t is None:
             return
-        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtWidgets import QColorDialog    # lazy: saves memory/startup until used
         chosen = QColorDialog.getColor(QColor(t["colors"][key]), self, f"Pick: {_CT_LABELS[key]}")
         if chosen.isValid():
             t["colors"][key] = chosen.name()
@@ -30357,7 +30845,7 @@ class _CtDialog(QDialog):
         t = self._cur()
         if t is None or not t.get("gradient"):
             return
-        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtWidgets import QColorDialog    # lazy: saves memory/startup until used
         chosen = QColorDialog.getColor(QColor(t["gradient"]), self, "Pick: Gradient colour")
         if chosen.isValid():
             t["gradient"] = chosen.name()
@@ -30381,10 +30869,10 @@ class _CtDialog(QDialog):
             self.themes[tid] = {"name": (src["name"] + " copy")[:30], "layout": src["layout"], "colors": dict(src["colors"]), "icon": "", "gradient": src.get("gradient", "")}
             if src.get("icon") == "user" and os.path.isfile(_ct_user_icon_file(self.cur_id)):
                 try:
-                    import shutil
+                    import shutil    # lazy: saves memory/startup until used
                     shutil.copyfile(_ct_user_icon_file(self.cur_id), _ct_user_icon_file(tid))
                     self.themes[tid]["icon"] = "user"
-                except OSError:
+                except OSError:    # expected: optional module may be missing
                     pass
         else:
             self.themes[tid] = {"name": "My theme", "layout": "modern", "colors": dict(_CT_PRESETS["Modern (New)"]), "icon": ""}
@@ -30410,7 +30898,7 @@ class _CtDialog(QDialog):
         else:
             self._load()
 
-    # ---- saving
+    # ── saving ──
     def _save(self, use):
         t = self._cur()
         if use and t is None:
@@ -30429,7 +30917,7 @@ class _CtDialog(QDialog):
             try:
                 self._on_saved(key, bool(use or was_active))
             except Exception:
-                pass
+                _log_exc("_save")
         return True
 
     def closeEvent(self, ev):
@@ -30507,7 +30995,7 @@ def _ui_add_custom_theme_setting(self):
             sp.dark_mode_combo.setEnabled(False)
             sp.dark_mode_combo.setToolTip("Your custom theme sets light or dark itself.")
         except Exception:
-            pass
+            _log_exc("_ui_add_custom_theme_setting")
 
     def opened():
         if not _ct_unlocked():
@@ -30619,21 +31107,21 @@ def _ui_apply_sunset():
     _theme_state["nav_text"] = theme["nav_text"]
     _theme_state["nav_active"] = theme["nav_active"]
     try:
-        import overlay as _overlay_mod
+        import overlay as _overlay_mod    # lazy: saves memory/startup until used
         _overlay_mod.set_light(QColor(theme["bg"]).lightness() >= 128)      # a custom theme can be light
         _overlay_mod.set_sunset(_UI_STYLE_AT_START == "new")
         _overlay_mod.set_accent(theme["accent"])
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     for listener in list(_theme_listeners):
         try:
             listener()
         except Exception:
-            pass
+            _log_exc("_ui_apply_sunset")
 
 SUNSET_ACCENT = SUNSET_THEME["accent"]
 
-# ---------------------------------------------------------------- custom theme, locked to one account
+# ── custom theme, locked to one account ──
 # Charcoal and silver (from that account's profile: black banner, silver-grey) with navy-blue highlights.
 _CUSTOM_THEME = dict(
     bg="#1e2023", sidebar="#101113", panel="#2a2c30", input="#1a1b1e", border="#43464a",
@@ -30771,7 +31259,7 @@ _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEM
                                    icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_kablooey.png",
                                               "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_kablooey.png?raw=true"])
 
-# ---------------------------------------------------------------- Legacy theme (side list, mint green)
+# ── Legacy theme (side list, mint green) ──
 _LEGACY_MINT = "#12e87c"
 _LEGACY_THEME = dict(SUNSET_THEME,
     bg="#121214", sidebar="#151517", panel="#18181b", input="#0f0f11", border="#26262a", on_accent="#ffffff",
@@ -30797,7 +31285,7 @@ QLineEdit, QTextEdit { selection-background-color: #12e87c; selection-color: #ff
 QComboBox QAbstractItemView { selection-background-color: #12e87c; selection-color: #ffffff; }
 """
 
-# ---------------------------------------------------------------- Sunset theme (purple night sky, orange accent)
+# ── Sunset theme (purple night sky, orange accent) ──
 _SS_THEME = dict(SUNSET_THEME,
     bg="#150b30", sidebar="#0f0824", panel="#1e1142", input="#140a2e", border="#2e1a5c", on_accent="#ffffff",
     text="#ffffff", subtext="#9d93bd", accent="#ff7a2f", accent_hover="#ff9650", accent_press="#e0561a",
@@ -30904,7 +31392,7 @@ def apply_dark_mode(mode):
             if _gcss and _app is not None:
                 _app.setStyleSheet(_app.styleSheet() + _gcss)
         except Exception:
-            pass
+            _log_exc("apply_dark_mode")
     if _SIDE_UI:
         _ui_apply_sunset()                # the theme is always dark
 
@@ -31024,7 +31512,7 @@ def _ui_move_nav_to_rail(self):
     root_layout.addWidget(body, 1)
     try:
         self._nav_center_filter.center.hide()            # the old centred strip is empty now
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 def _ui_add_setting(self):
@@ -31061,7 +31549,7 @@ def _ui_add_setting(self):
         try:
             sp.dark_mode_combo.setEnabled(False)
         except Exception:
-            pass
+            _log_exc("_ui_add_setting")
 
     def changed():
         d = combo.currentData()
@@ -31087,7 +31575,7 @@ def _ui_add_setting(self):
         try:
             sp.dark_mode_combo.setEnabled(False)             # always dark
         except Exception:
-            pass
+            _log_exc("_ui_add_setting")
     elif _SIDE_UI:
         sp.accent_btn.setEnabled(False)
         sp.accent_reset_btn.setEnabled(False)
@@ -31127,14 +31615,14 @@ def _ui_add_nsfw_setting(self):
     lay.addLayout(row)
     sp.nsfw_hide_btn = btn
 
-# ---------------------------------------------------------------- Controller Bridge (phone -> PC gamepad)
+# ── Controller Bridge (phone -> PC gamepad) ──
 _bridge_obj = None
 
 def _bridge_pin():
     s = load_launcher_settings()
     pin = str(s.get("bridge_pin", "") or "")
     if not pin:
-        import random
+        import random    # lazy: saves memory/startup until used
         pin = "%04d" % random.randint(0, 9999)
         s["bridge_pin"] = pin
         save_launcher_settings(s)
@@ -31143,7 +31631,7 @@ def _bridge_pin():
 def _bridge_set_running(on):
     global _bridge_obj
     try:
-        from controller_bridge import ControllerBridge
+        from controller_bridge import ControllerBridge    # lazy: saves memory/startup until used
     except Exception:
         return False
     if _bridge_obj is None:
@@ -31156,7 +31644,7 @@ def _bridge_set_running(on):
     return True
 
 def _ui_add_bridge_setting(self):
-    from controller_bridge import local_ip, PORT
+    from controller_bridge import local_ip, PORT    # lazy: saves memory/startup until used
     sp = self.settings_page
     lay = sp.dark_mode_combo.parentWidget().layout()
     row = QHBoxLayout()
@@ -31200,7 +31688,7 @@ def _ui_add_bridge_setting(self):
     if btn.isChecked():
         _bridge_set_running(True)
 
-# ---------------------------------------------------------------- theme picker (first launch)
+# ── theme picker (first launch) ──
 from PyQt6.QtGui import QLinearGradient as _QLG
 from PyQt6.QtCore import QRectF as _QRF
 from PyQt6.QtWidgets import QDialog as _QD, QButtonGroup as _QBG
@@ -31352,7 +31840,7 @@ def _ui_first_run_theme(win):
         if choice != running:
             restart_launcher(win)
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
 def _ui_unify_friends_scroll(self):
@@ -31395,57 +31883,9 @@ def _ui_unify_friends_scroll(self):
     lay.setContentsMargins(0, 0, 0, 0)
     lay.addWidget(sa)
 
-def _ui_refresh_shortcut_icon():
-    """If the user made a desktop shortcut earlier, re-point it at the current theme's icon (runs in the background)."""
-    try:
-        marker = _shortcut_marker()
-        if not os.path.isfile(marker):
-            return                           # no shortcut was created from here
-        icon = prepare_shortcut_icon()
-        with open(marker, encoding="utf-8") as f:
-            old = f.read().strip()
-        if icon and os.path.basename(icon) != old:
-            create_desktop_shortcut()
-    except Exception:
-        pass
 
-_ui_prev_init = AdaptiveApp.__init__
-def _ui_init(self):
-    _ui_prev_init(self)
-    import traceback
-    try:
-        _ui_add_setting(self)
-    except Exception:
-        traceback.print_exc()
-    try:
-        _ui_add_custom_theme_setting(self)
-    except Exception:
-        traceback.print_exc()
-    try:
-        _ui_add_nsfw_setting(self)
-    except Exception:
-        traceback.print_exc()
-    try:
-        _ui_add_bridge_setting(self)
-    except Exception:
-        traceback.print_exc()
-    if _SIDE_UI:
-        try:
-            _ui_move_nav_to_rail(self)
-        except Exception:
-            traceback.print_exc()
-    _ncz_refresh_launcher_shortcut(only_if_changed=True)
-    if _UI_STYLE_AT_START != "new":
-        try:
-            _ui_unify_friends_scroll(self)
-        except Exception:
-            traceback.print_exc()
-    if not _raw_setting("ui_theme_choice") and not _custom_theme_locked():
-        QTimer.singleShot(700, lambda: _ui_first_run_theme(self))      # first launch: pick a theme
-AdaptiveApp.__init__ = _ui_init
 
-# ---------------------------------------------------------------- Sunset UI: layout touches + fade animations
-from PyQt6.QtWidgets import QGraphicsOpacityEffect as _QGOE
+# ── Sunset UI: layout touches + fade animations ──
 from PyQt6.QtCore import QPropertyAnimation as _QPA, QEasingCurve as _QEC
 
 def _ui_fade_in(w, ms=340, delay=0):
@@ -31468,20 +31908,20 @@ def _ui_fade_in(w, ms=340, delay=0):
                 if getattr(w, "_ui_fx", None) is eff:
                     w._ui_fx = None
                     w.setGraphicsEffect(None)
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
         anim.finished.connect(lambda: QTimer.singleShot(0, clear))
 
         def go():
             try:
                 anim.start()
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
         if delay > 0:
             QTimer.singleShot(delay, go)
         else:
             go()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
 
 def _ui_stagger_library(self, base=0):
@@ -31582,7 +32022,7 @@ def _ui_rebuild_rows(self):
         try:
             n = len(self.friends)
             lbl.setText(f"YOUR FRIENDS  -  {n}" if n else "YOUR FRIENDS")
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 FriendsPage._rebuild_rows = _ui_rebuild_rows
 
@@ -31687,7 +32127,7 @@ def _ui_decorate(self):
         try:
             fn(self)
         except Exception:
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             traceback.print_exc()
     _lazy_on_built(self, "store_page", lambda _p: _ui_restyle_store(self))      # lazy pages: restyled when built
     _lazy_on_built(self, "gmod_page", lambda _p: _ui_restyle_gmod(self))
@@ -31721,7 +32161,7 @@ def _ui_intro(self):
                 _ui_fade_in(b, 420, 120 + i * 80)
         _ui_stagger_library(self, 300)
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
 _ui_anim_prev_show = AdaptiveApp.showEvent
@@ -31730,21 +32170,11 @@ def _ui_anim_show_event(self, ev):
     if _UI_STYLE_AT_START == "new" and not getattr(self, "_ui_intro_done", False) and hasattr(self, "_ui_rail"):
         self._ui_intro_done = True
         QTimer.singleShot(0, lambda: _ui_intro(self))
-AdaptiveApp.showEvent = _ui_anim_show_event
-
-_ui_anim_prev_init = AdaptiveApp.__init__
-def _ui_anim_init(self):
-    _ui_anim_prev_init(self)
-    if _UI_STYLE_AT_START == "new":
-        try:
-            _ui_decorate(self)
-        except Exception:
-            import traceback
-            traceback.print_exc()
-AdaptiveApp.__init__ = _ui_anim_init
+AdaptiveApp.showEvent = _ui_anim_show_event    # kept as patch chain: the base is inherited from Qt, so there is no method to merge into
 
 
-# ================================================================ cloud saves for EVERY game (Firebase)
+
+# ── cloud saves for EVERY game (Firebase) ──
 # How it works:
 #  * every game the launcher starts is already noticed by the process tracker (_TrackedPopen / _running), so this
 #    hooks the same place: before a game starts it pulls a newer cloud copy of the saves, after it closes it pushes.
@@ -31790,7 +32220,7 @@ def _ss_log(msg):
             os.remove(path)
         with open(path, "a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
 
 def _ss_fmt_size(n):
@@ -31800,7 +32230,7 @@ def _ss_fmt_size(n):
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
 
-# ---------------------------------------------------------------- local config (per device)
+# ── local config (per device) ──
 def _ss_cfg_path():
     return os.path.join(_ss_dir(), "cloud_saves.json")
 
@@ -31809,7 +32239,7 @@ def _ss_cfg_load():
     try:
         with open(_ss_cfg_path(), encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     if not isinstance(data, dict):
         data = {}
@@ -31859,7 +32289,7 @@ def _ss_is_own_sync_game(name):
     """Five Nights at NCZ AE / 2 already have their own Save Data / Sync Data buttons."""
     return str(name).strip().lower() in (AE_GAME_NAME.lower(), NCZ2_GAME_NAME.lower())
 
-# ---------------------------------------------------------------- cloud access (Realtime Database, same account as the rest)
+# ── cloud access (Realtime Database, same account as the rest) ──
 def _ss_node_url(uid, node, token):
     base = FIREBASE_DB_URL.strip().rstrip("/")
     return (f"{base}/users/{urllib.parse.quote(uid, safe='')}/games/{urllib.parse.quote(node, safe='')}.json"
@@ -31877,14 +32307,14 @@ def _ss_meta_get(key, timeout=8):
     d = _ss_get(_SS_PREFIX + key + "_meta", timeout)
     return d if isinstance(d, dict) else None
 
-# ---------------------------------------------------------------- where the save folders are (per platform)
+# ── where the save folders are (per platform) ──
 def _ss_documents():
     try:
-        from PyQt6.QtCore import QStandardPaths
+        from PyQt6.QtCore import QStandardPaths    # lazy: saves memory/startup until used
         p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         if p:
             return p
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     return os.path.join(os.path.expanduser("~"), "Documents")
 
@@ -31966,7 +32396,7 @@ def _ss_prefix_from_launch(args, env, exe_hint=None):
         return _wine_prefix()
     return None
 
-# ---------------------------------------------------------------- files -> zip -> files
+# ── files -> zip -> files ──
 def _ss_collect(entries):
     """[(root, is_file)] -> sorted [(arcname, abs path)]; arcname starts with the entry's index."""
     out = []
@@ -32058,7 +32488,7 @@ def _ss_unpack(data, entries):
                 ts = time.mktime(tuple(info.date_time) + (0, 0, -1))
                 os.utime(target, (ts, ts))
             except Exception:
-                pass
+                _log_exc("_ss_unpack")
             written += 1
     return written
 
@@ -32071,7 +32501,7 @@ def _ss_backup_bytes(key, data, label):
     for n in old[:-5]:
         try:
             os.remove(os.path.join(d, n))
-        except OSError:
+        except OSError:    # expected: cleanup that may already be done
             pass
 
 def _ss_backup_local(key, files):
@@ -32095,7 +32525,7 @@ def _ss_decide(local_digest, has_local, last_sha, cloud_sha):
         return "upload"            # the cloud didn't change, this PC did
     return "conflict"
 
-# ---------------------------------------------------------------- upload / download (blocking; run in a worker or BusyDialog)
+# ── upload / download (blocking; run in a worker or BusyDialog) ──
 def _ss_state(key, ctx):
     g = _ss_game(key)
     anchors = _ss_anchor_dirs(ctx.get("prefix"), ctx.get("folder"))
@@ -32157,7 +32587,7 @@ def _ss_backup_cloud(key):
     except Exception as e:
         _ss_log(f"{key}: couldn't back up the cloud copy: {e}")
 
-# ---------------------------------------------------------------- finding the save folders of a game
+# ── finding the save folders of a game ──
 def _ss_save_entry(parts, ext):
     """For files inside the game's own folder: the save-looking folder (or the file itself), else None."""
     dirs = parts[:-1]
@@ -32229,7 +32659,7 @@ def _ss_detect(name, anchors, t0):
         cands[0]["pre"] = True
     return cands[:12]
 
-# ---------------------------------------------------------------- the save folder = the first NEW folder in AppData
+# ── the save folder = the first NEW folder in AppData ──
 # Before a game's very first launch the folder names directly inside AppData\\Roaming, Local and LocalLow are noted.
 # When the game closes, the first folder that wasn't there before (the earliest created one) is taken as its save folder.
 _SS_APPDATA_ANCHORS = ("appdata", "localappdata", "locallow")
@@ -32247,7 +32677,7 @@ def _ss_appdata_snapshot(anchors):
                     if e.is_dir(follow_symlinks=False):
                         snap.add((anchor, e.name))
         except OSError:
-            pass
+            _log_exc("_ss_appdata_snapshot")
     return snap
 
 def _ss_first_new_folder(anchors, snap):
@@ -32283,11 +32713,11 @@ def _ss_first_new_folder(anchors, snap):
                                "path": e.path})
     return best[1] if best else None
 
-# ---------------------------------------------------------------- GUI-thread helper (dialogs must not run on a worker thread)
+# ── GUI-thread helper (dialogs must not run on a worker thread) ──
 def _ss_bridge():
     global _ss_bridge_obj
     if _ss_bridge_obj is None:
-        from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+        from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot    # lazy: saves memory/startup until used
 
         class _Bridge(QObject):
             call = pyqtSignal(object)
@@ -32313,7 +32743,7 @@ def _ss_gui(fn):
 
 def _ss_on_gui_thread():
     try:
-        from PyQt6.QtCore import QThread
+        from PyQt6.QtCore import QThread    # lazy: saves memory/startup until used
         app = QApplication.instance()
         return app is not None and QThread.currentThread() is app.thread()
     except Exception:
@@ -32340,7 +32770,7 @@ def _ss_conflict_box(name, meta, parent):
     box.exec()
     return box.clickedButton() is cloud_btn
 
-# ---------------------------------------------------------------- before the game starts
+# ── before the game starts ──
 def _ss_pre_launch(ctx):
     key, name = ctx["key"], ctx["name"]
     g = _ss_game(key)
@@ -32413,10 +32843,10 @@ def _ss_launch_ctx(a, k):
     ctx["t0"] = time.time()
     return ctx
 
-# ---------------------------------------------------------------- after the game closes
+# ── after the game closes ──
 def _ss_prompt_detect(ctx, cands):
     """GUI thread: offer the folders that changed while playing."""
-    from PyQt6.QtWidgets import QListWidget as _LW, QListWidgetItem as _LI
+    from PyQt6.QtWidgets import QListWidget as _LW, QListWidgetItem as _LI    # lazy: saves memory/startup until used
     key, name = ctx["key"], ctx["name"]
     dlg = QDialog(_ss_parent())
     dlg.setWindowTitle("Cloud saves")
@@ -32591,7 +33021,7 @@ def _ss_popen_init(self, *a, **k):
 
 _TrackedPopen.__init__ = _ss_popen_init
 
-# ---------------------------------------------------------------- "Cloud Saves..." in every game's menu
+# ── "Cloud Saves..." in every game's menu ──
 def _ss_ctx_for(title, exe_fn):
     """(name, key, ctx) for a game card: where its folder / Wine prefix are on this device."""
     name = pretty_game_name(title)
@@ -32672,7 +33102,7 @@ def _ss_menu_sync(app, title, exe_fn):
         QMessageBox.warning(app, "Sync Data", err)
 
 def _ss_open_dialog(app, title, exe_fn):
-    from PyQt6.QtWidgets import QCheckBox as _CB, QListWidget as _LW, QListWidgetItem as _LI
+    from PyQt6.QtWidgets import QCheckBox as _CB, QListWidget as _LW    # lazy: saves memory/startup until used
     name, key, ctx = _ss_ctx_for(title, exe_fn)
     dlg = QDialog(app)
     dlg.setWindowTitle(f"Cloud Saves - {name}")
@@ -32789,19 +33219,12 @@ def _ss_open_dialog(app, title, exe_fn):
     refresh()
     dlg.exec()
 
-_ss_prev_app_init = AdaptiveApp.__init__
 
-def _ss_app_init(self):
-    _ss_prev_app_init(self)
-    try:
-        _ss_bridge()
-    except Exception as e:
-        _ss_log(f"couldn't create the GUI bridge: {e!r}")
 
-AdaptiveApp.__init__ = _ss_app_init
 
 _ss_prev_add_shortcut = _add_shortcut_action
 
+# kept: used at import time before the later definition at line 32529
 def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
     _ss_prev_add_shortcut(app, card, title, exe_fn, tool_fn, cover, key)
     try:
@@ -32825,7 +33248,7 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
         _ss_log(f"couldn't add the Cloud Saves menu entry: {e!r}")
 
 
-# ---------------------------------------------------------------- start games from your phone
+# ── start games from your phone ──
 # The Android app writes a request to remote/<uid>/cmd. If (and only if) you turned this on in Friends, this PC picks it up,
 # presses that game's Play button, and writes the outcome to remote/<uid>/res. Only a game that is in your own library and
 # ready to play can ever be started, and old requests are thrown away instead of being run late.
@@ -32852,7 +33275,7 @@ def set_remote_start_enabled(on):
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"enabled": bool(on)}, f)
     except Exception as e:
-        print(f"remote start: couldn't save the setting ({e!r})")
+        _ncz_log(f"remote start: couldn't save the setting ({e!r})")
 
 def _remote_cards(app):
     out = []
@@ -32874,7 +33297,7 @@ def _remote_play_button(card):
         for b in card.findChildren(QPushButton):
             if b.isEnabled() and _PLAY_BTN_RE.match(b.text() or ""):
                 return b
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     return None
 
@@ -32978,26 +33401,15 @@ def _remote_tick(app):
 
     _remote_bg(app, work, done, failed)
 
-_rs_prev_app_init = AdaptiveApp.__init__
 
-def _rs_app_init(self):
-    _rs_prev_app_init(self)
-    try:
-        self._remote_timer = QTimer(self)
-        self._remote_timer.setInterval(REMOTE_POLL_MS)
-        self._remote_timer.timeout.connect(lambda: _remote_tick(self))
-        self._remote_timer.start()
-    except Exception as e:
-        print(f"remote start: couldn't start ({e!r})")
 
-AdaptiveApp.__init__ = _rs_app_init
 
 _rs_prev_build_list = FriendsPage._build_list
 
 def _rs_build_list(self):
     page = _rs_prev_build_list(self)
     try:
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox    # lazy: saves memory/startup until used
         lay = page.layout()
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -33016,12 +33428,12 @@ def _rs_build_list(self):
         lay.insertSpacing(3, 12)
         lay.insertWidget(4, panel)
     except Exception as e:
-        print(f"remote start: couldn't add the setting ({e!r})")
+        _ncz_log(f"remote start: couldn't add the setting ({e!r})")
     return page
 
 FriendsPage._build_list = _rs_build_list
 
-# ---------------------------------------------------------------- phone: PC store, Workshop mods, cloud saves, download server
+# ── phone: PC store, Workshop mods, cloud saves, download server ──
 # Builds on the "start games from your phone" channel above. The Android app puts requests in remote/<uid>/q/<id> and this PC
 # answers in remote/<uid>/r/<id>; the PC also publishes what the phone needs to show (library, running downloads, which
 # switches are on) in remote/<uid>/pcx. Two separate switches in Friends decide what the phone may do, both OFF by default:
@@ -33057,7 +33469,7 @@ def _rx_set_flag(name, on):
         with open(_rx_flag_path(), "w", encoding="utf-8") as f:
             json.dump(d, f)
     except Exception as e:
-        print(f"phone remote: couldn't save the setting ({e!r})")
+        _ncz_log(f"phone remote: couldn't save the setting ({e!r})")
 
 def _rx_int(v, lo=1, hi=2 ** 31 - 1):
     try:
@@ -33106,7 +33518,7 @@ def _rx_download_cards(win):
             w = lay.itemAt(i).widget()
             if isinstance(w, DownloadCard):
                 out.append(w)
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return out
 
@@ -33136,7 +33548,7 @@ def _rx_jobs(win):
             jobs.append({"k": "w", "id": str(q["id"]), "t": str(q["title"])[:80], "g": str(q["game"])[:60],
                          "s": {"queued": "queued", "downloading": "active", "done": "done"}.get(q["status"], "failed"),
                          "p": -1 if pct is None else int(pct), "x": str(q.get("line") or q.get("msg") or "")[:90]})
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     return jobs[-40:]
 
@@ -33157,7 +33569,7 @@ def _rx_build_pcx(win, fl):
     pcx["jobs"] = _rx_jobs(win)
     return pcx
 
-# ---------------------------------------------------------------- download server: the phone's pick beats the launcher's setting
+# ── download server: the phone's pick beats the launcher's setting ──
 # for that one download (and never pops the "Choose download server" window on the PC).
 _rx_prev_pw_server = pw_server
 
@@ -33180,7 +33592,7 @@ def _rx_fb_run(self):
     try:
         pick = _rx["server"].pop(_invite_norm(getattr(self, "title", "")), None)
     except Exception:
-        pass
+        _log_exc("_rx_fb_run")
     _pw_tls.rx_server = pick[0] if pick and time.time() - pick[1] < 180 else None
     try:
         return _rx_prev_fb_run(self)
@@ -33202,11 +33614,11 @@ def _ask_existing_archive(parent, title):
     if existing:
         try:
             os.remove(existing)
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
     return False, None
 
-# ---------------------------------------------------------------- store
+# ── store ──
 def _rx_remember(appid, title, base):
     _rx["store"][appid] = {"t": title, "b": base}
     while len(_rx["store"]) > 400:
@@ -33351,7 +33763,7 @@ def _rx_store_download(win, cid, a):
 
     _rx_ensure_library(win, appid, go)
 
-# ---------------------------------------------------------------- Steam Workshop
+# ── Steam Workshop ──
 def _rx_ws_details(ids):
     known = {g["appid"]: g["title"] for g in load_steam_library()}
     out = {}
@@ -33449,14 +33861,14 @@ def _rx_jobs_cancel(win, cid, a):
             continue
     _rx_reply(cid, False, "That download isn't running any more.")
 
-# ---------------------------------------------------------------- cloud saves
+# ── cloud saves ──
 def _rx_save_entries():
     out = []
     try:
         for gid, spec in GAME_SYNC.items():           # Five Nights at NCZ AE / 2: their own two-file format
             out.append({"k": "ncz:" + gid, "t": spec[0], "kind": "ncz", "gid": gid})
     except Exception:
-        pass
+        _log_exc("_rx_save_entries")
     for key, g in _ss_cfg_load()["games"].items():    # every other game the launcher keeps cloud saves for
         if isinstance(g, dict) and g.get("paths") and not g.get("never"):
             title = str(g.get("title") or key)
@@ -33606,7 +34018,7 @@ def _rx_save_all(win, cid, a):
 
     _rx_save_job(win, cid, work, msg)
 
-# ---------------------------------------------------------------- request loop
+# ── request loop ──
 def _rx_handle(app, cmd, fl):
     cid = str(cmd.get("id", ""))
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,40}", cid) or cid in _rx["seen"]:
@@ -33665,7 +34077,7 @@ def _rx_tick(app):
     try:
         pcx = _rx_build_pcx(_rx_win(), fl)
     except Exception as e:
-        print(f"phone remote: couldn't read the library ({e!r})")
+        _ncz_log(f"phone remote: couldn't read the library ({e!r})")
         pcx = {"v": 2, "dl": fl["dl"], "saves": fl["saves"]}
     sig = json.dumps(pcx, sort_keys=True)
     publish = sig != _rx["last_sig"] or time.time() - _rx["last_pub"] > (20 if active else 30)
@@ -33692,7 +34104,7 @@ def _rx_tick(app):
             for c in stale:
                 try:
                     _http_json(_fdb(f"remote/{uid}/r/{urllib.parse.quote(c, safe='')}", token), "DELETE")
-                except Exception:
+                except Exception:    # expected: offline or the server did not answer
                     pass
         return cmds
 
@@ -33714,19 +34126,8 @@ def _rx_tick(app):
 
     _remote_bg(app, work, done, failed)
 
-_rx_prev_app_init = AdaptiveApp.__init__
 
-def _rx_app_init(self):
-    _rx_prev_app_init(self)
-    try:
-        self._rx_timer = QTimer(self)
-        self._rx_timer.setInterval(RX_POLL_MS)
-        self._rx_timer.timeout.connect(lambda: _rx_tick(self))
-        self._rx_timer.start()
-    except Exception as e:
-        print(f"phone remote: couldn't start ({e!r})")
 
-AdaptiveApp.__init__ = _rx_app_init
 
 # remember how to find each game's folder, so cloud saves can be located for a request that didn't come from a game card
 _rx_prev_add_shortcut = _add_shortcut_action
@@ -33736,14 +34137,14 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
     try:
         _rx["exe_fns"][_pt_key(pretty_game_name(title))] = exe_fn      # == the cloud-saves key of that game
     except Exception:
-        pass
+        _log_exc("_add_shortcut_action")
 
 _rx_prev_build_list = FriendsPage._build_list
 
 def _rx_build_list(self):
     page = _rx_prev_build_list(self)
     try:
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox    # lazy: saves memory/startup until used
         lay = page.layout()
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -33769,12 +34170,12 @@ def _rx_build_list(self):
         lay.insertSpacing(5, 12)
         lay.insertWidget(6, panel)
     except Exception as e:
-        print(f"phone remote: couldn't add the settings ({e!r})")
+        _ncz_log(f"phone remote: couldn't add the settings ({e!r})")
     return page
 
 FriendsPage._build_list = _rx_build_list
 
-# ================================================================ "please update" lock (no demo.py next to main.py)
+# ── "please update" lock (no demo.py next to main.py) ──
 class _UpdateRequiredOverlay(QFrame):
     """Covers the whole launcher window (nav bar hidden) and can't be dismissed; has its own title strip."""
     def __init__(self, window):
@@ -33873,7 +34274,7 @@ class _UpdateRequiredOverlay(QFrame):
                 f"QPushButton#UpdateCap:hover {{ background: rgba(128,128,128,0.25); color: {t.get('text', '#f2f2f4')}; }}"
                 f"QPushButton#UpdateCapClose:hover {{ background: #e5484d; color: #ffffff; }}")
         except Exception:
-            pass
+            _log_exc("restyle")
 
     def _toggle_max(self):
         self._win.showNormal() if self._win.isMaximized() else self._win.showMaximized()
@@ -33900,7 +34301,7 @@ class _UpdateRequiredOverlay(QFrame):
                 pages.setEnabled(False)
             if self._win.isActiveWindow() and not self.hasFocus():
                 self.setFocus()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
     def eventFilter(self, obj, event):
@@ -33919,21 +34320,11 @@ class _UpdateRequiredOverlay(QFrame):
         QTimer.singleShot(0, self.enforce)               # can't be hidden
 
 
-_updlock_prev_init = AdaptiveApp.__init__
-
-def _updlock_init(self):
-    _updlock_prev_init(self)
-    if _demo_py_present():
-        return
-    try:
-        self._update_lock = _UpdateRequiredOverlay(self)
-    except Exception as e:
-        print(f"update lock: couldn't show it ({e!r})")
-
-AdaptiveApp.__init__ = _updlock_init
 
 
-# ================================================================ log out -> back to demo.py (sign-in window)
+
+
+# ── log out -> back to demo.py (sign-in window) ──
 def _go_back_to_demo(widget):
     """Starts demo.py (sign-in + installer, it starts main.py again after login) and closes this launcher."""
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
@@ -33950,7 +34341,7 @@ def _go_back_to_demo(widget):
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          close_fds=True, **kwargs)
     except Exception as e:
-        print(f"log out: couldn't start demo.py ({e!r})")
+        _ncz_log(f"log out: couldn't start demo.py ({e!r})")
         return False
     win = widget.window() if widget is not None else None
     if win is not None:
@@ -33971,7 +34362,7 @@ def _demo_log_out(self):
 AccountPage.log_out = _demo_log_out
 
 
-# ---------------------------------------------------------------- NCZ Link (stream this PC to your phone over LAN)
+# ── NCZ Link (stream this PC to your phone over LAN) ──
 # Like Steam Link, but small: turn it on in Settings, open NCZ Link in the phone app (same Wi-Fi), enter this PC's address and
 # the PIN once. The phone then sees your game list, can start a game, and gets a live view of this screen with touch /
 # mouse / keyboard control, plus the PC's sound (the PC itself goes quiet while the phone listens). Everything stays on your local network: only private (LAN) addresses are accepted, every request
@@ -33999,7 +34390,7 @@ def _lk_load():
             d = json.load(f)
         if isinstance(d, dict):
             return d
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return {}
 
@@ -34009,7 +34400,7 @@ def _lk_save(d):
         with open(_lk_cfg_path(), "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
     except Exception as e:
-        print(f"NCZ Link: couldn't save its settings ({e!r})")
+        _ncz_log(f"NCZ Link: couldn't save its settings ({e!r})")
 
 def _lk_enabled():
     return _lk_load().get("enabled") is True
@@ -34033,7 +34424,7 @@ def _lk_ip():
     finally:
         s.close()
 
-# ---- run something on the GUI thread (Qt widgets and screen grabs must not be touched from the server threads)
+# ── run something on the GUI thread (Qt widgets and screen grabs must not be touched from the server threads)
 class _LkInvoker(QObject):
     call = pyqtSignal(object)
 
@@ -34116,7 +34507,7 @@ def _lk_encode(img, width, quality, cx, cy, hint=True):
                        "The PC screen is black. If a game is running, set it to Borderless / Windowed (not exclusive "
                        "fullscreen) so it can be streamed.")
     except Exception:
-        pass
+        _log_exc("_lk_encode")
     x0, y0 = cx * img.width(), cy * img.height()
     if cx < 0:
         x0 = y0 = -100.0
@@ -34131,7 +34522,7 @@ def _lk_encode(img, width, quality, cx, cy, hint=True):
     img.save(buf, "JPG", int(quality))
     return bytes(buf.data())
 
-# ---- input injection (Windows: SendInput, Linux: xdotool)
+# ── input injection (Windows: SendInput, Linux: xdotool) ──
 _LK_VK = {"Enter": 0x0D, "Escape": 0x1B, "Backspace": 0x08, "Tab": 0x09, " ": 0x20, "Space": 0x20, "Shift": 0x10,
           "Control": 0x11, "Alt": 0x12, "ArrowLeft": 0x25, "ArrowUp": 0x26, "ArrowRight": 0x27, "ArrowDown": 0x28,
           "Delete": 0x2E, "Insert": 0x2D, "Home": 0x24, "End": 0x23, "PageUp": 0x21, "PageDown": 0x22,
@@ -34146,8 +34537,8 @@ _LK_XK.update({"F%d" % i: "F%d" % i for i in range(1, 13)})
 _lk_win_api = {}
 
 def _lk_win_setup():
-    import ctypes
-    from ctypes import wintypes
+    import ctypes    # lazy: saves memory/startup until used
+    from ctypes import wintypes    # lazy: saves memory/startup until used
     ulp = ctypes.c_size_t
 
     class MI(ctypes.Structure):
@@ -34199,7 +34590,7 @@ def _lk_vk_for(k):
     return None
 
 
-# ---- Linux on Wayland: the launcher itself runs through XWayland, whose screen grab is black and whose xdotool only reaches
+# ── Linux on Wayland: the launcher itself runs through XWayland, whose screen grab is black and whose xdotool only reaches
 # X11 windows. So on Wayland we use command-line tools instead: grim / spectacle / gnome-screenshot to capture, and ydotool
 # (needs its ydotoold daemon) to type and click.
 def _lk_wayland():
@@ -34295,6 +34686,7 @@ def _lk_ydotool(ev, sw, sh):
         if s_:
             yd("type", "--", s_)
 
+# kept: used at import time before the later definition at line 33889
 def _lk_inject(ev, sw, sh):
     """One input event from the phone. Everything is validated; unknown things are ignored."""
     t = ev.get("t")
@@ -34369,7 +34761,7 @@ def _lk_inject(ev, sw, sh):
             xd("type", "--", s)
 
 
-# ---- sound: PC audio (what the speakers play) is sent as raw 16-bit PCM; the phone plays it with Web Audio.
+# ── sound: PC audio (what the speakers play) is sent as raw 16-bit PCM; the phone plays it with Web Audio.
 # Windows uses WASAPI loopback through the PyAudioWPatch package (installed automatically the first time if it's missing);
 # Linux uses `parec` (PulseAudio / PipeWire) on the default output's monitor. macOS has no built-in way to capture it.
 def _lk_libs_dir():
@@ -34383,7 +34775,7 @@ def _lk_audio_install():
     _lk["ainst"] = True
     def run():
         try:
-            import hashlib, io
+            import hashlib, io    # lazy: saves memory/startup until used
             tag = "cp%d%d" % sys.version_info[:2]
             plat = "win_amd64" if sys.maxsize > 2 ** 32 else "win32"
             with urllib.request.urlopen("https://pypi.org/pypi/PyAudioWPatch/json", timeout=30, context=_NCZ_SSL_CTX) as r:
@@ -34404,7 +34796,7 @@ def _lk_audio_install():
             _lk["aerr"] = ""
         except Exception as e:
             _lk["aerr"] = f"couldn't download the sound package ({e})"
-            print(f"NCZ Link: {_lk['aerr']}")
+            _ncz_log(f"NCZ Link: {_lk['aerr']}")
         finally:
             _lk["ainst"] = "done"
     threading.Thread(target=run, daemon=True).start()
@@ -34416,7 +34808,7 @@ def _lk_audio_open():
         if os.path.isdir(d) and d not in sys.path:
             sys.path.insert(0, d)
         try:
-            import pyaudiowpatch as pa
+            import pyaudiowpatch as pa    # lazy: saves memory/startup until used
         except Exception:
             if _lk["ainst"] == "done" and _lk.get("aerr"):
                 raise RuntimeError(_lk["aerr"])
@@ -34439,7 +34831,7 @@ def _lk_audio_open():
                 try:
                     q.put_nowait(data)
                 except _lk_queue.Full:
-                    pass
+                    _log_exc("cb")
                 return (None, pa.paContinue)
             st = p.open(format=pa.paInt16, channels=int(dev["maxInputChannels"]), rate=rate, input=True,
                         input_device_index=dev["index"], frames_per_buffer=rate // 50, stream_callback=cb)
@@ -34454,7 +34846,7 @@ def _lk_audio_open():
             except _lk_queue.Empty:
                 return None
             if full > 2:                                   # keep just front left / right
-                import array
+                import array    # lazy: saves memory/startup until used
                 a = array.array("h", d)
                 out = array.array("h")
                 for i in range(0, len(a) - full + 1, full):
@@ -34483,7 +34875,7 @@ def _lk_audio_open():
                 try:
                     q.put_nowait(d)
                 except _lk_queue.Full:
-                    pass
+                    _log_exc("reader")
         threading.Thread(target=reader, daemon=True).start()
 
         def get(timeout):
@@ -34494,7 +34886,7 @@ def _lk_audio_open():
         return rate, ch, get, proc.kill
     raise RuntimeError("this PC can't capture sound (Windows, or Linux with pulseaudio-utils, is needed)")
 
-# ---- mute the PC's own speakers while a phone is listening (the phone still gets the sound).
+# ── mute the PC's own speakers while a phone is listening (the phone still gets the sound). ──
 # Windows: WASAPI loopback is captured before the endpoint's mute switch, so muting the default output device silences
 # the PC only. Linux: a silent null sink becomes the default output while streaming; its monitor is what gets captured.
 # Reference-counted (a reconnecting phone opens a new audio stream before the old one closes), restored when the last
@@ -34506,25 +34898,25 @@ def _lk_mute_pref():
     return _lk_load().get("mute_pc", True) is not False
 
 def _lk_com(obj, idx, argtypes, *args):
-    import ctypes
+    import ctypes    # lazy: saves memory/startup until used
     vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     hr = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vt[idx])(obj, *args)
     if hr < 0:
         raise OSError("COM error 0x%08X" % (hr & 0xFFFFFFFF))
 
 def _lk_com_release(obj):
-    import ctypes
+    import ctypes    # lazy: saves memory/startup until used
     try:
         if obj and obj.value:
             vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
             ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])(obj)
     except Exception:
-        pass
+        _log_exc("_lk_com_release")
 
 def _lk_win_mute(on, dev_id=""):
     """on=True: mutes the default output if it isn't muted already and returns its id ('' if nothing was changed).
     on=False: unmutes the device with that id."""
-    import ctypes
+    import ctypes    # lazy: saves memory/startup until used
     ole = ctypes.windll.ole32
     ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
     def guid(s):
@@ -34619,7 +35011,7 @@ def _lk_mute_apply(on):
                 _lk_lin_mute(False, st)
                 d = _lk_load(); d.pop("mute_recover", None); _lk_save(d)
     except Exception as e:
-        print(f"NCZ Link: couldn't {'mute' if on else 'unmute'} the PC sound ({e!r})")
+        _ncz_log(f"NCZ Link: couldn't {'mute' if on else 'unmute'} the PC sound ({e!r})")
 
 def _lk_pc_mute(on):
     """Takes (on=True) or gives back (on=False) a hold on the PC mute. The PC is silent while at least one hold exists."""
@@ -34647,7 +35039,7 @@ def _lk_pc_mute_recover():
             _lk_lin_mute(False, r["lin"])
         _lk_save(d)
     except Exception as e:
-        print(f"NCZ Link: couldn't restore the PC sound ({e!r})")
+        _ncz_log(f"NCZ Link: couldn't restore the PC sound ({e!r})")
 
 def _lk_pc_mute_exit():
     with _lk_mute["lock"]:
@@ -34657,7 +35049,7 @@ def _lk_pc_mute_exit():
 _lk_atexit.register(_lk_pc_mute_exit)
 
 
-# ---- v2: WebSocket transport (acked frames, adaptive quality), fast capture, persistent input workers, Input Bridge hand-off.
+# ── v2: WebSocket transport (acked frames, adaptive quality), fast capture, persistent input workers, Input Bridge hand-off.
 # Why the old version felt slow: every frame was grabbed on the launcher's GUI thread, every input batch was its own HTTP request
 # (two TCP writes + Nagle = 40-200 ms each, one at a time) and on Linux every key / mouse event spawned an xdotool / ydotool
 # process. MJPEG also has no back-pressure, so a slow Wi-Fi just filled buffers and the picture lagged further and further behind.
@@ -34684,14 +35076,14 @@ def _lk_jpeg(img, quality):
     return bytes(buf.data())
 
 
-# ---- screen capture. Each returns (QImage | None, hash): None means "nothing changed since `prev`", so no encode, no send.
+# ── screen capture. Each returns (QImage | None, hash): None means "nothing changed since `prev`", so no encode, no send.
 class _LkCapWin:
     """Windows: GDI StretchBlt straight into a small DIB, on the stream's own thread (the GUI thread is never touched)."""
     name = "gdi"
 
     def __init__(self):
-        import ctypes
-        from ctypes import wintypes as wt
+        import ctypes    # lazy: saves memory/startup until used
+        from ctypes import wintypes as wt    # lazy: saves memory/startup until used
         c = self.c = ctypes
         self.wt = wt
         u, g = self.u, self.g = c.windll.user32, c.windll.gdi32
@@ -34777,7 +35169,7 @@ class _LkCapWin:
             self._free()
             self.u.ReleaseDC(None, self.sdc)
         except Exception:
-            pass
+            _log_exc("close")
 
 
 class _LkCapX11:
@@ -34785,7 +35177,7 @@ class _LkCapX11:
     name = "x11"
 
     def __init__(self):
-        import ctypes, ctypes.util
+        import ctypes, ctypes.util    # lazy: saves memory/startup until used
         c = self.c = ctypes
         x = self.x = c.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
 
@@ -34852,7 +35244,7 @@ class _LkCapX11:
         try:
             self.x.XCloseDisplay(self.d)
         except Exception:
-            pass
+            _log_exc("close")
 
 
 class _LkCapQt:
@@ -34891,16 +35283,16 @@ def _lk_make_cap():
         try:
             return _LkCapWin()
         except Exception as e:
-            print(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
+            _ncz_log(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
     elif sys.platform.startswith("linux") and not _lk_wayland():
         try:
             return _LkCapX11()
         except Exception as e:
-            print(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
+            _ncz_log(f"NCZ Link: fast capture unavailable ({e!r}), using Qt")
     return _LkCapQt()
 
 
-# ---- input that doesn't spawn a process per event (Linux). Windows already uses SendInput in-process.
+# ── input that doesn't spawn a process per event (Linux). Windows already uses SendInput in-process.
 _LK_XKS = {"Enter": "Return", "Escape": "Escape", "Backspace": "BackSpace", "Tab": "Tab", " ": "space", "Space": "space",
            "Shift": "Shift_L", "Control": "Control_L", "Alt": "Alt_L", "ArrowLeft": "Left", "ArrowUp": "Up", "ArrowRight": "Right",
            "ArrowDown": "Down", "Delete": "Delete", "Insert": "Insert", "Home": "Home", "End": "End", "PageUp": "Prior",
@@ -34914,7 +35306,7 @@ class _LkXTest:
     name = "xtest"
 
     def __init__(self):
-        import ctypes, ctypes.util
+        import ctypes, ctypes.util    # lazy: saves memory/startup until used
         c = ctypes
         x = self.x = c.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
         t = self.t = c.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
@@ -34995,7 +35387,7 @@ class _LkUinput:
     name = "uinput"
 
     def __init__(self):
-        import fcntl
+        import fcntl    # lazy: saves memory/startup until used
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         try:
             io = lambda code, v: fcntl.ioctl(self.fd, code, v)
@@ -35082,7 +35474,7 @@ def _lk_backend():
             try:
                 be = _LkUinput() if _lk_wayland() else _LkXTest()
             except Exception as e:
-                print(f"NCZ Link: fast input unavailable ({e!r}), falling back to xdotool / ydotool")
+                _ncz_log(f"NCZ Link: fast input unavailable ({e!r}), falling back to xdotool / ydotool")
         _lk["be"] = be
     return _lk["be"]
 
@@ -35119,7 +35511,7 @@ def _lk_inject(ev, sw, sh):
     be.apply(ev, sw, sh)
 
 
-# ---- one input worker for every connection: strict order, never blocks the network threads, merges piled-up mouse moves
+# ── one input worker for every connection: strict order, never blocks the network threads, merges piled-up mouse moves
 _lk_inq = _lk_queue.Queue(maxsize=4000)
 
 
@@ -35148,7 +35540,7 @@ def _lk_input_loop():
         except Exception as e:
             if not _lk.get("ierr"):
                 _lk["ierr"] = True
-                print(f"NCZ Link: input error ({e!r})")
+                _ncz_log(f"NCZ Link: input error ({e!r})")
 
 
 def _lk_input_submit(evs):
@@ -35169,10 +35561,10 @@ def _lk_input_submit(evs):
     return ""
 
 
-# ---- Input Bridge hand-off: a phone with a controller asks for the bridge's port + PIN (it's already paired, so that's fine)
+# ── Input Bridge hand-off: a phone with a controller asks for the bridge's port + PIN (it's already paired, so that's fine)
 def _lk_bridge_state():
     try:
-        from controller_bridge import PORT as bp
+        from controller_bridge import PORT as bp    # lazy: saves memory/startup until used
     except Exception:
         return {"ok": False, "msg": "This PC has no Input Bridge, so the controller can't be sent."}
     return {"ok": True, "port": int(bp), "pin": _bridge_pin(), "running": _bridge_obj is not None}
@@ -35193,7 +35585,7 @@ def _lk_bridge_set(on):
     return st
 
 
-# ---- WebSocket (RFC 6455, just what we need: text + binary frames, ping / pong, close)
+# ── WebSocket (RFC 6455, just what we need: text + binary frames, ping / pong, close) ──
 class _LkWS:
     def __init__(self, h):
         self.h, self.lock, self.alive = h, threading.Lock(), True
@@ -35310,7 +35702,7 @@ def _lk_ws_video(ws, st, cfg, gen):
                 elif fails >= 3:
                     try:
                         cap.close()
-                    except Exception:
+                    except Exception:    # expected: cleanup that may already be done
                         pass
                     cap = _LkCapQt() if cap.name != "qt" else cap
                     ws.text({"cap": cap.name})
@@ -35342,13 +35734,13 @@ def _lk_ws_video(ws, st, cfg, gen):
                 break
             prev, lastsend = h, time.time()
     except Exception as e:
-        print(f"NCZ Link: stream stopped ({e!r})")
+        _ncz_log(f"NCZ Link: stream stopped ({e!r})")
     finally:
         ws.alive = False
         try:
             if cap:
                 cap.close()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
 
@@ -35401,14 +35793,14 @@ def _lk_ws_session(ws, q):
                     try:
                         cfg[k] = max(lo, min(hi, int(m["cfg"].get(k, cfg[k]))))
                     except Exception:
-                        pass
-    except Exception:
+                        _log_exc("_lk_ws_session")
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     finally:
         ws.alive = False
 
 
-# ---- the HTTP side
+# ── the HTTP side ──
 def _lk_ip_ok(ip):
     try:
         a = _lk_ipa.ip_address(ip.split("%")[0])
@@ -35511,13 +35903,13 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
             if path == "/audio":
                 return self._audio()
             return self._json(404, {"ok": False, "msg": "unknown"})
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):    # expected: offline or timed out
             pass
         except Exception as e:
             try:
                 self._json(500, {"ok": False, "msg": str(e)[:120]})
             except Exception:
-                pass
+                _log_exc("_route")
 
     def do_GET(self):
         self._route("GET")
@@ -35576,7 +35968,7 @@ class _LkHandler(_lk_http.BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(15)                      # a stalled phone must not leave the PC muted forever
         except Exception:
-            pass
+            _log_exc("_audio")
         with _lk["lock"]:
             _lk["agen"] += 1
             gen = _lk["agen"]                                 # a newer audio stream replaces this one
@@ -35671,13 +36063,13 @@ def ncz_link_set_running(on):
             try:
                 _bridge_set_running(False)
             except Exception:
-                pass
+                _log_exc("ncz_link_set_running")
         threading.Thread(target=srv.shutdown, daemon=True).start()
         srv.server_close()
     return ""
 
 def _lk_add_setting(self):
-    from PyQt6.QtWidgets import QPushButton as _B
+    from PyQt6.QtWidgets import QPushButton as _B    # lazy: saves memory/startup until used
     sp = self.settings_page
     lay = sp.dark_mode_combo.parentWidget().layout()
     row = QHBoxLayout()
@@ -35690,7 +36082,7 @@ def _lk_add_setting(self):
     desc.setWordWrap(True)
     col.addWidget(title)
     col.addWidget(desc)
-    from PyQt6.QtWidgets import QCheckBox as _LkCB
+    from PyQt6.QtWidgets import QCheckBox as _LkCB    # lazy: saves memory/startup until used
     mute_cb = _LkCB("Mute this PC's sound while a phone is listening (the phone keeps the sound)")
     mute_cb.setChecked(_lk_mute_pref())
     def _mute_changed(v):
@@ -35754,23 +36146,13 @@ def _lk_add_setting(self):
     if btn.isChecked():
         err = ncz_link_set_running(True)
         if err:
-            print(f"NCZ Link: {err}")
-
-_lk_prev_init = AdaptiveApp.__init__
-
-def _lk_init(self):
-    _lk_prev_init(self)
-    try:
-        _lk_pc_mute_recover()
-        _lk["inv"] = _LkInvoker()
-        _lk_add_setting(self)
-    except Exception as e:
-        print(f"NCZ Link: couldn't start ({e!r})")
-
-AdaptiveApp.__init__ = _lk_init
+            _ncz_log(f"NCZ Link: {err}")
 
 
-# ================================================================ NCZFront inside the launcher
+
+
+
+# ── NCZFront inside the launcher ──
 # "Play" on the NCZFront card opens the site in a browser tab inside the launcher (QtWebEngine) instead of the
 # default browser. The page stays alive when you switch to another launcher tab, so a running game keeps going.
 def _ncz_web_classes():
@@ -35779,7 +36161,7 @@ def _ncz_web_classes():
     global NczWebPage
     if "NczWebPage" in globals():
         return NczWebPage
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineWidgets import QWebEngineView    # lazy: saves memory/startup until used
     from PyQt6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
                                        QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo)
 
@@ -35792,7 +36174,7 @@ def _ncz_web_classes():
                     if host.endswith((".ngrok-free.dev", ".ngrok-free.app", ".ngrok.io", ".ngrok.app", ".ngrok.dev")):
                         info.setHttpHeader(b"ngrok-skip-browser-warning", b"true")
             except Exception:
-                pass
+                _log_exc("interceptRequest")
 
     class _WebTabPage(QWebEnginePage):
         def __init__(self, profile, owner, parent=None):
@@ -35876,7 +36258,7 @@ def _ncz_web_classes():
             self.tabs.currentChanged.connect(self._sync_toolbar)
             outer.addWidget(self.tabs, 1)
 
-        # -------------------------------------------------- tabs
+        # ── tabs ──
         def _cur(self):
             return self.tabs.currentWidget()
 
@@ -35920,7 +36302,7 @@ def _ncz_web_classes():
                 page = view.page()
                 view.setPage(None)
                 page.deleteLater()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
             view.deleteLater()
 
@@ -35934,7 +36316,7 @@ def _ncz_web_classes():
         def has_tabs(self):
             return self.tabs.count() > 0
 
-        # -------------------------------------------------- toolbar bits
+        # ── toolbar bits ──
         def _set_title(self, view, title):
             i = self.tabs.indexOf(view)
             if i >= 0:
@@ -35980,7 +36362,7 @@ def _ncz_web_classes():
             if v is not None:
                 _real_webbrowser_open(v.url().toString())
 
-        # -------------------------------------------------- downloads / fullscreen
+        # ── downloads / fullscreen ──
         def _on_download(self, item):
             try:
                 folder = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -35988,7 +36370,7 @@ def _ncz_web_classes():
                 item.setDownloadDirectory(folder)
                 item.accept()
             except Exception:
-                pass
+                _log_exc("_on_download")
 
         def _on_fullscreen(self, req):
             req.accept()
@@ -36031,43 +36413,10 @@ def _nczfront_unmark_playing():
         for cb in _playing_listeners:
             cb()
 
-def _open_nczfront(self):
-    if not _HAS_WEBENGINE:                      # PyQt6-WebEngine missing: old behaviour
-        webbrowser.open(NCZFRONT_URL)
-        return
-    page = self.__dict__.get("web_page")
-    if page is None:
-        try:
-            web_cls = _ncz_web_classes()
-        except Exception:                       # installed but won't load (broken install): default browser
-            import traceback
-            traceback.print_exc()
-            webbrowser.open(NCZFRONT_URL)
-            return
-        page = web_cls()
-        self.web_page = page
-        self.pages.addWidget(page)
-        page.back_requested.connect(self._leave_web_page)
-        page.closed.connect(self._web_page_emptied)
-        QApplication.instance().aboutToQuit.connect(page.shutdown)
-    page.open_url(NCZFRONT_URL)
-    self.pages.setCurrentWidget(page)
-    _nczfront_mark_playing()
 
-def _leave_web_page(self):
-    self.pages.setCurrentIndex(0)
-    btn = self.nav_group.button(0) if hasattr(self, "nav_group") else None
-    if btn is not None:
-        btn.setChecked(True)
 
-def _web_page_emptied(self):
-    _nczfront_unmark_playing()
-    self._leave_web_page()
 
-AdaptiveApp.open_nczfront = _open_nczfront
-AdaptiveApp._leave_web_page = _leave_web_page
-AdaptiveApp._web_page_emptied = _web_page_emptied
-# ================================================================ NCZ Chess: rules engine (pure python)
+# ── NCZ Chess: rules engine (pure python) ──
 _CH_FILES = "abcdefgh"
 _CH_START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 _CH_KN = ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1))
@@ -36415,7 +36764,7 @@ class _ChessGame:
                 tot[p[0]] += _CH_VALUE[p[1]]
         return tot["w"] - tot["b"]
 
-# ================================================================ NCZ Chess: piece icons + move sounds
+# ── NCZ Chess: piece icons + move sounds ──
 # Piece pictures: drop them in assets/chess/. Colour-specific files are used first, named wK.png ... bP.png
 # (also white_king.png, king_white.png, white-king.png ...). A single un-coloured set (king.png, queen.png, rook.png,
 # bishop.png, knight.png, pawn.png) also works: it's used as-is for Black and outlined + whitened for White.
@@ -36435,7 +36784,7 @@ def _ch_scan_icons():
             stem, ext = os.path.splitext(f)
             if ext.lower() in (".png", ".svg", ".webp", ".jpg", ".jpeg"):
                 files.setdefault(stem.lower(), os.path.join(d, f))
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     _ch_icons["files"] = files
 
@@ -36458,7 +36807,7 @@ def _ch_icon_file(piece):
 def _ch_load_pixmap(path, px):
     if path.lower().endswith(".svg"):
         try:
-            from PyQt6.QtSvg import QSvgRenderer
+            from PyQt6.QtSvg import QSvgRenderer    # lazy: saves memory/startup until used
             r = QSvgRenderer(path)
             if not r.isValid():
                 return None
@@ -36520,13 +36869,13 @@ def _ch_icon_pixmap(piece, px):
     cache[key] = res
     return res
 
-# ---- sounds: tiny synthesized "wood" clicks, so nothing has to be downloaded. Put your own move.wav, capture.wav,
+# ── sounds: tiny synthesized "wood" clicks, so nothing has to be downloaded. Put your own move.wav, capture.wav,
 # check.wav, castle.wav, promote.wav, end.wav or start.wav in assets/chess/sounds/ and those are used instead.
 import math as _math
 import wave as _wave
 import struct as _struct
 
-# ---- Linux audio: QtMultimedia frequently "plays" into a dead device on Linux (status Ready, no error, no sound).
+# ── Linux audio: QtMultimedia frequently "plays" into a dead device on Linux (status Ready, no error, no sound).
 # So on Linux we play through an installed command-line player (paplay / pw-play / aplay / ffplay / mpv) and only use Qt without one.
 _LX_PLAYERS = ("paplay", "pw-play", "aplay", "ffplay", "mpv", "cvlc")
 
@@ -36539,7 +36888,7 @@ def _lx_wav_for(path):
     ff = shutil.which("ffmpeg")
     if not ff:
         return None
-    import tempfile, hashlib
+    import tempfile, hashlib    # lazy: saves memory/startup until used
     out = os.path.join(tempfile.gettempdir(), "ncz_snd_" + hashlib.md5(path.encode()).hexdigest() + ".wav")
     if not os.path.exists(out):
         try:
@@ -36671,7 +37020,7 @@ def _ch_play(kind):
             return
         fx = _ch_snd["fx"].get(kind)
         if fx is None:
-            from PyQt6.QtMultimedia import QSoundEffect
+            from PyQt6.QtMultimedia import QSoundEffect    # lazy: saves memory/startup until used
             fx = QSoundEffect()
             fx.setSource(QUrl.fromLocalFile(_ch_sound_path(kind)))
             fx.setVolume(0.7)
@@ -36685,7 +37034,7 @@ def _ch_play(kind):
             try:
                 _lx_cli_play(_ch_sound_path(kind), 0.7)
             except Exception:
-                pass
+                _log_exc("_ch_play")
         else:
             _ch_snd["broken"] = True      # no QtMultimedia / no audio device: stay silent instead of erroring
 
@@ -36704,9 +37053,8 @@ def _ch_sound_for(san, result):
         return "capture"
     return "move"
 
-# ================================================================ NCZ Chess: board widget
-from PyQt6.QtGui import QBrush, QRadialGradient, QCursor, QFontMetricsF, QLinearGradient, QPolygonF
-from PyQt6.QtCore import QPointF
+# ── NCZ Chess: board widget ──
+from PyQt6.QtGui import QBrush, QRadialGradient, QCursor, QLinearGradient, QPolygonF
 from PyQt6.QtWidgets import QTextBrowser, QCheckBox
 
 _CH_GLYPH = {"K": "\u265A", "Q": "\u265B", "R": "\u265C", "B": "\u265D", "N": "\u265E", "P": "\u265F"}
@@ -36753,7 +37101,7 @@ class _ChessBoard(QWidget):
         self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._anim_tick)
 
-    # ---- geometry
+    # ── geometry ──
     def _geo(self):
         side = min(self.width(), self.height())
         return (self.width() - side) / 2.0, (self.height() - side) / 2.0, side / 8.0
@@ -36818,7 +37166,7 @@ class _ChessBoard(QWidget):
         self._drag = -1
         self.update()
 
-    # ---- pieces
+    # ── pieces ──
     def _piece_path(self, kind, fs):
         key = (kind, fs)
         pth = self._paths.get(key)
@@ -36858,7 +37206,7 @@ class _ChessBoard(QWidget):
         p.drawPath(pth)
         p.restore()
 
-    # ---- painting
+    # ── painting ──
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -36974,7 +37322,7 @@ class _ChessBoard(QWidget):
         p.setBrush(c)
         p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
 
-    # ---- mouse / keyboard
+    # ── mouse / keyboard ──
     def _can_pick(self, sq):
         pc = self.pos.b[sq] if sq >= 0 else None
         if not pc or self.who is None:
@@ -37099,11 +37447,11 @@ class _ChessBoard(QWidget):
         else:
             super().keyPressEvent(e)
 
-# ================================================================ NCZ Chess: the page
-import uuid as _uuid
+# ── NCZ Chess: the page ──
+_uuid = _LazyModule("uuid")
 import random as _random
 
-# ================================================================ NCZ Chess: bots (their own fast search engine)
+# ── NCZ Chess: bots (their own fast search engine) ──
 # The rules engine above is written for clarity, not speed, so the bots search with this separate engine: int-coded
 # moves, make/unmake on one board, alpha-beta with iterative deepening, a transposition table, null-move pruning,
 # late-move reductions and a quiescence search. A bot's level = search depth + thinking time + evaluation noise +
@@ -37206,7 +37554,7 @@ class _ChessBot:
         self.rbest = 0
         self.rnd = _random.random
 
-    # ---- position in / out
+    # ── position in / out ──
     def load(self, pos):
         self.b = [0] * 64
         for s, p in enumerate(pos.b):
@@ -37234,7 +37582,7 @@ class _ChessBot:
             h ^= _BP_ZS
         return h
 
-    # ---- attacks / move generation
+    # ── attacks / move generation ──
     def attacked(self, sq, by):
         b = self.b
         for s in _BP_PF[by][sq]:
@@ -37352,7 +37700,7 @@ class _ChessBot:
                             break
         return out
 
-    # ---- make / unmake
+    # ── make / unmake ──
     def make(self, m):
         b = self.b
         f, t, pr = m & 63, (m >> 6) & 63, m >> 12
@@ -37432,7 +37780,7 @@ class _ChessBot:
         self.ep, self.hash, self.half = self.nstack.pop()
         self.side = -self.side
 
-    # ---- evaluation (centipawns, from the side to move)
+    # ── evaluation (centipawns, from the side to move) ──
     def evaluate(self):
         b, tbl = self.b, _BP_PST
         s = 0
@@ -37469,7 +37817,7 @@ class _ChessBot:
             s += int((self.rnd() * 2 - 1) * self.noise)
         return s
 
-    # ---- search
+    # ── search ──
     def _poll_time(self):
         time.sleep(0.001)                      # lets the UI thread breathe while a bot thinks
         if self.can_stop and time.time() > self.deadline:
@@ -37655,7 +38003,7 @@ class _ChessBot:
         return best
 
 
-# ---- the bots
+# ── the bots ──
 _CH_BOT_LIST = [
     dict(elo=250, name="Pebble", blurb="Barely knows how the pieces move.", depth=1, secs=0.3, noise=450, blunder=0.50, quiesce=False),
     dict(elo=350, name="Toast", blurb="Grabs whatever it can and forgets to defend.", depth=1, secs=0.3, noise=330, blunder=0.35, quiesce=False),
@@ -37684,7 +38032,7 @@ def _bot_eval_for(pos, bot_color):
     return sc if bot.side == (1 if bot_color == "w" else -1) else -sc
 
 
-# ---- NCZ bots (their own tab). The Elo is a target: depth / time / noise / blunder rate are interpolated between the built-in bots.
+# ── NCZ bots (their own tab). The Elo is a target: depth / time / noise / blunder rate are interpolated between the built-in bots.
 _CH_NCZ_TIERS = ((701, "Beginner", "Still learning how the pieces move and hangs pieces often."),
                  (1001, "Casual", "Plays on instinct and drops the odd piece."),
                  (1500, "Club player", "Solid, and punishes loose pieces."),
@@ -37709,7 +38057,7 @@ def _ch_bot_from_elo(name, elo, color):
 _CH_NCZ_BOTS = [_ch_bot_from_elo(n, e, _CH_NCZ_COLORS[i % len(_CH_NCZ_COLORS)]) for i, (n, e) in enumerate(_CH_NCZ_BOT_DATA)]
 _ch_bot_av_cache = {}
 
-# ---- NCZ bot pictures from Discord: slug of the bot's name -> Discord user id. The pictures are looked up once (in the background,
+# ── NCZ bot pictures from Discord: slug of the bot's name -> Discord user id. The pictures are looked up once (in the background,
 # through a public Discord lookup site, no token needed) and kept in <launcher settings folder>/chess_bot_discord/<slug>.png.
 _CH_BOT_DISCORD = {
     "notacape": "1117393016773152821", "omarv4": "1321446023071273034", "hamza": "1225527076187017287",
@@ -37760,11 +38108,11 @@ def _ch_bot_pic(cfg, size=64):
     return _fo_avatar(_ch_bot_avatar_file(cfg), cfg["name"][:1].upper(), size)
 
 def _ch_discord_log(msg):
-    print("chess: " + msg)
+    _ncz_log("chess: " + msg)
     try:
         with open(os.path.join(_ch_discord_dir(), "log.txt"), "a", encoding="utf-8") as f:
             f.write(msg + "\n")
-    except Exception:
+    except Exception:    # expected: Discord or the controller may not be there
         pass
 
 def _ch_find_avatar_url(obj, uid):
@@ -37838,7 +38186,7 @@ def _ch_discord_fetch_all():
             elif _ch_discord_state["offline"]:
                 break
     except Exception as e:
-        print(f"chess: bot picture download failed: {e}")
+        _ncz_log(f"chess: bot picture download failed: {e}")
     finally:
         _ch_discord_state["running"] = False
         _ch_bot_av_cache.clear()          # the next time a bot card is drawn it finds the new pictures
@@ -37919,7 +38267,7 @@ def _ch_can_mate(pos, color):
                 return True
     return minors >= 2
 
-# ---- bot trash talk: a speech bubble next to the bot's name during the game. Fill the lists with texts (use {name} for the player's
+# ── bot trash talk: a speech bubble next to the bot's name during the game. Fill the lists with texts (use {name} for the player's
 # name). "*" is used by every bot; add a bot's lowercase name without spaces (e.g. "omarv4") to give that bot its own lines too.
 # events: bot_capture (bot took my piece), bot_check (bot checked me), my_capture (I took the bot's piece), my_check (I checked the bot),
 #         quiet (random chatter on a normal move), bot_win / bot_lose / draw (when the game ends)
@@ -37929,7 +38277,7 @@ _CH_TRASH = {
 _CH_TRASH_CHANCE = {"bot_capture": 0.5, "bot_check": 0.6, "my_capture": 0.4, "my_check": 0.4, "quiet": 0.07}
 _CH_TRASH_COOLDOWN = 4       # at least this many half-moves between two bubbles in the middle of a game
 
-# ---- the winner's gif bubble (shown next to the winner's name when a game is won). If the lookup of the klipy page ever fails, paste
+# ── the winner's gif bubble (shown next to the winner's name when a game is won). If the lookup of the klipy page ever fails, paste
 # the direct link to the gif (right-click the gif -> copy image address) into _CH_WIN_GIF_DIRECT.
 _CH_WIN_GIF_PAGE = "https://klipy.com/gifs/checkmate-19"
 _CH_WIN_GIF_DIRECT = "https://static2.klipy.com/ii/a8ada81afc59159ea5c8927feffa2e31/2e/4f/S9CKoccEfeWp1OXxW.gif"
@@ -37956,7 +38304,7 @@ def _ch_klipy_urls(html):
     return out
 
 def _ch_klipy_via_browser(url):
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright    # lazy: saves memory/startup until used
     found = []
     with sync_playwright() as p:
         br = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
@@ -37981,12 +38329,12 @@ def _ch_fetch_win_gif():
             data, _ct = _ch_http_bytes(_CH_WIN_GIF_PAGE)
             cands = _ch_klipy_urls(data.decode("utf-8", "replace"))
         except Exception as e:
-            print(f"chess: couldn't read the gif page directly ({e}); trying a hidden browser")
+            _ncz_log(f"chess: couldn't read the gif page directly ({e}); trying a hidden browser")
         if not cands:
             try:
                 cands = _ch_klipy_via_browser(_CH_WIN_GIF_PAGE)
             except Exception as e:
-                print(f"chess: couldn't get the win gif through the browser either: {e}")
+                _ncz_log(f"chess: couldn't get the win gif through the browser either: {e}")
     d = os.path.dirname(get_launcher_settings_path())
     for u in cands[:8]:
         try:
@@ -38002,7 +38350,7 @@ def _ch_fetch_win_gif():
                 f.write(data)
             return out
         except Exception as e:
-            print(f"chess: win gif download failed ({u}): {e}")
+            _ncz_log(f"chess: win gif download failed ({u}): {e}")
     return None
 
 class _ChessBg(QObject):
@@ -38214,7 +38562,7 @@ class _SquareHost(QWidget):
         for st in (self.top, self.bottom):
             st._place_big()
 
-# ---------------------------------------------------------------- Elo ratings (online games between friends)
+# ── Elo ratings (online games between friends) ──
 # Every player keeps one record at chess/ratings/<uid> = {r: rating, g: games, w, l, d, last: {gid, before, delta, opp}}.
 # Each client only ever writes ITS OWN record when a game ends. `last` remembers which game was counted last and the rating
 # before it, so (a) a game is never counted twice and (b) the other player can still compute the same pre-game rating.
@@ -38279,8 +38627,8 @@ def _ch_mix(a, b, t):
 
 def _ch_icon(kind, color="#ffffff", size=48):
     """Small vector icons painted on the fly (no emoji, no image files)."""
-    from PyQt6.QtGui import QPolygonF
-    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPolygonF    # lazy: saves memory/startup until used
+    from PyQt6.QtCore import QPointF    # lazy: saves memory/startup until used
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     q = QPainter(pm)
@@ -38346,13 +38694,13 @@ def _ch_load_piece_style():
             if st[0] == n:
                 _ch_piece_style["i"] = i
         return
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     try:                                    # nothing saved yet: people with their own piece pictures start on their untouched look
         if _ch_icon_pixmap("wK", 64) is not None:
             _ch_piece_style["i"] = [st[0] for st in _CH_PIECE_STYLES].index("Classic")
     except Exception:
-        pass
+        _log_exc("_ch_load_piece_style")
 
 _ch_tint_cache = {}
 
@@ -38404,7 +38752,7 @@ def _ch_save_piece_style():
         with open(_ch_piece_file(), "w", encoding="utf-8") as f:
             f.write(_CH_PIECE_STYLES[_ch_piece_style["i"]][0])
     except Exception:
-        pass
+        _log_exc("_ch_save_piece_style")
 
 _CH_BOARD_STYLES = [
     ("Classic green", ("#eeeed2", "#769656", "#f6f669")),
@@ -38427,7 +38775,7 @@ def _ch_load_board_style():
         for i, (nm, _c) in enumerate(_CH_BOARD_STYLES):
             if nm == n:
                 _ch_board_style["i"] = i
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _ch_save_board_style():
@@ -38435,7 +38783,7 @@ def _ch_save_board_style():
         with open(_ch_board_file(), "w", encoding="utf-8") as f:
             f.write(_CH_BOARD_STYLES[_ch_board_style["i"]][0])
     except Exception:
-        pass
+        _log_exc("_ch_save_board_style")
 
 def _ch_board_colors(t):
     st = _CH_BOARD_STYLES[_ch_board_style["i"] % len(_CH_BOARD_STYLES)][1]
@@ -38452,7 +38800,7 @@ def _ch_board_colors_launcher(t):
     s = min(s * 0.6, 0.5)
     return QColor.fromHslF(h, s, 0.80), QColor.fromHslF(h, s, 0.38), QColor("#3d8bfd")   # blue highlight so it never blends with the white-ish squares
 
-# ---- chess themes: a theme = board colours + piece colours + the page colours. The player picks one the first time NCZ Chess
+# ── chess themes: a theme = board colours + piece colours + the page colours. The player picks one the first time NCZ Chess
 # is opened (a window with a preview picture of each) and can change it any time with the "Theme" button at the top.
 def _ch_ui(top, bot, acc, acc_h, acc_p, on, pan, inp, bor, btn, btn_h, dis, dis_t, txt, sub):
     return dict(page_bg=(top, bot), accent=acc, accent_hover=acc_h, accent_press=acc_p, on_accent=on, panel=pan, input=inp,
@@ -38497,7 +38845,7 @@ def _ch_load_theme():
     try:
         with open(_ch_theme_file(), "r", encoding="utf-8") as f:
             _ch_cur["name"] = f.read().strip()
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _ch_apply_theme(name):
@@ -38507,7 +38855,7 @@ def _ch_apply_theme(name):
     try:
         _ch_board_style["i"] = [b[0] for b in _CH_BOARD_STYLES].index(th["board"])
         _ch_piece_style["i"] = [st[0] for st in _CH_PIECE_STYLES].index(th["pieces"])
-    except ValueError:
+    except ValueError:    # expected: missing or odd value: the default is fine
         pass
     _ch_tint_cache.clear()
     _ch_save_board_style()
@@ -38516,7 +38864,7 @@ def _ch_apply_theme(name):
         with open(_ch_theme_file(), "w", encoding="utf-8") as f:
             f.write(th["name"])
     except Exception:
-        pass
+        _log_exc("_ch_apply_theme")
 
 def _ch_theme_preview(th, w=220):
     """A picture of what the theme looks like: the page colour, a board with the pieces in this theme's colours, and the accent button."""
@@ -38536,7 +38884,7 @@ def _ch_theme_preview(th, w=220):
         bp = b.grab().scaled(bsz, bsz, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         b.deleteLater()
     except Exception as e:
-        print(f"chess: couldn't draw the theme preview: {e}")
+        _ncz_log(f"chess: couldn't draw the theme preview: {e}")
     finally:
         _ch_piece_style["i"] = saved
     pm = QPixmap(w, h)
@@ -38594,7 +38942,7 @@ class _ChessThemeDialog(QDialog):
         grid = QGridLayout(holder)
         grid.setContentsMargins(0, 8, 0, 8)
         grid.setSpacing(14)
-        from PyQt6.QtWidgets import QButtonGroup as _QBG
+        from PyQt6.QtWidgets import QButtonGroup as _QBG    # lazy: saves memory/startup until used
         self._grp = _QBG(self)
         self._grp.setExclusive(True)
         for i, th in enumerate(_CH_THEMES):
@@ -38628,7 +38976,7 @@ class _ChessThemeDialog(QDialog):
     def _pick(self, name):
         self.chosen = name
 
-# ---- while NCZ Chess is on screen the whole launcher (top bar, side rail, buttons, background) wears the chess theme; it goes back to
+# ── while NCZ Chess is on screen the whole launcher (top bar, side rail, buttons, background) wears the chess theme; it goes back to
 # the normal look as soon as another page is shown.
 _ch_orig = {"theme": None, "extra": None, "on": False}
 
@@ -38686,6 +39034,7 @@ def _ch_launcher_look(th):
         extra = extra.replace(k, v)
     return theme, extra
 
+# kept: used at import time before the later definition at line 51540
 def _ch_sync_launcher_look(page):
     """Put the chess look on the whole launcher while `page` is the page on screen, and take it off again when it isn't."""
     global SUNSET_THEME, _SUNSET_EXTRA
@@ -38705,7 +39054,7 @@ def _ch_sync_launcher_look(page):
             _ch_orig["on"] = False
             _ui_apply_sunset()
     except Exception as e:
-        print(f"chess: couldn't change the launcher look: {e}")
+        _ncz_log(f"chess: couldn't change the launcher look: {e}")
 
 def _ch_css(t=None):
     t = t or _ch_theme()
@@ -38754,7 +39103,7 @@ def _ch_css(t=None):
 #ChessPage #ChTier {{ font-size:11px; font-weight:800; }}
 """
 
-# ================================================================ NCZ Chess: game review (PGN -> Chesskit through Playwright)
+# ── NCZ Chess: game review (PGN -> Chesskit through Playwright) ──
 # The finished game is exported as PGN, a hidden Chromium (Playwright) opens Chesskit's analysis page, loads the PGN,
 # lets Chesskit's Stockfish review it, and the report is copied back here (a screenshot of it + the numbers we can read).
 # Needs: pip install playwright && playwright install chromium
@@ -38783,7 +39132,7 @@ def _ch_pgn(game, white, black, white_elo=None, black_elo=None):
     head = "\n".join(f'[{k} "{v}"]' for k, v in tags)
     return head + "\n\n" + " ".join(parts + [res]) + "\n"
 
-# ---- opening / gambit names (longest matching start of the game wins; moves written without move numbers)
+# ── opening / gambit names (longest matching start of the game wins; moves written without move numbers)
 _CH_OPENINGS_TXT = """
 e4|King's Pawn Game
 e4 e5|King's Pawn Game: Open Game
@@ -38979,15 +39328,12 @@ def _ch_opening(sans):
     return ""
 
 def _ch_opening_label(sans):
-    nm = _ch_opening(sans)
-    if not nm:
-        return ""
-    return nm
+    return _ch_opening(sans)
 
 _CH_REVIEW_BTN = re.compile(r"^(?!.*again).*(analy[sz]e|run analysis|start analysis|generate|game review|game report|\breview\b)", re.I)
 _CH_REVIEW_PCT = re.compile(r"accuracy[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%[\s\S]{0,160}?(\d{1,3}(?:\.\d+)?)\s*%", re.I)
 _CH_SAN = re.compile(r"^(?:O-O(?:-O)?|[KQRBN][a-h]?[1-8]?x?[a-h][1-8]|(?:[a-h]x)?[a-h][1-8](?:=[QRBN])?)[+#]?$")
-_CH_CLS_COLORS = {"splendid": "#1baca6", "perfect": "#5c8bb0", "book": "#a88865", "opening": "#a88865", "forced": "#9aa0a6", "best": "#26c281", "brilliant": "#1baca6",
+_CH_CLS_COLORS = {"book": "#a88865", "opening": "#a88865", "forced": "#9aa0a6", "best": "#26c281", "brilliant": "#1baca6",
                   "great": "#5c8bb0", "splendid": "#1baca6", "perfect": "#1baca6", "excellent": "#81b64c", "okay": "#81b64c",
                   "good": "#95b776", "inaccuracy": "#f7c631", "mistake": "#ffa459", "blunder": "#fa412d"}
 
@@ -38998,38 +39344,6 @@ def _ch_pgn_sans(pgn):
     body = re.sub(r"\d+\.(?:\.\.)?", " ", body)
     return [t for t in body.split() if _CH_SAN.match(t)]
 
-def _ch_align(entries, sans):
-    """Match what was scraped from Chesskit's move list (san + classification icon) to the game's own move list."""
-    ent = [e for e in entries if _CH_SAN.match(e.get("san", ""))]
-    n = len(sans)
-    for i in range(len(ent)):                                  # a clean run that equals the game
-        if [e["san"] for e in ent[i:i + n]] == sans:
-            return [{"san": e["san"], "cls": e.get("cls", "")} for e in ent[i:i + n]]
-    out, j = [], 0                                             # otherwise follow the moves in order
-    for s in sans:
-        k = j
-        while k < len(ent) and ent[k]["san"] != s:
-            k += 1
-        if k < len(ent):
-            out.append({"san": s, "cls": ent[k].get("cls", "")})
-            j = k + 1
-        else:
-            out.append({"san": s, "cls": ""})
-    return out
-
-def _ch_review_parse(text):
-    """Whatever numbers can be read from the report text. Never raises; returns {} when nothing matched."""
-    out = {}
-    try:
-        m = _CH_REVIEW_PCT.search(text or "")
-        if m:
-            out["acc"] = (float(m.group(1)), float(m.group(2)))
-        m = re.search(r"(?:estimated|est\.?)\s*(?:elo|rating)[\s\S]{0,60}?(\d{3,4})[\s\S]{0,60}?(\d{3,4})", text or "", re.I)
-        if m:
-            out["elo"] = (int(m.group(1)), int(m.group(2)))
-    except Exception:
-        pass
-    return out
 
 _CH_SCRAPE_JS = r"""() => {
   const isNum = e => e.children.length === 0 && /^\d+\.$/.test((e.textContent || '').trim());
@@ -39105,7 +39419,7 @@ class _ChessReviewWorker(QThread):
                 f.write("URL: " + page.url + "\nCONTROLS: " + " | ".join(self._controls(page)) + "\n\n")
                 f.write(page.evaluate("document.body.innerText") or "")
         except Exception:
-            pass
+            _log_exc("_dump")
 
     def _click_first(self, page, locators, timeout=1500):
         for loc in locators:
@@ -39150,12 +39464,12 @@ class _ChessReviewWorker(QThread):
             if d.get("elo"):
                 out["elo"] = (int(d["elo"][0]), int(d["elo"][1]))
         except Exception:
-            pass
+            _log_exc("_stats")
         return out
 
     def run(self):
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright    # lazy: optional module: the except below handles it missing
         except ImportError:
             self.failed.emit("Playwright isn't installed. Run: pip install playwright && playwright install chromium", "")
             return
@@ -39222,7 +39536,7 @@ class _ChessReviewWorker(QThread):
                     try:
                         dlg.first.wait_for(state="hidden", timeout=20000)
                     except Exception:
-                        pass
+                        _log_exc("run")
                     if self._stop:
                         return
                     # 6. when it has finished loading (Chesskit's engine marks every move), scrape the moves
@@ -39237,7 +39551,7 @@ class _ChessReviewWorker(QThread):
                         try:                                    # "ANALYZE AGAIN" only shows once the analysis is complete
                             finished = page.get_by_role("button", name=re.compile(r"analy[sz]e again", re.I)).first.is_visible()
                         except Exception:
-                            pass
+                            _log_exc("run")
                         self.progress.emit(f"Chesskit is analysing the game... {have}/{n} moves  ({int(time.time() - t0)}s)")
                         if have and ((n and have >= n) or finished):
                             settled += 1
@@ -39257,7 +39571,7 @@ class _ChessReviewWorker(QThread):
                 finally:
                     try:
                         browser.close()
-                    except Exception:
+                    except Exception:    # expected: cleanup that may already be done
                         pass
         except Exception as e:
             self.failed.emit(str(e) or type(e).__name__, "")
@@ -39268,7 +39582,7 @@ class _ChessReviewWorker(QThread):
         try:
             with open(base + ".json", "w", encoding="utf-8") as f:
                 json.dump({"summary": summary, "moves": moves}, f)
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         self.done.emit({"moves": moves, "text": text, "summary": summary})
 
@@ -39436,7 +39750,7 @@ class _ChessReviewPanel(QFrame):
                     self.status.setText("Saved review - click a move to jump to it.")
                     self._show(data["moves"], data.get("summary", {}))
                     return
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         if self.worker is not None and self.worker.isRunning():
             return
@@ -39481,8 +39795,8 @@ class NczChessPage(QWidget):
                 try:
                     self._refresh()
                 except Exception:
-                    pass
-        except RuntimeError:
+                    _log_exc("restyle")
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def __init__(self):
@@ -39615,7 +39929,7 @@ class NczChessPage(QWidget):
                 b.setIcon(_ch_icon(b._kind, col))
                 b.setIconSize(QSize(18, 18))
         except Exception:
-            pass
+            _log_exc("_set_icons")
 
     def choose_theme(self, first=False):
         """Open the theme picker (with preview pictures) and apply what the player picked."""
@@ -39630,7 +39944,7 @@ class NczChessPage(QWidget):
             _ch_sync_launcher_look(self)
             self._set_note("Theme: " + dlg.chosen)
         except Exception as e:
-            print(f"chess: theme picker failed: {e}")
+            _ncz_log(f"chess: theme picker failed: {e}")
             if first and not _ch_theme_saved():
                 _ch_apply_theme(_CH_THEMES[0]["name"])      # never get stuck asking on every open
                 self.restyle()
@@ -39670,7 +39984,7 @@ class NczChessPage(QWidget):
         if effect is None:
             super().setGraphicsEffect(None)
 
-    # ================================================================ lobby
+    # ── lobby ──
     def _card(self, title, sub=""):
         card = QFrame()
         card.setObjectName("ChCard")
@@ -39765,7 +40079,7 @@ class NczChessPage(QWidget):
                     if self._bubbles.get(col) == spec:
                         self._bubbles[col] = None
                         self._paint_strips()
-                except RuntimeError:
+                except RuntimeError:    # expected: the widget or object may already be deleted
                     pass
             QTimer.singleShot(ms, gone)
 
@@ -39802,7 +40116,7 @@ class NczChessPage(QWidget):
             name = (self._my_name or "").strip() or "you"
             self._say(botc, ("text", _random.choice(texts).replace("{name}", name)), ms)
         except Exception as e:
-            print(f"chess: trash talk failed: {e}")
+            _ncz_log(f"chess: trash talk failed: {e}")
 
     def _win_gif_check(self):
         """When the game was won (by me, or by either side in a two-player game on this PC) the checkmate gif appears next to the winner."""
@@ -39828,7 +40142,7 @@ class NczChessPage(QWidget):
         for av, cfg in getattr(self, "_bot_avs", []):
             try:
                 av.setPixmap(_ch_bot_pic(cfg, 64))
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
 
     def _bot_card(self, cfg):
@@ -40038,7 +40352,7 @@ class NczChessPage(QWidget):
             self._load_friend_ratings(list(res.keys()))
         self.bg.run(fn, cb)
 
-    # ---- ratings
+    # ── ratings ──
     def _paint_my_identity(self):
         try:
             uname, av = load_profile_cache()
@@ -40264,7 +40578,7 @@ class NczChessPage(QWidget):
                 self._set_note(f"Rating {r_me} \u2192 {after_me} ({d_me:+d})")
         self.bg.run(fn, cb)
 
-    # ---- inbox (challenges + online games you're in)
+    # ── inbox (challenges + online games you're in) ──
     def _poll_inbox(self):
         if self._inbox_polling or not self.isVisible() or self.stack.currentIndex() != 0:
             return
@@ -40351,7 +40665,7 @@ class NczChessPage(QWidget):
             self._poll_inbox()
         self.bg.run(fn, cb)
 
-    # ---- challenges
+    # ── challenges ──
     def send_challenge(self):
         data = self.friend_combo.currentData()
         if not data:
@@ -40379,7 +40693,7 @@ class NczChessPage(QWidget):
             try:
                 cloud_send_message(fuid, f"\u265F {me} challenged you to a game of chess ({tc_label}). "
                                          f"Open NCZ Chess in your library to accept.")
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
             return gid, fuid
         def cb(res, err):
@@ -40415,7 +40729,7 @@ class NczChessPage(QWidget):
             token, uid = get_id_token()
             try:
                 _http_json(_fdb(f"chess/games/{gid}", token), "PATCH", {"status": "declined"})
-            except CloudError:
+            except CloudError:    # expected: offline or timed out
                 pass
             _http_json(_fdb(f"chess/inbox/{uid}/{gid}", token), "DELETE")
         def cb(_r, err):
@@ -40423,7 +40737,7 @@ class NczChessPage(QWidget):
             self._poll_inbox()
         self.bg.run(fn, cb)
 
-    # ================================================================ game view
+    # ── game view ──
     def _build_game(self):
         page = QWidget()
         row = QHBoxLayout(page)
@@ -40565,10 +40879,10 @@ class NczChessPage(QWidget):
             self.side_stack.setFixedWidth(310)
             self.side_stack.removeWidget(rp)
             rp.deleteLater()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
-    # ---- starting games
+    # ── starting games ──
     def _mark(self, on):
         try:
             if on:
@@ -40580,7 +40894,7 @@ class NczChessPage(QWidget):
             for cb in _playing_listeners:
                 cb()
         except Exception:
-            pass
+            _log_exc("_mark")
 
     def _reset_game(self, mode, base, inc):
         self._review_close()
@@ -40605,7 +40919,7 @@ class NczChessPage(QWidget):
         self.board.arrows.clear()
         self.board.marks.clear()
 
-    # ---- bots
+    # ── bots ──
     def _bot_blurb_update(self, *_a):
         i = self.bot_combo.currentIndex()
         if 0 <= i < len(_CH_BOT_LIST):
@@ -40742,7 +41056,7 @@ class NczChessPage(QWidget):
         self._load_my_rating()
         self._poll_inbox()
 
-    # ---- clocks
+    # ── clocks ──
     def _now(self):
         return _ch_server_now() if self.mode == "online" else time.monotonic() * 1000.0
 
@@ -40801,7 +41115,7 @@ class NczChessPage(QWidget):
                       avatar=av_path, letter=av_letter, show_avatar=show_av, elo_html=self._strip_elo(col))
             strip.set_bubble(self._bubbles.get(col))
 
-    # ---- moves
+    # ── moves ──
     def _on_move(self, f, t, promo):
         g = self.game
         if not g or g.result or self.view_ply != len(g.moves):
@@ -40970,7 +41284,7 @@ class NczChessPage(QWidget):
         self.bg.run(fn, lambda _r, _e: None)
         self._refresh()
 
-    # ---- review
+    # ── review ──
     def _on_anchor(self, url):
         s = url.toString()
         if s.startswith("ply:") and self.game:
@@ -41003,7 +41317,7 @@ class NczChessPage(QWidget):
         else:
             super().keyPressEvent(e)
 
-    # ---- drawing the state
+    # ── drawing the state ──
     def _result_text(self):
         r = self.game.result
         if not r:
@@ -41114,7 +41428,7 @@ class NczChessPage(QWidget):
         for b in self.nav_btns:
             b.setEnabled(n > 0)
 
-    # ================================================================ online polling
+    # ── online polling ──
     def _poll_game(self):
         gid = self.net_gid
         if not gid or self._polling or self.net_state in ("over", "cancelled"):
@@ -41129,7 +41443,7 @@ class NczChessPage(QWidget):
             if self.game_timer.interval() != iv:
                 self.game_timer.setInterval(iv)
         except Exception:
-            pass
+            _log_exc("_poll_game")
         if self._game_etag_gid != gid or self.net_state != "active":
             self._game_etag, self._game_etag_gid = None, gid      # always do a full read until the game is running
         etag = self._game_etag
@@ -41245,26 +41559,11 @@ class NczChessPage(QWidget):
             prev = ts
         self.tick_ref = prev
 
-# ---- "Play" on the NCZ Chess card opens the chess page inside the launcher
-def _open_chess(self):
-    page = self.__dict__.get("chess_page")
-    if page is None:
-        page = NczChessPage()
-        self.chess_page = page
-        self.pages.addWidget(page)
-        page.back_requested.connect(self._leave_web_page)
-        self.pages.currentChanged.connect(lambda _i, p=page: _ch_sync_launcher_look(p))     # chess look on while chess is shown
-    self.pages.setCurrentWidget(page)
-    _ch_sync_launcher_look(page)
-    if not _ch_theme_saved():
-        QTimer.singleShot(150, page.maybe_first_run_theme)
-
-AdaptiveApp.open_chess = _open_chess
+# ── "Play" on the NCZ Chess card opens the chess page inside the launcher ──
 
 
 
-
-# ================================================================ Poll results: Discord picture sync + itch.io fan games
+# ── Poll results: Discord picture sync + itch.io fan games ──
 # 1) Launcher profile picture follows your Discord picture (Settings -> "Sync profile picture with Discord", on by
 #    default). It reads your Discord user from the local Discord app (same pipe Rich Presence uses), so it needs the
 #    Discord desktop app open. It only copies when your Discord picture CHANGES, so a picture you pick by hand in the
@@ -41276,7 +41575,7 @@ import struct as _dstruct
 import http.cookiejar as _cookiejar
 import tempfile as _tempfile
 
-# ---------------------------------------------------------------- Discord picture sync
+# ── Discord picture sync ──
 def _discord_ipc_candidates():
     if sys.platform.startswith("win"):
         return [r"\\?\pipe\discord-ipc-%d" % i for i in range(10)]
@@ -41290,7 +41589,7 @@ def _discord_ipc_candidates():
         if r not in bases:
             bases.append(r)
     except Exception:
-        pass
+        _log_exc("_discord_ipc_candidates")
     if "/tmp" not in bases:
         bases.append("/tmp")
     out = []
@@ -41349,7 +41648,7 @@ class _IPCConn:
                 self.sock.close()
             elif self.f:
                 self.f.close()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
 def _discord_local_user():
@@ -41373,7 +41672,7 @@ def _discord_local_user():
                     break
                 if op == 2:
                     break
-        except Exception:
+        except Exception:    # expected: Discord or the controller may not be there
             pass
         finally:
             conn.close()
@@ -41433,7 +41732,7 @@ class _DiscordPfpSync(QObject):
         finally:
             try:
                 os.remove(tmp)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
         cloud_save_profile(png=png)
         st = load_launcher_settings()
@@ -41451,7 +41750,7 @@ def set_discord_pfp_sync_enabled(on):
         if on:
             st["discord_pfp_hash"] = ""         # turning it on copies your Discord picture right away
         save_launcher_settings(st)
-    except Exception:
+    except Exception:    # expected: Discord or the controller may not be there
         pass
     _discord_pfp.poke()
 
@@ -41498,24 +41797,12 @@ def _pfp_settings_init(self, *a, **k):
 
 SettingsPage.__init__ = _pfp_settings_init
 
-def _pfp_refresh_ui(self):
-    try:
-        self.refresh_profile()
-        self.account_page.refresh_view()
-    except Exception:
-        pass
-
-AdaptiveApp._pfp_refresh_ui = _pfp_refresh_ui
-_pfp_prev_app_init = AdaptiveApp.__init__
-
-def _pfp_app_init(self, *a, **k):
-    _pfp_prev_app_init(self, *a, **k)
-    _discord_pfp.updated.connect(self._pfp_refresh_ui)
-
-AdaptiveApp.__init__ = _pfp_app_init
 
 
-# ---------------------------------------------------------------- itch.io fan games
+
+
+
+# ── itch.io fan games ──
 # itch.io games get the id  ITCH_ID_BASE + (itch game id)  so they never clash with Game Jolt ids and everything
 # that works on a fan game id (library, cloud sync, compat tool, uninstall) just works for them too.
 ITCH_ID_BASE = 1_000_000_000
@@ -41555,7 +41842,7 @@ def load_itch_games():
                     continue
                 tags = {t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()}
                 games.append((gid, name, link, tags, (row.get("cover") or "").strip()))
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return games
 
@@ -41578,7 +41865,7 @@ def _load_fan_games_with_itch():
 
 load_fan_games = _load_fan_games_with_itch
 
-# ---- browsing itch.io (the browse pages can answer as json: {"content": "<html of the game cells>"})
+# ── browsing itch.io (the browse pages can answer as json: {"content": "<html of the game cells>"})
 def _itch_parse_cells(html):
     cells = []
     marks = [m for m in re.finditer(r'<div[^>]*\bdata-game_id="(\d+)"[^>]*>', html)]
@@ -41640,7 +41927,7 @@ def scrape_itch_games(pages=3):
             with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "itch_debug.log"), "a", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + "\n".join(errors[-12:]) + "\n\n")
         except Exception:
-            pass
+            _log_exc("scrape_itch_games")
         raise RuntimeError("Couldn't get any games from itch.io.\n\nLast problem: " + (errors[-1] if errors else "none") +
                            "\n\n(Full details are in itch_debug.log next to launcher.json.)")
     old = {g[0] - ITCH_ID_BASE: [g[1], g[2], set(g[3]), g[4]] for g in load_itch_games()}
@@ -41660,7 +41947,7 @@ def scrape_itch_games(pages=3):
             w.writerow([iid, name, link, ",".join(sorted(tags)), cover])
     return new_count
 
-# ---- covers + details page (the details page reads a Game Jolt shaped dict, so we hand it one)
+# ── covers + details page (the details page reads a Game Jolt shaped dict, so we hand it one) ──
 _itch_prev_cover_fetch = FanCoverLoader._fetch
 
 def _itch_cover_fetch(self, appid, img_base, key, title):
@@ -41684,7 +41971,7 @@ def _itch_cover_fetch(self, appid, img_base, key, title):
                 if m:
                     url = html_lib.unescape(m.group(1))
                     break
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
     if url:
         try:
@@ -41693,7 +41980,7 @@ def _itch_cover_fetch(self, appid, img_base, key, title):
                 with open(path, "wb") as f:
                     f.write(data)
                 return path
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
     open(marker, "w").close()
     return ""
@@ -41711,7 +41998,7 @@ def fetch_itch_overview(gid):
         if time.time() - os.path.getmtime(cache_file) < 6 * 3600:
             with open(cache_file, encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     page = _http_get(link, headers={"User-Agent": ITCH_UA}, timeout=30).decode("utf-8", errors="replace")
     cover = g[4]
@@ -41743,7 +42030,7 @@ def fetch_itch_overview(gid):
         os.makedirs(cache_dir, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(game, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return game
 
@@ -41771,11 +42058,11 @@ def _itch_on_details(self, result):
             dev = result[2]
             self.meta_label.setText("  \u2022  ".join(([f"by {dev}"] if dev else []) + ["itch.io fan game"]))
     except Exception:
-        pass
+        _log_exc("_itch_on_details")
 
 FanDetailPage._on_fan_details = _itch_on_details
 
-# ---- downloading (itch.io's own download flow: page -> download_url -> file -> signed link)
+# ── downloading (itch.io's own download flow: page -> download_url -> file -> signed link) ──
 def _itch_csrf(page):
     m = (re.search(r'<meta[^>]+name="csrf_token"[^>]+value="([^"]+)"', page)
          or re.search(r'<meta[^>]+value="([^"]+)"[^>]+name="csrf_token"', page))
@@ -41895,9 +42182,9 @@ def _fan_install_itch(self, gid, title, cover_path, link):
     self.nav_group.button(6).setChecked(True)
     self.pages.setCurrentWidget(self.downloads_page)
 
-AdaptiveApp._fan_install = _fan_install_itch
+AdaptiveApp._fan_install = _fan_install_itch    # kept as patch chain: the wrapper calls the original inside a condition
 
-# ---- the "itch.io Games" button on the Fan Games page
+# ── the "itch.io Games" button on the Fan Games page ──
 def _itch_scrape_clicked(self):
     pages, ok = QInputDialog.getInt(self, "itch.io Games",
                                     "How many pages per category? (about 36 games per page, more pages take longer)",
@@ -41930,8 +42217,7 @@ def _itch_build_tags(self):
 FanGamesPage._build_tag_buttons = _itch_build_tags
 
 
-
-# ================================================================ Store: Trending / Most Popular / Works on your PC
+# ── Store: Trending / Most Popular / Works on your PC ──
 # Trending = Steam's current top sellers, Most Popular = most reviewed. "Works on your PC" keeps only games whose
 # listed RAM and disk needs fit this PC (the same check as the game's page, so it's RAM + free space only).
 _steam_req_cache = {}
@@ -42007,7 +42293,7 @@ def fetch_steam_games_mode(term, start, tags=None, mode="", count=STORE_PAGE_SIZ
             ids = _steam_most_played_ids() if mode == "popular" else _steam_trending_ids()
             return _steam_chart_page(ids, start, count)
         except Exception:
-            pass                                    # chart unavailable: use the search below
+            _log_exc("fetch_steam_games_mode")                                    # chart unavailable: use the search below
     base = {"query": "", "term": term, "start": start, "count": count, "dynamic_data": "",
             "category1": 998, "l": "english", "infinite": 1}
     if tags:
@@ -42052,7 +42338,7 @@ def _fits_load():
         if data.get("sig") == _fits_signature():
             for k, v in (data.get("games") or {}).items():
                 _steam_req_cache[int(k)] = bool(v)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _fits_save():
@@ -42061,7 +42347,7 @@ def _fits_save():
         games = {str(k): v for k, v in _steam_req_cache.items() if isinstance(k, int)}
         with open(_fits_cache_path(), "w", encoding="utf-8") as f:
             json.dump({"sig": _fits_signature(), "games": games}, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def steam_game_fits_pc(appid):
@@ -42183,7 +42469,7 @@ def _store_modes_on_page(self, result):
                              "\nIf this says 429 or 403, Steam is limiting requests: wait a few minutes.")
             with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "store_debug.log"), "a", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(result[4]) + "\n")
-    except Exception:
+    except Exception:    # expected: offline or the server did not answer
         pass
     if getattr(self, "_works", False) and result[0] == self._request_id and not result[4]:
         self.count_label.setText(f"{len(self._cards)} games that fit your PC")
@@ -42199,7 +42485,7 @@ StorePage._load_page = _store_load_page
 StorePage._on_page = _store_modes_on_page
 
 
-# ================================================================ "Can I run it": processor + graphics card
+# ── "Can I run it": processor + graphics card ──
 # Compares this PC's CPU/GPU with the game's listed ones using an approximate built-in ranking (no internet needed).
 # Close calls are a guess, and anything it can't read (e.g. "DirectX 11 compatible") is simply not judged.
 _CPU_TIER = {"3": 0, "5": 6, "7": 12, "9": 18}
@@ -42363,7 +42649,7 @@ def assess_requirements(reqs, platforms, system):
     return verdict, color, notes
 
 
-# ================================================================ NCZ Big Picture mode
+# ── NCZ Big Picture mode ──
 # Full-screen Library + Store for a couch / controller. Everything is painted by ONE widget (no widget per game), it only
 # animates while something is moving, and it SLEEPS while a game runs (window hidden, controller closed, timers
 # stopped) and wakes up again when the game closes.
@@ -42371,7 +42657,7 @@ def assess_requirements(reqs, platforms, system):
 # An on-screen keyboard opens for text input (Store search when a controller is in use, friend messages, Workshop search).
 # Open it: "Big Picture" button in the Library header, Ctrl+Shift+B, or start the launcher with --bigpicture.
 from PyQt6.QtCore import QVariantAnimation, QPropertyAnimation, QEasingCurve, QSocketNotifier
-from PyQt6.QtGui import QShortcut, QLinearGradient, QFontMetrics
+from PyQt6.QtGui import QShortcut, QFontMetrics
 
 
 class _BPInput(QObject):
@@ -42432,9 +42718,9 @@ class _BPInput(QObject):
         self._rep.setInterval(110)
         self._emit_dir()
 
-    # ---- Linux joystick API
+    # ── Linux joystick API ──
     def _open_js(self):
-        import glob
+        import glob    # lazy: saves memory/startup until used
         for p in sorted(glob.glob("/dev/input/js*")):
             try:
                 fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
@@ -42454,12 +42740,12 @@ class _BPInput(QObject):
         if self._fd is not None:
             try:
                 os.close(self._fd)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
             self._fd = None
 
     def _read_js(self, *_):
-        import struct
+        import struct    # lazy: saves memory/startup until used
         while self._fd is not None:
             try:
                 data = os.read(self._fd, 128)
@@ -42489,9 +42775,9 @@ class _BPInput(QObject):
                     self._set_dir((self._axes.get("x6", 0) or self._axes.get("x0", 0),
                                    self._axes.get("y7", 0) or self._axes.get("y1", 0)))
 
-    # ---- Windows XInput
+    # ── Windows XInput ──
     def _poll_xinput(self):
-        import ctypes
+        import ctypes    # lazy: saves memory/startup until used
         if self._xi is None:
             try:
                 try:
@@ -42533,8 +42819,6 @@ class _BPBridge(QObject):
     changed = pyqtSignal()      # _playing_listeners are called from a worker thread; this hops to the GUI thread
 
 
-from PyQt6.QtGui import QRadialGradient
-from PyQt6.QtCore import QPointF
 
 # Store categories shown as chips in Big Picture: (label, Steam sort order, tag ids)
 _BP_CATS = (
@@ -42680,7 +42964,7 @@ class _BigPicture(QWidget):
         self._bridge.changed.connect(self._on_playing)
         _playing_listeners.append(self._bridge.changed.emit)
 
-    # ---------------------------------------------------------------- open / close / sleep
+    # ── open / close / sleep ──
     def enter(self):
         if not self._active:
             self._was_max = self._app.isMaximized()
@@ -42745,7 +43029,7 @@ class _BigPicture(QWidget):
             self._refresh()
             self._show_awake()
 
-    # ---------------------------------------------------------------- library data (read straight from the library cards)
+    # ── library data (read straight from the library cards) ──
     def _refresh(self):
         keep = self._items[self._sel]["card"] if self._items and self._sel < len(self._items) else None
         cards, seen, items = list(getattr(self._app, "cards", [])), set(), []
@@ -42787,7 +43071,7 @@ class _BigPicture(QWidget):
             self._toast_t.start(ms)
         self.update()
 
-    # ---------------------------------------------------------------- store data
+    # ── store data ──
     def _store_params(self):
         label, sort, tags = _BP_CATS[max(0, self._chip - 1)]
         if self._search:
@@ -42891,7 +43175,7 @@ class _BigPicture(QWidget):
             self._details[appid] = info
         self.update()
 
-    # ---------------------------------------------------------------- animation callbacks
+    # ── animation callbacks ──
     def _on_anim(self, v):
         self._pos = float(v)
         self.update()
@@ -42908,7 +43192,7 @@ class _BigPicture(QWidget):
         self._bg_t = float(v)
         self.update()
 
-    # ---------------------------------------------------------------- backdrop
+    # ── backdrop ──
     def _current_art(self):
         if self._tab == 0:
             if self._items and 0 <= self._sel < len(self._items):
@@ -42941,7 +43225,7 @@ class _BigPicture(QWidget):
             self._bg_t = 1.0
         self.update()
 
-    # ---------------------------------------------------------------- navigation
+    # ── navigation ──
     def _switch_tab(self, t):
         t %= _BP_NTABS
         if t == self._tab:
@@ -43025,7 +43309,7 @@ class _BigPicture(QWidget):
             self.leave(True)
             btn.click()
 
-    # ---------------------------------------------------------------- store detail panel
+    # ── store detail panel ──
     def _in_library(self, appid):
         return appid in getattr(self._app, "steam_cards", {})
 
@@ -43074,7 +43358,7 @@ class _BigPicture(QWidget):
             self._detail = None
         self.update()
 
-    # ---------------------------------------------------------------- input
+    # ── input ──
     def _chip_count(self):
         return 1 + len(_BP_CATS)
 
@@ -43163,7 +43447,7 @@ class _BigPicture(QWidget):
                 try:
                     subprocess.Popen(["osk.exe"])
                 except Exception:
-                    pass
+                    _log_exc("_chip_accept")
             self._say("Type on your keyboard to search", 2500)
             return
         self._search = ""
@@ -43241,7 +43525,7 @@ class _BigPicture(QWidget):
         e.ignore()
         self.leave(True)
 
-    # ---------------------------------------------------------------- geometry
+    # ── geometry ──
     def _tile_rect(self, i):
         h, w = self.height(), self.width()
         th = h * self.LIB_TH
@@ -43269,7 +43553,7 @@ class _BigPicture(QWidget):
         row, col = divmod(i, cols)
         return QRectF(x0 + col * (tw + gap), top + pad + row * (th + gap) - self._sscroll, tw, th)
 
-    # ---------------------------------------------------------------- mouse
+    # ── mouse ──
     def mouseMoveEvent(self, e):
         if self.cursor().shape() != Qt.CursorShape.ArrowCursor:
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -43334,7 +43618,7 @@ class _BigPicture(QWidget):
                 self._store_move(self._ssel + d * self._grid_geom()[4])
             self._wheel -= 120 if self._wheel > 0 else -120
 
-    # ---------------------------------------------------------------- painting helpers
+    # ── painting helpers ──
     def resizeEvent(self, e):
         self._cache.clear()
         self._spix.clear()
@@ -43400,7 +43684,7 @@ class _BigPicture(QWidget):
             self._spix[it["appid"]] = pm
         return pm
 
-    # ---------------------------------------------------------------- painting
+    # ── painting ──
     def paintEvent(self, e):
         self._lseen = False
         p = QPainter(self)
@@ -43462,7 +43746,6 @@ class _BigPicture(QWidget):
         p.end()
 
     def _paint_header(self, p, w, h, m, acc):
-        al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         al_r = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         al_c = int(Qt.AlignmentFlag.AlignCenter)
         p.setFont(self._font(h * 0.03, True))
@@ -43680,7 +43963,7 @@ class _BigPicture(QWidget):
 
     def _paint_loading(self, p, w, h, area, msg):
         """Spinning NCZ logo + message + a Wikipedia fact. Drives its own 33 ms timer only while it is visible."""
-        from PyQt6.QtGui import QTextOption
+        from PyQt6.QtGui import QTextOption    # lazy: saves memory/startup until used
         self._lseen = True
         now = time.time()
         if self._lfact is None or now - self._lfact_t > 10:
@@ -43862,12 +44145,10 @@ class _BigPicture(QWidget):
             p.drawText(r, al_c, text)
 
 
-# ================================================================ Big Picture extras
+# ── Big Picture extras ──
 # On-screen keyboard (controller friendly) + three more tabs: Friends, Downloads, Workshop.
 # Added as a separate layer on top of _BigPicture (same pattern as _bp_open below): the original methods keep doing their
 # job, these wrappers only take over when the keyboard is open or one of the new tabs (index >= 2) is showing.
-from PyQt6.QtCore import QRect
-from PyQt6.QtGui import QBrush
 
 _BP_NTABS = 5                       # Library, Store, Friends, Downloads, Workshop (+ Fan Games, GMod Addons: set at runtime)
 _bp_friend_listeners = []           # called after FriendsPage finished a refresh
@@ -44004,13 +44285,13 @@ def _bpx_fp_on_fetched(self, res, err):
         try:
             fn()
         except Exception:
-            pass
+            _log_exc("_bpx_fp_on_fetched")
 
 
 FriendsPage._on_fetched = _bpx_fp_on_fetched
 
 
-# ---------------------------------------------------------------- setup / lifecycle
+# ── setup / lifecycle ──
 @_bpm("__init__")
 def _bpx_init(self, app):
     _bpx_o["__init__"](self, app)
@@ -44148,7 +44429,7 @@ def _bpx_tick(self):
         self.update()
 
 
-# ---------------------------------------------------------------- input
+# ── input ──
 @_bpm("_act")
 def _bpx_act(self, name):
     if not self._from_key:
@@ -44303,7 +44584,7 @@ def _bpx_click(self, pt):
             self._zone = "content"
             try:
                 self._x_tag(tag)
-            except (IndexError, KeyError):
+            except (IndexError, KeyError):    # expected: missing or odd value: the default is fine
                 pass
             return
 
@@ -44358,7 +44639,7 @@ def _bpx_hint(self):
     return "Arrows  Browse      A  Install      Y  Search      X  Sort      LB / RB  Switch tab      B  Games"
 
 
-# ---------------------------------------------------------------- on-screen keyboard
+# ── on-screen keyboard ──
 @_bpm("_kb_open")
 def _bpx_kb_open(self, title, text, on_change, on_submit, maxlen=120):
     self._kb = {"k": _BPKeys(text, maxlen), "title": title, "on_change": on_change, "on_submit": on_submit, "rects": []}
@@ -44470,7 +44751,7 @@ def _bpx_kb_key(self, e):
     self.update()
 
 
-# ---------------------------------------------------------------- shared painting helpers
+# ── shared painting helpers ──
 @_bpm("_x_text")
 def _bpx_text(self, p, r, text, size, color, bold=False, align=None, elide=True):
     f = self._font(self.height() * size, bold)
@@ -44613,7 +44894,7 @@ def _bpx_paint_kb(self, p, w, h, acc):
             p.drawText(r, al_c, label)
 
 
-# ---------------------------------------------------------------- Friends tab
+# ── Friends tab ──
 @_bpm("_fr_enter")
 def _bpx_fr_enter(self):
     fp = getattr(self._app, "friends_page", None)
@@ -44657,7 +44938,7 @@ def _bpx_fr_changed(self):
         self._fr_build()
         if self._tab == 2:
             self.update()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
 
 
@@ -44671,7 +44952,6 @@ def _bpx_fr_ensure(self):
 @_bpm("_fr_act")
 def _bpx_fr_act(self, name):
     fr = self._fr
-    fp = getattr(self._app, "friends_page", None)
     if fr["chat"]:
         if name == "back":
             fr["chat"] = None
@@ -44725,7 +45005,7 @@ def _bpx_fr_answer(self, uid, accept):
         try:
             self._say(str(err) if err else ("Friend added" if accept else "Request declined"), 2500)
             fp.refresh()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     fp._run(lambda: fn(uid), done)
 
@@ -44757,7 +45037,7 @@ def _bpx_fr_send(self, uid, text):
                 if fr["chat"] == uid:
                     self._fr_load_chat(uid, quiet=True)
             self.update()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     fp._run(lambda: cloud_send_message(uid, text), done)
 
@@ -44780,7 +45060,7 @@ def _bpx_fr_load_chat(self, uid, quiet=False):
                 fr["me"], fr["msgs"] = res[0], res[1]
             if self._tab == 2:
                 self.update()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     fp._run(lambda: cloud_get_messages(uid), done, key="bp-chat")
 
@@ -44891,7 +45171,7 @@ def _bpx_paint_chat(self, p, w, h, acc):
         self._xhits.append((r, ("cbtn", j)))
 
 
-# ---------------------------------------------------------------- Downloads tab
+# ── Downloads tab ──
 @_bpm("_dl_infos")
 def _bpx_dl_infos(self):
     out = []
@@ -44920,9 +45200,9 @@ def _bpx_dl_infos(self):
                                 "info": wdg.info_label.text(), "state": getattr(wdg, "state", "active"),
                                 "btns": [(b.text(), b.click) for b in (wdg.pause_btn, wdg.action_btn, wdg.clear_btn)
                                          if not b.isHidden()]})
-                except RuntimeError:
+                except RuntimeError:    # expected: the widget or object may already be deleted
                     pass
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     wp = getattr(self._app, "workshop_page", None)
     if wp is not None:
@@ -44988,7 +45268,7 @@ def _bpx_dl_act(self, name):
                 if obj is not None:
                     (obj.clear_finished)()
             except Exception:
-                pass
+                _log_exc("_bpx_dl_act")
         self._say("Cleared finished downloads", 1800)
 
 
@@ -45061,7 +45341,7 @@ def _bpx_paint_downloads(self, p, w, h, m, acc):
     p.restore()
 
 
-# ---------------------------------------------------------------- Workshop tab
+# ── Workshop tab ──
 _BPX_HDR = "https://cdn.cloudflare.steamstatic.com/steam/apps/%d/header.jpg"
 
 
@@ -45225,7 +45505,7 @@ def _bpx_ws_filter_games(self):
 def _bpx_ws_ensure(self):
     wk = self._wk
     games = wk["mode"] == "games"
-    gap, tw, th, cols, x0, top, bot = self._x_grid(2.14 if games else 1.6, 0.2 if games else 0.2)
+    gap, tw, th, cols, x0, top, bot = self._x_grid(2.14 if games else 1.6, 0.2)
     row = (wk["gsel"] if games else wk["sel"]) // cols
     pitch = th + gap
     self._x_ensure(row * pitch, row * pitch + pitch + self.height() * 0.024, bot - top)
@@ -45422,7 +45702,7 @@ def _bpx_paint_ws(self, p, w, h, m, acc):
                           and e["status"] in ("queued", "downloading")), None)
                 if q is not None:
                     badge = "QUEUED" if q["status"] == "queued" else "DOWNLOADING"
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         by = ("by " + it["author"]) if it.get("author") else ""
         self._x_tile(p, r, self._ws_pix(it.get("preview", "")), it.get("title", "?"), by, acc, badge)
@@ -45437,7 +45717,7 @@ def _bpx_paint_ws(self, p, w, h, m, acc):
         p.drawText(QRectF(0, bot - h * 0.035, w, h * 0.03), int(Qt.AlignmentFlag.AlignCenter), wk["err"])
 
 
-# ================================================================ Big Picture: X options sidebar, in-BP download server picker,
+# ── Big Picture: X options sidebar, in-BP download server picker,
 # Fan Games tab and Garry's Mod Addons tab. Tabs: Library, Store, Friends, Downloads, Workshop, Fan Games, (GMod Addons).
 _bpy_o = {n: getattr(_BigPicture, n) for n in (
     "__init__", "enter", "leave", "_act", "keyPressEvent", "mousePressEvent", "wheelEvent", "_launch", "_switch_tab",
@@ -45451,7 +45731,7 @@ def _bpy_active_bp():
             if bp is not None and bp._active and not bp._asleep and bp.isVisible():
                 return bp
     except Exception:
-        pass
+        _log_exc("_bpy_active_bp")
     return None
 
 
@@ -45494,7 +45774,7 @@ def _bpy_leave(self, show_main=True):
     try:
         self._fgl.cancel_pending()
     except Exception:
-        pass
+        _log_exc("_bpy_leave")
     _bpy_o["leave"](self, show_main)
 
 
@@ -45510,7 +45790,7 @@ def _bpy_tab_labels(self):
     return tuple(_bpy_o["_tab_labels"](self)) + ("Fan Games",) + (("GMod Addons",) if self._gm_root else ())
 
 
-# ---------------------------------------------------------------- downloads stay inside Big Picture
+# ── downloads stay inside Big Picture ──
 @_bpm("_launch")
 def _bpy_launch(self):
     if not self._items:
@@ -45544,7 +45824,7 @@ def _bpy_asker_show(title, box, ev):
 
 try:
     _PW_ASKER.request.disconnect()
-except Exception:
+except Exception:    # expected: cleanup that may already be done
     pass
 _PW_ASKER.request.connect(_bpy_asker_show)
 
@@ -45585,12 +45865,12 @@ def _bpy_pick_done(self, sid):
     self.update()
 
 
-# ---------------------------------------------------------------- X sidebar (the launcher's 3-dot menu)
+# ── X sidebar (the launcher's 3-dot menu) ──
 def _bpy_menu_entries(menu):
     try:
         menu.aboutToShow.emit()           # some menus fill themselves in lazily
     except Exception:
-        pass
+        _log_exc("_bpy_menu_entries")
     out = []
     for a in menu.actions():
         try:
@@ -45853,7 +46133,7 @@ def _bpy_paint_ov(self, p, w, h, acc):
     ov["rects"].append((r, ("cancel", len(ov["sids"]))))
 
 
-# ---------------------------------------------------------------- Fan Games tab
+# ── Fan Games tab ──
 @_bpm("_x_enter")
 def _bpy_x_enter(self, t):
     _bpy_o["_x_enter"](self, t)
@@ -46061,7 +46341,7 @@ def _bpy_paint_fan(self, p, w, h, m, acc):
     self._x_grid_paint(p, w, h, acc, len(lst), fg["sel"], 1.6, draw)
 
 
-# ---------------------------------------------------------------- Garry's Mod Addons tab
+# ── Garry's Mod Addons tab ──
 def _bpy_gm_page(self):
     return getattr(self._app, "gmod_page", None) if self._gm_root else None
 
@@ -46243,7 +46523,7 @@ def _bpy_paint_gm(self, p, w, h, m, acc):
     p.restore()
 
 
-# ================================================================ Big Picture chat: game invites + attachments
+# ── Big Picture chat: game invites + attachments ──
 class _BPMediaBus(QObject):
     ready = pyqtSignal(str, str, str)       # attachment id (or "inv:<link>"), file path, error
 
@@ -46270,7 +46550,7 @@ def _bpz_leave(self, show_main=True):
     _bpz_o["leave"](self, show_main)
 
 
-# ---------------------------------------------------------------- media (thumbnails, invite covers)
+# ── media (thumbnails, invite covers) ──
 @_bpm("_fr_media_req")
 def _bpz_media_req(self, att, force=False):
     fr = self._fr
@@ -46287,7 +46567,7 @@ def _bpz_media_req(self, att, force=False):
             path, err = "", (str(e) or "Couldn't load this attachment.")
         try:
             bus.ready.emit(aid, path, err)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     threading.Thread(target=work, daemon=True).start()
 
@@ -46367,7 +46647,7 @@ def _bpz_cover(self, inv, sender):
     try:
         path = invite_cover_path(inv, sender)
     except Exception:
-        pass
+        _log_exc("_bpz_cover")
     if path:
         q = QPixmap(path)
         pm = q.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation) if not q.isNull() else QPixmap()
@@ -46388,13 +46668,13 @@ def _bpz_cover(self, inv, sender):
                 pth = ""
             try:
                 bus.ready.emit(key, pth, "")
-            except RuntimeError:
+            except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
         threading.Thread(target=work, daemon=True).start()
     return None
 
 
-# ---------------------------------------------------------------- chat drawing
+# ── chat drawing ──
 @_bpm("_chat_parts")
 def _bpz_parts(self, mg, iw, fm):
     fr, h, parts = self._fr, self.height(), []
@@ -46534,7 +46814,7 @@ def _bpz_paint_chat(self, p, w, h, acc):
         self._xhits.append((r, ("cbtn", j)))
 
 
-# ---------------------------------------------------------------- chat input
+# ── chat input ──
 @_bpm("_fr_act")
 def _bpz_fr_act(self, name):
     fr = self._fr
@@ -46641,7 +46921,7 @@ def _bpz_tick(self):
             fr["seen"] = key
 
 
-# ---------------------------------------------------------------- sending: messages, files, invites
+# ── sending: messages, files, invites ──
 @_bpm("_fr_send_raw")
 def _bpz_send_raw(self, uid, fn, ok):
     fp = getattr(self._app, "friends_page", None)
@@ -46662,7 +46942,7 @@ def _bpz_send_raw(self, uid, fn, ok):
                 if fr["chat"] == uid:
                     self._fr_load_chat(uid, quiet=True)
             self.update()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     fp._run(fn, done)
 
@@ -46701,7 +46981,7 @@ def _bpz_invite(self, uid):
             else:
                 self._fr_invite_ask(uid, game, appid, link)
             self.update()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     fp._run(detect_invite_info, done, key="bp-invite")
 
@@ -46734,11 +47014,11 @@ def _bpz_invite_name(self, uid, link, appid, text):
     try:
         appid = appid or _steam_appid_for_title(game)
     except Exception:
-        pass
+        _log_exc("_bpz_invite_name")
     self._fr_send_invite(uid, game, link, appid)
 
 
-# ---------------------------------------------------------------- in-Big-Picture file browser (images / videos)
+# ── in-Big-Picture file browser (images / videos) ──
 def _bpz_ls(path):
     if path is None:                                  # Windows drive list
         return [{"label": d + ":\\", "path": d + ":\\", "dir": True} for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -46760,7 +47040,7 @@ def _bpz_ls(path):
             except OSError:
                 continue
     except OSError:
-        pass
+        _log_exc("_bpz_ls")
     dirs.sort(key=lambda e: e.name.lower())
     files.sort(key=lambda e: -e.stat().st_mtime if os.path.exists(e.path) else 0)
     ents += [{"label": e.name, "path": e.path, "dir": True} for e in dirs[:300]]
@@ -46890,51 +47170,23 @@ def _bpz_paint_ov(self, p, w, h, acc):
                "Up / Down  Move      A  Open / Send      Left  Parent folder      B  Close")
 
 
-def _bp_open(self):
-    bp = getattr(self, "_big_picture", None)
-    if bp is None:
-        bp = self._big_picture = _BigPicture(self)
-    bp.enter()
 
 
-AdaptiveApp.open_big_picture = _bp_open
-_bp_prev_init = AdaptiveApp.__init__
 
 
-def _bp_init(self, *a, **k):
-    _bp_prev_init(self, *a, **k)
-    try:                                                           # "Big Picture" button next to the library search box
-        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
-        btn = QPushButton("Big Picture")
-        btn.setFixedHeight(36)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip("Full-screen mode for controller / keyboard (Ctrl+Shift+B)")
-        btn.clicked.connect(lambda _c=False: self.open_big_picture())
-        idx = header.indexOf(self.search_edit)
-        header.insertWidget(idx, btn)
-        header.insertSpacing(idx + 1, 10)
-    except Exception:
-        pass
-    sc = QShortcut(QKeySequence("Ctrl+Shift+B"), self)
-    sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
-    sc.activated.connect(self.open_big_picture)
-    if "--bigpicture" in sys.argv:
-        QTimer.singleShot(300, self.open_big_picture)
 
 
-AdaptiveApp.__init__ = _bp_init
 
 
-# ================================================================ Big Picture: embedded windows, settings cog, download covers
+# ── Big Picture: embedded windows, settings cog, download covers ──
 # Every dialog the launcher opens with exec() / QMessageBox.xxx() / QInputDialog.getXxx() while Big Picture is on screen is
 # shown INSIDE Big Picture (dimmed backdrop + panel) instead of as a separate window, so the X sidebar options (Launch Options,
 # Switch Compatibility Tool, Uninstall confirmations, ...) and the new Settings cog stay in Big Picture. The controller moves
 # focus around the panel (D-pad), A presses / opens, B closes. Text fields open Big Picture's on-screen keyboard with A.
 # Native OS file/folder pickers (QFileDialog.getXxx) and external programs (Winetricks, browsers) can't be embedded.
-from PyQt6.QtCore import QEventLoop, QPoint
-from PyQt6.QtGui import QPainterPath, QTransform, QKeyEvent
-from PyQt6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QAbstractSlider, QAbstractItemView, QTextEdit,
-                             QPlainTextEdit, QInputDialog, QColorDialog, QTabBar, QGridLayout, QFrame, QLabel)
+from PyQt6.QtCore import QEventLoop
+from PyQt6.QtGui import QTransform, QKeyEvent
+from PyQt6.QtWidgets import QAbstractButton, QAbstractSpinBox, QAbstractSlider, QTextEdit, QPlainTextEdit, QColorDialog, QTabBar, QFrame, QLabel
 
 
 def _bpe_draw_cog(p, r, col):
@@ -47114,7 +47366,7 @@ def _bpe_focus_first(self, ent):
                 c.setFocus()
                 return
         w.setFocus()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
 
 
@@ -47138,19 +47390,19 @@ def _bpe_close_ent(self, ent):
     w = ent["w"]
     try:
         ent["scroll"].takeWidget()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     try:
         w.hide()
         if ent.get("on_close"):
             ent["on_close"]()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     try:
         ent["host"].hide()
         ent["host"].setParent(None)
         ent["host"].deleteLater()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     if self._embs:
         self._emb_focus_first(self._embs[-1])
@@ -47172,7 +47424,7 @@ def _bpe_run(self, dlg):
     loop.exec()
     try:
         dlg.finished.disconnect(loop.quit)
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     self._emb_close_ent(ent)
     return dlg.result()
@@ -47273,7 +47525,7 @@ def _bpe_get_color(initial=None, parent=None, title="", options=None):
 QColorDialog.getColor = staticmethod(_bpe_get_color)
 
 
-# ---------------------------------------------------------------- controller / keyboard navigation inside an embedded window
+# ── controller / keyboard navigation inside an embedded window ──
 def _bpe_key(widget, key):
     for t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
         QApplication.sendEvent(widget, QKeyEvent(t, key, Qt.KeyboardModifier.NoModifier))
@@ -47286,7 +47538,7 @@ def _bpe_scroll_to(w):
             try:
                 par.ensureWidgetVisible(w, 40, 90)
             except Exception:
-                pass
+                _log_exc("_bpe_scroll_to")
             break
         par = par.parentWidget()
 
@@ -47483,7 +47735,7 @@ def _bpe_act(self, name):
                         self._zone = "content"
                     try:
                         self._x_tag(tag)
-                    except (IndexError, KeyError):
+                    except (IndexError, KeyError):    # expected: missing or odd value: the default is fine
                         pass
                 elif name in ("prev", "next"):
                     self._switch_tab(self._tab + (1 if name == "next" else -1))
@@ -47589,7 +47841,7 @@ def _bpe_resize(self, e):
     for ent in getattr(self, "_embs", ()):
         try:
             ent["host"].setGeometry(0, 0, self.width(), self.height())
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
 
@@ -47612,13 +47864,13 @@ def _bpe_leave(self, show_main=True):
         try:
             ent["close"]()
         except Exception:
-            pass
+            _log_exc("_bpe_leave")
     for ent in list(self._embs):
         self._emb_close_ent(ent)
     _bpe_o["leave"](self, show_main)
 
 
-# ---------------------------------------------------------------- Settings: a native Big Picture menu (cog wheel in the header,
+# ── Settings: a native Big Picture menu (cog wheel in the header,
 # Start button, Ctrl+,). The rows are read from the launcher's Settings page, so every setting that page has is here and
 # changing one here changes the real setting (the controls of the real page are driven, nothing is duplicated).
 def _bpe_hidden(w, stop):
@@ -47724,13 +47976,13 @@ def _bpe_st_press(self, c):
                 try:
                     c.editingFinished.emit()
                 except Exception:
-                    pass
+                    _log_exc("done")
                 try:
                     c.returnPressed.emit()
                 except Exception:
-                    pass
+                    _log_exc("done")
             self._kb_open(title, c.text(), None, done, 500)
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     self.update()
 
@@ -47859,13 +48111,13 @@ def _bpe_paint_st(self, p, w, h, acc):
                "Up / Down  Move      Left / Right  Change      A  Select      B  Close")
 
 
-# ================================================================ Admin panel + bans
+# ── Admin panel + bans ──
 # The admin panel is for ADMIN_UID only: the button is hidden for everyone else AND every call refuses to run for other
 # accounts. The real gate is the Firebase database rules (see firebase_rules_admin.txt): the client check is only UI.
 # Bans: bans/<uid> in the database. A banned launcher crashes on startup, and a local ban.lock keeps it crashing after
 # logging out (any account) until the ban is removed. Running launchers also check every ~45 s and crash when banned.
 ADMIN_UID = "XcqSn5Zvhsf1npoNl3FNG1bKpU63"
-_ADMIN_UIDS = {ADMIN_UID, "LtVp5drXTcfedfGmWGMhHSVzGiU2"}          # both can open the admin panel
+_ADMIN_UIDS = {ADMIN_UID, "LtVp5drXTcfedfGmWGMhHSVzGiU2", "uL9mPMvEjzLwxyeROUSylV6ra123"}   # all can open the admin panel
 
 def _adm_is_admin():
     try:
@@ -47877,7 +48129,7 @@ def _adm_require():
     if not _adm_is_admin():
         raise CloudError("Admin only.", "NOT_ADMIN")
 
-# ---- ban lock (survives log out, lives next to launcher.json)
+# ── ban lock (survives log out, lives next to launcher.json) ──
 def _ban_lock_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "ban.lock")
 
@@ -47887,7 +48139,7 @@ def _ban_lock_read():
             d = json.load(f)
         if isinstance(d, dict) and d.get("uid"):
             return d
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return None
 
@@ -47896,13 +48148,13 @@ def _ban_lock_write(uid):
         os.makedirs(os.path.dirname(_ban_lock_path()), exist_ok=True)
         with open(_ban_lock_path(), "w", encoding="utf-8") as f:
             json.dump({"uid": uid}, f)
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
 
 def _ban_lock_clear():
     try:
         os.remove(_ban_lock_path())
-    except OSError:
+    except OSError:    # expected: cleanup that may already be done
         pass
 
 def _ban_fetch(uid):
@@ -47915,7 +48167,7 @@ def _ban_crash():
         sys.stderr.write("NCZ Games Launcher: this account is banned.\n")
         sys.stderr.flush()
     except Exception:
-        pass
+        _log_exc("_ban_crash")
     os._exit(1)
 
 def _ban_check_startup():
@@ -47968,7 +48220,7 @@ def _acct_watch_start(window):
                     if _ban_fetch(uid):
                         _ban_lock_write(uid)
                         _ban_crash()
-                except CloudError:
+                except CloudError:    # expected: offline or timed out
                     pass
                 token, _u = get_id_token()
                 upd = _http_json(_fdb(f"users/{uid}/profile/updated", token))
@@ -47982,11 +48234,11 @@ def _acct_watch_start(window):
                     changed = True
                 if changed:
                     bus.changed.emit()
-            except Exception:
+            except Exception:    # expected: offline or the server did not answer
                 pass
     threading.Thread(target=loop, daemon=True).start()
 
-# ---- admin cloud operations (all need the admin's token + the admin database rules)
+# ── admin cloud operations (all need the admin's token + the admin database rules) ──
 def _adm_sv():
     return {".sv": "timestamp"}
 
@@ -48023,7 +48275,7 @@ def _adm_patch_both(uid, fields):
     _http_json(_fdb(f"users/{uid}/profile", token), "PATCH", dict(fields, updated=_adm_sv()))
     try:
         _http_json(_fdb(f"public/{uid}", token), "PATCH", fields)
-    except CloudError:
+    except CloudError:    # expected: offline or timed out
         pass
 
 def _adm_set_username(uid, name):
@@ -48083,7 +48335,7 @@ def _adm_add_friend(uid, other):
     for a, b in ((uid, other), (other, uid)):
         try:
             _http_json(_fdb(f"requests/{a}/{b}", token), "DELETE")
-        except CloudError:
+        except CloudError:    # expected: offline or timed out
             pass
 
 def _adm_ban(uid, reason):
@@ -48095,7 +48347,7 @@ def _adm_ban(uid, reason):
                {"reason": (reason or "")[:200], "by": (load_account() or {}).get("uid", ADMIN_UID), "time": _adm_sv()})
     try:
         _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "playing": "", "idle": False})
-    except CloudError:
+    except CloudError:    # expected: offline or timed out
         pass
 
 def _adm_unban(uid):
@@ -48118,7 +48370,8 @@ def _adm_set_theme_override(uid, value):
     else:
         _http_json(_fdb(f"themeunlock/{uid}", token), "PUT", bool(value))
 
-# ---- admin UI
+
+# ── admin UI ──
 def _adm_run(owner, func, done=None, busy="Working..."):
     """Runs func on a worker thread with a wait dialog; shows errors; calls done(result) on success."""
     dlg = BusyDialog(busy, func, owner)
@@ -48492,41 +48745,11 @@ def _adm_open(window):
         return
     AdminPanel(window).exec()
 
-_adm_prev_init = AdaptiveApp.__init__
-
-def _adm_init(self, *a, **k):
-    _adm_prev_init(self, *a, **k)
-    try:
-        box = QFrame()
-        bl = QHBoxLayout(box)
-        bl.setContentsMargins(0, 18, 0, 0)
-        btn = QPushButton("Admin panel")
-        btn.setObjectName("Primary")
-        btn.setMinimumHeight(36)
-        btn.clicked.connect(lambda _c=False: _adm_open(self))
-        bl.addWidget(btn)
-        bl.addStretch()
-        content = self.settings_page._content_layout
-        last = content.itemAt(content.count() - 1)
-        if last is not None and last.spacerItem() is not None:
-            content.insertWidget(content.count() - 1, box)
-        else:
-            content.addWidget(box)
-        box.setVisible(_adm_is_admin())
-        self.account_page.account_changed.connect(lambda: box.setVisible(_adm_is_admin()))
-        self._adm_box = box
-        sc = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
-        sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc.activated.connect(lambda: _adm_open(self))
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-AdaptiveApp.__init__ = _adm_init
 
 
 
-# ================================================================ Settings: grouped sections + Big Picture auto-launch
+
+# ── Settings: grouped sections + Big Picture auto-launch ──
 # 1) The Settings page (regular AND Big Picture) is sorted into sections: Appearance, Big Picture & Controller, Startup & Updates,
 #    Library & Downloads, Compatibility, Online & Integrations. Big Picture reads the real page, so it gets the same sections.
 # 2) New settings: "Launch Big Picture on startup" and "Big Picture when a controller connects".
@@ -48559,7 +48782,7 @@ def _ncz_block_title(w):
         for c in w.findChildren(QLabel):
             if c.objectName() == "RowTitle" and c.text().strip():
                 return c.text().strip()
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     return None
 
@@ -48625,14 +48848,14 @@ def _ncz_organize(sp):
         _ncz_section_header(sp, _ncz_cat_name(ci)).setVisible(any(not w.isHidden() for w in ws))
 
 
-# ---- the two new settings
+# ── the two new settings ──
 _NCZ_PAD = {"timer": None, "had": None, "app": None}
 
 
 def _ncz_pad_present():
     try:
         if sys.platform.startswith("win"):
-            import ctypes
+            import ctypes    # lazy: saves memory/startup until used
             try:
                 dll = ctypes.windll.xinput1_4
             except Exception:
@@ -48640,9 +48863,9 @@ def _ncz_pad_present():
             buf = ctypes.create_string_buffer(16)
             return any(dll.XInputGetState(i, buf) == 0 for i in range(4))
         if sys.platform.startswith("linux"):
-            import glob
+            import glob    # lazy: saves memory/startup until used
             return bool(glob.glob("/dev/input/js*"))
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     return False
 
@@ -48735,34 +48958,19 @@ def _ncz_settings_show(self, e):
     try:
         _ncz_organize(self)                              # picks up panels other features added after startup
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
 
 SettingsPage.showEvent = _ncz_settings_show
 
-_ncz_prev_init = AdaptiveApp.__init__
 
 
-def _ncz_init(self, *a, **k):
-    _ncz_prev_init(self, *a, **k)
-    try:
-        _NCZ_PAD["app"] = self
-        sp = self.settings_page
-        _ncz_add_bp_settings(sp)
-        _ncz_organize(sp)
-        _ncz_pad_apply()
-        if load_launcher_settings().get("bp_on_startup", False) and "--bigpicture" not in sys.argv:
-            QTimer.singleShot(900, self.open_big_picture)
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
 
-AdaptiveApp.__init__ = _ncz_init
 
 
-# ---- Big Picture settings menu: same sections (section titles are rows that can't be selected)
+# ── Big Picture settings menu: same sections (section titles are rows that can't be selected) ──
 _ncz_scan_o = _bpe_st_scan
 
 
@@ -48842,8 +49050,6 @@ _BigPicture._st_click = _ncz_bp_st_click
 _BigPicture._paint_st = _ncz_bp_paint_st
 
 
-
-
 def _ncz_dominant_pixmap(pix):
     """2x2 pixmap filled with the most repeated colour of `pix` (colours bucketed so near-identical shades count together;
     near-black / near-white pixels are ignored so cover borders don't win)."""
@@ -48871,7 +49077,7 @@ def _ncz_dominant_pixmap(pix):
     return out
 
 
-# ================================================================ Overlay toast chime
+# ── Overlay toast chime ──
 # A short two-note chime (synthesized once into the settings folder, nothing to download) plays whenever an overlay toast
 # (friend playing / invite / chess challenge / messages) is shown. Settings -> "Overlay notification sound" turns it off.
 _NCZ_CHIME = {"fx": None, "broken": False, "last": 0.0}
@@ -48911,7 +49117,7 @@ def _ncz_chime():
             return
         fx = _NCZ_CHIME["fx"]
         if fx is None:
-            from PyQt6.QtMultimedia import QSoundEffect
+            from PyQt6.QtMultimedia import QSoundEffect    # lazy: saves memory/startup until used
             fx = QSoundEffect()
             fx.setSource(QUrl.fromLocalFile(_ncz_chime_path()))
             fx.setVolume(0.6)
@@ -48925,7 +49131,7 @@ def _ncz_chime():
             try:
                 _lx_cli_play(_ncz_chime_path(), 0.6)
             except Exception:
-                pass
+                _log_exc("_ncz_chime")
         else:
             _NCZ_CHIME["broken"] = True                   # no QtMultimedia / audio device: stay silent
 
@@ -48947,13 +49153,13 @@ def _ncz_wrap_overlay():
         try:
             setattr(ov, name, wrapped)
         except Exception:
-            pass
+            _log_exc("_ncz_wrap_overlay")
 
 
 _ncz_wrap_overlay()
 
 
-# ================================================================ NCZ Chess inside Big Picture
+# ── NCZ Chess inside Big Picture ──
 # While Big Picture is open, "Play" on the NCZ Chess card (or accepting a chess challenge) shows the chess page in a panel on
 # top of Big Picture instead of switching the hidden main window. B / the page's Library button closes the panel; the page goes
 # back into the launcher's page stack and keeps its game running.
@@ -48976,7 +49182,7 @@ def _ncz_open_chess_bp(self):
         self.pages.currentChanged.connect(lambda _i, p=page: _ch_sync_launcher_look(p))
     try:
         page.back_requested.disconnect(self._leave_web_page)   # inside Big Picture "back" closes the panel instead
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     holder = {}
 
@@ -48987,13 +49193,13 @@ def _ncz_open_chess_bp(self):
     def restore():
         try:
             page.back_requested.disconnect(close_panel)
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
         try:
             page.back_requested.connect(self._leave_web_page)
             self.pages.addWidget(page)                       # back into the launcher's page stack
         except Exception:
-            pass
+            _log_exc("restore")
         bp._ncz_chess_ent = None
 
     page.back_requested.connect(close_panel)
@@ -49003,17 +49209,17 @@ def _ncz_open_chess_bp(self):
     try:
         _ch_sync_launcher_look(page)
     except Exception:
-        pass
+        _log_exc("_ncz_open_chess_bp")
     try:
         bp._say("", 1)                                       # clear the "Launching NCZ Chess..." toast
     except Exception:
-        pass
+        _log_exc("_ncz_open_chess_bp")
 
 
-AdaptiveApp.open_chess = _ncz_open_chess_bp
+AdaptiveApp.open_chess = _ncz_open_chess_bp    # kept as patch chain: the wrapper calls the original inside a condition
 
 
-# ================================================================ NCZ logo (assets/icon.png) in more places
+# ── NCZ logo (assets/icon.png) in more places ──
 # Regular launcher: a small round logo next to every page title (follows the accent recolor).
 # Big Picture: logo next to "NCZ" in the header, a faint watermark behind every tab, and one on the Settings menu.
 _NCZ_LOGO_CACHE = {}
@@ -49068,7 +49274,7 @@ def _ncz_add_title_logos(win):
             rl = QHBoxLayout(row)
             rl.setContentsMargins(0, 0, 0, 0)
             rl.setSpacing(10)
-            logo = QLabel()
+            logo = QLabel(row)          # parented: setVisible on a parentless label flashed it as its own window
             logo.setFixedSize(28, 28)
             _ncz_set_title_logo(logo)
             rl.addWidget(logo)
@@ -49077,36 +49283,17 @@ def _ncz_add_title_logos(win):
             lay.insertWidget(idx, row)
             logos.append((logo, title))
         except Exception:
-            pass
+            _log_exc("_ncz_add_title_logos")
 
 
-_ncz_logo_prev_init = AdaptiveApp.__init__
 
 
-def _ncz_logo_init(self, *a, **k):
-    _ncz_logo_prev_init(self, *a, **k)
-    try:
-        _ncz_add_title_logos(self)
-        QTimer.singleShot(3000, lambda: _ncz_add_title_logos(self))     # pages that are built a little later
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
 
-AdaptiveApp.__init__ = _ncz_logo_init
-_ncz_logo_prev_reload = AdaptiveApp.reload_brand_logo
 
 
-def _ncz_logo_reload(self):
-    _ncz_logo_prev_reload(self)
-    for logo, _t in self.__dict__.get("_ncz_title_logos", []):
-        try:
-            _ncz_set_title_logo(logo)
-        except RuntimeError:
-            pass
 
 
-AdaptiveApp.reload_brand_logo = _ncz_logo_reload
 
 _ncz_logo_hdr_o = _BigPicture._paint_header
 
@@ -49134,7 +49321,7 @@ def _ncz_logo_bp_header(self, p, w, h, m, acc):
             p.setClipPath(path_)
             p.drawPixmap(r, pm, QRectF(pm.rect()))
             p.restore()
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 
@@ -49151,14 +49338,13 @@ def _ncz_logo_bp_st(self, p, w, h, acc):
             adv = QFontMetrics(self._font(h * 0.038, True)).horizontalAdvance("Settings")
             p.drawPixmap(QRectF(w * 0.14 + adv + h * 0.015, h * 0.06 + (h * 0.07 - s) / 2, s, s), pm, QRectF(pm.rect()))
     except Exception:
-        pass
+        _log_exc("_ncz_logo_bp_st")
 
 
 _BigPicture._paint_st = _ncz_logo_bp_st
 
 
-
-# ================================================================ library: favorites / hidden / recently played
+# ── library: favorites / hidden / recently played ──
 from PyQt6.QtWidgets import QCheckBox as _LbCheck, QSpinBox as _LbSpin, QDoubleSpinBox as _LbDSpin, QDialogButtonBox as _LbBtns
 
 def _lbmeta_path():
@@ -49182,7 +49368,7 @@ def lbmeta_save():
         os.makedirs(os.path.dirname(_lbmeta_path()), exist_ok=True)
         with open(_lbmeta_path(), "w", encoding="utf-8") as f:
             json.dump(lbmeta(), f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def lb_toggle(kind, title):
@@ -49206,7 +49392,7 @@ def _track_playing(name, proc, folder=None):     # remembers when each game was 
             lbmeta()["last"][str(n).casefold()] = now
         lbmeta_save()
     except Exception:
-        pass
+        _log_exc("_track_playing")
 
 _LB_VIEWS = (("All games", "all"), ("Favorites", "fav"), ("Recently played", "recent"), ("Hidden", "hidden"))
 _lb_view = {"mode": "all"}
@@ -49262,34 +49448,12 @@ def _lb_apply_filter(self, text=""):
             if not _lb_keep(t):
                 c.hide()
 
-AdaptiveApp.apply_filter = _lb_apply_filter
+AdaptiveApp.apply_filter = _lb_apply_filter    # kept as patch chain: two wrappers call the original inside a condition or twice
 
-_lb_prev_init = AdaptiveApp.__init__
 
-def _lb_init(self):
-    _lb_prev_init(self)
-    try:
-        header = self.search_edit.parentWidget().layout().itemAt(0).layout()
-        idx = header.indexOf(self.search_edit)
-        combo = QComboBox()
-        combo.setFixedHeight(36)
-        combo.setToolTip("Show favorites, recently played or hidden games. Use a game's ••• menu to favorite or hide it.")
-        for label, key in _LB_VIEWS:
-            combo.addItem(label, key)
-        def changed(_i):
-            _lb_view["mode"] = combo.currentData()
-            self.apply_filter(self.search_edit.text())
-        combo.currentIndexChanged.connect(changed)
-        header.insertWidget(idx, combo)
-        header.insertSpacing(idx + 1, 8)
-        self.lib_view_combo = combo
-        self.apply_filter(self.search_edit.text())
-    except Exception:
-        pass
 
-AdaptiveApp.__init__ = _lb_init
 
-# ================================================================ downloads: speed limit, schedule, pause all
+# ── downloads: speed limit, schedule, pause all ──
 def _dl_limits_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "download_limits.json")
 
@@ -49302,7 +49466,7 @@ def dl_limits():
         try:
             with open(_dl_limits_path(), encoding="utf-8") as f:
                 d.update(json.load(f))
-        except Exception:
+        except Exception:    # expected: file may not exist yet or be unreadable
             pass
         _dl_lim["d"], _dl_lim["t"] = d, time.time()
     return _dl_lim["d"]
@@ -49312,7 +49476,7 @@ def dl_limits_save(d):
         os.makedirs(os.path.dirname(_dl_limits_path()), exist_ok=True)
         with open(_dl_limits_path(), "w", encoding="utf-8") as f:
             json.dump(d, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     _dl_lim["d"], _dl_lim["t"] = d, time.time()
 
@@ -49326,7 +49490,7 @@ def _dl_throttle(n, w=None):
     if d.get("sched") and not _dl_in_window(d):
         try:
             w.status_update.emit(f"Waiting for the download window ({int(d['from']):02d}:00 to {int(d['to']):02d}:00)...")
-        except Exception:
+        except Exception:    # expected: offline or the server did not answer
             pass
         while not _dl_in_window(dl_limits()) and dl_limits().get("sched"):
             if w is not None and _dl_cancelled(w):
@@ -49392,12 +49556,12 @@ def _dlp_init(self, parent=None):
             b.clicked.connect(lambda _c=False, f=fn: f())
             row.insertWidget(at, b)
     except Exception:
-        pass
+        _log_exc("_dlp_init")
 
 DownloadsPage.__init__ = _dlp_init
 
 
-# ================================================================ friends: activity feed
+# ── friends: activity feed ──
 def _act_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "friend_activity.json")
 
@@ -49416,7 +49580,7 @@ def _act_add(items):
     try:
         with open(_act_path(), "w", encoding="utf-8") as f:
             json.dump(data, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _act_ago(ts):
@@ -49452,7 +49616,7 @@ def _act_detect(self):
             _act_add(new)
             self._act_refresh()
     except Exception:
-        pass
+        _log_exc("_act_detect")
     return _act_prev_detect(self)
 
 def _act_refresh(self):
@@ -49492,11 +49656,11 @@ def _act_init(self, parent=None):
         lay.insertWidget(lay.indexOf(self.req_box) + 2, panel)
         self._act_refresh()
     except Exception:
-        pass
+        _log_exc("_act_init")
 
 FriendsPage.__init__ = _act_init
 
-# ================================================================ screenshots: per-game gallery + share
+# ── screenshots: per-game gallery + share ──
 def _shots_for(game):
     safe = re.sub(r'[\\/:*?"<>|]+', "", str(game)).strip().casefold()
     try:
@@ -49552,7 +49716,7 @@ class _ShotGallery(QDialog):
         for p in self._paths():
             try:
                 os.remove(p)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
         self.fill()
 
@@ -49581,7 +49745,7 @@ class _ShotGallery(QDialog):
         self._tasks.append(w)
         w.start()
 
-# ================================================================ store: game reviews and ratings (Firebase: reviews/<appid>/<uid>)
+# ── store: game reviews and ratings (Firebase: reviews/<appid>/<uid>) ──
 def cloud_get_reviews(appid):
     token, _uid = get_id_token()
     d = _http_json(_fdb(f"reviews/{appid}", token))
@@ -49623,7 +49787,7 @@ def _rv_init(self, *a, **k):
         lay.insertWidget(lay.indexOf(self.similar_wrap), wrap)
         self._rv_tasks = []
     except Exception:
-        pass
+        _log_exc("_rv_init")
 
 def _rv_render(self, reviews):
     while self.rv_list.count():
@@ -49678,12 +49842,12 @@ def _rv_show(self, appid, title, cover_path):
             self.rv_status.setText("")
             _rv_load(self)
     except Exception:
-        pass
+        _log_exc("_rv_show")
 
 StoreDetailPage.show_game = _rv_show
 
 
-# ================================================================ F9 screenshots: fix black captures (Wayland / XWayland)
+# ── F9 screenshots: fix black captures (Wayland / XWayland) ──
 def _shot_is_black(img):
     try:
         small = img.scaled(32, 18, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
@@ -49728,7 +49892,7 @@ def _shot_take(self):
 _ScreenshotTaker.take = _shot_take
 
 
-# ================================================================ #14 recommendations ("because you played X")
+# ── #14 recommendations ("because you played X") ──
 def compute_recommendations(sources=3, per=6):
     lib = load_steam_library()
     if not lib:
@@ -49756,40 +49920,8 @@ def compute_recommendations(sources=3, per=6):
                 break
     return out
 
-def _open_store_game_any(app, rec):
-    """Opens a game's Store page, in Big Picture when that is what's on screen."""
-    bp = _bpy_active_bp()
-    if bp is None:
-        app.open_store_game(rec["appid"], rec["title"], "")
-        return
-    it = bp._sbyid.get(rec["appid"]) or {"appid": rec["appid"], "title": rec["title"], "path": "", "nsfw": False, "done": False}
-    bp._sbyid.setdefault(rec["appid"], it)
-    try:
-        bp._loader.request(rec["appid"], rec["base"], rec["title"])
-    except Exception:
-        pass
-    if bp._tab != 1:
-        bp._switch_tab(1)
-    bp._detail, bp._detail_btn = {"item": it}, 0
-    bp._load_details(rec["appid"])
-    bp.update()
 
-# ================================================================ small dialogs used by Big Picture
-class _ActDialog(QDialog):
-    def __init__(self, app):
-        super().__init__(app)
-        self.setWindowTitle("Friend activity")
-        self.resize(520, 420)
-        lay = QVBoxLayout(self)
-        lst = QListWidget()
-        items = _act_load()[:40]
-        for it in items:
-            lst.addItem(f"{it.get('n', '')} {it.get('x', '')}  ({_act_ago(it.get('t', 0))})")
-        if not items:
-            lst.addItem("Nothing yet. Friend activity is collected while the launcher is open.")
-        lay.addWidget(lst)
-        c = QPushButton("Close"); c.clicked.connect(self.reject)
-        lay.addWidget(c)
+# ── small dialogs used by Big Picture ──
 
 class _ReviewsDialog(QDialog):
     def __init__(self, app, appid, title):
@@ -49845,7 +49977,7 @@ class _ReviewsDialog(QDialog):
         self.summary.setText("Posting...")
         self._run(lambda: cloud_post_review(self.appid, stars, text), lambda _r: (self.text.clear(), self.load()))
 
-# ================================================================ library cards: extra entries in the 3-dot menu (also what Big Picture's X menu shows)
+# ── library cards: extra entries in the 3-dot menu (also what Big Picture's X menu shows) ──
 _bpf_prev_decorate = _lb_decorate
 
 def _bpf_decorate(self, card, title):
@@ -49858,7 +49990,7 @@ def _bpf_decorate(self, card, title):
         menu = more.menu() if more is not None else None
         if menu is None:
             return
-        from PyQt6.QtGui import QAction as _QAct
+        from PyQt6.QtGui import QAction as _QAct    # lazy: saves memory/startup until used
         acts = menu.actions()
         first = acts[0] if acts else None
         fav, shots, hide = _QAct("Add to favorites", menu), _QAct("Screenshots...", menu), _QAct("Hide from library", menu)
@@ -49895,12 +50027,12 @@ def _bpf_decorate(self, card, title):
             if ub is not None:
                 ub.click()
         upd.triggered.connect(lambda _c=False: do_update())
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
 
 _lb_decorate = _bpf_decorate
 
-# ================================================================ Big Picture
+# ── Big Picture ──
 _bpf_prev_refresh = _BigPicture._refresh
 
 def _bpf_refresh(self):
@@ -49917,7 +50049,7 @@ def _bpf_refresh(self):
         self._sel = next((n for n, i in enumerate(items) if i["card"] is keep), 0)
         self._pos = float(self._sel)
     except Exception:
-        pass
+        _log_exc("_bpf_refresh")
 
 _BigPicture._refresh = _bpf_refresh
 
@@ -49973,8 +50105,7 @@ def _bpf_settings_open(self):
 _BigPicture._settings_open = _bpf_settings_open
 
 
-
-# ================================================================ recommendations cache (used by the Store shelf and the Big Picture "For You" tab)
+# ── recommendations cache (used by the Store shelf and the Big Picture "For You" tab) ──
 _fy_cache = {"t": 0.0, "v": None}
 
 def _fy_recs(force=False):
@@ -49983,7 +50114,7 @@ def _fy_recs(force=False):
         _fy_cache["v"], _fy_cache["t"] = compute_recommendations(4, 6), time.time()
     return list(_fy_cache["v"])
 
-# ================================================================ Big Picture Friends tab: activity under the friend list
+# ── Big Picture Friends tab: activity under the friend list ──
 _fa_prev_build = _BigPicture._fr_build
 
 def _fa_build(self):
@@ -50060,7 +50191,7 @@ def _fa_act(self, name):
 
 _BigPicture._fr_act = _fa_act
 
-# ================================================================ Big Picture Downloads tab: pause / resume all
+# ── Big Picture Downloads tab: pause / resume all ──
 def _bpf_pause_all(self):
     dp = getattr(self._app, "downloads_page", None)
     if dp is None:
@@ -50119,7 +50250,7 @@ def _bpd_hint(self):
 _BigPicture._x_hint = _bpd_hint
 
 
-# ================================================================ Store: "Recommended for you" shelf (horizontal covers, no popup)
+# ── Store: "Recommended for you" shelf (horizontal covers, no popup) ──
 _REC_W, _REC_H = 280, 131                      # Steam's landscape header art is 460x215
 
 class _RecArt(QObject):
@@ -50158,7 +50289,7 @@ class _RecArt(QObject):
             path = ""
         try:
             self.loaded.emit(appid, path)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
 
@@ -50328,7 +50459,7 @@ def _rs_init(self, *a, **k):
         self.loader.loaded.connect(self._rec_cover_loaded)
         self.loader.nsfw_known.connect(self._rec_nsfw_known)
     except Exception:
-        pass
+        _log_exc("_rs_init")
 
 def _rec_open(self, rec):
     card = self._rec_shelf.cards.get(rec["appid"])
@@ -50410,7 +50541,7 @@ def _rs_show(self, event):
 StorePage.showEvent = _rs_show
 
 
-# ================================================================ Big Picture: For You tab, Screenshots tab, library toolbar, download limits
+# ── Big Picture: For You tab, Screenshots tab, library toolbar, download limits ──
 _BPG_SPEEDS = (0, 1, 2, 5, 10, 20, 50, 100, 250, 500)           # MB/s, 0 = unlimited
 _BPE_BAR_TAGS = _BPE_BAR_TAGS + ("rrefresh", "sgame", "sfolder", "dlimit", "dpause")     # toolbar pills the controller can reach
 
@@ -50452,7 +50583,7 @@ def _bpg_tab_labels(self):
     return tuple(_bpg_o["_tab_labels"](self)) + ("For You", "Screenshots")
 
 
-# ---------------------------------------------------------------- Library toolbar: view filters + favorite / hide
+# ── Library toolbar: view filters + favorite / hide ──
 def _bpg_lb_tags(self):
     tags = [("view", k) for _l, k in _LB_VIEWS]
     if self._items:
@@ -50602,7 +50733,7 @@ def _bpg_paint_library(self, p, w, h, m, acc, k):
             x += bw + gap
 
 
-# ---------------------------------------------------------------- Downloads: speed limit and schedule
+# ── Downloads: speed limit and schedule ──
 @_bpm("_paint_downloads")
 def _bpg_paint_dl(self, p, w, h, m, acc):
     _bpg_o["_paint_downloads"](self, p, w, h, m, acc)
@@ -50652,7 +50783,7 @@ def _bpg_dlim_adjust(ov, row, step, wrap=False):
     dl_limits_save({"mb_s": d["mb_s"], "sched": d["sched"], "from": d["from"], "to": d["to"]})
 
 
-# ---------------------------------------------------------------- For You tab (horizontal covers)
+# ── For You tab (horizontal covers) ──
 @_bpm("_rc_load")
 def _bpg_rc_load(self, force=False):
     rc = self._rc
@@ -50803,7 +50934,7 @@ def _bpg_paint_rec(self, p, w, h, m, acc):
     self._x_grid_paint(p, w, h, acc, len(lst), rc["sel"], 2.14, draw)
 
 
-# ---------------------------------------------------------------- Screenshots tab
+# ── Screenshots tab ──
 def _bpg_shots_all():
     try:
         d = _screenshots_dir()
@@ -50993,7 +51124,7 @@ def _bpg_shot_delete(bp, ov):
     path = ov["list"][ov["i"]]
     try:
         os.remove(path)
-    except OSError:
+    except OSError:    # expected: cleanup that may already be done
         pass
     bp._sg["pix"].pop(path, None)
     ov["list"].pop(ov["i"])
@@ -51008,7 +51139,7 @@ def _bpg_shot_delete(bp, ov):
     bp._say("Screenshot deleted", 2000)
 
 
-# ---------------------------------------------------------------- tab plumbing
+# ── tab plumbing ──
 @_bpm("_x_enter")
 def _bpg_x_enter(self, t):
     n0 = _bpg_base(self)
@@ -51101,7 +51232,7 @@ def _bpg_paint_extra(self, p, w, h, m, acc, k):
             self._x_ring(p, r, r.height() / 2)
 
 
-# ---------------------------------------------------------------- overlays: download limits + screenshot viewer
+# ── overlays: download limits + screenshot viewer ──
 @_bpm("_ov_act")
 def _bpg_ov_act(self, name):
     ov = self._ov
@@ -51265,8 +51396,7 @@ def _bpg_paint_ov(self, p, w, h, acc):
                "Up / Down  Select      Left / Right  Change      A  Toggle / Done      B  Close")
 
 
-
-# ---------------------------------------------------------------- games started outside the launcher
+# ── games started outside the launcher ──
 # A game that was already running when the launcher opened, or that was started some other way (desktop shortcut,
 # Steam, Explorer, a terminal...), is noticed by a background scan and then counted exactly like a game started with
 # the Launch button: Stop button, "Playing" status, playtime, Discord presence, friends. A game is recognised when one
@@ -51286,7 +51416,7 @@ class _AdoptedProc:
         self.returncode = None
 
     def _alive(self):
-        import psutil
+        import psutil    # lazy: saves memory/startup until used
         try:
             return self._ps.is_running() and self._ps.status() != psutil.STATUS_ZOMBIE
         except psutil.Error:
@@ -51310,20 +51440,20 @@ class _AdoptedProc:
     def terminate(self):
         try:
             self._ps.terminate()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
     def kill(self):
         try:
             self._ps.kill()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
     def send_signal(self, sig):
         try:
             self._ps.send_signal(sig)
         except Exception:
-            pass
+            _log_exc("send_signal")
 
 
 def _ext_fix_path(p):
@@ -51372,7 +51502,7 @@ def _ext_build_index():
             if os.path.isdir(d):
                 folders[os.path.normcase(d) + os.sep] = title
         except Exception:
-            pass
+            _log_exc("_ext_build_index")
         rec = recorded.get(raw_title) or recorded.get(sanitize_folder_name(raw_title))
         if rec and os.path.isfile(rec):
             full = os.path.abspath(rec)
@@ -51437,7 +51567,7 @@ def _ext_is_running(title):
 
 def _ext_scan(cache):
     """-> {title: [(create_time, psutil.Process, exe path)]} for every library game that has a live process."""
-    import psutil
+    import psutil    # lazy: saves memory/startup until used
     idx = _ext_build_index()
     sig = (tuple(sorted(idx["exes"].items())), tuple(sorted(idx["folders"].items())), tuple(idx["roots"]))
     if cache.get("sig") != sig:                 # the library changed: forget what was decided before
@@ -51448,7 +51578,7 @@ def _ext_scan(cache):
     mine = {me}
     try:
         mine.update(c.pid for c in psutil.Process(me).children(recursive=True))   # the launcher's own helpers/installers
-    except psutil.Error:
+    except psutil.Error:    # expected: the process may already have exited
         pass
     for gpid in list(_ncz_game_pids):             # ... except games a shortcut started through this launcher process
         try:
@@ -51489,7 +51619,7 @@ def _ext_on_adopt(title, proc, folder):
             return
         _track_playing(title, proc, folder or None)
     except Exception:
-        pass
+        _log_exc("_ext_on_adopt")
 
 
 def _ext_loop(bus, stop=None):
@@ -51517,25 +51647,15 @@ def _ext_loop(bus, stop=None):
                     streak.pop(title, None)
                     bus.adopt.emit(title, _AdoptedProc(ps), _game_folder_for([path], None) or "")
         except Exception:
-            pass
+            _log_exc("_ext_loop")
         time.sleep(_EXT_SCAN_SECS)
 
 
-_ext_prev_init = AdaptiveApp.__init__
-
-def _ext_init(self, *a, **k):
-    _ext_prev_init(self, *a, **k)
-    try:
-        self._ext_bus = _ExtGameBus(self)
-        self._ext_bus.adopt.connect(_ext_on_adopt)
-        threading.Thread(target=_ext_loop, args=(self._ext_bus,), daemon=True).start()
-    except Exception:
-        pass
-
-AdaptiveApp.__init__ = _ext_init
 
 
-# ================================================================ desktop shortcuts
+
+
+# ── desktop shortcuts ──
 # 1. A game's desktop shortcut runs `main.py --launch-game <title>`: if the launcher is open it is told to start the
 #    game, otherwise the launcher starts and then starts the game.
 # 2. Desktop shortcuts whose name is a game in the store are added to the library automatically (with their path).
@@ -51568,7 +51688,7 @@ def _ncz_launch_arg():
 def _ncz_send_launch(title, wait=0):
     """Asks the running launcher to start `title`. True if one answered (retries for `wait` seconds)."""
     try:
-        from PyQt6.QtNetwork import QLocalSocket
+        from PyQt6.QtNetwork import QLocalSocket    # lazy: optional module: the except below handles it missing
     except ImportError:
         return False
     deadline = time.time() + wait
@@ -51583,7 +51703,7 @@ def _ncz_send_launch(title, wait=0):
                 sock.disconnectFromServer()
                 return True
         except Exception:
-            pass
+            _log_exc("_ncz_send_launch")
         if time.time() >= deadline:
             return False
         time.sleep(0.3)
@@ -51603,7 +51723,7 @@ def _ncz_launch_requested(app, title, tries=0):
                             btn.click()
                         return
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
     if tries < 60:
         QTimer.singleShot(500, lambda: _ncz_launch_requested(app, title, tries + 1))
@@ -51621,7 +51741,7 @@ def _ncz_after_window_created(app, window, title):
         QTimer.singleShot(1500, lambda t=t: _ncz_launch_requested(app, t))
     QTimer.singleShot(8000, lambda: _ncz_convert_shortcuts_once(window))     # once: old launcher-routed shortcuts -> direct
 
-# ---------------------------------------------------------------- auto-add desktop shortcuts that are store games
+# ── auto-add desktop shortcuts that are store games ──
 def _ncz_autoadd_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "desktop_autoadd.json")
 
@@ -51633,7 +51753,7 @@ def _ncz_autoadd_load():
             st.setdefault("added", {})
             st.setdefault("cache", {})
             return st
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return {"added": {}, "cache": {}}
 
@@ -51642,7 +51762,7 @@ def _ncz_autoadd_save(st):
         os.makedirs(os.path.dirname(_ncz_autoadd_path()), exist_ok=True)
         with open(_ncz_autoadd_path(), "w", encoding="utf-8") as f:
             json.dump(st, f)
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
 
 def _ncz_store_lookup(title, cache):
@@ -51691,6 +51811,7 @@ def _ncz_autoadd_scan(dirs, titles, exes, urls, appids, state, key, loader):
             c["cover_path"] = ""
     return out
 
+# kept: used at import time before the later definition at line 51026
 def _ncz_reroute_shortcut(c, gid):
     """Makes the desktop shortcut open the launcher, which then starts the game. The original is kept in the settings
     folder. Only .desktop (Linux) and .lnk (Windows) files can be changed; .url / .exe / folders are left alone."""
@@ -51757,7 +51878,7 @@ def _ncz_autoadd_apply(window, cands, state):
                     shutil.copyfile(cover, dest)
                     cover = dest
                 except Exception:
-                    pass
+                    _log_exc("_ncz_autoadd_apply")
             entry = {"id": gid, "title": c["title"], "exe_path": c["exe_path"], "cover_path": cover, "compat_tool": ""}
             if c.get("launch_file"):
                 try:
@@ -51767,7 +51888,7 @@ def _ncz_autoadd_apply(window, cands, state):
                     shutil.copyfile(c["launch_file"], keep)
                     c["launch_file"] = keep
                 except Exception:
-                    pass
+                    _log_exc("_ncz_autoadd_apply")
             for k in ("launch_url", "launch_file", "launch_args", "launch_cmd", "workdir"):
                 if c.get(k):
                     entry[k] = c[k]
@@ -51778,7 +51899,7 @@ def _ncz_autoadd_apply(window, cands, state):
             try:
                 _ncz_reroute_shortcut(c, gid)
             except Exception:
-                import traceback
+                import traceback    # lazy: saves memory/startup until used
                 traceback.print_exc()
         window.apply_filter()
     _ncz_autoadd_save(state)
@@ -51805,7 +51926,7 @@ def _ncz_autoadd_desktop(window):
             try:
                 _ncz_autoadd_apply(window, cands, state)
             except Exception:
-                import traceback
+                import traceback    # lazy: saves memory/startup until used
                 traceback.print_exc()
 
         def failed(_msg):
@@ -51816,10 +51937,10 @@ def _ncz_autoadd_desktop(window):
         worker.start()
     except Exception:
         window._ncz_autoadd_busy = False
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
-# ---------------------------------------------------------------- update game shortcuts made by older launchers (once)
+# ── update game shortcuts made by older launchers (once) ──
 def _ncz_migration_path():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "shortcut_migration.json")
 
@@ -51836,10 +51957,11 @@ def _ncz_old_shortcut_title(path):
             r = _desk_parse_lnk(path)
             if r and r[0].lower().endswith(".exe") and "--launch-game" not in r[1]:
                 return os.path.splitext(os.path.basename(path))[0]    # old ones are named after the game
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     return ""
 
+# kept: used at import time before the later definition at line 51033
 def _ncz_migrate_old_shortcuts(window):
     """First launch since this update: every desktop shortcut an older launcher made for a library game is rewritten
     to open the launcher and then the game. Retries a couple of times in case the library is still loading."""
@@ -51890,10 +52012,10 @@ def _ncz_migrate_old_shortcuts(window):
         with open(_ncz_migration_path(), "w", encoding="utf-8") as f:
             json.dump(st, f)
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
 
-# ---------------------------------------------------------------- launcher shortcut: delete + recreate with the new icon
+# ── launcher shortcut: delete + recreate with the new icon ──
 def _ncz_theme_icon_src(kind):
     """The icon file a theme uses ('' -> the normal one). Mirrors asset_path('icon.png') for another theme."""
     if kind == "classic":
@@ -51934,7 +52056,7 @@ def _ncz_recreate_launcher_shortcut(existing, theme_key, only_if_changed):
                 with open(p, "rb") as f:
                     backups[p] = f.read()
                 os.remove(p)                             # delete the old shortcut ...
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
         create_desktop_shortcut(src)                     # ... and make a new one with the new icon
     except Exception:
@@ -51944,7 +52066,7 @@ def _ncz_recreate_launcher_shortcut(existing, theme_key, only_if_changed):
                     with open(p, "wb") as f:
                         f.write(data)
                     os.chmod(p, 0o755)
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
 
 def _ncz_refresh_launcher_shortcut(theme_key=None, only_if_changed=False):
@@ -51962,7 +52084,7 @@ def _ncz_refresh_launcher_shortcut(theme_key=None, only_if_changed=False):
                      daemon=True).start()
 
 
-# ================================================================ Settings: install missing dependencies
+# ── Settings: install missing dependencies ──
 # Same package list as bootstrap_win.py. One button checks what's missing and pip-installs it into the Python
 # that's running the launcher (the private embeddable Python on Windows), plus Chromium for Playwright.
 # Packages installed while the launcher is open are picked up after a restart.
@@ -52031,7 +52153,7 @@ def _dep_add_to_path(folder):
         os.environ["PATH"] = folder + os.pathsep + cur
     if not sys.platform.startswith("win"):
         return
-    import winreg, ctypes
+    import winreg, ctypes    # lazy: saves memory/startup until used
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
                         winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
         try:
@@ -52046,7 +52168,7 @@ def _dep_add_to_path(folder):
     try:      # tell Explorer / new terminals the environment changed
         ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
     except Exception:
-        pass
+        _log_exc("_dep_add_to_path")
 
 def _dep_ffmpeg_missing():
     return sys.platform.startswith("win") and shutil.which("ffmpeg") is None
@@ -52056,7 +52178,7 @@ try:
     if sys.platform.startswith("win") and os.path.exists(os.path.join(_dep_ffmpeg_dir(), "ffmpeg.exe")):
         _dep_add_to_path(_dep_ffmpeg_dir())
 except Exception:
-    pass
+    _log_exc("<module>")
 
 class _DepPanel(QFrame):
     _line = pyqtSignal(str)
@@ -52213,12 +52335,12 @@ def _dep_settings_init(self, *a, **k):
         layout.insertSpacing(idx, 12)
         layout.insertWidget(idx + 1, panel)
     except Exception:
-        pass
+        _log_exc("_dep_settings_init")
 
 SettingsPage.__init__ = _dep_settings_init
 
 
-# ================================================================ Game shortcuts launch the exe directly
+# ── Game shortcuts launch the exe directly ──
 # Shortcuts you create from a game's menu in the launcher start the game's exe on their own. The launcher no longer
 # adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
@@ -52266,7 +52388,7 @@ def _sc_write_direct(path, title, exe, args="", workdir=""):
             for ln in f:
                 if ln.startswith("Icon="):
                     icon = ln.strip()
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     if not icon:
         p = _exe_icon_png(exe, sanitize_folder_name(title) or "Game")
@@ -52305,7 +52427,7 @@ def _ncz_spawn_game_exe(exe, args=""):
         _ncz_game_pids.add(proc.pid)
         return True
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
         return False
 
@@ -52324,7 +52446,7 @@ def _sc_launcher_title(path):
             m = re.search(r'--launch-game"?\s+"?([^"\s]+)', txt)
             if m:
                 return urllib.parse.unquote(m.group(1).replace("%%", "%"))
-    except Exception:
+    except Exception:    # expected: cleanup that may already be done
         pass
     return ""
 
@@ -52361,7 +52483,7 @@ def _sc_restore_all():
                     done += 1
                     continue
             except Exception:
-                pass
+                _log_exc("_sc_restore_all")
             left += 1
     return done, left
 
@@ -52386,7 +52508,7 @@ _sc_prev_create = create_game_shortcut
 def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", launch_args=None):
     if get_shortcuts_via_launcher() or not _sc_can_direct(exe, compat_tool):
         return _sc_prev_create(app, title, exe, compat_tool, fallback_icon, launch_args)
-    from PyQt6.QtCore import QStandardPaths
+    from PyQt6.QtCore import QStandardPaths    # lazy: saves memory/startup until used
     desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation) or os.path.expanduser("~/Desktop")
     try:
         os.makedirs(desktop, exist_ok=True)
@@ -52397,7 +52519,7 @@ def create_game_shortcut(app, title, exe, compat_tool="", fallback_icon="", laun
             try:
                 subprocess.run(["gio", "set", target, "metadata::trusted", "true"], capture_output=True, timeout=5)
             except Exception:
-                pass
+                _log_exc("create_game_shortcut")
         QMessageBox.information(app, "Desktop Shortcut", f"Shortcut created (launches the game directly):\n{target}")
     except Exception as e:
         QMessageBox.warning(app, "Desktop Shortcut", f"Couldn't create the shortcut: {e}")
@@ -52441,19 +52563,19 @@ def _ncz_convert_shortcuts_once(window):
                         try:
                             _sc_write_direct(path, game, exe)
                         except Exception:
-                            pass
+                            _log_exc("work")
                 st = load_launcher_settings()
                 st["shortcuts_made_direct_v2"] = True
                 save_launcher_settings(st)
             except Exception:
-                import traceback
+                import traceback    # lazy: saves memory/startup until used
                 traceback.print_exc()
         threading.Thread(target=work, daemon=True).start()
     except Exception:
-        pass
+        _log_exc("_sc_settings_init")
 
 
-# ================================================================ pages built the first time they're opened
+# ── pages built the first time they're opened ──
 # Store, Store detail, GE-Proton, Wine, GMod addons, Fan Games and Fan detail used to be built at startup although a normal
 # start never opens them. A placeholder keeps each one's slot (so hard-coded indexes like pages.setCurrentIndex(4) and the
 # nav buttons keep working); the real page is built when the placeholder is shown or when code reads win.<name>
@@ -52525,7 +52647,7 @@ def _lazy_build(app, name):
         try:
             hook(page)
         except Exception:
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             traceback.print_exc()
     ent["hooks"] = []
     if was_current:
@@ -52538,10 +52660,10 @@ def _lazy_getattr(self, name):
     if lazy and name in lazy:
         return _lazy_build(self, name)
     raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-AdaptiveApp.__getattr__ = _lazy_getattr
+AdaptiveApp.__getattr__ = _lazy_getattr    # kept as patch: _lazy_getattr belongs to the lazy-page memory work, which stays exactly as it is
 
 
-# ================================================================ chess page: timers only while they have something to do
+# ── chess page: timers only while they have something to do ──
 # The page is kept after you leave it, and its 100 ms clock, 1.5 s game poll and 10 s inbox poll kept firing for good.
 #   clock_timer: only while a board is on screen (_tick did nothing otherwise; a clock that ran out is flagged on return)
 #   inbox_timer: only while the lobby is on screen (_poll_inbox already returned early otherwise)
@@ -52556,7 +52678,7 @@ def _ch_sync_timers(self):
                 t.start()
             elif not on and t.isActive():
                 t.stop()
-    except (AttributeError, RuntimeError):
+    except (AttributeError, RuntimeError):    # expected: cleanup that may already be done
         pass
 
 _ch_prev_init = NczChessPage.__init__
@@ -52584,15 +52706,15 @@ def _ch_timers_poll_game(self):
 NczChessPage._poll_game = _ch_timers_poll_game
 
 
-# ================================================================ memory: NCZ_MEMLOG=1 logging, free memory while hidden in the tray
+# ── memory: NCZ_MEMLOG=1 logging, free memory while hidden in the tray ──
 _MEMLOG = os.environ.get("NCZ_MEMLOG", "").strip() not in ("", "0")
 
 def _mem_usage():
     """(working set MiB, private MiB) on Windows, (RSS MiB, anonymous RSS MiB) on Linux, None if unknown."""
     try:
         if sys.platform.startswith("win"):
-            import ctypes
-            from ctypes import wintypes
+            import ctypes    # lazy: saves memory/startup until used
+            from ctypes import wintypes    # lazy: saves memory/startup until used
             class _PMC(ctypes.Structure):       # PROCESS_MEMORY_COUNTERS_EX
                 _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
                     (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
@@ -52614,7 +52736,7 @@ def _mem_usage():
                         vals[k] = int(v.split()[0]) / 1024.0
             if "VmRSS" in vals:
                 return vals["VmRSS"], vals.get("RssAnon", 0.0)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
     return None
 
@@ -52632,7 +52754,7 @@ def _memlog(what):
             with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "memlog.txt"), "a", encoding="utf-8") as f:
                 f.write(text + "\n")
         except Exception:
-            pass
+            _log_exc("_memlog")
 
 def _memlog_start(window):
     """Called once from main(): startup figure now, then every 60 s."""
@@ -52660,25 +52782,57 @@ def _ui_timers_pause(self):
             if t.isActive():
                 t.stop()
                 paused.append(t)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     self._ui_paused_timers = paused
+    movies = getattr(self, "_ui_paused_movies", [])          # chat GIFs kept animating (decoding frames) while hidden
+    for mv in self.findChildren(QMovie):
+        try:
+            if mv.state() == QMovie.MovieState.Running:
+                mv.setPaused(True)
+                movies.append(mv)
+        except RuntimeError:    # expected: the widget or object may already be deleted
+            pass
+    self._ui_paused_movies = movies
+    _web_tabs_sleep(self, True)
+
+def _web_tabs_sleep(self, sleep):
+    """NCZFront tabs are frozen (no JS, no timers) while the window is hidden, unless NCZFront is what's playing."""
+    page = self.__dict__.get("web_page")
+    if page is None or (sleep and _now_playing.get("name") == "NCZFront"):
+        return
+    try:
+        from PyQt6.QtWebEngineCore import QWebEnginePage    # lazy: saves memory/startup until used
+        want = QWebEnginePage.LifecycleState.Frozen if sleep else QWebEnginePage.LifecycleState.Active
+        for i in range(page.tabs.count()):
+            pg = page.tabs.widget(i).page()
+            if pg.lifecycleState() != want and (not sleep or pg.lifecycleState() == QWebEnginePage.LifecycleState.Active):
+                pg.setLifecycleState(want)
+    except Exception as e:
+        _ncz_log(f"NCZFront: couldn't change the tabs' sleep state ({e!r})")
 
 def _ui_timers_resume(self):
     paused, self._ui_paused_timers = getattr(self, "_ui_paused_timers", []), []
+    _web_tabs_sleep(self, False)
+    for mv in getattr(self, "_ui_paused_movies", []):
+        try:
+            mv.setPaused(False)
+        except RuntimeError:
+            pass                        # that chat message was removed meanwhile
+    self._ui_paused_movies = []
     gp = getattr(getattr(self, "friends_page", None), "group_page", None)
     for t in paused:
         try:
             if t is getattr(gp, "tick_timer", None) and not gp.chat_timer.isActive():
                 continue            # the group chat was closed meanwhile
             t.start()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
     if paused:
         try:
             _pt_refresh_cards(self)     # playtime labels right away instead of after 3 s
         except Exception:
-            pass
+            _log_exc("_ui_timers_resume")
 
 _mem_prev_show = AdaptiveApp.showEvent
 def _mem_show_event(self, ev):
@@ -52686,7 +52840,7 @@ def _mem_show_event(self, ev):
     if not self.isMinimized():
         _ui_timers_resume(self)
         _memlog("window shown")
-AdaptiveApp.showEvent = _mem_show_event
+AdaptiveApp.showEvent = _mem_show_event    # kept as patch chain: the base is inherited from Qt, so there is no method to merge into
 
 def _mem_drop_store_cards(page):
     """Drops a Store / Fan Games page's loaded cards (and their covers). Its showEvent loads them again from the top, with
@@ -52704,16 +52858,16 @@ def _mem_trim():
     """Hands unused memory back to the OS, so Task Manager's figure really drops (pages come back on demand)."""
     try:
         if sys.platform.startswith("win"):
-            import ctypes
-            from ctypes import wintypes
+            import ctypes    # lazy: saves memory/startup until used
+            from ctypes import wintypes    # lazy: saves memory/startup until used
             psapi, k32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")
             k32.GetCurrentProcess.restype = wintypes.HANDLE
             psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
             psapi.EmptyWorkingSet(k32.GetCurrentProcess())
         elif sys.platform.startswith("linux"):
-            import ctypes
+            import ctypes    # lazy: saves memory/startup until used
             ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
+    except Exception:    # expected: optional module may be missing
         pass
 
 def _mem_free_hidden(self, step=0):
@@ -52726,17 +52880,101 @@ def _mem_free_hidden(self, step=0):
         if step == 0:
             for name in ("store_page", "fan_page"):
                 _mem_drop_store_cards(self.__dict__.get(name))
+            _free_idle_chess(self)
+            _free_big_picture(self)
             QTimer.singleShot(500, lambda: _mem_free_hidden(self, 1))     # deleteLater runs in the event loop first
             return
-        from PyQt6.QtGui import QPixmapCache
-        import gc
+        from PyQt6.QtGui import QPixmapCache    # lazy: saves memory/startup until used
+        import gc    # lazy: saves memory/startup until used
         QPixmapCache.clear()
         gc.collect()
         _mem_trim()
         _memlog("after freeing memory (hidden)")
     except Exception:
-        import traceback
+        import traceback    # lazy: saves memory/startup until used
         traceback.print_exc()
+
+def _free_idle_chess(self):
+    """The chess page is kept for good once opened; free it while hidden unless a game is going (open_chess builds it
+    again)."""
+    cp = self.__dict__.get("chess_page")
+    if cp is None:
+        return
+    try:
+        g = cp.game
+        busy = ((g is not None and not getattr(g, "result", None)) or
+                (cp.net_gid and cp.net_state not in ("over", "cancelled")) or cp.bg._cbs or self.pages.currentWidget() is cp)
+        if busy:
+            return
+        for t in (cp.clock_timer, cp.game_timer, cp.inbox_timer):
+            t.stop()
+        try:
+            _theme_listeners.remove(cp.restyle)
+        except ValueError:    # expected: missing or odd value: the default is fine
+            pass
+        self.pages.removeWidget(cp)
+        del self.__dict__["chess_page"]
+        cp.deleteLater()
+        _memlog("freed the chess page (hidden)")
+    except Exception:
+        import traceback    # lazy: saves memory/startup until used
+        traceback.print_exc()
+
+# Big Picture: kept for good once opened. It's freed while hidden in the tray when it isn't open and nothing is embedded in
+# it; open_big_picture builds a new one. Its callbacks in the module-level listener lists are removed first (game
+# tracking calls _playing_listeners without error handling, so a deleted Big Picture there would break it).
+_BP_LISTENER_LISTS = ("_playing_listeners", "_bp_friend_listeners", "_theme_listeners")
+
+_bpf_prev_open = AdaptiveApp.open_big_picture
+def _bpf_open(self):
+    if getattr(self, "_big_picture", None) is not None:
+        return _bpf_prev_open(self)
+    before = {n: len(globals()[n]) for n in _BP_LISTENER_LISTS if isinstance(globals().get(n), list)}
+    _bpf_prev_open(self)
+    bp = getattr(self, "_big_picture", None)
+    if bp is not None:      # exactly what it added (a bound signal's emit can't be matched back to its object later)
+        bp._ncz_added = [(n, globals()[n][i]) for n, k in before.items() for i in range(k, len(globals()[n]))]
+AdaptiveApp.open_big_picture = _bpf_open    # kept as patch chain: the wrapper uses the original twice
+
+def _free_big_picture(self):
+    bp = self.__dict__.get("_big_picture")
+    if bp is None or getattr(bp, "_active", False) or getattr(bp, "_embs", None):
+        return
+    try:
+        from PyQt6 import sip    # lazy: saves memory/startup until used
+        for n, cb in getattr(bp, "_ncz_added", []):
+            try:
+                globals()[n].remove(cb)
+            except ValueError:    # expected: missing or odd value: the default is fine
+                pass
+        kids = set(id(o) for o in bp.findChildren(QObject)) | {id(bp)}
+        for n in _BP_LISTENER_LISTS:                 # added later (e.g. its friends tab): bound methods of it or its parts
+            lst = globals().get(n)
+            if isinstance(lst, list):
+                lst[:] = [cb for cb in lst if id(getattr(cb, "__self__", None)) not in kids]
+        loader = getattr(bp, "_loader", None)
+        for name in ("cancel_pending", "shutdown"):
+            try:
+                getattr(loader, name)()
+            except Exception:
+                _log_exc("_free_big_picture")
+        del self.__dict__["_big_picture"]
+        bp.deleteLater()
+        _memlog("freed Big Picture (hidden)")
+    except Exception:
+        import traceback    # lazy: saves memory/startup until used
+        traceback.print_exc()
+
+_ch_prev_sync_look = _ch_sync_launcher_look
+def _ch_sync_launcher_look(page):
+    """Ignores a chess page that was freed (its pages.currentChanged hook stays connected)."""
+    try:
+        from PyQt6 import sip    # lazy: optional module: the except below handles it missing
+        if sip.isdeleted(page):
+            return
+    except ImportError:    # expected: optional module may be missing
+        pass
+    return _ch_prev_sync_look(page)
 
 _mem_prev_hide = getattr(AdaptiveApp, "hideEvent", QMainWindow.hideEvent)
 def _mem_hide_event(self, ev):
@@ -52745,10 +52983,10 @@ def _mem_hide_event(self, ev):
         _ui_timers_pause(self)
         _memlog("window hidden")
         QTimer.singleShot(1500, lambda: _mem_free_hidden(self))      # not on a quick hide / show
-AdaptiveApp.hideEvent = _mem_hide_event
+AdaptiveApp.hideEvent = _mem_hide_event    # kept as patch chain: the base is inherited from Qt, so there is no method to merge into
 
 
-# ================================================================ Big Picture: startup animation
+# ── Big Picture: startup animation ──
 # Plays a full-screen animation (with sound) every time Big Picture opens. Press ANY key / mouse button / controller button to skip.
 # Settings -> "Big Picture startup animation": pick the NCZ default, turn it off, or use your own. A custom animation is an image
 # file (GIF / WebP / APNG, or a PNG / JPG still) dropped in the "startup_animations" folder inside the launcher's settings folder
@@ -52768,7 +53006,7 @@ def _ncz_su_dir():
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
-        pass
+        _log_exc("_ncz_su_dir")
     return d
 
 
@@ -52788,7 +53026,7 @@ def _ncz_su_customs():
             base, ext = os.path.splitext(fn)
             if ext.lower() in _NCZ_SU_IMG:
                 out.append((base, os.path.join(d, fn), _ncz_su_find_sound(os.path.join(d, base))))
-    except OSError:
+    except OSError:    # expected: file may not exist yet or be unreadable
         pass
     return out
 
@@ -52823,14 +53061,14 @@ class _NczSuSound:
             return
         try:
             if path.lower().endswith(".wav"):
-                from PyQt6.QtMultimedia import QSoundEffect
+                from PyQt6.QtMultimedia import QSoundEffect    # lazy: saves memory/startup until used
                 self._fx = QSoundEffect()
                 self._fx.setVolume(self._vol)
                 self._fx.statusChanged.connect(self._fx_status)
                 self._fx.setSource(QUrl.fromLocalFile(path))
                 self._fx_status()
             else:
-                from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+                from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput    # lazy: saves memory/startup until used
                 self._ao = QAudioOutput()
                 self._ao.setVolume(self._vol)
                 self._pl = QMediaPlayer()
@@ -52873,7 +53111,7 @@ class _NczSuSound:
             if self._pl is not None:
                 self._pl.play()
         except Exception:
-            pass
+            _log_exc("play")
 
     def _set(self, v):
         try:
@@ -52882,7 +53120,7 @@ class _NczSuSound:
             if self._ao is not None:
                 self._ao.setVolume(v)
         except Exception:
-            pass
+            _log_exc("_set")
 
     def stop(self):
         try:
@@ -52892,7 +53130,7 @@ class _NczSuSound:
                 self._pl.stop()
             if self._cli is not None and self._cli.poll() is None:
                 self._cli.terminate()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
     def fade_stop(self, ms=180):
@@ -52907,7 +53145,7 @@ class _NczStartup(QWidget):
     done = pyqtSignal()
 
     def __init__(self, host, img, snd):
-        from PyQt6.QtCore import QEvent, QVariantAnimation, QEasingCurve
+        from PyQt6.QtCore import QVariantAnimation, QEasingCurve    # lazy: saves memory/startup until used
         super().__init__(host)
         self._host, self._ending, self._skipped = host, False, False
         self._op, self._last, self._sched = 1.0, -1, False
@@ -52963,11 +53201,11 @@ class _NczStartup(QWidget):
         self._cap.start(self._cap_ms)
 
     def eventFilter(self, obj, ev):
-        from PyQt6.QtCore import QEvent
+        from PyQt6.QtCore import QEvent    # lazy: saves memory/startup until used
         try:
             if obj is self._host and ev.type() == QEvent.Type.Resize:
                 self.setGeometry(self._host.rect())
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
         return False
 
@@ -53011,7 +53249,7 @@ class _NczStartup(QWidget):
             self._movie.stop()
         try:
             self._host.removeEventFilter(self)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
         self.hide()
         self.done.emit()
@@ -53019,7 +53257,7 @@ class _NczStartup(QWidget):
         try:
             self._host.setFocus()
             self._host.update()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def kill(self):
@@ -53031,7 +53269,7 @@ class _NczStartup(QWidget):
         _ncz_su_stop_sound()
         try:
             self._host.removeEventFilter(self)
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
         self.hide()
         self.deleteLater()
@@ -53080,7 +53318,7 @@ def _ncz_su_live(bp):
     try:
         if ov is not None and ov.isVisible() and not ov._ending:
             return ov
-    except RuntimeError:
+    except RuntimeError:    # expected: the widget or object may already be deleted
         pass
     return None
 
@@ -53091,7 +53329,7 @@ def _ncz_su_kill(bp):
     if ov is not None:
         try:
             ov.kill()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
 
@@ -53119,7 +53357,7 @@ def _ncz_su_enter(self):
         try:
             _ncz_su_start(self)
         except Exception:
-            import traceback
+            import traceback    # lazy: saves memory/startup until used
             traceback.print_exc()
 
 
@@ -53169,7 +53407,7 @@ _BigPicture.keyPressEvent = _ncz_su_key
 _BigPicture._act = _ncz_su_act
 
 
-# ---- Settings: choose / add / remove startup animations
+# ── Settings: choose / add / remove startup animations ──
 def _ncz_su_fill(combo):
     sel = str(load_launcher_settings().get("bp_startup_anim", "default") or "default")
     combo.blockSignals(True)
@@ -53238,7 +53476,7 @@ def _ncz_su_remove_custom(sp):
                 try:
                     if f:
                         os.remove(f)
-                except OSError:
+                except OSError:    # expected: cleanup that may already be done
                     pass
     _ncz_su_set("bp_startup_anim", "default")
     _ncz_su_fill(sp._ncz_su_combo)
@@ -53307,21 +53545,6 @@ def _ncz_su_add_settings(sp):
     sp._ncz_su_panel, sp._ncz_su_combo = panel, combo
 
 
-_ncz_su_init_o = AdaptiveApp.__init__
-
-
-def _ncz_su_init(self, *a, **k):
-    _ncz_su_init_o(self, *a, **k)
-    try:
-        sp = self.settings_page
-        _ncz_su_add_settings(sp)
-        _ncz_organize(sp)
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-
-AdaptiveApp.__init__ = _ncz_su_init
 
 _ncz_su_show_o = SettingsPage.showEvent
 
@@ -53332,7 +53555,7 @@ def _ncz_su_settings_show(self, e):
         if getattr(self, "_ncz_su_combo", None) is not None:
             _ncz_su_fill(self._ncz_su_combo)              # picks up files dropped into the folder
     except Exception:
-        pass
+        _log_exc("_ncz_su_settings_show")
 
 
 SettingsPage.showEvent = _ncz_su_settings_show

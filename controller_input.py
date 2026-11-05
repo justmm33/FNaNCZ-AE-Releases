@@ -13,6 +13,38 @@ import threading
 import time
 from ctypes import wintypes
 
+import re
+_LOG_EXC_LAST = {}      # where -> time of its last log line
+
+
+def _log_exc(where):
+    """For `except` blocks that used to be silent: appends the exception being handled, with its traceback, to
+    launcher.log (same folder and file as main.py's _ncz_log), at most once per place per 60 s. Never raises."""
+    try:
+        now = time.monotonic()
+        last = _LOG_EXC_LAST.get(where)
+        if last is not None and now - last < 60:
+            return
+        _LOG_EXC_LAST[where] = now
+        import traceback        # lazy: only needed once something went wrong
+        folder = (os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
+                  if sys.platform.startswith("win") else os.path.expanduser("~/.config/NCZ_Games_Launcher"))
+        profile = re.sub(r"[^A-Za-z0-9_-]", "_", os.environ.get("NCZ_PROFILE", "").strip())
+        if profile:
+            folder += "_" + profile
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "launcher.log")
+        try:
+            if os.path.getsize(path) > 1000000:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + where + ": " + traceback.format_exc() + "\n")
+    except Exception:
+        pass    # expected: logging must never break the launcher
+
+
 AVAILABLE = sys.platform.startswith("win")
 
 STICK_KEY_THRESHOLD = 0.40   # left stick deflection that counts as a press
@@ -76,7 +108,7 @@ def read_profile(path):
                 prof[k] = max(2, min(40, int(v)))
             elif k in DEFAULTS and v in ACTIONS:
                 prof[k] = v
-    except Exception:
+    except Exception:    # expected: file may not exist yet or be unreadable
         pass
     return prof
 
@@ -115,7 +147,7 @@ if AVAILABLE:
         try:
             _xi = ctypes.WinDLL(_n)
             break
-        except OSError:
+        except OSError:    # expected: this XInput version is not installed, try the next one
             pass
     AVAILABLE = _xi is not None
     if AVAILABLE:

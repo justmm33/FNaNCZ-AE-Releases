@@ -20,6 +20,37 @@ from PyQt6.QtCore import (Qt, QTimer, QVariantAnimation, QSequentialAnimationGro
 from PyQt6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPixmap, QPen, QPainterPath, QGuiApplication,
                          QFontDatabase, QMovie, QDesktopServices)
 
+_LOG_EXC_LAST = {}      # where -> time of its last log line
+
+
+def _log_exc(where):
+    """For `except` blocks that used to be silent: appends the exception being handled, with its traceback, to
+    launcher.log (same folder and file as main.py's _ncz_log), at most once per place per 60 s. Never raises."""
+    try:
+        now = time.monotonic()
+        last = _LOG_EXC_LAST.get(where)
+        if last is not None and now - last < 60:
+            return
+        _LOG_EXC_LAST[where] = now
+        import traceback        # lazy: only needed once something went wrong
+        folder = (os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
+                  if sys.platform.startswith("win") else os.path.expanduser("~/.config/NCZ_Games_Launcher"))
+        profile = re.sub(r"[^A-Za-z0-9_-]", "_", os.environ.get("NCZ_PROFILE", "").strip())
+        if profile:
+            folder += "_" + profile
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "launcher.log")
+        try:
+            if os.path.getsize(path) > 1000000:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + where + ": " + traceback.format_exc() + "\n")
+    except Exception:
+        pass    # expected: logging must never break the launcher
+
+
 W, H = 400, 110
 SCALE = 2 / 3   # overall size; 1.0 = original, lower = smaller
 SW, SH = int(W * SCALE), int(H * SCALE)
@@ -162,7 +193,7 @@ def _make_font(px, bold):
     return f
 
 
-# ---- Apple emoji drawn as pictures inside the toast text (the OS font would draw its own emoji otherwise)
+# ── Apple emoji drawn as pictures inside the toast text (the OS font would draw its own emoji otherwise)
 import re
 import urllib.request
 
@@ -220,7 +251,7 @@ def _emoji_fetch(code, path):
                         if blob[:4] == b"\x89PNG":
                             data = blob
                             break
-                    except Exception:
+                    except Exception:    # expected: offline or the server did not answer
                         pass
                 if data:
                     break
@@ -233,7 +264,7 @@ def _emoji_fetch(code, path):
                         if blob[:4] == b"\x89PNG":
                             data = blob
                             break
-                    except Exception:
+                    except Exception:    # expected: offline or the server did not answer
                         pass
             if data:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -319,61 +350,24 @@ def _draw_text(p, rect, text, flags=Qt.AlignmentFlag.AlignVCenter):
 ICON_D = 46                       # size of the little icon on the right (unscaled toast units)
 ICON_PAD = 14                     # gap to the toast's right edge
 ICON_RESERVE = ICON_D + ICON_PAD + 6      # text stops this far from the right edge
-_icon_cache = {"pm": None, "key": None}
-_icon_provider = None             # launcher side: callable returning the launcher's current icon path
-_icon_path = ""                   # helper side: the path the launcher sent along with the toast
-
-
-def set_icon_provider(fn):
-    """Launcher side: fn() returns the path of the launcher's CURRENT icon (it changes with the accent colour)."""
-    global _icon_provider
-    _icon_provider = fn
-
-
-def set_icon_path(path):
-    """Helper process side: the launcher's current icon path, sent along with each toast."""
-    global _icon_path
-    _icon_path = str(path or "")
-
-
-def _current_icon_path():
-    """The launcher's current icon (follows accent recolouring), or "" when unknown."""
-    if _icon_provider is not None:
-        try:
-            p = _icon_provider()
-            if p:
-                return str(p)
-        except Exception:
-            pass
-    return _icon_path
+_icon_cache = {"pm": None, "tried": False}
 
 
 def _toast_icon():
-    """The launcher's current icon as a square, cropped to the middle (falls back to assets/icon.png)."""
-    cands = []
-    cur = _current_icon_path()
-    if cur:
-        cands.append(cur)
-    cands += [os.path.join(d, "icon.png") for d in _assets_dirs()]
-    for path in cands:
-        try:
-            if not os.path.isfile(path):
-                continue
-            key = (path, os.path.getmtime(path))
-        except OSError:
-            continue
-        if _icon_cache["key"] == key:
-            return _icon_cache["pm"]
-        pm = QPixmap(path)
-        if pm.isNull():
-            continue
-        big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                        Qt.TransformationMode.SmoothTransformation)
-        _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
-                                     ICON_D * 2, ICON_D * 2)
-        _icon_cache["key"] = key
-        return _icon_cache["pm"]
-    return None
+    """assets/icon.png as a square, cropped to the middle (None when the file isn't there)."""
+    if not _icon_cache["tried"]:
+        _icon_cache["tried"] = True
+        for d in _assets_dirs():
+            path = os.path.join(d, "icon.png")
+            if os.path.isfile(path):
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                    Qt.TransformationMode.SmoothTransformation)
+                    _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
+                                                 ICON_D * 2, ICON_D * 2)
+                    break
+    return _icon_cache["pm"]
 
 
 def _draw_icon(p, cy):
@@ -490,7 +484,7 @@ class PlayingToast(QWidget):
             t = getattr(self, "_emoji_timer", None)
             if t is not None:
                 t.stop()
-        except RuntimeError:
+        except RuntimeError:    # expected: the widget or object may already be deleted
             pass
 
     def dismiss(self):
@@ -658,7 +652,7 @@ def _accept_invite(link):
             hook(link)
             return
         except Exception:
-            pass
+            _log_exc("_accept_invite")
     QDesktopServices.openUrl(QUrl(link))
 
 
@@ -666,10 +660,6 @@ class InviteToast(PlayingToast):
     """'<friend> invited you to play <game>' with the game's cover and clickable Accept / Dismiss buttons.
     Accept opens the Steam join link, exactly like accepting an invite in Steam. Unlike the other toasts this one takes
     mouse clicks (it still never takes keyboard focus away from the game)."""
-
-    SUBTITLE = "invited you to play"
-    ACCEPT_TEXT, DISMISS_TEXT = "Accept", "Dismiss"
-    COVER_LETTER = ""
 
     def __init__(self, user, game, link, avatar_path=None, cover_path=None, duration_ms=20000):
         super().__init__(user, game, avatar_path, duration_ms=duration_ms, prefix="invited you to play ")
@@ -685,7 +675,7 @@ class InviteToast(PlayingToast):
         self._dismiss_r = QRectF(tx + 138, 96, 119, 38)
         self._hover = None
 
-    # ---- clicks (the toast is drawn scaled and slid sideways, so map the mouse back to toast coordinates)
+    # ── clicks (the toast is drawn scaled and slid sideways, so map the mouse back to toast coordinates)
     def _which(self, e):
         pt = QPointF((e.position().x() - self._off) / SCALE, e.position().y() / SCALE)
         if self._accept_r.contains(pt):
@@ -711,21 +701,11 @@ class InviteToast(PlayingToast):
         if getattr(self, "_leaving", False):
             return
         w = self._which(e)
-        if w == "accept":
-            if self._do_accept():
-                self.slide_out()
-        elif w == "dismiss":
-            self._do_dismiss()
+        if w == "accept" and self.link:
+            _accept_invite(self.link)
             self.slide_out()
-
-    def _do_accept(self):
-        if not self.link:
-            return False
-        _accept_invite(self.link)
-        return True
-
-    def _do_dismiss(self):
-        pass
+        elif w == "dismiss":
+            self.slide_out()
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -757,7 +737,7 @@ class InviteToast(PlayingToast):
             p.fillRect(r, AVATAR_COLOR)
             p.setPen(QColor("white") if AVATAR_COLOR.lightnessF() < 0.6 else QColor("#111111"))
             p.setFont(_make_font(40, True))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.COVER_LETTER or self.game[:1] or "?").upper())
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.game[:1] or "?").upper())
         p.restore()
 
         # sender: small avatar + name, then "invited you to play", then the game
@@ -783,14 +763,14 @@ class InviteToast(PlayingToast):
         _draw_text(p, QRectF(nx, 10, W - nx - 12 - ICON_RESERVE, 30), self.user)
         p.setPen(TEXT_COLOR)
         p.setFont(_make_font(15, False))
-        p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, self.SUBTITLE)
+        p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, "invited you to play")
         p.setPen(GAME_COLOR)
         p.setFont(_fit_font(self.game, 21, full_w))
         _draw_text(p, QRectF(tx, 64, full_w, 28), self.game)
 
         # buttons
-        for rect, text, primary, key in ((self._accept_r, self.ACCEPT_TEXT, True, "accept"),
-                                         (self._dismiss_r, self.DISMISS_TEXT, False, "dismiss")):
+        for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
+                                         (self._dismiss_r, "Dismiss", False, "dismiss")):
             hot = self._hover == key
             bp = QPainterPath()
             bp.addRoundedRect(rect, 8, 8)
@@ -804,128 +784,6 @@ class InviteToast(PlayingToast):
             p.setPen(txt)
             p.setFont(_make_font(16, True))
             p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-
-
-# ---- chess challenges: toast with Accept / Decline. main.py sets the two hooks (gid, opp_uid, user). In the XWayland
-# helper process there are no hooks, so the click is sent back to the launcher as a tagged line on the helper's stdout.
-chess_accept_hook = None
-chess_decline_hook = None
-_IS_HELPER = False
-_ACTION_TAG = "@@ncz-action@@ "
-
-
-def _emit_action(d):
-    try:
-        sys.stdout.write(_ACTION_TAG + json.dumps(d) + "\n")
-        sys.stdout.flush()
-    except Exception:
-        pass
-
-
-def _chess_action(kind, gid, opp_uid, user):
-    hook = chess_accept_hook if kind == "accept" else chess_decline_hook
-    if hook is not None:
-        try:
-            hook(gid, opp_uid, user)
-        except Exception:
-            pass
-        return
-    if _IS_HELPER:
-        _emit_action({"action": "chess_" + kind, "gid": gid, "opp_uid": opp_uid, "user": user})
-
-
-class ChessInviteToast(InviteToast):
-    """'<friend> challenged you to chess' with the time control and clickable Accept / Decline buttons."""
-    SUBTITLE = "challenged you to chess"
-    ACCEPT_TEXT, DISMISS_TEXT = "Accept", "Decline"
-    COVER_LETTER = "\u265F"
-
-    def __init__(self, user, tc, gid, opp_uid, avatar_path=None, cover_path=None, duration_ms=30000):
-        super().__init__(user, tc or "Chess", "", avatar_path, cover_path, duration_ms)
-        self.prefix = "challenged you to chess"
-        self.gid, self.opp_uid = gid, opp_uid
-
-    def _do_accept(self):
-        _chess_action("accept", self.gid, self.opp_uid, self.user)
-        return True
-
-    def _do_dismiss(self):
-        _chess_action("decline", self.gid, self.opp_uid, self.user)
-
-
-class _ActionBridge(QObject):
-    got = pyqtSignal(dict)
-
-    @pyqtSlot(dict)
-    def on_got(self, d):
-        a = str(d.get("action", ""))
-        if a in ("chess_accept", "chess_decline"):
-            _chess_action(a[6:], str(d.get("gid", "")), str(d.get("opp_uid", "")), str(d.get("user", "")))
-
-
-_action_bridge_obj = None
-
-
-def _action_bridge():
-    """Created on the GUI thread (first call comes from there) so signals emitted by worker threads arrive on it."""
-    global _action_bridge_obj
-    if _action_bridge_obj is None:
-        b = _ActionBridge()
-        b.got.connect(b.on_got)
-        _action_bridge_obj = b
-    return _action_bridge_obj
-
-
-def _helper_reader(proc, logpath, bridge):
-    """Reads the helper's stdout: tagged lines are button clicks, everything else goes to its log file."""
-    try:
-        with open(logpath, "a", encoding="utf-8", errors="replace") as log:
-            for line in proc.stdout:
-                if line.startswith(_ACTION_TAG):
-                    try:
-                        bridge.got.emit(json.loads(line[len(_ACTION_TAG):]))
-                    except ValueError:
-                        pass
-                else:
-                    log.write(line)
-                    log.flush()
-    except (OSError, ValueError):
-        pass
-
-
-def _linux_notify_chess(user, tc, chess, icon=None):
-    """Wayland fallback: a libnotify notification with Accept / Decline actions (needs notify-send with --action)."""
-    exe = shutil.which("notify-send")
-    if not exe:
-        return False
-    body = html.escape(f"challenged you to chess ({tc})" if tc else "challenged you to chess")
-    try:
-        helptext = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=3)
-        has_actions = "--action" in (helptext.stdout + helptext.stderr)
-    except Exception:
-        has_actions = False
-    cmd = [exe, "-a", "NCZ Games Launcher", "-t", "30000", "-i", icon or "applications-games"]
-    if has_actions:
-        cmd += ["-A", "accept=Accept", "-A", "decline=Decline"]
-    cmd += [str(user), body]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if has_actions else subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, text=True)
-    except OSError:
-        return False
-    if has_actions:
-        bridge = _action_bridge()
-
-        def wait():
-            try:
-                out = (proc.communicate(timeout=60)[0] or "").strip()
-            except Exception:
-                return
-            if out in ("accept", "decline"):
-                bridge.got.emit({"action": "chess_" + out, "gid": chess.get("gid", ""),
-                                 "opp_uid": chess.get("opp_uid", ""), "user": str(user)})
-        threading.Thread(target=wait, daemon=True).start()
-    return True
 
 
 def _linux_notify(user, game, prefix, icon=None, link=None):
@@ -961,11 +819,11 @@ def _linux_notify(user, game, prefix, icon=None, link=None):
                             QTimer.singleShot(0, lambda l=str(link): invite_accept_hook(l))   # back on the GUI thread
                             return
                         except Exception:
-                            pass
+                            _log_exc("wait")
                     try:
                         subprocess.Popen(["xdg-open", str(link)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     except OSError:
-                        pass
+                        _log_exc("wait")
             threading.Thread(target=wait, daemon=True).start()
             return True
     try:
@@ -987,7 +845,7 @@ class OverlayManager:
     def set_mode(self, mode):
         self.mode = mode if mode in ("off", "window", "inject") else "window"
 
-    # ---- Linux / Wayland: a native Wayland window can't be positioned or hidden from the taskbar, so the toasts
+    # ── Linux / Wayland: a native Wayland window can't be positioned or hidden from the taskbar, so the toasts
     # are drawn by a small helper process running through XWayland (see run_server below).
     def _wants_helper(self):
         return (sys.platform.startswith("linux") and not self._helper_failed
@@ -999,14 +857,12 @@ class OverlayManager:
         env.pop("QT_WAYLAND_DISABLE_WINDOWDECORATION", None)
         cmd = ([sys.executable, "--ncz-overlay-server"] if getattr(sys, "frozen", False)
                else [sys.executable, os.path.abspath(__file__), "--server"])
-        logpath = os.path.join(tempfile.gettempdir(), "ncz_overlay_helper.log")
-        log = open(logpath, "w")
+        log = open(os.path.join(tempfile.gettempdir(), "ncz_overlay_helper.log"), "w")
         try:
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=log,
                                           env=env, text=True, bufsize=1, start_new_session=True)
         finally:
             log.close()                       # the child keeps its own copy of the handle
-        threading.Thread(target=_helper_reader, args=(self._proc, logpath, _action_bridge()), daemon=True).start()
         self._pending = []
         QTimer.singleShot(2500, self._check_helper)
 
@@ -1019,10 +875,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix, image, link, badge, plain, chess in pending:
-            self._show_local(user, game, avatar, prefix, image, link, badge, plain, chess)
+        for user, game, avatar, prefix, image, link, badge, plain in pending:
+            self._show_local(user, game, avatar, prefix, image, link, badge, plain)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False, chess=None):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -1036,12 +892,12 @@ class OverlayManager:
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
-                                         "badge": badge or "", "plain": bool(plain), "chess": chess or {},
+                                         "badge": badge or "", "plain": bool(plain),
                                          "accent": _accent_hex, "light": _light, "sunset": _sunset,
-                                         "icon": _current_icon_path(), "emoji_dir": emoji_dir}) + "\n")
+                                         "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain, chess))
+                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain))
             return True
         except (OSError, ValueError):
             self._proc = None
@@ -1076,32 +932,17 @@ class OverlayManager:
             return
         self._show_local(user, game, avatar_path, prefix, image, link)
 
-    def notify_chess_invite(self, user, tc, gid, opp_uid, avatar_path=None, image=None):
-        """'<user> challenged you to chess (<tc>)' with Accept / Decline buttons. image: path of the chess cover."""
-        if self.mode == "off":
-            return
-        chess = {"gid": gid, "opp_uid": opp_uid}
-        prefix = "challenged you to chess"
-        if self._wants_helper() and self._send_to_helper(user, tc, avatar_path, prefix, image, None, None, False, chess):
-            return
-        self._show_local(user, tc, avatar_path, prefix, image, None, None, False, chess)
-
-    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False, chess=None):
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
-            if chess:
-                if _linux_notify_chess(user, game, chess, image or avatar_path):
-                    return
-            elif _linux_notify(user, game, prefix, image, link):
+            if _linux_notify(user, game, prefix, image, link):
                 return
         # "inject" backend is a later phase; use the window backend for now.
         live = [x for x in self._toasts if x.isVisible()]
         while len(live) >= MAX_STACK:          # keep the stack on screen: drop the oldest
             live.pop(0).dismiss()
-        if chess:
-            t = ChessInviteToast(user, game, chess.get("gid", ""), chess.get("opp_uid", ""), avatar_path, image)
-        elif link:
+        if link:
             t = InviteToast(user, game, link, avatar_path, image)
         else:
             t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge, plain=plain)
@@ -1126,7 +967,7 @@ class OverlayManager:
 
 overlay = OverlayManager()
 
-# ---------------------------------------------------------------- injection backend (Windows, D3D11)
+# ── injection backend (Windows, D3D11) ──
 def _game_pids_linux(exe_name):
     """PIDs of the Wine process(es) running <exe_name>, best match first. Under Proton several processes mention the
     exe: `proton run <exe>` (python), the 32-bit `steam.exe` wrapper (the exe's unix path is one of its arguments) and
@@ -1171,7 +1012,7 @@ def _pid_alive(name, pid):
 def _find_pid(exe_name):
     if sys.platform.startswith("linux"):
         return _find_pid_linux(exe_name)
-    import subprocess
+    import subprocess    # lazy: saves memory/startup until used
     try:
         out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/FO", "CSV", "/NH"],
                              capture_output=True, text=True, timeout=5,
@@ -1181,14 +1022,14 @@ def _find_pid(exe_name):
             if len(parts) > 1 and parts[0].lower() == exe_name.lower():
                 return int(parts[1])
     except Exception:
-        pass
+        _log_exc("_find_pid")
     return None
 
 
 def _inject_dll(pid, dll_path):
     """Classic LoadLibraryW remote-thread injection. DLL bitness must match the game's."""
-    import ctypes
-    from ctypes import wintypes
+    import ctypes    # lazy: saves memory/startup until used
+    from ctypes import wintypes    # lazy: saves memory/startup until used
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     k.OpenProcess.restype = wintypes.HANDLE
     k.VirtualAllocEx.restype = ctypes.c_void_p
@@ -1224,7 +1065,6 @@ _injected = {}   # exe name -> pid of games that already have the overlay DLL
 
 def inject_overlay(exe_path, dll_path):
     """Injects dll_path into the running game (once per process). True if the game has the overlay."""
-    import os
     if sys.platform.startswith("linux"):
         return _inject_linux(exe_path)
     if not sys.platform.startswith("win") or not os.path.exists(dll_path):
@@ -1241,7 +1081,7 @@ def inject_overlay(exe_path, dll_path):
     return False
 
 
-# ---------------------------------------------------------------- Wine / Proton (Linux)
+# ── Wine / Proton (Linux) ──
 # The DLL can't be pushed in with CreateRemoteThread from a native Linux process, so the launcher registers it as an
 # AppInit_DLL in the game's prefix (see _overlay_prepare_wine in main.py) and Wine loads it into the game itself.
 # This side finds the game, confirms the DLL really got loaded and works out where the DLL's temp files live.
@@ -1254,7 +1094,7 @@ def register_wine_prefix(exe_path, prefix):
 
 
 def _wine_temp_dir(prefix):
-    import glob
+    import glob    # lazy: saves memory/startup until used
     cands = [p for p in glob.glob(os.path.join(prefix, "drive_c", "users", "*", "Temp"))
              if os.path.basename(os.path.dirname(p)).lower() != "public"]
     cands.sort(key=lambda p: os.path.basename(os.path.dirname(p)) != "steamuser")   # Proton's user comes first
@@ -1333,7 +1173,7 @@ def diagnose_linux(exe_path):
 def injected_temp_dirs():
     """Folders where the overlay DLL reads/writes its ncz_*.txt files: %TEMP% on Windows, the Temp folder of each
     Wine prefix with an injected game on Linux."""
-    import tempfile
+    import tempfile    # lazy: saves memory/startup until used
     if sys.platform.startswith("linux"):
         dirs = []
         for n in list(_injected):
@@ -1351,7 +1191,6 @@ _send_running = False
 
 def _send_worker():
     global _send_running
-    import os, time, tempfile
     one = lambda s: " ".join(str(s).split())
     while _send_q:
         time.sleep(0.15)                       # notifications that arrive together go out as one batch
@@ -1365,7 +1204,7 @@ def _send_worker():
                 with open(path + ".tmp", "w", encoding="utf-8") as f:
                     f.write(f"{time.time_ns()}\n{body}")      # line 1 changes -> the DLL shows every toast in the file
                 os.replace(path + ".tmp", path)
-            except OSError:
+            except OSError:    # expected: cleanup that may already be done
                 pass
         time.sleep(0.7)                        # the DLL polls every 0.5 s: give each batch its own tick
     _send_running = False
@@ -1374,7 +1213,6 @@ def _send_worker():
 def send_to_injected(user, game, prefix="is playing "):
     """Queues a toast for the injected DLL. True if a game with the overlay is still running."""
     global _send_running
-    import threading
     alive = {n: p for n, p in _injected.items() if _pid_alive(n, p)}
     _injected.clear()
     _injected.update(alive)
@@ -1403,7 +1241,7 @@ def has_injected():
     return bool(alive)
 
 
-# ---------------------------------------------------------------- XWayland helper process (Linux)
+# ── XWayland helper process (Linux) ──
 class _ServerBridge(QObject):
     got = pyqtSignal(dict)
     done = pyqtSignal()
@@ -1414,17 +1252,10 @@ class _ServerBridge(QObject):
             set_emoji_dir(d["emoji_dir"])
         if d.get("accent"):
             set_accent(str(d["accent"]))
-        if d.get("icon"):
-            set_icon_path(d["icon"])
         if "sunset" in d:
             set_sunset(bool(d["sunset"]))
         if "light" in d:
             set_light(bool(d["light"]))
-        ch = d.get("chess")
-        if isinstance(ch, dict) and ch.get("gid"):
-            overlay.notify_chess_invite(str(d.get("user", "")), str(d.get("game", "")), str(ch["gid"]),
-                                        str(ch.get("opp_uid", "")), d.get("avatar") or None, d.get("image") or None)
-            return
         if d.get("link"):
             overlay.notify_invite(str(d.get("user", "")), str(d.get("game", "")), str(d["link"]),
                                   d.get("avatar") or None, d.get("image") or None)
@@ -1441,8 +1272,6 @@ def run_server():
     """Helper process: draws the toasts the launcher sends as JSON lines on stdin, using the X11 (xcb) platform so
     the windows can be placed exactly, stay out of the taskbar and sit above XWayland (Proton) games.
     Exits when the launcher closes the pipe."""
-    global _IS_HELPER
-    _IS_HELPER = True
     os.environ["QT_QPA_PLATFORM"] = "xcb"
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
@@ -1454,7 +1283,7 @@ def run_server():
         for line in sys.stdin:
             try:
                 bridge.got.emit(json.loads(line))
-            except ValueError:
+            except ValueError:    # expected: missing or odd value: the default is fine
                 pass
         bridge.done.emit()
 

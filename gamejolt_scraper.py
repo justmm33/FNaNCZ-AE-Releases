@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
+"""Game Jolt fan-game scraper (command line).
+
+Opens Game Jolt with Playwright, collects the most popular games for each tag and writes them to fan_games.csv; its
+prints are its progress output. main.py downloads this file next to itself and runs it from the Fan Games
+"Scrape Games" button.
+"""
 import argparse
 import csv
-import json
 import re
 import sys
 import time

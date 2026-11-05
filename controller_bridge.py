@@ -24,7 +24,7 @@ _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 IDLE_TIMEOUT = 30   # seconds with no frame at all (not even a pong) before a phone is treated as dead
 PING_EVERY = 5      # server -> phone ping interval; an idle (untouched) controller must not look "silent"
 
-# ------------------------------------------------------------------ logging
+# ── logging ──
 # Every connection step is written to the console, to controller_bridge.log (next to this file) and to an
 # in-memory buffer (get_log()) so the launcher can show it.
 _LOG_LINES = collections.deque(maxlen=500)
@@ -42,14 +42,31 @@ def log(msg, *args):
         try:
             print(line, flush=True)
         except Exception:
-            pass
+            pass    # expected: no console to print to (pythonw)
         try:
             if os.path.exists(_LOG_FILE) and os.path.getsize(_LOG_FILE) > _LOG_MAX_BYTES:
                 os.replace(_LOG_FILE, _LOG_FILE + ".old")
             with open(_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
+
+
+_LOG_EXC_LAST = {}      # where -> time of its last log line
+
+
+def _log_exc(where):
+    """For `except` blocks that used to be silent: logs the exception being handled through log(), at most once
+    per place per 60 s. Never raises."""
+    try:
+        now = time.monotonic()
+        last = _LOG_EXC_LAST.get(where)
+        if last is not None and now - last < 60:
+            return
+        _LOG_EXC_LAST[where] = now
+        log("%s: %s", where, traceback.format_exc())
+    except Exception:
+        pass    # expected: logging must never break the bridge
 
 
 def get_log():
@@ -70,7 +87,7 @@ def log_path():
 class _WinPad:
     def __init__(self):
         import vgamepad as vg
-        self.vg = vg
+        self.vg = vg    # lazy: saves memory/startup until used
         self.pad = vg.VX360Gamepad()
         B = vg.XUSB_BUTTON
         self.map = {0: B.XUSB_GAMEPAD_A, 1: B.XUSB_GAMEPAD_B, 2: B.XUSB_GAMEPAD_X, 3: B.XUSB_GAMEPAD_Y,
@@ -102,7 +119,7 @@ class _WinPad:
         try:
             self.update(0, [0, 0, 0, 0], 0, 0)
         except Exception:
-            pass
+            _log_exc("close")
 
     def destroy(self):
         """Really unplug the virtual pad (only when the bridge is stopped)."""
@@ -113,7 +130,7 @@ class _WinPad:
 class _LinuxPad:
     def __init__(self):
         from evdev import UInput, AbsInfo, ecodes as e
-        self.e = e
+        self.e = e    # lazy: saves memory/startup until used
         stick = AbsInfo(0, -32768, 32767, 16, 128, 0)
         trig = AbsInfo(0, 0, 255, 0, 0, 0)
         hat = AbsInfo(0, -1, 1, 0, 0, 0)
@@ -144,20 +161,20 @@ class _LinuxPad:
         try:
             self.update(0, [0, 0, 0, 0], 0, 0)
         except Exception:
-            pass
+            _log_exc("close")
 
     def destroy(self):
         self.close()
         try:
             self.ui.close()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
 
 
 def _make_pad():
     import sys
     return _WinPad() if sys.platform.startswith("win") else _LinuxPad()
-
+    # lazy: saves memory/startup until used
 
 # ------------------------------------------------------------------ minimal WebSocket
 def _recv_exact(sock, n):
@@ -290,7 +307,7 @@ class ControllerBridge:
         self.running = False
         try:
             self.srv.close()
-        except Exception:
+        except Exception:    # expected: cleanup that may already be done
             pass
         with self.pad_lock:
             act, self.active_sock = self.active_sock, None
@@ -298,7 +315,7 @@ class ControllerBridge:
         if act is not None:
             try:
                 act.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
         if pad is not None:
             pad.destroy()
@@ -385,11 +402,11 @@ class ControllerBridge:
                             log("%s: replacing the previous phone connection (same pad is reused)", who)
                             try:
                                 old.shutdown(socket.SHUT_RDWR)
-                            except Exception:
+                            except Exception:    # expected: cleanup that may already be done
                                 pass
                             try:
                                 old.close()
-                            except Exception:
+                            except Exception:    # expected: cleanup that may already be done
                                 pass
                         self.client = addr[0]
                         send(1, b'{"t":"ok"}')
@@ -424,7 +441,7 @@ class ControllerBridge:
                 pad.close()             # release all buttons/sticks, but the virtual pad stays plugged in
             try:
                 sock.close()
-            except Exception:
+            except Exception:    # expected: cleanup that may already be done
                 pass
             log("%s: disconnected", who)
 
