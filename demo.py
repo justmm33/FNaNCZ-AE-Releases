@@ -38,7 +38,8 @@ import secrets
 import webbrowser
 import http.server
 
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
+from PyQt6.QtCore import (Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation,
+                          QBuffer, QIODevice)
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
                          QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption, QImage)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect,
@@ -99,6 +100,12 @@ OAUTH_GITHUB_CLIENT_ID = "Ov23li5aW7haTC7gA6Y5"
 OAUTH_GITHUB_CLIENT_SECRET = "5107fd92abb41b040f1dc894e446252dc414ac3f"     # GitHub's code exchange needs it
 OAUTH_TIMEOUT_S = 180               # how long to wait for the browser to finish
 
+# Discord sign-in. Firebase has no Discord provider, so the Discord token is sent to a small function you host
+# (discord_auth/index.js) that checks it with Discord and answers with a Firebase custom token.
+DISCORD_OAUTH_CLIENT_SECRET = "AY5wSMsZDi_TavthlAa-wNAplYub6v_W"     # Developer Portal > OAuth2 > Client Secret. Leave empty if the app is set to "Public Client"
+DISCORD_REDIRECT_PORT = 53682        # Discord needs the exact redirect, so this port is fixed: add http://localhost:53682 under OAuth2 > Redirects
+DISCORD_AUTH_ENDPOINT = "https://ncz-discord-auth.mm33mods.workers.dev"           # the deployed function's URL, e.g. https://europe-west1-<project>.cloudfunctions.net/discordAuth
+
 user_email = ""      # set to the typed email when Sign in / Create Account is clicked
 
 if getattr(sys, "frozen", False):
@@ -112,6 +119,32 @@ ICON_JPG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoH
 
 
 # ------------------------------------------------------------------------------------------------ local files
+# ---- themes: the same ones main.py has (built-in themes, account themes, the user's own custom themes) ----
+# main.py stores the choice in launcher.json: ui_theme_choice (new / sunset / classic / legacy), accent_color (Classic),
+# ui_theme (an account theme or "custom_<id>") and custom_themes ({id: {name, layout, colors, icon, gradient}}).
+# Nothing is written here; this only reads, with the same rules main.py uses to decide what is allowed.
+_THEME_ADMIN_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
+_CT_UNLOCK_SECONDS = 8 * 3600
+_CT_MAX_THEMES = 20
+_CT_KEYS = ("bg", "sidebar", "panel", "text", "subtext", "accent", "button", "border")
+_CT_HEX = re.compile(r"#[0-9a-fA-F]{6}")
+_CT_ID = re.compile(r"[0-9a-f]{4,12}")
+_CT_BASE = {
+    "classic": dict(bg="#0d0d0f", sidebar="#050506", panel="#151518", text="#f2f2f4", subtext="#8d8d96", accent="#a666ff", button="#222226", border="#26262b"),
+    "modern":  dict(bg="#080808", sidebar="#000000", panel="#1a1a1a", text="#ffffff", subtext="#aaaaaa", accent="#fcfcfc", button="#222222", border="#2e2e2e"),
+}
+# Account themes (same colours as main.py's _MM33_THEME / _OMAR_V4_THEME / _CUSTOM_THEME)
+_ACCOUNT_THEMES = {
+    "kablooey": dict(uids={"cXU0pEFo4uaOVRT1s0cx8VQ1jH53"}, layout="modern", icon="icon_kablooey.png",
+                     pal=dict(bg="#1e2023", sidebar="#101113", panel="#2a2c30", accent="#4a6fc0")),
+    "mm33": dict(uids={"XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, layout="modern", icon="icon_mm33.png",
+                 pal=dict(bg="#102f31", sidebar="#08191b", panel="#1b3f41", accent="#c98420")),
+    "omar_v4": dict(uids={"ojTnHLIVMuNpPPfL35FQIancCdz1", "XcqSn5Zvhsf1npoNl3FNG1bKpU63"}, layout="classic", icon="icon-v4.png",
+                    default_uids={"ojTnHLIVMuNpPPfL35FQIancCdz1"},
+                    pal=dict(bg="#0c0a14", sidebar="#06050b", panel="#151222", accent="#8a63e8")),
+}
+
+
 def settings_dir():
     if sys.platform.startswith("win"):
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
@@ -119,23 +152,129 @@ def settings_dir():
     return os.path.expanduser("~/.config/NCZ_Games_Launcher")
 
 
-def _read_theme_choice():
-    """(theme, accent) from the launcher's settings: theme is new / sunset / classic / legacy (default new)."""
+def _read_json_file(name):
     try:
-        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+        with open(os.path.join(settings_dir(), name), encoding="utf-8") as f:
             d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except Exception:
-        d = {}
-    if not isinstance(d, dict):
-        d = {}
-    c = d.get("ui_theme_choice")
-    acc = d.get("accent_color")
-    return (c if c in ("sunset", "classic", "legacy") else "new"), (acc if isinstance(acc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", acc) else "#a666ff")
+        return {}
 
-THEME_NAME, _THEME_ACCENT = _read_theme_choice()
+
+def _saved_uid():
+    # read straight from account.json (load_account() is defined further down)
+    return str(_read_json_file("account.json").get("uid") or "")
+
+
+def _ct_lum(color):
+    c = QColor(color)
+    return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255.0
+
+
+def _ct_mix(a, b, t):
+    ca, cb = QColor(a), QColor(b)
+    return QColor(int(round(ca.red() + (cb.red() - ca.red()) * t)),
+                  int(round(ca.green() + (cb.green() - ca.green()) * t)),
+                  int(round(ca.blue() + (cb.blue() - ca.blue()) * t))).name()
+
+
+def _ct_clean(ent):
+    """A saved custom theme checked and completed (same as main.py), or None if it isn't usable."""
+    if not isinstance(ent, dict):
+        return None
+    layout = ent.get("layout") if ent.get("layout") in ("classic", "modern") else "modern"
+    src = ent.get("colors") if isinstance(ent.get("colors"), dict) else {}
+    base = _CT_BASE[layout]
+    colors = {k: (src[k].lower() if isinstance(src.get(k), str) and _CT_HEX.fullmatch(src[k]) else base[k]) for k in _CT_KEYS}
+    return {"layout": layout, "colors": colors, "icon": "user" if ent.get("icon") == "user" else ""}
+
+
+def _ct_unlocked(uid):
+    """Custom themes unlock after 8 hours on the launcher, or by an admin override (usage.json, written by main.py)."""
+    if not uid:
+        return False
+    if uid in _THEME_ADMIN_UIDS:
+        return True
+    usage = _read_json_file("usage.json")
+    ov = (usage.get("override") or {}).get(uid) if isinstance(usage.get("override"), dict) else None
+    if isinstance(ov, bool):
+        return ov
+    try:
+        return int((usage.get("seconds") or {}).get(uid, 0)) >= _CT_UNLOCK_SECONDS
+    except Exception:
+        return False
+
+
+def _resolve_theme():
+    """-> dict(style, accent, key, tid, palette, layout, icon). style = new / sunset / classic / legacy (the sign-in
+    window's look); palette is None for the built-in themes, else the 4 colours the window is built from."""
+    d = _read_json_file("launcher.json")
+    uid = _saved_uid()
+    acc = d.get("accent_color")
+    accent = acc if isinstance(acc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", acc) else "#a666ff"
+    choice = d.get("ui_theme_choice")
+    choice = choice if choice in ("sunset", "classic", "legacy") else "new"
+
+    customs = {}
+    raw = d.get("custom_themes")
+    if isinstance(raw, dict):
+        for tid, ent in list(raw.items())[:_CT_MAX_THEMES]:
+            c = _ct_clean(ent)
+            if c and _CT_ID.fullmatch(str(tid)):
+                customs["custom_" + str(tid)] = c
+
+    chosen = d.get("ui_theme")
+    if uid:                                   # an account theme made for this account becomes its default, once
+        done = d.get("ui_defaults_applied")
+        done = list(done) if isinstance(done, (list, tuple)) else []
+        todo = [k for k, t in _ACCOUNT_THEMES.items() if uid in t.get("default_uids", ()) and k not in done]
+        if todo:
+            chosen = todo[-1]
+
+    def allowed(key):
+        if key in customs:
+            return uid in _THEME_ADMIN_UIDS or _ct_unlocked(uid)
+        t = _ACCOUNT_THEMES.get(key)
+        return bool(t) and bool(uid) and (uid in _THEME_ADMIN_UIDS or uid in t["uids"])
+
+    key = chosen if isinstance(chosen, str) and allowed(chosen) else ""
+    entry = customs.get(key) or _ACCOUNT_THEMES.get(key) or {}
+    layout = entry.get("layout", "")
+    # same rule as main.py: a Classic-layout theme gives the Classic look; any other one only counts on the "new" style
+    style = "classic" if (key and layout == "classic") else choice
+    if key and style != "new" and layout != "classic":
+        key, entry = "", {}
+    pal = None
+    if key:
+        pal = dict(entry["colors"]) if key in customs else dict(entry["pal"])
+    return dict(style=style, accent=accent, key=key, tid=key[7:] if key in customs else "", palette=pal,
+                layout=layout, icon=entry.get("icon", ""), custom=key in customs)
+
+
+_THEME_STATE = _resolve_theme()
+THEME_NAME = _THEME_STATE["style"]
+_THEME_ACCENT = _THEME_STATE["accent"]
+
+
+def _theme_from_palette(pal, layout):
+    """Sign-in window colours from a theme's own colours: its sidebar/background at the top, fading into its accent
+    at the bottom. A light theme still gets a dark window (the text on it is white)."""
+    acc = QColor(pal["accent"])
+    base = pal["bg"] if _ct_lum(pal["bg"]) < 0.5 else "#0d0d0f"
+    top = pal.get("sidebar") if _ct_lum(pal.get("sidebar", "#000000")) < 0.5 else "#000000"
+    stops = [(0.0, top), (0.45, base), (0.70, _ct_mix(base, acc, 0.22)), (0.88, _ct_mix(base, acc, 0.42)),
+             (1.0, _ct_mix(base, acc, 0.62))]
+    r, g, b = acc.red(), acc.green(), acc.blue()
+    flat = layout == "classic"
+    return dict(bg=[(p, QColor(c).getRgb()[:3]) for p, c in stops],
+                mist=(r, g, b), halo=(r, g, b),
+                btn=(acc, acc) if flat else (acc.lighter(112), acc.darker(118)),
+                btn_text=QColor(20, 20, 20) if _ct_lum(acc) > 0.6 else QColor(255, 255, 255),
+                bar0=acc.darker(125), bar1=acc.lighter(120), glow=(r, g, b))
+
 
 def _make_theme(name, accent_hex):
-    """Colours of the sign-in / download window for each launcher theme."""
+    """Colours of the sign-in / download window for each built-in launcher theme."""
     if name == "sunset":
         acc = QColor("#ff7a2f")
         return dict(bg=[(0.0, (15, 8, 38)), (0.45, (26, 13, 60)), (0.70, (54, 22, 92)), (0.88, (96, 38, 120)), (1.0, (140, 58, 130))],
@@ -157,7 +296,11 @@ def _make_theme(name, accent_hex):
                 mist=(255, 255, 255), halo=(255, 255, 255), btn=(QColor(255, 255, 255), QColor(255, 255, 255)), btn_text=QColor(28, 28, 28),
                 bar0=QColor(120, 120, 120), bar1=QColor(255, 255, 255), glow=(255, 255, 255))
 
-THEME = _make_theme(THEME_NAME, _THEME_ACCENT)
+
+if _THEME_STATE["palette"]:
+    THEME = _theme_from_palette(_THEME_STATE["palette"], _THEME_STATE["layout"])
+else:
+    THEME = _make_theme(THEME_NAME, _THEME_ACCENT)
 
 def _hue_shift_icon(src, hue, sat_scale, size=512):
     """Icon with the N and the glow moved to `hue`; white outline, stars and black sky stay."""
@@ -175,9 +318,47 @@ def _hue_shift_icon(src, hue, sat_scale, size=512):
                 img.setPixelColor(x, y, c)
     return img
 
+def _theme_key_icon():
+    """Icon of an account theme (assets/ or the settings folder) or of a custom theme: the icon the user picked, or the
+    Classic icon recoloured to the theme's accent (same recipe and file name main.py uses, so they share the file)."""
+    st = _THEME_STATE
+    if not st["custom"]:
+        for d in (ASSETS_DIR, settings_dir()):
+            f = os.path.join(d, st["icon"])
+            if st["icon"] and os.path.isfile(f):
+                return f
+        return ""
+    tid, accent = st["tid"], QColor(st["palette"]["accent"]).name().lower()
+    user = os.path.join(settings_dir(), f"icon_custom_{tid}_user.png")
+    if st["icon"] == "user" and os.path.isfile(user):
+        return user
+    if accent == "#a666ff":
+        f = os.path.join(ASSETS_DIR, "icon-cl.png")
+        return f if os.path.isfile(f) else ""
+    path = os.path.join(settings_dir(), f"icon_custom_{tid}_{accent[1:]}.png")
+    if os.path.isfile(path):
+        return path
+    orig = next((os.path.join(ASSETS_DIR, c) for c in ("icon-cl.png", "icon_default.png", "icon.png")
+                 if os.path.isfile(os.path.join(ASSETS_DIR, c))), "")
+    if not orig:
+        return ""
+    c = QColor(accent)
+    img = _hue_shift_icon(orig, max(0.0, c.hueF()), c.saturationF() / 0.6)
+    os.makedirs(settings_dir(), exist_ok=True)
+    return path if img is not None and img.save(path, "PNG") else ""
+
+
 def theme_icon_path():
     """The icon of the active theme (same files the launcher uses). '' if none is available yet."""
     try:
+        if _THEME_STATE["key"]:
+            p = _theme_key_icon()
+            if p:
+                return p
+            if _THEME_STATE["layout"] == "classic":
+                f = os.path.join(ASSETS_DIR, "icon-cl.png")
+                return f if os.path.isfile(f) else ""
+            return ""
         if THEME_NAME == "sunset":
             f = os.path.join(ASSETS_DIR, "icon-ss.png")
             return f if os.path.isfile(f) else ""
@@ -289,6 +470,9 @@ CLOUD_ERRORS = {
     "OPERATION_NOT_ALLOWED": "That sign-in method isn't enabled for this cloud project.",
     "INVALID_IDP_RESPONSE": "The sign-in provider's answer was rejected. Check the provider settings in Firebase.",
     "FEDERATED_USER_ID_ALREADY_LINKED": "That account is already linked to a different user.",
+    "discord_rejected": "Discord didn't accept that sign-in. Please try again.",
+    "wrong_app": "Discord didn't accept that sign-in. Please try again.",
+    "discord_failed": "Couldn't reach Discord. Please try again in a moment.",
     "Permission denied": "The cloud refused the request (check the database rules).",
 }
 
@@ -357,8 +541,41 @@ def db_profile_exists(uid, token):
     return _http_json(_profile_url(uid, token)) is not None
 
 
-def db_create_profile(uid, token):
-    _http_json(_profile_url(uid, token), "PATCH", {"updated": {".sv": "timestamp"}})
+def db_create_profile(uid, token, username=None, photo_png=None):
+    payload = {"updated": {".sv": "timestamp"}}
+    if username:
+        payload["username"] = username                              # same fields main.py's cloud_save_profile writes
+    if photo_png:
+        payload["photo"] = base64.b64encode(photo_png).decode("ascii")
+    _http_json(_profile_url(uid, token), "PATCH", payload)
+
+
+def discord_profile_name(name):
+    """Discord username -> a username main.py accepts (3-20 characters: letters, numbers, _ . -)."""
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(name or ""))[:20]
+    return name if len(name) >= 3 else ""
+
+
+def discord_avatar_png(url):
+    """Discord profile picture -> 128x128 square PNG bytes, prepared like main.py's prepare_avatar_png. None on any problem."""
+    try:
+        if not str(url).startswith("https://cdn.discordapp.com/avatars/"):
+            return None
+        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read(2_000_000)
+        img = QImage()
+        if not img.loadFromData(raw):
+            return None
+        side = min(img.width(), img.height())
+        img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
+        img = img.scaled(128, 128, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(buf.data())
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------------------------------------ social sign-in
@@ -384,6 +601,11 @@ def _provider_cfg(name):
                       "auth_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
                       "token_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
                       "scope": "openid email profile User.Read", "extra": {"prompt": "select_account"}},
+        "discord": {"label": "Discord", "firebase_id": "", "client_id": DISCORD_APP_ID,
+                    "client_secret": DISCORD_OAUTH_CLIENT_SECRET, "pkce": True, "port": DISCORD_REDIRECT_PORT,
+                    "auth_url": "https://discord.com/oauth2/authorize",
+                    "token_url": "https://discord.com/api/oauth2/token",
+                    "scope": "identify email", "extra": {"prompt": "consent"}},
         "github": {"label": "GitHub", "firebase_id": "github.com", "client_id": OAUTH_GITHUB_CLIENT_ID,
                    "client_secret": OAUTH_GITHUB_CLIENT_SECRET, "pkce": False,
                    "auth_url": "https://github.com/login/oauth/authorize",
@@ -395,7 +617,7 @@ def _provider_cfg(name):
 class _CallbackServer:
     """One-shot local web server that catches the browser's redirect (?code=...&state=...)."""
 
-    def __init__(self, state):
+    def __init__(self, state, port=0):
         self.state = state
         self.result = None
         outer = self
@@ -418,7 +640,10 @@ class _CallbackServer:
             def log_message(self, *a):
                 pass
 
-        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        try:
+            self.httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)
+        except OSError:
+            raise CloudError(f"Port {port} is in use. Close the program using it and try again.")
         self.httpd.timeout = 0.5
         self.port = self.httpd.server_address[1]
 
@@ -467,7 +692,7 @@ def oauth_tokens(name, cancel):
         raise CloudError(f"{label} sign-in isn't set up yet.")
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
-    server = _CallbackServer(state)
+    server = _CallbackServer(state, cfg.get("port", 0))
     try:
         redirect = f"http://localhost:{server.port}"
         params = {"client_id": cfg["client_id"], "redirect_uri": redirect, "response_type": "code",
@@ -534,9 +759,47 @@ def fb_sign_in_idp(provider_id, tokens):
             "account": {"email": email, "uid": res["localId"], "refresh_token": res["refreshToken"]}}
 
 
+def fb_sign_in_discord(tokens):
+    """Discord token -> your function (checks it, mints a Firebase custom token) -> Firebase session. Same return
+    shape as fb_auth, plus the Discord id (so the ban list can be checked without the Discord desktop app)."""
+    at = tokens.get("access_token")
+    if not at:
+        raise CloudError("Discord didn't return a token.")
+    if not DISCORD_AUTH_ENDPOINT:
+        raise CloudError("Discord sign-in isn't set up yet.")
+    url = DISCORD_AUTH_ENDPOINT.strip()
+    if not url.lower().startswith(("http://", "https://")):      # pasted without the https://
+        url = "https://" + url
+    r = _http_json(url, "POST", {"access_token": at})
+    if not isinstance(r, dict) or not r.get("token"):
+        raise CloudError("The sign-in server didn't send a token.")
+    res = _http_json(
+        FIREBASE_AUTH_URL.format(action="signInWithCustomToken", key=urllib.parse.quote(FIREBASE_API_KEY, safe="")),
+        "POST", {"token": r["token"], "returnSecureToken": True})
+    email = r.get("email") or r.get("username") or "Discord account"
+    uid = res.get("localId")                     # a custom-token sign-in doesn't return localId: read it from the id token
+    if not uid:
+        try:
+            part = res["idToken"].split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+            uid = claims.get("user_id") or claims.get("sub")
+        except Exception:
+            uid = None
+    if not uid:
+        raise CloudError("Firebase didn't return the account id.")
+    return {"uid": uid, "token": res["idToken"], "discord_id": str(r.get("discord_id") or ""),
+            "discord_username": str(r.get("username") or ""), "discord_avatar": str(r.get("avatar") or ""),
+            "account": {"email": email, "uid": uid, "refresh_token": res["refreshToken"]}}
+
+
 def social_sign_in(name, cancel):
     cfg = _provider_cfg(name)
     tokens = oauth_tokens(name, cancel)
+    if name == "discord":
+        try:
+            return fb_sign_in_discord(tokens)
+        except CloudError as e:
+            raise CloudError(f"Discord: {e}")
     try:
         return fb_sign_in_idp(cfg["firebase_id"], tokens)
     except CloudError as e:
@@ -1000,6 +1263,7 @@ class PrimaryButton(QPushButton):
 _ICON_DATA = {
     "google": (48, [("#EA4335", 'M24,9.5 C27.54,9.5,30.71,10.72,33.21,13.1 L40.06,6.25 C35.9,2.38,30.47,0,24,0 C14.62,0,6.51,5.38,2.56,13.22 L10.54,19.41 C12.43,13.72,17.74,9.5,24,9.5 Z'), ("#4285F4", 'M46.98,24.55 C46.98,22.98,46.83,21.46,46.6,20 L24,20 L24,29.02 L36.94,29.02 C36.36,31.98,34.68,34.5,32.16,36.2 L39.89,42.2 C44.4,38.02,46.98,31.84,46.98,24.55 Z'), ("#FBBC05", 'M10.53,28.59 C10.05,27.14,9.77,25.6,9.77,24 C9.77,22.4,10.04,20.86,10.53,19.41 L2.55,13.22 C0.92,16.46,0,20.12,0,24 C0,27.88,0.92,31.54,2.56,34.78 L10.53,28.59 Z'), ("#34A853", 'M24,48 C30.48,48,35.93,45.87,39.89,42.19 L32.16,36.19 C30.01,37.64,27.24,38.49,24,38.49 C17.74,38.49,12.43,34.27,10.53,28.58 L2.55,34.77 C6.51,42.62,14.62,48,24,48 Z')]),
     "github": (16, [("#FFFFFF", 'M8,0 C3.58,0,0,3.58,0,8 C0,11.54,2.29,14.53,5.47,15.59 C5.87,15.66,6.02,15.42,6.02,15.21 C6.02,15.02,6.01,14.39,6.01,13.72 C4,14.09,3.48,13.23,3.32,12.78 C3.23,12.55,2.84,11.84,2.5,11.65 C2.22,11.5,1.82,11.13,2.49,11.12 C3.12,11.11,3.57,11.7,3.72,11.94 C4.44,13.15,5.59,12.81,6.05,12.6 C6.12,12.08,6.33,11.73,6.56,11.53 C4.78,11.33,2.92,10.64,2.92,7.58 C2.92,6.71,3.23,5.99,3.74,5.43 C3.66,5.23,3.38,4.41,3.82,3.31 C3.82,3.31,4.49,3.1,6.02,4.13 C6.66,3.95,7.34,3.86,8.02,3.86 C8.7,3.86,9.38,3.95,10.02,4.13 C11.55,3.09,12.22,3.31,12.22,3.31 C12.66,4.41,12.38,5.23,12.3,5.43 C12.81,5.99,13.12,6.7,13.12,7.58 C13.12,10.65,11.25,11.33,9.47,11.53 C9.76,11.78,10.01,12.26,10.01,13.01 C10.01,14.08,10,14.94,10,15.21 C10,15.42,10.15,15.67,10.55,15.59 C13.81,14.49,16,11.44,16,8 C16,3.58,12.42,0,8,0 Z')]),
+    "discord": (24, [("#5865F2", 'M20.317,4.37 C18.761,3.656,17.119,3.147,15.432,2.855 C15.4,2.849,15.368,2.864,15.353,2.892 C15.143,3.267,14.909,3.756,14.745,4.142 C12.926,3.866,11.077,3.866,9.258,4.142 C9.075,3.714,8.87,3.297,8.641,2.892 C8.625,2.865,8.593,2.85,8.562,2.855 C6.875,3.146,5.233,3.655,3.677,4.37 C3.664,4.376,3.653,4.385,3.645,4.397 C0.533,9.046,-0.32,13.58,0.099,18.057 C0.101,18.079,0.112,18.1,0.13,18.114 C1.942,19.456,3.968,20.481,6.123,21.144 C6.154,21.153,6.188,21.142,6.207,21.116 C6.67,20.486,7.08,19.82,7.433,19.122 C7.443,19.103,7.444,19.08,7.436,19.06 C7.428,19.04,7.412,19.024,7.392,19.016 C6.745,18.769,6.119,18.47,5.52,18.124 C5.498,18.111,5.483,18.088,5.482,18.062 C5.48,18.036,5.491,18.012,5.512,17.996 C5.638,17.902,5.762,17.804,5.884,17.704 C5.906,17.686,5.936,17.683,5.961,17.694 C9.889,19.487,14.141,19.487,18.023,17.694 C18.049,17.682,18.079,17.686,18.101,17.704 C18.221,17.802,18.347,17.902,18.474,17.996 C18.494,18.011,18.506,18.036,18.505,18.061 C18.503,18.086,18.49,18.11,18.468,18.123 C17.87,18.473,17.243,18.771,16.595,19.015 C16.575,19.023,16.558,19.039,16.551,19.059 C16.543,19.08,16.544,19.103,16.554,19.122 C16.914,19.82,17.326,20.484,17.779,21.115 C17.798,21.141,17.832,21.153,17.863,21.143 C20.021,20.482,22.051,19.457,23.865,18.113 C23.883,18.1,23.894,18.081,23.897,18.059 C24.397,12.882,23.059,8.385,20.348,4.399 C20.342,4.386,20.331,4.375,20.317,4.369 Z M8.02,15.33 C6.837,15.33,5.863,14.245,5.863,12.911 C5.863,11.578,6.819,10.492,8.02,10.492 C9.23,10.492,10.196,11.588,10.177,12.912 C10.177,14.245,9.221,15.33,8.02,15.33 Z M15.995,15.33 C14.812,15.33,13.838,14.245,13.838,12.911 C13.838,11.578,14.793,10.492,15.995,10.492 C17.205,10.492,18.171,11.588,18.152,12.912 C18.152,14.245,17.206,15.33,15.995,15.33 Z')]),
 }
 _icon_cache = {}
 
@@ -1454,7 +1718,7 @@ class LoginWindow(QWidget):
 
         # social sign-in row, same width as the primary button (x 713..1250), just below the Create / Forgot links
         self._social_buttons = []
-        for i, (kind, text) in enumerate((("google", "Google"), ("microsoft", "Microsoft"), ("github", "GitHub"))):
+        for i, (kind, text) in enumerate((("google", "Google"), ("discord", "Discord"), ("github", "GitHub"))):
             b = SocialButton(kind, text, self)
             b.clicked.connect(lambda _=False, k=kind: self.on_social(k))
             self._track(b, 713 + i * 183, 958, 171, 50, 22, W.Normal, 0)
@@ -1961,6 +2225,9 @@ class LoginWindow(QWidget):
         if r["exists"]:
             self._let_pass(r["account"])             # already in the database -> straight through
             return
+        if r.get("discord_id"):                      # signed up with Discord: already checked against the ban list
+            self._register_profile(r)
+            return
         # signed in, but no database record: this is a brand-new account, so it goes through the Discord check
         self._new_account_gate(lambda: self._register_profile(r))
 
@@ -1969,7 +2236,11 @@ class LoginWindow(QWidget):
 
         def job():
             if WRITE_PROFILE_FOR_NEW_ACCOUNTS:
-                db_create_profile(r["uid"], r["token"])
+                if r.get("discord_id"):          # signed up with Discord: take over its username and picture
+                    db_create_profile(r["uid"], r["token"], discord_profile_name(r.get("discord_username")),
+                                      discord_avatar_png(r.get("discord_avatar")) if r.get("discord_avatar") else None)
+                else:
+                    db_create_profile(r["uid"], r["token"])
             return r["account"]
 
         self._run(job, self._let_pass)
@@ -1979,6 +2250,9 @@ class LoginWindow(QWidget):
         cfg = _provider_cfg(name)
         if not cfg["client_id"]:
             self.set_status(f"{cfg['label']} sign-in isn't set up yet.")
+            return
+        if name == "discord" and not DISCORD_AUTH_ENDPOINT:
+            self.set_status("Discord sign-in isn't set up yet.")
             return
         user_email = f"{cfg['label']} sign-in"          # shown in the ban alert until the real email is known
         _oauth_cancel.clear()
@@ -1999,6 +2273,11 @@ class LoginWindow(QWidget):
         global user_email
         if r["account"].get("email"):
             user_email = r["account"]["email"]
+        did = r.get("discord_id")
+        if did and did in BANNED_DISCORD_IDS:            # Discord sign-in: the id is known, no desktop app needed
+            self._busy_flag = False
+            self.ban(did, action="sign in to")
+            return
         self._signed_in(r)                               # same path as email/password: profile check, Discord gate for new accounts
 
     def _email_enter(self):
