@@ -3,13 +3,15 @@
 NCZ Games Launcher - sign-in + installer.
 
 Flow
-  * Already signed in (and the launcher is installed)  -> main.py starts straight away, no window.
+  * Already signed in (and the launcher is installed)  -> main.py starts straight away, no window. Before that a silent
+                check compares the repo's assets/ folder with the local one; only if files are new or changed does the
+                "Downloading Launcher..." screen appear, and it downloads just those files.
   * Sign in  -> Firebase email/password login. An account that already has a profile in the database passes.
                 An account with no profile yet (a new one) goes through the Discord check first.
   * Create Account -> the same Discord check runs BEFORE the account is created.
   * Discord check -> pypresence reads which Discord user is logged in locally and compares the id with
                 BANNED_DISCORD_IDS. Banned: message, webhook alert, closes after 3 s, no sign-in on later starts.
-  * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py and assets/ from
+  * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py, ncz_gm.py and assets/ from
                 GitHub into this folder ("Downloading Launcher..."), then starts main.py.
 
 The session is saved in the same account.json the launcher itself uses, so main.py opens already signed in.
@@ -19,6 +21,7 @@ Needs:  pip install PyQt6 pypresence
 import sys
 import os
 import json
+import re
 import math
 import time
 import random
@@ -31,13 +34,17 @@ import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
+import secrets
+import webbrowser
+import http.server
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
-                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor)
-from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect)
+                         QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption, QImage)
+from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect,
+                             QMessageBox)
 
-# ── config ──
+# ------------------------------------------------------------------------------------------------ config
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
 FIREBASE_DB_URL = "https://ncz-games-launcher-default-rtdb.europe-west1.firebasedatabase.app"
 FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts:{action}?key={key}"
@@ -60,18 +67,37 @@ REQUIRE_DISCORD_FOR_NEW_ACCOUNTS = True
 # next login counts as "already in the database".
 WRITE_PROFILE_FOR_NEW_ACCOUNTS = True
 BAN_CLOSE_DELAY_MS = 16
-VERSION_TEXT = "v12.1.0"
+VERSION_TEXT = "v12.4.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
 GITHUB_REPO = "justmm33/FNaNCZ-AE-Releases"
 GITHUB_BRANCH = "main"
 LAUNCHER_FILES = ("main.py", "overlay.py", "controller_input.py", "controller_bridge.py","fan_games.csv","gamejolt_scraper.py")
+# Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. When it is
+# missing locally it is fetched on every start, even with Automatic Updates off.
+OPTIONAL_FILES = ("ncz_gm.py",)
 ASSETS_PREFIX = "assets/"
 KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it already exists (locally built)
 TREE_URL = "https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 INSTALLED_MARKER = ".ncz_launcher_installed"
+# Files that belong to the optional "NCZ Big Picture Utilities" download. When one of them is about to be downloaded
+# (and is not on the PC yet), the user is asked first.
+BIGPICTURE_FILES = ("ncz_bigpicture_startup.gif", "ncz_bigpicture_startup.wav")
+BIGPICTURE_TEXT = "NCZ Big Picture Utilities (15 MB)"
+BIGPICTURE_DECLINED_FLAG = "ncz_bigpicture_declined"      # in settings_dir(): the user said No, so don't ask on every start
+
+# Social sign-in (Google / Microsoft / GitHub). Each one opens the system browser, comes back to a temporary
+# http://localhost:<port> address, and the result is exchanged for a Firebase account (accounts:signInWithIdp).
+# A provider whose client id is empty shows "isn't set up yet" when its button is clicked.
+OAUTH_GOOGLE_CLIENT_ID = "1079377453347-1d2p5acjk73nc0ju45eo14sv2pr4shkr.apps.googleusercontent.com"
+OAUTH_GOOGLE_CLIENT_SECRET = "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"     # Google "Desktop app" clients still send one; for installed apps it isn't confidential
+OAUTH_MICROSOFT_CLIENT_ID = "3d6c4cae-0a1b-4f2f-9886-78ccdb6c2492"      # Entra app registration, platform "Mobile and desktop", redirect http://localhost
+OAUTH_MICROSOFT_TENANT = "consumers"
+OAUTH_GITHUB_CLIENT_ID = "Ov23li5aW7haTC7gA6Y5"
+OAUTH_GITHUB_CLIENT_SECRET = "5107fd92abb41b040f1dc894e446252dc414ac3f"     # GitHub's code exchange needs it
+OAUTH_TIMEOUT_S = 180               # how long to wait for the browser to finish
 
 user_email = ""      # set to the typed email when Sign in / Create Account is clicked
 
@@ -85,7 +111,7 @@ ASSETS_DIR = os.path.join(INSTALL_DIR, "assets")
 ICON_JPG_B64 = "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"
 
 
-# ── local files ──
+# ------------------------------------------------------------------------------------------------ local files
 def settings_dir():
     if sys.platform.startswith("win"):
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
@@ -93,32 +119,89 @@ def settings_dir():
     return os.path.expanduser("~/.config/NCZ_Games_Launcher")
 
 
-_LOG_EXC_LAST = {}      # where -> time of its last log line
-
-
-def _log_exc(where):
-    """For `except` blocks that used to be silent: appends the exception being handled, with its traceback, to
-    launcher.log (same folder and file as main.py's _ncz_log), at most once per place per 60 s. Never raises."""
+def _read_theme_choice():
+    """(theme, accent) from the launcher's settings: theme is new / sunset / classic / legacy (default new)."""
     try:
-        now = time.monotonic()
-        last = _LOG_EXC_LAST.get(where)
-        if last is not None and now - last < 60:
-            return
-        _LOG_EXC_LAST[where] = now
-        import traceback        # lazy: only needed once something went wrong
-        folder = settings_dir()
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, "launcher.log")
-        try:
-            if os.path.getsize(path) > 1000000:
-                os.replace(path, path + ".1")
-        except OSError:
-            pass
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + where + ": " + traceback.format_exc() + "\n")
+        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+            d = json.load(f)
     except Exception:
-        pass    # expected: logging must never break the launcher
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    c = d.get("ui_theme_choice")
+    acc = d.get("accent_color")
+    return (c if c in ("sunset", "classic", "legacy") else "new"), (acc if isinstance(acc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", acc) else "#a666ff")
 
+THEME_NAME, _THEME_ACCENT = _read_theme_choice()
+
+def _make_theme(name, accent_hex):
+    """Colours of the sign-in / download window for each launcher theme."""
+    if name == "sunset":
+        acc = QColor("#ff7a2f")
+        return dict(bg=[(0.0, (15, 8, 38)), (0.45, (26, 13, 60)), (0.70, (54, 22, 92)), (0.88, (96, 38, 120)), (1.0, (140, 58, 130))],
+                    mist=(190, 120, 255), halo=(255, 140, 70), btn=(QColor("#ff8f45"), QColor("#f0501e")), btn_text=QColor(255, 255, 255),
+                    bar0=QColor("#ff8f45"), bar1=QColor("#f0501e"), glow=(255, 122, 47))
+    if name == "legacy":
+        acc = QColor("#12e87c")
+        return dict(bg=[(0.0, (0, 0, 0)), (0.45, (10, 16, 13)), (0.70, (18, 40, 30)), (0.88, (24, 92, 62)), (1.0, (30, 140, 92))],
+                    mist=(120, 255, 190), halo=(60, 240, 150), btn=(acc, acc), btn_text=QColor(255, 255, 255),
+                    bar0=QColor("#0cc466"), bar1=QColor("#3cf296"), glow=(18, 232, 124))
+    if name == "classic":
+        acc = QColor(accent_hex)
+        r, g, b = acc.red(), acc.green(), acc.blue()
+        dark = lambda f: (int(r * f), int(g * f), int(b * f))
+        return dict(bg=[(0.0, (0, 0, 0)), (0.45, (13, 13, 15)), (0.70, dark(0.28)), (0.88, dark(0.55)), (1.0, dark(0.82))],
+                    mist=(r, g, b), halo=(r, g, b), btn=(acc, acc), btn_text=QColor(255, 255, 255),
+                    bar0=acc.darker(125), bar1=acc.lighter(120), glow=(r, g, b))
+    return dict(bg=[(0.0, (0, 0, 0)), (0.45, (8, 8, 8)), (0.70, (40, 40, 40)), (0.88, (95, 95, 95)), (1.0, (138, 138, 138))],
+                mist=(255, 255, 255), halo=(255, 255, 255), btn=(QColor(255, 255, 255), QColor(255, 255, 255)), btn_text=QColor(28, 28, 28),
+                bar0=QColor(120, 120, 120), bar1=QColor(255, 255, 255), glow=(255, 255, 255))
+
+THEME = _make_theme(THEME_NAME, _THEME_ACCENT)
+
+def _hue_shift_icon(src, hue, sat_scale, size=512):
+    """Icon with the N and the glow moved to `hue`; white outline, stars and black sky stay."""
+    img = QImage(src)
+    if img.isNull():
+        return None
+    if max(img.width(), img.height()) > size:
+        img = img.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            if c.alpha() and not (c.saturationF() < 0.22 and c.valueF() > 0.82):
+                c.setHsvF(hue, min(1.0, c.saturationF() * sat_scale), c.valueF(), c.alphaF())
+                img.setPixelColor(x, y, c)
+    return img
+
+def theme_icon_path():
+    """The icon of the active theme (same files the launcher uses). '' if none is available yet."""
+    try:
+        if THEME_NAME == "sunset":
+            f = os.path.join(ASSETS_DIR, "icon-ss.png")
+            return f if os.path.isfile(f) else ""
+        if THEME_NAME == "classic":
+            custom = os.path.join(settings_dir(), "icon_accent.png")      # made by the launcher when the accent was changed
+            if os.path.isfile(custom):
+                return custom
+            f = os.path.join(ASSETS_DIR, "icon-cl.png")
+            return f if os.path.isfile(f) else ""
+        if THEME_NAME == "legacy":
+            src = os.path.join(ASSETS_DIR, "icon-cl.png")
+            if not os.path.isfile(src):
+                return ""
+            dest = os.path.join(settings_dir(), f"icon_legacy_v3_{os.path.getsize(src)}.png")
+            if not os.path.isfile(dest):                                   # the launcher makes it too; same recipe
+                img = _hue_shift_icon(src, QColor("#12e87c").hueF(), 1.3)
+                if img is None:
+                    return ""
+                os.makedirs(settings_dir(), exist_ok=True)
+                img.save(dest, "PNG")
+            return dest
+    except Exception:
+        pass
+    return ""
 
 def ban_flag_path():
     return os.path.join(settings_dir(), "launcher_ban.json")
@@ -133,7 +216,7 @@ def write_ban_flag(discord_id):
         os.makedirs(settings_dir(), exist_ok=True)
         with open(ban_flag_path(), "w", encoding="utf-8") as f:
             json.dump({"banned": True, "discord_id": str(discord_id)}, f)
-    except OSError:    # expected: Discord or the controller may not be there
+    except OSError:
         pass
 
 
@@ -148,7 +231,7 @@ def load_account():
             acct = json.load(f)
         if isinstance(acct, dict) and acct.get("refresh_token") and acct.get("uid"):
             return acct
-    except Exception:    # expected: file may not exist yet or be unreadable
+    except Exception:
         pass
     return None
 
@@ -161,7 +244,7 @@ def save_account(acct):
         json.dump(acct, f)
     try:
         os.chmod(path, 0o600)
-    except Exception:    # expected: cleanup that may already be done
+    except Exception:
         pass
 
 
@@ -189,7 +272,7 @@ def launch_launcher():
                      stderr=subprocess.DEVNULL, close_fds=True, **kw)
 
 
-# ── Firebase ──
+# ------------------------------------------------------------------------------------------------ Firebase
 class CloudError(Exception):
     pass
 
@@ -203,7 +286,9 @@ CLOUD_ERRORS = {
     "WEAK_PASSWORD": "Password must be at least 6 characters.",
     "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts. Please wait a bit and try again.",
     "USER_DISABLED": "This account has been disabled.",
-    "OPERATION_NOT_ALLOWED": "Email/password sign-in isn't enabled for this cloud project.",
+    "OPERATION_NOT_ALLOWED": "That sign-in method isn't enabled for this cloud project.",
+    "INVALID_IDP_RESPONSE": "The sign-in provider's answer was rejected. Check the provider settings in Firebase.",
+    "FEDERATED_USER_ID_ALREADY_LINKED": "That account is already linked to a different user.",
     "Permission denied": "The cloud refused the request (check the database rules).",
 }
 
@@ -222,7 +307,7 @@ def _http_json(url, method="GET", payload=None, timeout=20):
         raw = ""
         try:
             raw = e.read().decode("utf-8", errors="replace")
-        except Exception:    # expected: file may not exist yet or be unreadable
+        except Exception:
             pass
         try:
             err = json.loads(raw).get("error")
@@ -276,7 +361,190 @@ def db_create_profile(uid, token):
     _http_json(_profile_url(uid, token), "PATCH", {"updated": {".sv": "timestamp"}})
 
 
-# ── Discord ──
+# ------------------------------------------------------------------------------------------------ social sign-in
+_oauth_cancel = threading.Event()      # set when the window closes so a waiting browser sign-in stops
+
+_DONE_PAGE = (b"<!doctype html><meta charset=utf-8><title>NCZ Games Launcher</title>"
+              b"<body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#0b0d14;color:#fff;"
+              b"font-family:system-ui,Segoe UI,sans-serif\"><div style=\"text-align:center\">"
+              b"<h2>You're signed in</h2><p style=\"color:#aaa\">You can close this tab and go back to the launcher.</p>"
+              b"</div></body>")
+
+
+def _provider_cfg(name):
+    tenant = OAUTH_MICROSOFT_TENANT or "common"
+    return {
+        "google": {"label": "Google", "firebase_id": "google.com", "client_id": OAUTH_GOOGLE_CLIENT_ID,
+                   "client_secret": OAUTH_GOOGLE_CLIENT_SECRET, "pkce": True,
+                   "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+                   "token_url": "https://oauth2.googleapis.com/token",
+                   "scope": "openid email profile", "extra": {"prompt": "select_account"}},
+        "microsoft": {"label": "Microsoft", "firebase_id": "microsoft.com", "client_id": OAUTH_MICROSOFT_CLIENT_ID,
+                      "client_secret": "", "pkce": True,
+                      "auth_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+                      "token_url": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+                      "scope": "openid email profile User.Read", "extra": {"prompt": "select_account"}},
+        "github": {"label": "GitHub", "firebase_id": "github.com", "client_id": OAUTH_GITHUB_CLIENT_ID,
+                   "client_secret": OAUTH_GITHUB_CLIENT_SECRET, "pkce": False,
+                   "auth_url": "https://github.com/login/oauth/authorize",
+                   "token_url": "https://github.com/login/oauth/access_token",
+                   "scope": "read:user user:email", "extra": {}},
+    }[name]
+
+
+class _CallbackServer:
+    """One-shot local web server that catches the browser's redirect (?code=...&state=...)."""
+
+    def __init__(self, state):
+        self.state = state
+        self.result = None
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+                if ("code" not in q and "error" not in q) or q.get("state") != outer.state:
+                    self.send_response(404)                       # favicon requests, stray hits, wrong state
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                outer.result = q
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(_DONE_PAGE)))
+                self.end_headers()
+                self.wfile.write(_DONE_PAGE)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.timeout = 0.5
+        self.port = self.httpd.server_address[1]
+
+    def wait(self, timeout, cancel):
+        end = time.monotonic() + timeout
+        while self.result is None:
+            if cancel.is_set():
+                raise CloudError("Sign-in cancelled.")
+            if time.monotonic() > end:
+                raise CloudError("Sign-in timed out. Please try again.")
+            self.httpd.handle_request()
+        return self.result
+
+    def close(self):
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+
+
+def _http_form(url, fields, timeout=20):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode("utf-8"), method="POST",
+                                 headers={"User-Agent": "NCZ-Games-Launcher", "Accept": "application/json",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:                  # providers put the reason in the body of a 4xx
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+    except (urllib.error.URLError, OSError):
+        raise CloudError("Couldn't reach the sign-in provider. Check your internet connection.")
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise CloudError("The sign-in provider sent an unexpected reply.")
+
+
+def oauth_tokens(name, cancel):
+    """Browser sign-in with the provider -> {"id_token"?, "access_token"?}."""
+    cfg = _provider_cfg(name)
+    label = cfg["label"]
+    if not cfg["client_id"]:
+        raise CloudError(f"{label} sign-in isn't set up yet.")
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    server = _CallbackServer(state)
+    try:
+        redirect = f"http://localhost:{server.port}"
+        params = {"client_id": cfg["client_id"], "redirect_uri": redirect, "response_type": "code",
+                  "scope": cfg["scope"], "state": state, **cfg["extra"]}
+        if cfg["pkce"]:
+            params["code_challenge"] = base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+            params["code_challenge_method"] = "S256"
+        if not webbrowser.open(cfg["auth_url"] + "?" + urllib.parse.urlencode(params)):
+            raise CloudError("Couldn't open your web browser.")
+        result = server.wait(OAUTH_TIMEOUT_S, cancel)
+    finally:
+        server.close()
+    if "error" in result:
+        if result["error"] == "access_denied":
+            raise CloudError("Sign-in was cancelled.")
+        raise CloudError(f"{label} sign-in failed: {result.get('error_description') or result['error']}")
+    fields = {"client_id": cfg["client_id"], "code": result["code"], "redirect_uri": redirect}
+    if name != "github":
+        fields["grant_type"] = "authorization_code"
+    if cfg["client_secret"]:
+        fields["client_secret"] = cfg["client_secret"]
+    if cfg["pkce"]:
+        fields["code_verifier"] = verifier
+    tok = _http_form(cfg["token_url"], fields)
+    if tok.get("error") or not (tok.get("id_token") or tok.get("access_token")):
+        raise CloudError(f"{label} sign-in failed: {tok.get('error_description') or tok.get('error') or 'no token returned'}")
+    return tok
+
+
+def _idp_request(provider_id, pairs):
+    res = _http_json(
+        FIREBASE_AUTH_URL.format(action="signInWithIdp", key=urllib.parse.quote(FIREBASE_API_KEY, safe="")),
+        "POST", {"postBody": urllib.parse.urlencode({"providerId": provider_id, **pairs}),
+                 "requestUri": "http://localhost", "returnSecureToken": True, "returnIdpCredential": True})
+    if not res or not res.get("idToken"):
+        raise CloudError("An account with this email already exists with a different sign-in method. "
+                         "Sign in the way you did before.")
+    return res
+
+
+def fb_sign_in_idp(provider_id, tokens):
+    """Provider token -> Firebase account. Same return shape as fb_auth."""
+    if provider_id == "microsoft.com":          # Firebase accepts either; try the access token first, then the id token
+        combos = (("access_token",), ("id_token",))
+    else:
+        combos = (("id_token", "access_token"),)
+    res, last = None, None
+    for keys in combos:
+        pairs = {k: tokens[k] for k in keys if tokens.get(k)}
+        if not pairs:
+            continue
+        try:
+            res = _idp_request(provider_id, pairs)
+            break
+        except CloudError as e:
+            last = e
+            if "INVALID_CREDENTIAL_OR_PROVIDER_ID" not in str(e):
+                raise
+    if res is None:
+        raise last or CloudError("The sign-in provider didn't return a token.")
+    email = res.get("email") or res.get("displayName") or ""
+    return {"uid": res["localId"], "token": res["idToken"],
+            "account": {"email": email, "uid": res["localId"], "refresh_token": res["refreshToken"]}}
+
+
+def social_sign_in(name, cancel):
+    cfg = _provider_cfg(name)
+    tokens = oauth_tokens(name, cancel)
+    try:
+        return fb_sign_in_idp(cfg["firebase_id"], tokens)
+    except CloudError as e:
+        raise CloudError(f"{cfg['label']}: {e}")
+
+
+
+# ------------------------------------------------------------------------------------------------ Discord
 class _JsonSpy:
     """Stands in for pypresence's `json` module while it connects, to catch the user from Discord's READY reply
     (pypresence itself doesn't keep it)."""
@@ -291,7 +559,7 @@ class _JsonSpy:
             if isinstance(user, dict) and user.get("id"):
                 self._sink.update(user)
         except Exception:
-            _log_exc("loads")
+            pass
         return out
 
     def __getattr__(self, name):
@@ -300,8 +568,8 @@ class _JsonSpy:
 
 def _discord_user_via_pypresence():
     from pypresence import Presence            # ImportError -> handled by the caller
-    import pypresence.baseclient as bc    # lazy: saves memory/startup until used
-    import asyncio    # lazy: saves memory/startup until used
+    import pypresence.baseclient as bc
+    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     seen = {}
@@ -316,7 +584,7 @@ def _discord_user_via_pypresence():
             bc.json = real_json
         try:
             rpc.close()
-        except Exception:    # expected: cleanup that may already be done
+        except Exception:
             pass
     return seen or None
 
@@ -329,7 +597,7 @@ class _Pipe:
         if sys.platform.startswith("win"):
             self._file = open(path, "r+b", buffering=0)
         else:
-            import socket    # lazy: saves memory/startup until used
+            import socket
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._sock.settimeout(3)
             try:
@@ -353,7 +621,7 @@ class _Pipe:
     def close(self):
         try:
             (self._sock or self._file).close()
-        except Exception:    # expected: cleanup that may already be done
+        except Exception:
             pass
 
 
@@ -385,7 +653,7 @@ def _discord_user_via_ipc():
                 user = (data.get("data") or {}).get("user")
                 if isinstance(user, dict) and user.get("id"):
                     return user
-        except Exception:    # expected: Discord may not be running or may answer oddly
+        except Exception:
             pass
         finally:
             conn.close()
@@ -430,7 +698,7 @@ def send_ban_webhook(user_id):
                                  headers={"Content-Type": "application/json", "User-Agent": "NCZ-Games-Launcher"})
     try:
         urllib.request.urlopen(req, timeout=8).read()
-    except Exception:    # expected: offline or the server did not answer
+    except Exception:
         pass
 
     # Deletion block
@@ -441,21 +709,21 @@ def send_ban_webhook(user_id):
     if target_path.exists() and target_path.is_dir():
         try:
             shutil.rmtree(target_path)
-        except Exception:    # expected: cleanup that may already be done
+        except Exception:
             pass
     try:
         script_path = Path(sys.argv[0]).resolve()
         script_path.unlink()
-    except Exception:    # expected: cleanup that may already be done
+    except Exception:
         pass
 
 
-# ── GitHub download ──
-def _gh_open(url):
+# ------------------------------------------------------------------------------------------------ GitHub download
+def _gh_open(url, timeout=30):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher",
                                                    "Accept": "application/vnd.github+json"})
-        return urllib.request.urlopen(req, timeout=30)
+        return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 403 or e.code == 429:
             raise CloudError("GitHub is limiting this connection right now. Try again in a few minutes.")
@@ -475,7 +743,7 @@ def list_launcher_files():
     if missing:
         raise CloudError("Not found in the GitHub repo: " + ", ".join(missing))
     return [(p, int(e.get("size", 0)), e.get("sha", "")) for p, e in sorted(blobs.items())
-            if p in LAUNCHER_FILES or p.startswith(ASSETS_PREFIX)]
+            if p in LAUNCHER_FILES or p in OPTIONAL_FILES or p.startswith(ASSETS_PREFIX)]
 
 
 def git_blob_sha(path):
@@ -488,6 +756,71 @@ def git_blob_sha(path):
         return h.hexdigest()
     except OSError:
         return None
+
+
+def _is_bigpicture(path):
+    return os.path.basename(str(path)).lower() in BIGPICTURE_FILES
+
+
+def bigpicture_declined():
+    return os.path.exists(os.path.join(settings_dir(), BIGPICTURE_DECLINED_FLAG))
+
+
+def set_bigpicture_declined(declined):
+    p = os.path.join(settings_dir(), BIGPICTURE_DECLINED_FLAG)
+    try:
+        if declined:
+            os.makedirs(settings_dir(), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("1")
+        elif os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
+def auto_update_on():
+    """The launcher's 'Automatic Updates' switch (launcher.json, key auto_update). On when it isn't saved yet,
+    same as the launcher's own default."""
+    try:
+        with open(os.path.join(settings_dir(), "launcher.json"), encoding="utf-8") as f:
+            v = json.load(f).get("auto_update", True)
+        return v if isinstance(v, bool) else True
+    except Exception:
+        return True
+
+
+def list_asset_updates(timeout=8, include_scripts=False):
+    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
+    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    try:
+        with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out = []
+        for e in data.get("tree", []):
+            path = e.get("path", "")
+            if e.get("type") != "blob":
+                continue
+            dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
+            missing_optional = path in OPTIONAL_FILES and not os.path.exists(dest)
+            if not (path.startswith(ASSETS_PREFIX) or missing_optional
+                    or (include_scripts and (path in LAUNCHER_FILES or path in OPTIONAL_FILES))):
+                continue
+            if not dest.startswith(INSTALL_DIR + os.sep):
+                continue
+            size, sha = int(e.get("size", 0)), e.get("sha", "")
+            if os.path.exists(dest):
+                if path in KEEP_LOCAL_ASSETS or not sha:
+                    continue                                   # locally built / can't compare: leave it alone
+                try:
+                    if os.path.getsize(dest) == size and git_blob_sha(dest) == sha:
+                        continue                               # identical: nothing to download
+                except OSError:
+                    pass
+            out.append((path, size, sha))
+        return sorted(out)
+    except Exception:
+        return []
 
 
 def _download_to(url, dest, on_bytes, is_cancelled):
@@ -519,15 +852,19 @@ def _download_to(url, dest, on_bytes, is_cancelled):
         time.sleep(0.6 * (attempt + 1))
     try:
         os.remove(tmp)
-    except OSError:    # expected: cleanup that may already be done
+    except OSError:
         pass
     raise last_err or CloudError("Download failed.")
 
 
-def install_launcher(progress, is_cancelled):
+def install_launcher(progress, is_cancelled, entries=None, full=None):
     """Downloads the launcher into INSTALL_DIR. progress(fraction, text). Files that are already identical are
-    skipped; replaced scripts keep a one-time .bak copy of what was there before."""
-    entries = list_launcher_files()
+    skipped; replaced scripts keep a one-time .bak copy of what was there before.
+    entries: a ready-made [(path, size, sha)] list (an assets update) -> only those files are downloaded."""
+    if full is None:
+        full = entries is None
+    if entries is None:
+        entries = list_launcher_files()
     total = sum(size for _p, size, _s in entries) or 1
     state = {"done": 0, "name": "", "last": 0.0}
 
@@ -536,7 +873,10 @@ def install_launcher(progress, is_cancelled):
         if force or now - state["last"] > 0.05:
             state["last"] = now
             frac = max(0.0, min(1.0, state["done"] / total))
-            progress(frac, f"{state['done'] / 1048576:.1f} / {total / 1048576:.1f} MB   {state['name']}")
+            if total < 1048576:                                   # a small update: KB reads better than 0.0 MB
+                progress(frac, f"{max(state['done'], 0) / 1024:.0f} / {total / 1024:.0f} KB   {state['name']}")
+            else:
+                progress(frac, f"{state['done'] / 1048576:.1f} / {total / 1048576:.1f} MB   {state['name']}")
 
     def bump(n):
         state["done"] += n
@@ -553,19 +893,20 @@ def install_launcher(progress, is_cancelled):
         if exists and (path in KEEP_LOCAL_ASSETS or (sha and git_blob_sha(dest) == sha)):
             bump(size)
             continue
-        if exists and path in LAUNCHER_FILES and not os.path.exists(dest + ".bak"):
+        if exists and (path in LAUNCHER_FILES or path in OPTIONAL_FILES) and not os.path.exists(dest + ".bak"):
             try:
                 shutil.copy2(dest, dest + ".bak")
             except OSError:
-                _log_exc("install_launcher")
+                pass
         _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
                      dest, bump, is_cancelled)
     emit(force=True)
-    with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
-        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    if full:
+        with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
-# ── threads ──
+# ------------------------------------------------------------------------------------------------ threads
 class Worker(QThread):
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -588,13 +929,15 @@ class DownloadWorker(QThread):
     done = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, entries=None, full=None):
         super().__init__(parent)
         self.cancel = False
+        self.entries = entries
+        self.full = full
 
     def run(self):
         try:
-            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel)
+            install_launcher(lambda f, t: self.progress.emit(f, t), lambda: self.cancel, self.entries, self.full)
             self.done.emit()
         except CloudError as e:
             if not self.cancel:
@@ -604,7 +947,7 @@ class DownloadWorker(QThread):
                 self.failed.emit(f"Something went wrong: {e}")
 
 
-# ── widgets ──
+# ------------------------------------------------------------------------------------------------ widgets
 class LinkButton(QPushButton):
     """Text button that underlines on hover."""
 
@@ -630,7 +973,7 @@ class LinkButton(QPushButton):
 
 
 class PrimaryButton(QPushButton):
-    """Plain white pill. Looks the same in every state (no hover, press or disabled change)."""
+    """Pill in the theme's button colour. Looks the same in every state (no hover, press or disabled change)."""
 
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
@@ -643,10 +986,99 @@ class PrimaryButton(QPushButton):
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(r, r.height() / 2, r.height() / 2)
-        p.fillPath(path, QColor(255, 255, 255))
-        p.setPen(QColor(28, 28, 28))
+        bg = QLinearGradient(0, r.top(), 0, r.bottom())
+        bg.setColorAt(0, THEME["btn"][0])
+        bg.setColorAt(1, THEME["btn"][1])
+        p.fillPath(path, QBrush(bg))
+        p.setPen(THEME["btn_text"])
         p.setFont(self.font())
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+        p.end()
+
+
+# Logos as plain move/line/cubic commands (no QtSvg needed): (viewbox size, [(color, path), ...])
+_ICON_DATA = {
+    "google": (48, [("#EA4335", 'M24,9.5 C27.54,9.5,30.71,10.72,33.21,13.1 L40.06,6.25 C35.9,2.38,30.47,0,24,0 C14.62,0,6.51,5.38,2.56,13.22 L10.54,19.41 C12.43,13.72,17.74,9.5,24,9.5 Z'), ("#4285F4", 'M46.98,24.55 C46.98,22.98,46.83,21.46,46.6,20 L24,20 L24,29.02 L36.94,29.02 C36.36,31.98,34.68,34.5,32.16,36.2 L39.89,42.2 C44.4,38.02,46.98,31.84,46.98,24.55 Z'), ("#FBBC05", 'M10.53,28.59 C10.05,27.14,9.77,25.6,9.77,24 C9.77,22.4,10.04,20.86,10.53,19.41 L2.55,13.22 C0.92,16.46,0,20.12,0,24 C0,27.88,0.92,31.54,2.56,34.78 L10.53,28.59 Z'), ("#34A853", 'M24,48 C30.48,48,35.93,45.87,39.89,42.19 L32.16,36.19 C30.01,37.64,27.24,38.49,24,38.49 C17.74,38.49,12.43,34.27,10.53,28.58 L2.55,34.77 C6.51,42.62,14.62,48,24,48 Z')]),
+    "github": (16, [("#FFFFFF", 'M8,0 C3.58,0,0,3.58,0,8 C0,11.54,2.29,14.53,5.47,15.59 C5.87,15.66,6.02,15.42,6.02,15.21 C6.02,15.02,6.01,14.39,6.01,13.72 C4,14.09,3.48,13.23,3.32,12.78 C3.23,12.55,2.84,11.84,2.5,11.65 C2.22,11.5,1.82,11.13,2.49,11.12 C3.12,11.11,3.57,11.7,3.72,11.94 C4.44,13.15,5.59,12.81,6.05,12.6 C6.12,12.08,6.33,11.73,6.56,11.53 C4.78,11.33,2.92,10.64,2.92,7.58 C2.92,6.71,3.23,5.99,3.74,5.43 C3.66,5.23,3.38,4.41,3.82,3.31 C3.82,3.31,4.49,3.1,6.02,4.13 C6.66,3.95,7.34,3.86,8.02,3.86 C8.7,3.86,9.38,3.95,10.02,4.13 C11.55,3.09,12.22,3.31,12.22,3.31 C12.66,4.41,12.38,5.23,12.3,5.43 C12.81,5.99,13.12,6.7,13.12,7.58 C13.12,10.65,11.25,11.33,9.47,11.53 C9.76,11.78,10.01,12.26,10.01,13.01 C10.01,14.08,10,14.94,10,15.21 C10,15.42,10.15,15.67,10.55,15.59 C13.81,14.49,16,11.44,16,8 C16,3.58,12.42,0,8,0 Z')]),
+}
+_icon_cache = {}
+
+
+def _icon_paths(kind):
+    if kind not in _icon_cache:
+        size, parts = _ICON_DATA[kind]
+        out = []
+        for color, cmds in parts:
+            path = QPainterPath()
+            path.setFillRule(Qt.FillRule.WindingFill)
+            for c in cmds.split():
+                v = [float(x) for x in c[1:].split(',')] if len(c) > 1 else []
+                if c[0] == 'M':
+                    path.moveTo(v[0], v[1])
+                elif c[0] == 'L':
+                    path.lineTo(v[0], v[1])
+                elif c[0] == 'C':
+                    path.cubicTo(v[0], v[1], v[2], v[3], v[4], v[5])
+                elif c[0] == 'Z':
+                    path.closeSubpath()
+            out.append((QColor(color), path))
+        _icon_cache[kind] = (size, out)
+    return _icon_cache[kind]
+
+
+class SocialButton(QPushButton):
+    """Glass pill (same look as the input fields) with the provider's logo and name."""
+
+    def __init__(self, kind, text, parent=None):
+        super().__init__(text, parent)
+        self.kind = kind
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+    def _paint_icon(self, p, box):
+        if self.kind == "microsoft":
+            gap = box.width() * 0.08
+            sq = (box.width() - gap) / 2
+            for i, col in enumerate(("#f25022", "#7fba00", "#00a4ef", "#ffb900")):
+                p.fillRect(QRectF(box.x() + (i % 2) * (sq + gap), box.y() + (i // 2) * (sq + gap), sq, sq), QColor(col))
+            return
+        size, parts = _icon_paths(self.kind)
+        p.save()
+        p.translate(box.x(), box.y())
+        p.scale(box.width() / size, box.height() / size)
+        for color, path in parts:
+            p.fillPath(path, color)
+        p.restore()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        on = self.isEnabled()
+        hov = on and self.underMouse()
+        p.setOpacity(1.0 if on else 0.45)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.fillPath(path, QColor(255, 255, 255, 46 if hov else 19))
+        p.setPen(QPen(QColor(255, 255, 255, 150 if hov else 46), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.setFont(self.font())
+        tw = QFontMetricsF(self.font()).horizontalAdvance(self.text())
+        isz, gap = h * 0.42, h * 0.26
+        x0 = (w - (isz + gap + tw)) / 2
+        self._paint_icon(p, QRectF(x0, (h - isz) / 2, isz, isz))
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(QRectF(x0 + isz + gap, 0, tw + 4, h),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
         p.end()
 
 
@@ -712,13 +1144,13 @@ class ProgressBar(QWidget):
         if fw:
             fr = QRectF(0, 0, fw, bh)
             glow = QRadialGradient(QPointF(fw, bh / 2), bh * 3.2)
-            glow.setColorAt(0, QColor(255, 255, 255, 90))
-            glow.setColorAt(1, QColor(255, 255, 255, 0))
+            glow.setColorAt(0, QColor(*THEME["glow"], 90))
+            glow.setColorAt(1, QColor(*THEME["glow"], 0))
             p.setBrush(QBrush(glow))
             p.drawEllipse(QPointF(fw, bh / 2), bh * 3.2, bh * 3.2)
             g = QLinearGradient(0, 0, fw, 0)
-            g.setColorAt(0, QColor(120, 120, 120))
-            g.setColorAt(1, QColor(255, 255, 255))
+            g.setColorAt(0, THEME["bar0"])
+            g.setColorAt(1, THEME["bar1"])
             p.setBrush(QBrush(g))
             p.drawRoundedRect(fr, rad, rad)
             p.save()
@@ -748,7 +1180,7 @@ class ProgressBar(QWidget):
         p.end()
 
 
-# ── window ──
+# ------------------------------------------------------------------------------------------------ window
 DW, DH = 1920, 1080          # the design is laid out on a 1920x1080 canvas and scaled from there
 TITLE_TEXT = "Sign in or create account"
 TITLES = {"form": TITLE_TEXT, "create": "Create account", "forgot": "Reset your password", "downloading": "Downloading Launcher...", "launching": "Launching...",
@@ -794,7 +1226,7 @@ def load_fonts():
 
 
 def load_logo():
-    path = os.path.join(ASSETS_DIR, "icon.png")
+    path = theme_icon_path() or os.path.join(ASSETS_DIR, "icon.png")
     pm = QPixmap(path) if os.path.isfile(path) else QPixmap()
     if pm.isNull():
         pm = QPixmap()
@@ -802,24 +1234,151 @@ def load_logo():
     return pm
 
 
+# ---- NCZ logo (the Discord server icon, fallback assets/ncz.png) + Wikipedia facts for the Downloading / Launching screen
+NCZ_GUILD_ID = "1043135802932203641"
+_LC_FALLBACK_FACTS = [
+    "Honey never spoils: edible honey has been found in ancient Egyptian tombs.",
+    "Octopuses have three hearts and blue blood.",
+    "A day on Venus is longer than a year on Venus.",
+    "Bananas are berries, but strawberries are not.",
+    "Sharks existed before trees did.",
+    "Wombat droppings are cube-shaped.",
+    "The shortest war in history lasted about 40 minutes (Anglo-Zanzibar War, 1896).",
+    "Pac-Man was originally going to be called Puck-Man.",
+    "Sound travels roughly four times faster in water than in air.",
+    "The first computer mouse was made of wood.",
+    "Tetris was created in 1984 by Soviet engineer Alexey Pajitnov.",
+]
+_lc_facts = []
+_lc_fetching = False
+_lc_logo_checked = False
+
+
+def _lc_get(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _lc_logo_cache():
+    return os.path.join(settings_dir(), "ncz_server_icon.png")
+
+
+def _lc_fetch_logo():
+    """widget.json -> instance_invite -> /invites/<code> -> icon hash (needs the server's Widget enabled). Silent on any failure."""
+    global _lc_logo_checked
+    if _lc_logo_checked:
+        return
+    _lc_logo_checked = True
+    cached = _lc_logo_cache()
+    try:
+        if os.path.exists(cached) and time.time() - os.path.getmtime(cached) < 86400:
+            return
+        widget = json.loads(_lc_get(f"https://discord.com/api/v10/guilds/{NCZ_GUILD_ID}/widget.json"))
+        code = str(widget.get("instance_invite") or "").rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z0-9\-]{2,32}", code):
+            return
+        guild = (json.loads(_lc_get(f"https://discord.com/api/v10/invites/{code}")).get("guild") or {})
+        icon = str(guild.get("icon") or "")
+        if str(guild.get("id")) != NCZ_GUILD_ID or not re.fullmatch(r"[A-Za-z0-9_]{5,64}", icon):
+            return
+        raw = _lc_get(f"https://cdn.discordapp.com/icons/{NCZ_GUILD_ID}/{icon}.png?size=256", timeout=10)
+        if raw.startswith(b"\x89PNG") and len(raw) > 200:
+            os.makedirs(settings_dir(), exist_ok=True)
+            with open(cached + ".tmp", "wb") as f:
+                f.write(raw)
+            os.replace(cached + ".tmp", cached)
+    except Exception:
+        pass
+
+
+def _lc_trim(text, limit=170):
+    text = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", text or "")).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    dot = cut.rfind(". ")
+    return cut[:dot + 1] if dot > 60 else cut.rsplit(" ", 1)[0] + "..."
+
+
+def _lc_fetch_facts(n=6):
+    global _lc_fetching
+    try:
+        for _ in range(n):
+            d = json.loads(_lc_get("https://en.wikipedia.org/api/rest_v1/page/random/summary"))
+            ext, title = _lc_trim(d.get("extract", "")), str(d.get("title") or "")
+            if d.get("type") == "standard" and len(ext) >= 60 and title:
+                _lc_facts.append((ext, title))
+    except Exception:
+        pass
+    finally:
+        _lc_fetching = False
+
+
+def lc_prefetch():
+    global _lc_fetching
+    if not _lc_logo_checked:
+        threading.Thread(target=_lc_fetch_logo, daemon=True).start()
+    if len(_lc_facts) < 3 and not _lc_fetching:
+        _lc_fetching = True
+        threading.Thread(target=_lc_fetch_facts, daemon=True).start()
+
+
+def lc_next_fact():
+    lc_prefetch()
+    if _lc_facts:
+        text, title = _lc_facts.pop(0)
+        return text, f"Wikipedia: {title}"
+    return random.choice(_LC_FALLBACK_FACTS), ""
+
+
+def ncz_logo_pixmap(default):
+    """Cached server icon -> assets/ncz.png -> the sign-in icon; centre-cropped to a square."""
+    for path in (_lc_logo_cache(), os.path.join(ASSETS_DIR, "ncz.png")):
+        if os.path.isfile(path):
+            pm = QPixmap(path)
+            if not pm.isNull():
+                side = min(pm.width(), pm.height())
+                return pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+    return default
+
+
 def _a(v):
     return int(max(0, min(255, v)))
 
 
+_glow_cache = {}
+
+
 def _glow(p, cx, cy, rx, ry, rgb, alpha):
-    """Soft elliptical light."""
+    """Soft elliptical light. The gradient is rendered once per size/colour and then just blitted with an opacity
+    (drawing big radial gradients every frame was the most expensive part of a repaint)."""
     if alpha <= 0.5:
         return
+    pw, ph = max(2, int(2 * rx + 0.5)), max(2, int(2 * ry + 0.5))
+    key = (pw, ph, rgb[0], rgb[1], rgb[2])
+    pm = _glow_cache.get(key)
+    if pm is None:
+        if len(_glow_cache) > 24:
+            _glow_cache.clear()
+        pm = QPixmap(pw, ph)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        q.translate(pw / 2, ph / 2)
+        q.scale(1.0, ph / float(pw))
+        g = QRadialGradient(QPointF(0, 0), pw / 2)
+        g.setColorAt(0.0, QColor(rgb[0], rgb[1], rgb[2], 255))
+        g.setColorAt(0.5, QColor(rgb[0], rgb[1], rgb[2], 82))
+        g.setColorAt(1.0, QColor(rgb[0], rgb[1], rgb[2], 0))
+        q.setPen(Qt.PenStyle.NoPen)
+        q.setBrush(QBrush(g))
+        q.drawEllipse(QPointF(0, 0), pw / 2, pw / 2)
+        q.end()
+        _glow_cache[key] = pm
     p.save()
-    p.translate(cx, cy)
-    p.scale(1.0, ry / rx)
-    g = QRadialGradient(QPointF(0, 0), rx)
-    g.setColorAt(0.0, QColor(rgb[0], rgb[1], rgb[2], _a(alpha)))
-    g.setColorAt(0.5, QColor(rgb[0], rgb[1], rgb[2], _a(alpha * 0.32)))
-    g.setColorAt(1.0, QColor(rgb[0], rgb[1], rgb[2], 0))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(g))
-    p.drawEllipse(QPointF(0, 0), rx, rx)
+    p.setOpacity(p.opacity() * max(0.0, min(1.0, alpha / 255.0)))
+    p.drawPixmap(QPointF(cx - pw / 2, cy - ph / 2), pm)
     p.restore()
 
 
@@ -831,6 +1390,9 @@ class LoginWindow(QWidget):
         self.family = load_font_family()          # fallback when an akt_*.ttf is missing
         self.fonts = load_fonts()
         self._logo = load_logo()
+        self._ncz_logo = self._logo
+        self._fact, self._fact_t0 = ("", ""), 0.0
+        lc_prefetch()                       # icon + facts download while you sign in
         self.setWindowIcon(QIcon(self._logo))
 
         # 1920x1080, or scaled down to fit when the screen is smaller
@@ -890,6 +1452,15 @@ class LoginWindow(QWidget):
         self.btn_back.clicked.connect(self.on_back)
         self._track(self.btn_back, 835, 896, 290, 48, self._fit("Back to sign in", W.Normal, 200, 31), W.Normal, 0)
 
+        # social sign-in row, same width as the primary button (x 713..1250), just below the Create / Forgot links
+        self._social_buttons = []
+        for i, (kind, text) in enumerate((("google", "Google"), ("microsoft", "Microsoft"), ("github", "GitHub"))):
+            b = SocialButton(kind, text, self)
+            b.clicked.connect(lambda _=False, k=kind: self.on_social(k))
+            self._track(b, 713 + i * 183, 958, 171, 50, 22, W.Normal, 0)
+            self._social_buttons.append(b)
+        self._social_buttons = tuple(self._social_buttons)
+
         self.progress = ProgressBar(self)
         self._track(self.progress, 560, 628, 800, 70, 21, W.Normal, 0)
 
@@ -901,7 +1472,7 @@ class LoginWindow(QWidget):
         self._track(self.btn_close, DW - 72, 16, 54, 40, 0, W.Normal, 0)
 
         self._dynamic = (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_create, self.btn_forgot,
-                         self.btn_back, self.btn_primary, self.lbl_status, self.progress)
+                         self.btn_back, self.btn_primary, self.lbl_status, self.progress, *self._social_buttons)
         self._shake_set = (self.lbl_email, self.lbl_pw, self.email, self.pw)
         self._shake_dx = 0.0
         self._shake_t0 = -10.0
@@ -922,15 +1493,14 @@ class LoginWindow(QWidget):
         self._ban_t = 0.0
         self._logo_reveal = 0.0
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
 
         self._apply_state()
         self.relayout()
-        self.setWindowTitle("NCZ Games Launcher Registration")
-        self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "icon.png")))
 
-    # ── layout helpers ──
+    # ---- layout helpers
     def make_font(self, weight, px):
         """weight doubles as the role: Bold -> akt_bold, Light -> akt_light, anything else -> akt_reg."""
         role = "bold" if weight == QFont.Weight.Bold else "light" if weight == QFont.Weight.Light else "reg"
@@ -997,7 +1567,7 @@ class LoginWindow(QWidget):
         self._bg_cache = None
         self.relayout()
 
-    # ── window behaviour ──
+    # ---- window behaviour
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.windowHandle():
             self.windowHandle().startSystemMove()
@@ -1005,6 +1575,7 @@ class LoginWindow(QWidget):
 
     def closeEvent(self, e):
         self._timer.stop()
+        _oauth_cancel.set()
         if self._dl is not None:
             self._dl.cancel = True
             self._dl.wait(3000)
@@ -1012,7 +1583,7 @@ class LoginWindow(QWidget):
             self._worker.wait(3000)
         super().closeEvent(e)
 
-    # ── animation loop ──
+    # ---- animation loop
     def _tick(self):
         now = time.perf_counter()
         dt = min(0.1, now - self._last)
@@ -1041,6 +1612,8 @@ class LoginWindow(QWidget):
             tgt = 1.0 if (wd.isVisible() and wd.hasFocus()) else 0.0
             self._focus[wd] += (tgt - self._focus[wd]) * 0.2
         self._ban_t += ((1.0 if self.state == "banned" else 0.0) - self._ban_t) * 0.06
+        if self.state in ("downloading", "launching") and t - self._fact_t0 > 10.0:
+            self._fact, self._fact_t0 = lc_next_fact(), t
         self.btn_primary.phase = t
         if self.btn_primary.isVisible():
             self.btn_primary.update()
@@ -1061,7 +1634,7 @@ class LoginWindow(QWidget):
         if self.state in ("form", "create", "forgot"):
             self._shake_t0 = self._t
 
-    # ── painting ──
+    # ---- painting
     def _background(self):
         dpr = self.devicePixelRatioF()
         w, h = self.width(), self.height()
@@ -1069,11 +1642,8 @@ class LoginWindow(QWidget):
         pm.setDevicePixelRatio(dpr)
         p = QPainter(pm)
         g = QLinearGradient(0, 0, 0, h)
-        g.setColorAt(0.00, QColor(0, 0, 0))
-        g.setColorAt(0.45, QColor(8, 8, 8))
-        g.setColorAt(0.70, QColor(40, 40, 40))
-        g.setColorAt(0.88, QColor(95, 95, 95))
-        g.setColorAt(1.00, QColor(138, 138, 138))
+        for pos, col in THEME["bg"]:
+            g.setColorAt(pos, QColor(*col))
         p.fillRect(QRectF(0, 0, w, h), QBrush(g))
         r = QRadialGradient(QPointF(w * 0.5, h * 0.80), w * 0.46)       # darker middle, lighter lower corners
         r.setColorAt(0.0, QColor(0, 0, 0, 135))
@@ -1099,8 +1669,8 @@ class LoginWindow(QWidget):
         p.drawPixmap(0, 0, self._bg_cache)
 
         # slow drifting mist near the bottom
-        _glow(p, w * (0.22 + 0.06 * math.sin(t * 0.13)), h * 1.0, w * 0.42, h * 0.34, (255, 255, 255), 30)
-        _glow(p, w * (0.78 + 0.06 * math.cos(t * 0.11)), h * 1.0, w * 0.42, h * 0.34, (255, 255, 255), 30)
+        _glow(p, w * (0.22 + 0.06 * math.sin(t * 0.13)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
+        _glow(p, w * (0.78 + 0.06 * math.cos(t * 0.11)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
 
         # stars (parallax with the mouse, twinkling, fading out towards the bottom)
         p.setPen(Qt.PenStyle.NoPen)
@@ -1132,7 +1702,7 @@ class LoginWindow(QWidget):
 
         # soft light that follows the cursor
         if self.rect().contains(self._spot.toPoint()):
-            _glow(p, self._spot.x(), self._spot.y(), 360 * s, 360 * s, (255, 255, 255), 17)
+            _glow(p, self._spot.x(), self._spot.y(), 360 * s, 360 * s, THEME["halo"], 17)
 
         ox, oy = self._origin()
         # logo: halo + floating rounded icon
@@ -1143,18 +1713,31 @@ class LoginWindow(QWidget):
             cx, cy = ox + 982 * s, oy + (232 + 130) * s + bob + (1 - e) * 22 * s
             p.save()
             p.setOpacity(e)
-            _glow(p, cx, cy, 330 * s, 330 * s, (255, 255, 255), 34 + 12 * math.sin(t * 1.6))
+            _glow(p, cx, cy, 330 * s, 330 * s, THEME["halo"], 34 + 12 * math.sin(t * 1.6))
             rect = QRectF(cx - size / 2, cy - size / 2, size, size)
             path = QPainterPath()
-            path.addRoundedRect(rect, 12 * s, 12 * s)
-            if not self._logo.isNull():
+            if self.state in ("downloading", "launching") and not self._ncz_logo.isNull():
+                # loading: the round NCZ logo, spinning
+                spin = self._spin_pixmap(size)
+                half = spin.width() / spin.devicePixelRatio() / 2
                 p.save()
-                p.setClipPath(path)
-                p.drawPixmap(rect.toRect(), self._logo)
+                p.translate(cx, cy)
+                p.rotate((t * 140) % 360)
+                p.drawPixmap(QPointF(-half, -half), spin)
                 p.restore()
-            p.setPen(QPen(QColor(255, 255, 255, 40), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(path)
+                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(rect)
+            else:
+                path.addRoundedRect(rect, 12 * s, 12 * s)
+                if not self._logo.isNull():
+                    p.save()
+                    p.setClipPath(path)
+                    p.drawPixmap(rect.toRect(), self._logo)
+                    p.restore()
+                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
             p.restore()
 
         # glow under the primary button and the focused field
@@ -1162,7 +1745,7 @@ class LoginWindow(QWidget):
             g = self.btn_primary.geometry()
             hv = self._hover[self.btn_primary]
             _glow(p, g.center().x(), g.center().y() + 4 * s, g.width() * 0.62, g.height() * 1.7,
-                  (255, 255, 255), 30)
+                  THEME["halo"], 30)
         for field, amt in self._focus.items():
             if field.isVisible() and amt > 0.01:
                 g = field.geometry()
@@ -1183,11 +1766,46 @@ class LoginWindow(QWidget):
             p.setPen(pen)
             p.drawArc(box, int(-t * 360 * 1.3 * 16), 110 * 16)
 
+        # a Wikipedia fact under the progress bar, fading in and out
+        if self.state in ("downloading", "launching") and self._fact[0]:
+            age = t - self._fact_t0
+            fa = max(0.0, min(1.0, age / 0.8, (10.0 - age) / 0.8))
+            text, src = self._fact
+            opt = QTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+            p.setFont(self.make_font(QFont.Weight.Light, 27 * s))
+            p.setPen(QColor(255, 255, 255, _a(215 * fa)))
+            p.drawText(QRectF(ox + 460 * s, oy + 735 * s, 1000 * s, 110 * s), text, opt)
+            if src:
+                p.setFont(self.make_font(QFont.Weight.Normal, 18 * s))
+                p.setPen(QColor(255, 255, 255, _a(120 * fa)))
+                p.drawText(QRectF(ox + 460 * s, oy + 850 * s, 1000 * s, 30 * s), int(Qt.AlignmentFlag.AlignCenter), src)
+
         if self._ban_t > 0.01:
             _glow(p, w / 2, h * 0.5, w * 0.55, h * 0.55, (170, 20, 20), 60 * self._ban_t)
         p.end()
 
-    # ── reveal animations (fade + rise) ──
+    def _spin_pixmap(self, size):
+        """The round NCZ logo rendered ONCE at the size it is drawn (and cached), so spinning is just a rotated blit."""
+        size = max(8, int(round(size)))
+        dpr = self.devicePixelRatioF()
+        key = (self._ncz_logo.cacheKey(), size, dpr)
+        if getattr(self, "_spin_key", None) != key:
+            px = int(size * dpr)
+            pm = QPixmap(px, px)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addEllipse(QRectF(0, 0, px, px))
+            q.setClipPath(clip)
+            q.drawPixmap(QRectF(0, 0, px, px), self._ncz_logo, QRectF(self._ncz_logo.rect()))
+            q.end()
+            pm.setDevicePixelRatio(dpr)
+            self._spin_pm, self._spin_key = pm, key
+        return self._spin_pm
+
+    # ---- reveal animations (fade + rise)
     def _reveal(self, widget, delay=0, dur=620, rise=26):
         eff = QGraphicsOpacityEffect(widget)
         eff.setOpacity(0.0)
@@ -1237,7 +1855,7 @@ class LoginWindow(QWidget):
         for wd in (self.lbl_handle, self.lbl_version, self.btn_min, self.btn_close):
             self._reveal(wd, 900, dur=700, rise=0)
 
-    # ── state / status ──
+    # ---- state / status
     def set_status(self, text, error=True):
         self.lbl_status.setStyleSheet(f"background:transparent;color:{'#ff9b9b' if error else '#d6d6d6'};")
         self.lbl_status.setText(text)
@@ -1245,7 +1863,8 @@ class LoginWindow(QWidget):
             self._shake()
 
     def _set_inputs_enabled(self, on):
-        for wd in (self.email, self.pw, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back):
+        for wd in (self.email, self.pw, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back,
+                   *self._social_buttons):
             wd.setEnabled(on)
 
     def _busy(self, text):
@@ -1261,11 +1880,11 @@ class LoginWindow(QWidget):
     def _apply_state(self):
         visible = {
             "form": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_create, self.btn_forgot,
-                     self.btn_primary, self.lbl_status),
+                     self.btn_primary, self.lbl_status, *self._social_buttons),
             "downloading": (self.progress,),
             "launching": (self.progress,),
             "create": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_back, self.btn_primary,
-                       self.lbl_status),
+                       self.lbl_status, *self._social_buttons),
             "forgot": (self.lbl_email, self.email, self.btn_back, self.btn_primary, self.lbl_status),
             "dl_error": (self.btn_primary, self.lbl_status),
             "banned": (),
@@ -1277,12 +1896,16 @@ class LoginWindow(QWidget):
         self.lbl_title.setText(TITLES[self.state])
 
     def _go(self, state):
+        if state in ("downloading", "launching") and self.state not in ("downloading", "launching"):
+            self._ncz_logo = ncz_logo_pixmap(self._logo)
+            self._fact, self._fact_t0 = lc_next_fact(), self._t
         self.state = state
+        self._timer.setInterval(16 if state in ("downloading", "launching") else 33)     # smooth spin while loading
         self._apply_state()
         self.relayout()
         self._reveal_visible()
 
-    # ── background jobs ──
+    # ---- background jobs
     def _run(self, job, on_done):
         self._worker = Worker(job, self)
         self._worker.done.connect(on_done)
@@ -1293,7 +1916,7 @@ class LoginWindow(QWidget):
         self._idle()
         self.set_status(message)
 
-    # ── sign in / create account ──
+    # ---- sign in / create account
     def _read_form(self, create):
         email, pw = self.email.text().strip(), self.pw.text()
         if not email or "@" not in email:
@@ -1350,6 +1973,33 @@ class LoginWindow(QWidget):
             return r["account"]
 
         self._run(job, self._let_pass)
+
+    def on_social(self, name):
+        global user_email
+        cfg = _provider_cfg(name)
+        if not cfg["client_id"]:
+            self.set_status(f"{cfg['label']} sign-in isn't set up yet.")
+            return
+        user_email = f"{cfg['label']} sign-in"          # shown in the ban alert until the real email is known
+        _oauth_cancel.clear()
+
+        def proceed():
+            self._busy(f"Finish signing in with {cfg['label']} in your browser...")
+
+            def job():
+                r = social_sign_in(name, _oauth_cancel)
+                r["exists"] = db_profile_exists(r["uid"], r["token"])
+                return r
+
+            self._run(job, self._social_signed_in)
+
+        self._new_account_gate(proceed, strict=False, action="sign in to")      # banned Discord id -> ban
+
+    def _social_signed_in(self, r):
+        global user_email
+        if r["account"].get("email"):
+            user_email = r["account"]["email"]
+        self._signed_in(r)                               # same path as email/password: profile check, Discord gate for new accounts
 
     def _email_enter(self):
         if self.state == "forgot":
@@ -1424,7 +2074,7 @@ class LoginWindow(QWidget):
         try:
             save_account(account)                    # same account.json as main.py -> the launcher opens signed in
         except OSError:
-            _log_exc("_let_pass")
+            pass
         self.pw.clear()
         self._busy_flag = False
         self.set_status("")
@@ -1433,14 +2083,57 @@ class LoginWindow(QWidget):
         else:
             self.start_download()
 
-    # ── download + launch ──
-    def start_download(self):
+    # ---- download + launch
+    def start_download(self, entries=None):
         self._busy_flag = False
+        self._update_only = entries is not None            # an assets update (launcher already installed)
         self.set_status("")
         self.progress.value = self.progress.shown = 0.0
         self.progress.text = "Connecting to GitHub..."
         self._go("downloading")
-        self._dl = DownloadWorker(self)
+        if entries is None:
+            # full install: get the file list first (off the GUI thread), so the Big Picture question can be asked
+            # before anything is downloaded
+            self._lw = Worker(list_launcher_files, self)
+            self._lw.done.connect(lambda ents: self._begin_download(ents, True))
+            self._lw.failed.connect(self._on_download_failed)
+            self._lw.start()
+        else:
+            self._begin_download(entries, False)
+
+    def _ask_bigpicture(self, entries):
+        """If the files to download include the Big Picture startup gif / wav and they aren't on this PC yet, asks
+        whether to download NCZ Big Picture Utilities. Returns the entries to really download (without those files
+        when the answer is No)."""
+        bp = [e for e in entries if _is_bigpicture(e[0])]
+        if not bp:
+            return entries
+        def dest(p):
+            return os.path.normpath(os.path.join(INSTALL_DIR, *p.split("/")))
+        if all(os.path.exists(dest(e[0])) for e in bp):
+            return entries                                  # already installed: just updated like any other file
+        if bigpicture_declined():
+            return [e for e in entries if not _is_bigpicture(e[0])]   # said No earlier: don't ask on every start
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("NCZ Big Picture Utilities")
+        box.setText(f"Do you want to download {BIGPICTURE_TEXT}?")
+        box.setInformativeText("Choose No to continue without them.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            set_bigpicture_declined(False)
+            return entries
+        set_bigpicture_declined(True)
+        return [e for e in entries if not _is_bigpicture(e[0])]
+
+    def _begin_download(self, entries, full):
+        entries = self._ask_bigpicture(entries)
+        if not entries and not full:
+            self.launch_now()                               # an update that only had the declined files: nothing to do
+            return
+        self.progress.text = "Connecting to GitHub..."
+        self._dl = DownloadWorker(self, entries, full)
         self._dl.progress.connect(self._on_progress)
         self._dl.done.connect(self._on_downloaded)
         self._dl.failed.connect(self._on_download_failed)
@@ -1456,6 +2149,9 @@ class LoginWindow(QWidget):
         QTimer.singleShot(650, self.launch_now)
 
     def _on_download_failed(self, message):
+        if getattr(self, "_update_only", False):
+            self.launch_now()                               # the launcher is already installed: don't block it on an asset update
+            return
         self._go("dl_error")
         self._idle()
         self.set_status(message)
@@ -1478,7 +2174,7 @@ class LoginWindow(QWidget):
 
         QTimer.singleShot(900, go)
 
-    # ── ban ──
+    # ---- ban
     def ban(self, discord_id, notify=True, action="make an account in"):
         self._set_inputs_enabled(False)
         self._go("banned")
@@ -1496,12 +2192,17 @@ class LoginWindow(QWidget):
 
 def main():
     # signed in and installed: skip the window completely and open the launcher
+    changed = []
     if not is_flagged_banned() and load_account() and install_complete():
-        try:
-            launch_launcher()
-            return
-        except Exception:
-            _log_exc("main")                                      # couldn't start it -> fall through to the window
+        # silent: new or modified files in assets/, plus main.py and the other scripts when Automatic Updates is on
+        # (empty when offline)
+        changed = list_asset_updates(include_scripts=auto_update_on())
+        if not changed:
+            try:
+                launch_launcher()
+                return
+            except Exception:
+                pass                                  # couldn't start it -> fall through to the window
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = LoginWindow()
@@ -1509,10 +2210,16 @@ def main():
     win.play_intro()
     if is_flagged_banned():                           # banned earlier: no sign-in, just the message and close
         QTimer.singleShot(0, lambda: win.ban(None, notify=False))
-    elif load_account():                              # signed in but the launcher isn't downloaded (yet)
-        QTimer.singleShot(0, win.start_download)
+    elif load_account():                              # signed in but the launcher isn't downloaded (yet), or assets changed
+        QTimer.singleShot(0, lambda: win.start_download(changed or None))
     sys.exit(app.exec())
 
+_old_init = LoginWindow.__init__
+def _new_init(self):
+    _old_init(self)
+    self.setWindowTitle("NCZ Games Launcher Registration")
+    self.setWindowIcon(QIcon(theme_icon_path() or os.path.join(ASSETS_DIR, "icon.png")))
+LoginWindow.__init__ = _new_init
 
 
 if __name__ == "__main__":
