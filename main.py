@@ -4119,8 +4119,8 @@ class CreditsPage(QWidget):
     CREDITS = (
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
         ("mr.fancypigeon", "Linux Script for FNaNCZ 1 and 2, Garry's Mod Addon Manager, and ideas", "pigeon.png"),
-        ("notacape", "NCZFront", "notacape.png"),
-        ("Kablooey", "Terms and Conditions, Ideas", "kablooey.png"),
+        ("notacape", "NCZFront, Optimization and porting", "notacape.png"),
+        ("glimpsesofhope", "Terms and Conditions, Ideas", "kablooey.png"),
     )
 
     @staticmethod
@@ -12067,7 +12067,7 @@ PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
 PW_RELAY_BUTTONS = 'button.download, a.download, [onclick*="openLink"]'  # link buttons on the container page
-PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to", "pixeldrain.com")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
+PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to", "pixeldrain.com", "itsfileditchfiles.st")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
 PW_HEADLESS = True                                     # True hides the browser; it only pops up while you solve a captcha
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
@@ -12220,7 +12220,7 @@ PW_LABEL_JS = r"""el => {
         node = p;
     }
     const h = node.outerHTML;
-    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h), pixeldrain: /pixel\s*-?drain/i.test(h)};
+    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h), pixeldrain: /pixel\s*-?drain/i.test(h), fileditch: /file\s*-?ditch/i.test(h)};
 }"""
 
 def _pw_host_ok(url, hosts):
@@ -12447,13 +12447,16 @@ def _pw_find_link(self, start_url):
                             bad |= {i for i, f in enumerate(flags) if f["mega"]}
                         order = ([i for i, f in enumerate(flags) if f["bzzhr"]] +
                                  [i for i, f in enumerate(flags) if f["pixeldrain"]] +
-                                 [i for i, f in enumerate(flags) if f["gofile"]] + list(range(n)))
+                                 [i for i, f in enumerate(flags) if f["gofile"]] +
+                                 [i for i, f in enumerate(flags) if f.get("fileditch")] + list(range(n)))
                         if any(f["bzzhr"] for f in flags):
                             self.status_update.emit("Found a BZZHR button, using it...")
                         elif any(f["pixeldrain"] for f in flags):
                             self.status_update.emit("No BZZHR button, using Pixeldrain...")
                         elif any(f["gofile"] for f in flags):
                             self.status_update.emit("No BZZHR or Pixeldrain button, using GoFile...")
+                        elif any(f.get("fileditch") for f in flags):
+                            self.status_update.emit("No BZZHR, Pixeldrain or GoFile button, using Fileditch...")
                     idx = next((i for i in (order or range(n)) if i not in bad), None) if n else 0
                     if idx is None:
                         raise RuntimeError("No other DOWNLOAD HERE button found.")
@@ -12489,6 +12492,16 @@ def _pw_find_link(self, start_url):
             if not target:
                 raise RuntimeError("Couldn't reach a valid download link.")
 
+            if _pw_on(target.url, ("itsfileditchfiles.st",)):
+                # Fileditch has a Cloudflare check that blocks Playwright's Chromium, so (like server 3) the page is
+                # opened in your own browser; you pass the check, "⬇️ Download" is pressed for you, the launcher takes the link.
+                fd_url = target.url
+                try:
+                    target.close()
+                except Exception:    # expected: cleanup that may already be done
+                    pass
+                self.status_update.emit("Fileditch has a Cloudflare check, opening it in your browser...")
+                return _pw_s3_capture_in_browser(self, fd_url, auto_click=True)
             self.status_update.emit("Getting file link...")
             mega = _pw_on(target.url, PW_MEGADB)
             if mega:
@@ -13014,23 +13027,53 @@ class _MiniWS:
         except Exception:    # expected: cleanup that may already be done
             pass
 
-def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
+def _pw_close_browser(proc):
+    """Closes the browser started for a capture, with all of its processes (on Linux the main process is often a
+    launcher script and Chrome's helpers live on, so the whole process group is ended)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        else:
+            import signal
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:    # expected: still shutting down
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+    except Exception:    # expected: cleanup that may already be done
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30, auto_click=False):
     """Opens url in your real, normally launched Chrome / Edge / Brave and does NOT automate it at all (no Playwright
     attached to the page, no navigation by script), so Cloudflare's captcha sees a normal browser. The launcher only
     listens on the browser-level DevTools port for 'a download is about to start': that event carries the download
     link. The browser's own download is denied, the link + the browser's cookies / user agent are copied, and
-    (url, headers) is returned so the launcher downloads the file itself."""
+    (url, headers) is returned so the launcher downloads the file itself.
+    auto_click: once the page shows a button that says Download (so any Cloudflare check is already passed), it is
+    pressed with a real browser-level mouse click (no script on the page, no Runtime.enable), a few tries at most."""
     exe = _pw_real_browser_exe()
     if not exe:
-        raise RuntimeError("Couldn't find Chrome, Edge or Brave on this PC. Install one of them for server 3.")
+        raise RuntimeError("Couldn't find Chrome, Edge or Brave on this PC. Install one of them for this server.")
     port = _pw_free_port()
     profile = os.path.join(os.path.dirname(get_launcher_settings_path()), "server3_browser_profile")   # kept, so a solved captcha is remembered
     os.makedirs(profile, exist_ok=True)
     self.status_update.emit("Opening the page in your browser. Finish the captcha / verification there...")
     proc = subprocess.Popen([exe, f"--remote-debugging-port={port}", f"--remote-debugging-address=127.0.0.1",
                              f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", url],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=(os.name != "nt"))    # own process group, so it can be closed whole
     ws = None
+    click = {"ws": None, "page": None, "last": 0.0, "n": 0}
     try:
         info = None
         for _ in range(60):          # wait for the debug port to come up
@@ -13065,6 +13108,56 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
         # Browser-level only: deny the browser's own download, but report it (with its link) first
         call("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": True})
 
+        click_host = (urllib.parse.urlparse(url).hostname or "").lower()
+        click_js = r"""(() => {
+            const re = /^\s*(\u2B07\uFE0F?\s*)?download\s*$/i;
+            const txt = e => (e.innerText || e.value || "").trim();
+            let el = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].find(e => re.test(txt(e)));
+            if (!el) el = [...document.querySelectorAll('div,span,p')].find(e => !e.children.length && re.test(txt(e)));
+            if (!el) return null;
+            el.scrollIntoView({block: 'center'});
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return null;
+            return [r.left + r.width / 2, r.top + r.height / 2];
+        })()"""
+        def page_call(method, params):
+            w = click["ws"]
+            ids["n"] += 1
+            mid = ids["n"]
+            w.send(json.dumps({"id": mid, "method": method, "params": params}))
+            end = time.time() + 5
+            while time.time() < end:
+                m = w.recv(0.5)
+                if m:
+                    d = json.loads(m)
+                    if d.get("id") == mid:
+                        return d.get("result") or {}
+            return {}
+        def try_click():
+            """Looks for the Download button on the page in the browser and presses it with a real mouse click."""
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+                pages = [t for t in json.loads(r.read().decode()) if t.get("type") == "page"
+                         and (urllib.parse.urlparse(str(t.get("url", ""))).hostname or "").lower().endswith(click_host)]
+            if not pages:
+                return
+            pg = pages[-1]
+            if click["page"] != pg["id"]:
+                if click["ws"]:
+                    click["ws"].close()
+                u = urllib.parse.urlparse(pg["webSocketDebuggerUrl"])
+                click["ws"] = _MiniWS(u.hostname, u.port, u.path)
+                click["page"] = pg["id"]
+            val = ((page_call("Runtime.evaluate", {"expression": click_js, "returnByValue": True}).get("result") or {}).get("value"))
+            if not val:
+                return
+            x, y = val
+            self.status_update.emit("Pressing Download...")
+            page_call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+            page_call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+            page_call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+            click["n"] += 1
+            click["last"] = time.time() + 4      # give the download a few seconds before looking again
+
         dl_url = ""
         deadline = time.time() + wait_minutes * 60
         while not dl_url:
@@ -13072,6 +13165,12 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
                 raise RuntimeError("CANCELLED")
             if time.time() > deadline:
                 raise RuntimeError("No download started in the browser window.")
+            if auto_click and click["n"] < 5 and time.time() - click["last"] > 1.5:
+                click["last"] = time.time()
+                try:
+                    try_click()
+                except Exception:    # expected: page navigating, or the browser not ready yet
+                    click["ws"], click["page"] = None, None
             if proc.poll() is not None:
                 raise RuntimeError("The browser window was closed before a download started.")
             m = ws.recv(0.5)
@@ -13107,9 +13206,11 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
         if ws:
             ws.close()
         try:
-            proc.terminate()
+            if click["ws"]:
+                click["ws"].close()
         except Exception:    # expected: cleanup that may already be done
             pass
+        _pw_close_browser(proc)
 
 def _pw_find_link_s3(self, start_url):
     """Server 3. Stays in the hidden Playwright browser (Download, Download) until the site redirects away from the
