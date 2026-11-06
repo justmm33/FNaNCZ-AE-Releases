@@ -350,23 +350,64 @@ def _draw_text(p, rect, text, flags=Qt.AlignmentFlag.AlignVCenter):
 ICON_D = 46                       # size of the little icon on the right (unscaled toast units)
 ICON_PAD = 14                     # gap to the toast's right edge
 ICON_RESERVE = ICON_D + ICON_PAD + 6      # text stops this far from the right edge
-_icon_cache = {"pm": None, "tried": False}
+_icon_cache = {"pm": None, "path": None, "mtime": None, "checked": 0.0}
+_icon_provider = None          # set by the launcher: returns the icon of the active theme (main.py's asset_path("icon.png"))
+_icon_override = ""            # path sent along to the XWayland helper process, which has no launcher to ask
+
+
+def set_icon_provider(fn):
+    """The launcher hands over a function that returns the icon file of the current theme (New / Sunset / Classic /
+    Legacy, an account theme or a custom theme), so the toasts show the same icon as the launcher."""
+    global _icon_provider
+    _icon_provider = fn if callable(fn) else None
+    _icon_cache.update(pm=None, path=None, mtime=None, checked=0.0)
+
+
+def set_icon_path(path):
+    """Fixed icon file (used by the XWayland helper, which gets the path from the launcher with every toast)."""
+    global _icon_override
+    path = str(path or "")
+    if path != _icon_override:
+        _icon_override = path
+        _icon_cache.update(pm=None, path=None, mtime=None, checked=0.0)
+
+
+def current_icon_path():
+    """The icon file the toasts use right now: the theme's icon, else assets/icon.png ('' when there is none)."""
+    cands = []
+    if _icon_provider is not None:
+        try:
+            cands.append(_icon_provider())
+        except Exception:
+            pass
+    if _icon_override:
+        cands.append(_icon_override)
+    cands += [os.path.join(d, "icon.png") for d in _assets_dirs()]
+    for path in cands:
+        if path and os.path.isfile(path):
+            return path
+    return ""
 
 
 def _toast_icon():
-    """assets/icon.png as a square, cropped to the middle (None when the file isn't there)."""
-    if not _icon_cache["tried"]:
-        _icon_cache["tried"] = True
-        for d in _assets_dirs():
-            path = os.path.join(d, "icon.png")
-            if os.path.isfile(path):
-                pm = QPixmap(path)
-                if not pm.isNull():
-                    big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                    Qt.TransformationMode.SmoothTransformation)
-                    _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
-                                                 ICON_D * 2, ICON_D * 2)
-                    break
+    """The theme's icon as a square, cropped to the middle (None when there is no icon file). The file is looked up
+    again every couple of seconds, so a theme or accent change shows up without restarting."""
+    now = time.monotonic()
+    if _icon_cache["pm"] is None or now - _icon_cache["checked"] > 2.0:
+        _icon_cache["checked"] = now
+        path = current_icon_path()
+        try:
+            mtime = os.path.getmtime(path) if path else None
+        except OSError:
+            mtime = None
+        if path != _icon_cache["path"] or mtime != _icon_cache["mtime"]:
+            _icon_cache.update(path=path, mtime=mtime, pm=None)
+            pm = QPixmap(path) if path else QPixmap()
+            if not pm.isNull():
+                big = pm.scaled(ICON_D * 2, ICON_D * 2, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                Qt.TransformationMode.SmoothTransformation)
+                _icon_cache["pm"] = big.copy((big.width() - ICON_D * 2) // 2, (big.height() - ICON_D * 2) // 2,
+                                             ICON_D * 2, ICON_D * 2)
     return _icon_cache["pm"]
 
 
@@ -893,7 +934,7 @@ class OverlayManager:
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
                                          "badge": badge or "", "plain": bool(plain),
-                                         "accent": _accent_hex, "light": _light, "sunset": _sunset,
+                                         "accent": _accent_hex, "light": _light, "sunset": _sunset, "icon": current_icon_path(),
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
@@ -1250,6 +1291,8 @@ class _ServerBridge(QObject):
     def on_got(self, d):
         if d.get("emoji_dir"):
             set_emoji_dir(d["emoji_dir"])
+        if d.get("icon"):
+            set_icon_path(str(d["icon"]))
         if d.get("accent"):
             set_accent(str(d["accent"]))
         if "sunset" in d:
