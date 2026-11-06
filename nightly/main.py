@@ -5184,6 +5184,278 @@ def check_steamgriddb_key(key):
         raise
     return "ok"
 
+def sgdb_search_games(term, key):
+    """Games on SteamGridDB matching a search term: [{'id', 'name', ...}]."""
+    found = _sgdb_get_json("/search/autocomplete/" + urllib.parse.quote(term, safe=""), key)
+    return [g for g in (found or {}).get("data") or [] if isinstance(g, dict) and g.get("id")]
+
+def sgdb_steam_game(appid, key):
+    """The SteamGridDB game for a Steam app id, or None."""
+    found = _sgdb_get_json(f"/games/steam/{appid}", key)
+    game = (found or {}).get("data")
+    return game if isinstance(game, dict) and game.get("id") else None
+
+def sgdb_game_grids(game_id, key, page=0):
+    """One page (up to 50) of static portrait covers for a SteamGridDB game id: [{'url', 'thumb', ...}]."""
+    found = _sgdb_get_json(f"/grids/game/{game_id}?dimensions={SGDB_PORTRAIT_SIZES}&types=static&page={page}", key)
+    return [g for g in (found or {}).get("data") or [] if isinstance(g, dict) and g.get("url")]
+
+
+class _SgdbPickSignals(QObject):
+    games = pyqtSignal(int, object)         # token, [game dicts]
+    grids = pyqtSignal(int, int, object)    # token, page, [grid dicts]
+    thumb = pyqtSignal(int, int, object)    # token, row, image bytes
+    error = pyqtSignal(int, str)            # token, message
+    chosen = pyqtSignal(int, object)        # token, full image bytes
+
+
+class SgdbCoverPickerDialog(QDialog):
+    """Search SteamGridDB for a game and pick one of its covers. After exec(), selected_bytes holds the image."""
+    _pool = ThreadPoolExecutor(max_workers=6)
+
+    def __init__(self, parent, title, key, steam_appid=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pick Cover")
+        self.resize(900, 640)
+        self.selected_bytes = None
+        self._key = key
+        self._steam_appid = steam_appid
+        self._games_token = 0
+        self._grid_token = 0
+        self._pick_token = 0
+        self._game_id = None
+        self._page = 0
+        self._sig = _SgdbPickSignals(self)
+        self._sig.games.connect(self._on_games)
+        self._sig.grids.connect(self._on_grids)
+        self._sig.thumb.connect(self._on_thumb)
+        self._sig.error.connect(self._on_error)
+        self._sig.chosen.connect(self._on_chosen)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        self.search_edit = QLineEdit(title or "")
+        self.search_edit.setPlaceholderText("Search SteamGridDB for a game")
+        self.search_edit.returnPressed.connect(self._search)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.search_btn.clicked.connect(self._search)
+        top.addWidget(self.search_edit, 1)
+        top.addWidget(self.search_btn)
+        layout.addLayout(top)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        self.games_list = QListWidget()
+        self.games_list.setFixedWidth(230)
+        self.games_list.currentRowChanged.connect(self._on_game_selected)
+        body.addWidget(self.games_list)
+
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self.grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.grid.setMovement(QListWidget.Movement.Static)
+        self.grid.setWrapping(True)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setIconSize(QSize(150, 225))
+        self.grid.setGridSize(QSize(166, 238))
+        self.grid.setSpacing(4)
+        self.grid.itemDoubleClicked.connect(lambda _it: self._pick())
+        self.grid.currentItemChanged.connect(lambda *_a: self._update_buttons())
+        body.addWidget(self.grid, 1)
+        layout.addLayout(body, 1)
+
+        self.status = QLabel("")
+        self.status.setObjectName("RowDesc")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        bottom = QHBoxLayout()
+        self.more_btn = QPushButton("Load more")
+        self.more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.more_btn.clicked.connect(self._load_more)
+        self.more_btn.hide()
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        self.use_btn = QPushButton("Use This Cover")
+        self.use_btn.setObjectName("Primary")
+        self.use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.use_btn.setEnabled(False)
+        self.use_btn.clicked.connect(self._pick)
+        bottom.addWidget(self.more_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(cancel)
+        bottom.addWidget(self.use_btn)
+        layout.addLayout(bottom)
+
+        QTimer.singleShot(0, self._search)
+
+    # -- helpers --
+    def _emit(self, signal, *args):
+        try:
+            signal.emit(*args)
+        except RuntimeError:    # expected: the dialog was closed while a request was still running
+            pass
+
+    def _update_buttons(self):
+        self.use_btn.setEnabled(self.grid.currentItem() is not None and self.use_btn.text() == "Use This Cover")
+
+    def done(self, result):
+        self._games_token += 1
+        self._grid_token += 1
+        self._pick_token += 1
+        super().done(result)
+
+    # -- searching games --
+    def _search(self):
+        term = self.search_edit.text().strip()
+        self._games_token += 1
+        self._grid_token += 1
+        token = self._games_token
+        self.games_list.clear()
+        self.grid.clear()
+        self.more_btn.hide()
+        self._game_id = None
+        self.status.setText("Searching...")
+        key, appid = self._key, self._steam_appid
+        first_search = not getattr(self, "_searched_once", False)
+        self._searched_once = True
+
+        def work():
+            try:
+                games = []
+                if appid and first_search:        # the exact Steam match goes first
+                    exact = sgdb_steam_game(appid, key)
+                    if exact:
+                        games.append(exact)
+                if term:
+                    for g in sgdb_search_games(term, key):
+                        if not any(x["id"] == g["id"] for x in games):
+                            games.append(g)
+                self._emit(self._sig.games, token, games)
+            except urllib.error.HTTPError as e:
+                msg = "SteamGridDB rejected the API key. Check it in Settings." if e.code in (401, 403) \
+                    else f"SteamGridDB error ({e.code})."
+                self._emit(self._sig.error, token, msg)
+            except Exception as e:
+                self._emit(self._sig.error, token, f"Couldn't reach SteamGridDB: {e}")
+        self._pool.submit(work)
+
+    def _on_games(self, token, games):
+        if token != self._games_token:
+            return
+        self.games_list.blockSignals(True)
+        for g in games:
+            item = QListWidgetItem(str(g.get("name") or "Unknown"))
+            item.setData(Qt.ItemDataRole.UserRole, g["id"])
+            self.games_list.addItem(item)
+        self.games_list.blockSignals(False)
+        if not games:
+            self.status.setText("No games found. Try a different name.")
+            return
+        self.status.setText("")
+        self.games_list.setCurrentRow(0)
+
+    # -- covers for the selected game --
+    def _on_game_selected(self, row):
+        item = self.games_list.item(row) if row >= 0 else None
+        if item is None:
+            return
+        self._game_id = item.data(Qt.ItemDataRole.UserRole)
+        self._grid_token += 1
+        self._page = 0
+        self.grid.clear()
+        self.more_btn.hide()
+        self._fetch_page(0)
+
+    def _load_more(self):
+        self._fetch_page(self._page + 1)
+
+    def _fetch_page(self, page):
+        token, game_id, key = self._grid_token, self._game_id, self._key
+        self.status.setText("Loading covers...")
+        self.more_btn.setEnabled(False)
+
+        def work():
+            try:
+                self._emit(self._sig.grids, token, page, sgdb_game_grids(game_id, key, page))
+            except Exception as e:
+                self._emit(self._sig.error, token, f"Couldn't load covers: {e}")
+        self._pool.submit(work)
+
+    def _on_grids(self, token, page, grids):
+        if token != self._grid_token:
+            return
+        self._page = page
+        placeholder = QPixmap(150, 225)
+        placeholder.fill(QColor(60, 60, 66))
+        for g in grids:
+            item = QListWidgetItem(QIcon(placeholder), "")
+            item.setData(Qt.ItemDataRole.UserRole, g["url"])
+            item.setSizeHint(QSize(160, 232))
+            self.grid.addItem(item)
+            row = self.grid.count() - 1
+            link = g.get("thumb") or g["url"]
+
+            def fetch(r=row, u=link):
+                try:
+                    self._emit(self._sig.thumb, token, r, _http_get(u))
+                except Exception:    # expected: one thumbnail failing just leaves its placeholder
+                    pass
+            self._pool.submit(fetch)
+        self.more_btn.setEnabled(True)
+        self.more_btn.setVisible(len(grids) >= 50)
+        self.status.setText("" if self.grid.count() else "SteamGridDB has no portrait covers for this game.")
+
+    def _on_thumb(self, token, row, data):
+        if token != self._grid_token:
+            return
+        item = self.grid.item(row)
+        pix = QPixmap()
+        if item is not None and data and pix.loadFromData(data):
+            item.setIcon(QIcon(pix.scaled(150, 225, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation)))
+
+    def _on_error(self, token, message):
+        if token not in (self._games_token, self._grid_token, self._pick_token):
+            return
+        self.more_btn.setEnabled(True)
+        self.use_btn.setText("Use This Cover")
+        self._update_buttons()
+        self.status.setText(message)
+
+    # -- choosing --
+    def _pick(self):
+        item = self.grid.currentItem()
+        if item is None or self.use_btn.text() != "Use This Cover":
+            return
+        url = item.data(Qt.ItemDataRole.UserRole)
+        self._pick_token += 1
+        token = self._pick_token
+        self.use_btn.setText("Downloading...")
+        self.use_btn.setEnabled(False)
+
+        def work():
+            try:
+                self._emit(self._sig.chosen, token, _http_get(url, timeout=30))
+            except Exception as e:
+                self._emit(self._sig.error, token, f"Couldn't download that cover: {e}")
+        self._pool.submit(work)
+
+    def _on_chosen(self, token, data):
+        if token != self._pick_token:
+            return
+        if not data or not QPixmap().loadFromData(data):
+            self._on_error(token, "That image couldn't be read. Try another cover.")
+            return
+        self.selected_bytes = data
+        self.accept()
+
+
 def fetch_steam_description(appid):
     """Short description for a Steam app (empty string if unavailable)."""
     url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
@@ -7949,6 +8221,69 @@ class AdaptiveApp(QMainWindow):
 
     # ── Firebase Steam Link & Downloads Tab Integration ──
 
+    def _ask_sgdb_cover(self, title, steam_appid=None):
+        """Opens the SteamGridDB cover picker. Returns the chosen image bytes, or None."""
+        key = get_steamgriddb_key()
+        if not key:
+            QMessageBox.information(self, "Pick Cover",
+                                    "Add your SteamGridDB API key in Settings first, then try again.")
+            return None
+        dlg = SgdbCoverPickerDialog(self, title, key, steam_appid)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_bytes:
+            return dlg.selected_bytes
+        return None
+
+    def pick_steam_game_cover(self, appid):
+        title_text = next((g["title"] for g in load_steam_library() if g["appid"] == appid), "")
+        data = self._ask_sgdb_cover(title_text, appid)
+        if not data:
+            return
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"{appid}.img")
+            with open(saved_cover, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            QMessageBox.warning(self, "Pick Cover", f"Couldn't save the cover: {e}")
+            return
+        games = load_steam_library()
+        for g in games:
+            if g["appid"] == appid:
+                g["cover"] = saved_cover
+        save_steam_library(games)
+        if appid in self.steam_cards:
+            _rebuild_steam_card_in_place(self, appid, title_text, saved_cover)
+            self.apply_filter()
+
+    def pick_custom_game_cover(self, game_id):
+        games = load_custom_games()
+        entry = next((g for g in games if g.get("id") == game_id), None)
+        if entry is None:
+            return
+        data = self._ask_sgdb_cover(entry.get("title", ""))
+        if not data:
+            return
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved_cover = os.path.join(get_library_cover_dir(), f"{game_id}.img")
+            with open(saved_cover, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            QMessageBox.warning(self, "Pick Cover", f"Couldn't save the cover: {e}")
+            return
+        entry["cover_path"] = saved_cover
+        save_custom_games(games)
+        card = getattr(self, "custom_cards", {}).get(game_id)
+        item = card.layout().itemAt(0) if card is not None and card.layout() is not None else None
+        label = item.widget() if item is not None else None
+        pix = self.get_rounded_pixmap(saved_cover, COVER_W, COVER_H, 8)
+        if isinstance(label, QLabel) and pix:
+            label.setObjectName("")
+            label.setText("")
+            label.setPixmap(pix)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
     def change_steam_game_cover(self, appid):
         path, _filter = QFileDialog.getOpenFileName(
             self, "Choose Custom Cover", os.path.expanduser("~"),
@@ -8151,6 +8486,7 @@ class AdaptiveApp(QMainWindow):
 
         if sys.platform.startswith("linux"):
             menu.addAction("Switch Compatibility Tool").triggered.connect(switch_custom_tool)
+        menu.addAction("Pick Cover").triggered.connect(lambda _c=False, g=game_id: self.pick_custom_game_cover(g))
         menu.addAction("Remove from Library").triggered.connect(remove_custom_game)
         menu.addAction("Open Game Location").triggered.connect(lambda: self.open_game_location(os.path.dirname(exe_path)))
         menu.addAction("Install Common Redist").triggered.connect(
@@ -10364,6 +10700,7 @@ def _patched_create_steam_card(self, appid, title_text, cover_path):
             menu = more_btn.menu()
             menu.addSeparator()
             menu.addAction("Change Cover").triggered.connect(lambda _c=False, a=appid: self.change_steam_game_cover(a))
+            menu.addAction("Pick Cover").triggered.connect(lambda _c=False, a=appid: self.pick_steam_game_cover(a))
             menu.addAction("Refresh Cover").triggered.connect(lambda _c=False, a=appid: self.refresh_steam_game_cover(a))
             
             def uninstall_steam_game():
