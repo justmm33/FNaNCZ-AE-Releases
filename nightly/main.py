@@ -56346,14 +56346,145 @@ SettingsPage.__init__ = _slr_settings_init
 # The asker sends a manifest (size + rdiff signature hash per file) through the same Firebase nodes mod sharing uses
 # (kind="diff"). The friend's launcher compares it with their own copy and zips every file that is different or new
 # into <APPDATA>/ncz/outputs, then opens File Explorer on the zip. Nothing is uploaded: the friend sends the zip manually.
+# Big files that only changed in places go in the zip as small block patches instead of whole files; the receiver
+# installs the zip with "Apply update zip..." (3-dot menu), which copies the whole files and patches the rest.
 import hashlib as _dg_hashlib
 import zipfile as _dg_zipfile
 import zlib as _dg_zlib
 import io as _dg_io
+import struct as _dg_struct
 
 _DG_BLOCK = 1024 * 1024
 _DG_SKIP_DIRS = {".git", "__pycache__"}
 _DG_SKIP_EXT = (".part", ".tmp")
+_DG_MIN_DELTA = 2 * _DG_BLOCK         # smaller files are always sent whole
+_DG_DELTA_MAGIC = b"NCZD1"
+_DG_DELTA_MAX_RATIO = 0.6             # if a patch would be bigger than this share of the file, send the whole file
+_DG_DELTA_DIR = "_ncz_deltas/"
+_DG_META = "_ncz_update.json"
+
+# >>> ncz-delta-core (pure functions, no Qt)
+class _DgCancelled(Exception):
+    pass
+
+def _dg_sig_blocks(path, want_blocks=True):
+    """(file signature, [first 8 bytes of the md5 of every 1 MB block]) from ONE read pass.
+    The file signature is the same value the old built-in method produced, so old and new launchers still agree."""
+    h, digs = _dg_hashlib.sha1(), []
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(_DG_BLOCK)
+            if not b:
+                break
+            d = _dg_hashlib.md5(b).digest()
+            h.update(d)
+            if want_blocks:
+                digs.append(d[:8])
+    return _dg_hashlib.sha1(h.digest()).hexdigest()[:20], digs
+
+class _DgSigStream:
+    """Computes the same file signature while the bytes are being written (used to verify a patched file)."""
+    def __init__(self):
+        self.h, self.buf = _dg_hashlib.sha1(), bytearray()
+
+    def feed(self, data):
+        self.buf += data
+        while len(self.buf) >= _DG_BLOCK:
+            self.h.update(_dg_hashlib.md5(bytes(self.buf[:_DG_BLOCK])).digest())
+            del self.buf[:_DG_BLOCK]
+
+    def result(self):
+        if self.buf:
+            self.h.update(_dg_hashlib.md5(bytes(self.buf)).digest())
+            self.buf.clear()
+        return _dg_hashlib.sha1(self.h.digest()).hexdigest()[:20]
+
+def _dg_delta_plan(digs, other_b64):
+    """Per block of the NEW file: True when the other copy already has the same block at the same place.
+    Returns (same-flags, bytes the patch has to carry as new data)."""
+    try:
+        other = base64.b64decode(other_b64)
+    except Exception:
+        other = b""
+    n = len(other) // 8
+    same = [i < n and other[i * 8:i * 8 + 8] == d for i, d in enumerate(digs)]
+    return same, sum(1 for s in same if not s) * _DG_BLOCK
+
+def _dg_write_delta(out, path, size, sig, same, cancel=None):
+    """Writes a patch: COPY ranges the other copy already has, DATA runs for the blocks that changed."""
+    out.write(_DG_DELTA_MAGIC + _dg_struct.pack("<QI", size, _DG_BLOCK) + sig.encode("ascii"))
+    with open(path, "rb") as fh:
+        i, n = 0, len(same)
+        while i < n:
+            j = i
+            while j < n and same[j] == same[i]:
+                j += 1
+            start = i * _DG_BLOCK
+            length = min(j * _DG_BLOCK, size) - start
+            if same[i]:
+                out.write(_dg_struct.pack("<BQQ", 1, start, length))
+            else:
+                out.write(_dg_struct.pack("<BQ", 2, length))
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    if cancel and cancel():
+                        raise _DgCancelled()
+                    b = fh.read(min(left, 4 * _DG_BLOCK))
+                    if not b:
+                        raise OSError("the file changed while it was being read")
+                    out.write(b)
+                    left -= len(b)
+            i = j
+    out.write(b"\x00")
+
+def _dg_read_exact(fh, n):
+    buf = b""
+    while len(buf) < n:
+        b = fh.read(n - len(buf))
+        if not b:
+            raise ValueError("the patch file is cut off")
+        buf += b
+    return buf
+
+def _dg_apply_delta(old_path, delta_fh, new_path, progress=None, cancel=None):
+    """old file + patch -> new_path. Raises ValueError when the result doesn't match what the patch expects."""
+    if _dg_read_exact(delta_fh, len(_DG_DELTA_MAGIC)) != _DG_DELTA_MAGIC:
+        raise ValueError("not a patch file")
+    size, blk = _dg_struct.unpack("<QI", _dg_read_exact(delta_fh, 12))
+    if blk != _DG_BLOCK:
+        raise ValueError("patch uses a different block size")
+    want = _dg_read_exact(delta_fh, 20).decode("ascii")
+    ss, written = _DgSigStream(), 0
+    with open(old_path, "rb") as old, open(new_path, "wb") as out:
+        while True:
+            op = _dg_read_exact(delta_fh, 1)[0]
+            if op == 0:
+                break
+            if op == 1:
+                off, left = _dg_struct.unpack("<QQ", _dg_read_exact(delta_fh, 16))
+                old.seek(off)
+                src_fh = old
+            elif op == 2:
+                left, = _dg_struct.unpack("<Q", _dg_read_exact(delta_fh, 8))
+                src_fh = delta_fh
+            else:
+                raise ValueError("bad patch file")
+            while left > 0:
+                if cancel and cancel():
+                    raise _DgCancelled()
+                b = src_fh.read(min(left, 4 * _DG_BLOCK))
+                if not b:
+                    raise ValueError("your old file is shorter than the patch expects" if op == 1 else "the patch file is cut off")
+                out.write(b)
+                ss.feed(b)
+                left -= len(b)
+                written += len(b)
+                if progress:
+                    progress(len(b))
+    if written != size or ss.result() != want:
+        raise ValueError("the patched file doesn't match. Your old file isn't the version this patch was made for")
+# <<< ncz-delta-core
 
 def _dg_norm(t):
     """Title key that ignores case, spaces, punctuation and a trailing "(Wine)": "FNAF: Foo" == "fnaf foo"."""
@@ -56421,19 +56552,12 @@ def _dg_builtin_sig(fh):
     return h.digest()
 
 def _dg_method():
-    """'librsync-<version>' when python-rsync (pyrsync) works here, else 'builtin'. Both sides must use the same one;
-    if they don't match, the asker's launcher is told to redo it with the built-in signature."""
-    try:
-        import pyrsync
-        _dg_rs_sig(_dg_io.BytesIO(b"probe"))
-        return "librsync-" + str(getattr(pyrsync, "__version__", "?"))
-    except Exception:
-        return "builtin"
+    """'blk1' = per-1-MB-block signatures (no extra library needed). 'builtin' is the same file signature without
+    the block list, which is what older launchers send, so they still work (whole files only)."""
+    return "blk1"
 
 def _dg_file_sig(path, tag):
-    with open(path, "rb") as fh:
-        raw = _dg_rs_sig(fh) if tag.startswith("librsync") else _dg_builtin_sig(fh)
-    return _dg_hashlib.sha1(raw).hexdigest()[:20]
+    return _dg_sig_blocks(path, False)[0]
 
 def _dg_walk(root):
     out = {}
@@ -56457,7 +56581,12 @@ def _dg_manifest(root, tag, progress, cancel, cache=None):
         if cancel():
             return None
         try:
-            man[rel] = [size, (cache or {}).get(rel) or _dg_file_sig(path, tag), int(os.path.getmtime(path))]
+            mt = int(os.path.getmtime(path))
+            if (cache or {}).get(rel):
+                man[rel] = [size, cache[rel], mt]           # identical to the other copy: no block list needed
+            else:
+                sg, digs = _dg_sig_blocks(path, size >= _DG_MIN_DELTA)
+                man[rel] = [size, sg, mt] + ([base64.b64encode(b"".join(digs)).decode("ascii")] if digs else [])
         except OSError:
             pass
         done += size
@@ -56465,13 +56594,37 @@ def _dg_manifest(root, tag, progress, cancel, cache=None):
     return man
 
 def _dg_pack(man):
-    return base64.b64encode(_dg_zlib.compress(json.dumps(man, separators=(",", ":")).encode("utf-8"), 6)).decode("ascii")
+    """Entries are [size, sig, mtime(, block list)]. Block lists travel under one extra key, so older launchers
+    (which only read 2-3 item lists) simply ignore them."""
+    plain, blocks = {}, {}
+    for k, v in man.items():
+        if len(v) > 3:
+            blocks[k], v = v[3], v[:3]
+        plain[k] = v
+    if blocks:
+        plain["\x00b"] = blocks
+    return base64.b64encode(_dg_zlib.compress(json.dumps(plain, separators=(",", ":")).encode("utf-8"), 6)).decode("ascii")
+
+def _dg_pack_capped(man, cap=8 * 1024 * 1024):
+    """Packed manifest, dropping the block lists (whole-file mode) if it would be too big. None if still too big."""
+    blob = _dg_pack(man)
+    if len(blob) > cap:
+        blob = _dg_pack({k: v[:3] for k, v in man.items()})
+    return blob if len(blob) <= cap else None
 
 def _dg_unpack(blob):
-    man = json.loads(_dg_zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
-    if not isinstance(man, dict):
+    raw = json.loads(_dg_zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
+    if not isinstance(raw, dict):
         raise ValueError("bad manifest")
-    return {str(k): v for k, v in man.items() if isinstance(v, list) and len(v) in (2, 3)}
+    blocks = raw.get("\x00b") if isinstance(raw.get("\x00b"), dict) else {}
+    out = {}
+    for k, v in raw.items():
+        if isinstance(v, list) and len(v) in (2, 3):
+            v = list(v)
+            if len(v) == 3 and isinstance(blocks.get(k), str):
+                v.append(blocks[k])
+            out[str(k)] = v
+    return out
 
 def _dg_compare(root, man, tag, progress, cancel):
     """Files here that differ from (or are missing in) the asker's manifest. None if cancelled."""
@@ -56479,6 +56632,7 @@ def _dg_compare(root, man, tag, progress, cancel):
     theirs_lc = {k.lower(): k for k in man}
     total, done = (sum(s for s, _p in mine.values()) or 1), 0
     differ, new, same, seen, sigs, newer, older = [], [], 0, set(), {}, 0, 0
+    other, blk = {}, {}
     for rel, (size, path) in mine.items():
         if cancel():
             return None
@@ -56491,51 +56645,167 @@ def _dg_compare(root, man, tag, progress, cancel):
             try:
                 bad = size != ent[0]
                 if not bad:
-                    sigs[rel] = _dg_file_sig(path, tag)
-                    bad = sigs[rel] != ent[1]
+                    sg, digs = _dg_sig_blocks(path, size >= _DG_MIN_DELTA and len(ent) > 3)
+                    bad = sg != ent[1]
+                    if not bad:
+                        sigs[rel] = sg                      # identical: remembered so the handoff manifest can skip it
+                    elif digs:
+                        blk[rel] = (sg, digs)               # reused by the zip step, saves another full read
                 if not bad:
                     same += 1
                 else:
                     differ.append(rel)
+                    other[rel] = ent
                     if len(ent) > 2:
                         mt = os.path.getmtime(path)
                         newer += mt > ent[2] + 2
                         older += mt < ent[2] - 2
             except OSError:
                 differ.append(rel)
+                other[rel] = ent
         done += size
         progress(done, total)
     removed = [k for k in man if k not in seen]
     return {"differ": differ, "new": new, "removed": removed, "same": same, "files": mine,
-            "sigs": sigs, "newer": newer, "older": older}
+            "sigs": sigs, "newer": newer, "older": older, "other": other, "blk": blk}
 
 def _dg_make_zip(title, cmp_, progress, cancel):
+    """Zip with the whole new files, except big files the other copy already has most of: those go in as small
+    patches (_ncz_deltas/<file>.nczd) that the other launcher's "Apply update zip" turns back into the new file."""
     rels = cmp_["differ"] + cmp_["new"]
     safe = re.sub(r"[^\w\-. ]+", "_", title).strip() or "game"
     path = os.path.join(_dg_outputs_dir(), f"{safe}_update_{time.strftime('%Y%m%d-%H%M%S')}.zip")
-    files = cmp_["files"]
-    total, done, failed = (sum(files[r][0] for r in rels) or 1), 0, 0
+    files, other, blk = cmp_["files"], cmp_.get("other") or {}, cmp_.get("blk") or {}
+    plan, failed, cancelled = {}, 0, False
+    cand = [r for r in cmp_["differ"] if len(other.get(r) or []) > 3 and files[r][0] >= _DG_MIN_DELTA]
+    total = (sum(files[r][0] for r in cand if r not in blk) + sum(files[r][0] for r in rels)) or 1
+    done = 0
+    for rel in cand:                                        # decide: patch or whole file
+        if cancel():
+            cancelled = True
+            break
+        try:
+            sg, digs = blk.get(rel) or _dg_sig_blocks(files[rel][1])
+            if rel not in blk:
+                done += files[rel][0]
+                progress(done, total)
+            same, carried = _dg_delta_plan(digs, other[rel][3])
+            if any(same) and carried <= files[rel][0] * _DG_DELTA_MAX_RATIO:
+                plan[rel] = (sg, same)
+        except OSError:
+            pass
+    meta = {"v": 2, "title": title, "full": [], "delta": [], "removed": list(cmp_["removed"])}
     with _dg_zipfile.ZipFile(path, "w", _dg_zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
-        for rel in rels:
+        for rel in ([] if cancelled else rels):
             if cancel():
+                cancelled = True
                 break
             try:
-                zf.write(files[rel][1], rel)
+                if rel in plan:
+                    zname = _DG_DELTA_DIR + rel + ".nczd"
+                    with zf.open(zname, "w", force_zip64=True) as out:
+                        _dg_write_delta(out, files[rel][1], files[rel][0], plan[rel][0], plan[rel][1], cancel)
+                    meta["delta"].append({"rel": rel, "z": zname, "size": files[rel][0], "sig": plan[rel][0]})
+                else:
+                    zf.write(files[rel][1], rel)
+                    meta["full"].append(rel)
+            except _DgCancelled:
+                cancelled = True
+                break
             except OSError:
                 failed += 1
             done += files[rel][0]
             progress(done, total)
         notes = [f"{title}: files that differ from the other copy ({len(cmp_['differ'])}) and new files ({len(cmp_['new'])})",
+                 f"{len(plan)} of them are small patches (_ncz_deltas folder), the rest are whole files.",
+                 "Use 'Apply update zip...' in the game's 3-dot menu in the launcher to install this zip.",
                  "", "Differ:"] + cmp_["differ"] + ["", "New:"] + cmp_["new"] + \
                 ["", "Only in the other copy (not included, delete them if the update removed them):"] + cmp_["removed"]
         zf.writestr("_ncz_file_list.txt", "\n".join(notes))
-    if cancel():
+        zf.writestr(_DG_META, json.dumps(meta))
+    cmp_["n_delta"] = len(meta["delta"])
+    if cancelled or cancel():
         try:
             os.remove(path)
         except OSError:
             pass
         return None, 0, 0
     return path, os.path.getsize(path), failed
+
+# >>> ncz-apply-core (pure function, no Qt)
+def _dg_apply_zip(zip_path, root, progress, cancel):
+    """Installs an update zip made by _dg_make_zip into the game folder. Returns (whole files, patched files, [problems])."""
+    root = os.path.abspath(root)
+    problems, nfull, npatch = [], 0, 0
+
+    def dest_of(rel):
+        d = os.path.abspath(os.path.join(root, *[p for p in rel.replace("\\", "/").split("/") if p]))
+        if d != root and not d.startswith(root + os.sep):
+            raise ValueError("unsafe path in the zip")
+        return d
+
+    with _dg_zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        if _DG_META in names:
+            meta = json.loads(zf.read(_DG_META).decode("utf-8"))
+            full, deltas = list(meta.get("full") or []), list(meta.get("delta") or [])
+        else:                                               # a zip made by the older version: whole files only
+            full = [n for n in names if not n.endswith("/") and not n.startswith("_ncz_")]
+            deltas = []
+        total = (sum(zf.getinfo(r).file_size for r in full if r in names) + sum(int(d.get("size") or 0) for d in deltas)) or 1
+        state = {"done": 0}
+
+        def tick(n):
+            state["done"] += n
+            progress(state["done"], total)
+
+        for rel in full:
+            if cancel():
+                raise _DgCancelled()
+            try:
+                if rel not in names:
+                    raise ValueError("missing from the zip")
+                dest = dest_of(rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                tmp = dest + ".ncz_new"
+                with zf.open(rel) as src_fh, open(tmp, "wb") as out:
+                    while True:
+                        b = src_fh.read(4 * _DG_BLOCK)
+                        if not b:
+                            break
+                        out.write(b)
+                        tick(len(b))
+                os.replace(tmp, dest)
+                nfull += 1
+            except _DgCancelled:
+                raise
+            except Exception as e:
+                problems.append(f"{rel}: {e}")
+        for d in deltas:
+            if cancel():
+                raise _DgCancelled()
+            rel, tmp = str(d.get("rel") or ""), None
+            try:
+                dest = dest_of(rel)
+                if not os.path.isfile(dest):
+                    raise ValueError("your copy doesn't have this file, so the patch can't be applied")
+                tmp = dest + ".ncz_new"
+                with zf.open(d["z"]) as dfh:
+                    _dg_apply_delta(dest, dfh, tmp, tick, cancel)
+                os.replace(tmp, dest)
+                npatch += 1
+            except _DgCancelled:
+                raise
+            except Exception as e:
+                problems.append(f"{rel}: {e}")
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+    return nfull, npatch, problems
+# <<< ncz-apply-core
 
 def _dg_game_version(title):
     try:
@@ -56734,8 +57004,8 @@ class _DgAskWorker(QThread):
                 if man is None:
                     self.done.emit({}, "cancelled")
                     return
-                blob = _dg_pack(man)
-                if len(blob) > 8 * 1024 * 1024:
+                blob = _dg_pack_capped(man)
+                if blob is None:
                     self.done.emit({}, "This game has too many files to compare through the cloud.")
                     return
                 cloud_diff_send_request(self.friend, self.title, blob, tag, len(man), _dg_game_version(self.title), self.direction)
@@ -56794,8 +57064,8 @@ def _dg_cover(title):
     return ""
 
 class _DgUpdateCard(DownloadCard):
-    def __init__(self, game, other, feed):
-        super().__init__("Creating update files", "", 0, _dg_cover(game), None, worker=feed)
+    def __init__(self, game, other, feed, title="Creating update files"):
+        super().__init__(title, "", 0, _dg_cover(game), None, worker=feed)
         self.game, self.other = game, other
         self.pause_btn.hide()
         self.status_label.setText("Starting...")
@@ -56837,12 +57107,12 @@ class _DgUpdateCard(DownloadCard):
         self.action_btn.setEnabled(False)
         self.worker.cancel()
 
-def _dg_card(win, game, other):
+def _dg_card(win, game, other, title="Creating update files"):
     """Adds a "Creating update files" card to the Downloads tab and returns the feed that drives it."""
     feed = _DgFeed()
     try:
         page = win.downloads_page
-        page.add_download_card(_DgUpdateCard(game, other, feed))
+        page.add_download_card(_DgUpdateCard(game, other, feed, title))
         win.pages.setCurrentWidget(page)
     except Exception:
         _log_exc("_dg_card")
@@ -57007,7 +57277,9 @@ def _dg_zip_here(self, name, title, root, reply, feed):
         _dg_reveal(path)
         QMessageBox.information(self, "Get different files",
                                 f"Your {title} update is ready: {info['zipped']} "
-                                f"file(s) ({_dg_mb(int(info.get('bytes') or 0))}) in your NCZ outputs folder. Send it to {name}.")
+                                f"file(s) ({_dg_mb(int(info.get('bytes') or 0))}) in your NCZ outputs folder"
+                                f"{(', ' + str(info['deltas']) + ' of them as small patches') if info.get('deltas') else ''}. "
+                                f"Send it to {name}.")
     w.done.connect(finished)
     self.__dict__.setdefault("_dg_keep", []).append(w)
     w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
@@ -57044,8 +57316,10 @@ def _dg_asked(self, name, title, reply, err, root, feed):
     feed.finished.emit("")
     QMessageBox.information(self, "Get different files",
                             f"{name} made a zip with {n} file(s) ({_dg_mb(int(reply.get('bytes') or 0))}) that differ from "
-                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new. It's in their NCZ outputs "
-                            f"folder. Ask them to send it to you.")
+                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new"
+                            f"{(', ' + str(reply['deltas']) + ' of them as small patches') if reply.get('deltas') else ''}. "
+                            f"It's in their NCZ outputs folder. Ask them to send it to you, then use 'Apply update zip...' "
+                            f"in the game's 3-dot menu.")
 
 # --- friend side: answers a diff request ---
 class _DgMakeWorker(QThread):
@@ -57080,8 +57354,8 @@ class _DgMakeWorker(QThread):
                 if mine is None:
                     self.done.emit({}, "cancelled")
                     return
-                blob = _dg_pack(mine)
-                if len(blob) > 8 * 1024 * 1024:
+                blob = _dg_pack_capped(mine)
+                if blob is None:
                     self.done.emit({}, "This game has too many files to compare through the cloud.")
                     return
                 info.update({"handoff": True, "man": blob, "m": self.tag})
@@ -57093,7 +57367,8 @@ class _DgMakeWorker(QThread):
                 if path is None:
                     self.done.emit({}, "cancelled")
                     return
-                info.update({"zipped": len(cmp_["differ"]) + len(cmp_["new"]) - failed, "bytes": size, "path": path})
+                info.update({"zipped": len(cmp_["differ"]) + len(cmp_["new"]) - failed, "bytes": size, "path": path,
+                             "deltas": int(cmp_.get("n_delta") or 0)})
             self.done.emit(info, "")
         except Exception as e:
             self.done.emit({}, str(e) or "Something went wrong.")
@@ -57134,8 +57409,8 @@ def _dg_handle_request(self, uid, d):
         answer(False, {"reason": "not_installed"})
         return
     req_tag, my_tag = str(d.get("m") or "builtin"), _dg_method()
-    if req_tag.startswith("librsync") and req_tag != my_tag:
-        answer(True, {"retry": "builtin", "zipped": 0})  # no matching rdiff library here: ask them to use the built-in one
+    if req_tag.startswith("librsync"):
+        answer(True, {"retry": "builtin", "zipped": 0})  # an older launcher used librsync signatures: ask it to resend the built-in kind
         return
     try:
         man = _dg_unpack(d.get("man") or "")
@@ -57170,12 +57445,95 @@ def _dg_handle_request(self, uid, d):
             feed.finished.emit(path)
             _dg_reveal(path)
             QMessageBox.information(self.window(), "Compare game files",
-                                    f"Done. {info['zipped']} file(s) went into a zip in your NCZ outputs folder. "
+                                    f"Done. {info['zipped']} file(s) went into a zip in your NCZ outputs folder"
+                                    f"{(' (' + str(info['deltas']) + ' as small patches)') if info.get('deltas') else ''}. "
                                     f"Send it to {name}.")
         else:
             feed.status_update.emit("Files are identical")
             feed.finished.emit("")
             QMessageBox.information(self.window(), "Compare game files", f"{name}'s files are identical to yours.")
+    w.done.connect(finished)
+    self.__dict__.setdefault("_dg_keep", []).append(w)
+    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
+    w.start()
+
+class _DgApplyWorker(QThread):
+    status = pyqtSignal(str, bool)
+    prog = pyqtSignal(object, object)
+    done = pyqtSignal(dict, str)
+
+    def __init__(self, zip_path, root, parent=None):
+        super().__init__(parent)
+        self.zip_path, self.root, self._cancel = zip_path, root, False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            self.status.emit("Installing the update files...", False)
+            nfull, npatch, problems = _dg_apply_zip(self.zip_path, self.root, lambda d, t: self.prog.emit(d, t),
+                                                    lambda: self._cancel)
+            self.done.emit({"full": nfull, "patched": npatch, "problems": problems}, "")
+        except _DgCancelled:
+            self.done.emit({}, "cancelled")
+        except Exception as e:
+            self.done.emit({}, str(e) or "Something went wrong.")
+
+def _dg_apply_begin(self, title):
+    """3-dot menu > Apply update zip...: installs a zip made by 'Get different files' into this game's folder."""
+    start = _dg_outputs_dir()
+    zp, _f = QFileDialog.getOpenFileName(self, f"Pick the {title} update zip", start, "Zip files (*.zip)")
+    if not zp:
+        return
+    try:
+        with _dg_zipfile.ZipFile(zp) as zf:
+            ok = _DG_META in zf.namelist() or "_ncz_file_list.txt" in zf.namelist()
+            meta = json.loads(zf.read(_DG_META).decode("utf-8")) if _DG_META in zf.namelist() else {}
+    except Exception:
+        ok, meta = False, {}
+    if not ok:
+        QMessageBox.warning(self, "Apply update zip", "That zip wasn't made by 'Get different files'.")
+        return
+    if meta.get("title") and _dg_norm(meta["title"]) != _dg_norm(title):
+        ans = QMessageBox.question(self, "Apply update zip",
+                                   f"This zip is for \"{meta['title']}\", not {title}. Install it into {title} anyway?")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+    root = _dg_find_dir(title) or _dg_ask_folder(self, title)
+    if not root:
+        return
+    n_full, n_delta = len(meta.get("full") or []), len(meta.get("delta") or [])
+    ans = QMessageBox.question(self, "Apply update zip",
+                               f"Install this update into:\n{root}\n\n"
+                               f"{n_full if meta else 'The'} whole file(s) get replaced"
+                               f"{(' and ' + str(n_delta) + ' file(s) get patched') if n_delta else ''}. Patched files are checked "
+                               f"before they replace yours. Close the game first. Continue?")
+    if ans != QMessageBox.StandardButton.Yes:
+        return
+    w = _DgApplyWorker(zp, root, self)
+    feed = _dg_card(self.window(), title, "the update zip", "Applying update files")
+    _dg_feed_wire(w, feed)
+
+    def finished(info, err):
+        if err == "cancelled":
+            feed.failed.emit("CANCELLED")
+            return
+        if err:
+            feed.failed.emit(err)
+            QMessageBox.warning(self, "Apply update zip", err)
+            return
+        probs = info.get("problems") or []
+        feed.status_update.emit(f"{info['full']} copied, {info['patched']} patched" + (f", {len(probs)} problem(s)" if probs else ""))
+        feed.finished.emit("")
+        msg = f"Done. {info['full']} file(s) copied and {info['patched']} patched."
+        if probs:
+            msg += "\n\nThese could not be installed (your old files for them were left untouched):\n" + "\n".join(probs[:12])
+            if len(probs) > 12:
+                msg += f"\n...and {len(probs) - 12} more"
+            QMessageBox.warning(self, "Apply update zip", msg)
+        else:
+            QMessageBox.information(self, "Apply update zip", msg)
     w.done.connect(finished)
     self.__dict__.setdefault("_dg_keep", []).append(w)
     w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
@@ -57208,6 +57566,8 @@ def _dg_decorate(self, card, title):
             return
         act = menu.addAction("Get different files...")
         act.triggered.connect(lambda _c=False: _dg_begin(self, title))
+        act2 = menu.addAction("Apply update zip...")
+        act2.triggered.connect(lambda _c=False: _dg_apply_begin(self, title))
     except Exception:
         _log_exc("_dg_decorate")
 
