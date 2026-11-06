@@ -293,6 +293,47 @@ class _LazyModule:
         return getattr(importlib.import_module(self.__dict__["_ncz_name"]), attr)
 
 zipfile = _LazyModule("zipfile")
+
+# ── Python override: Settings > "Python version" can switch the launcher to a private Python 3.12 ──
+# python_override.txt (next to launcher.json) holds that interpreter's path. This runs before anything heavy is imported:
+# if the file points at another Python than the one running now, the launcher is started again with it and this process ends.
+def _ncz_py_override_file():
+    if sys.platform.startswith("win"):
+        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
+    else:
+        base = os.path.expanduser("~/.config/NCZ_Games_Launcher")
+    return os.path.join(base, "python_override.txt")
+
+def _ncz_py_reexec():
+    if getattr(sys, "frozen", False) or os.environ.get("NCZ_PY_REEXEC") or "--ncz-rp-helper" in sys.argv:
+        return
+    try:
+        with open(_ncz_py_override_file(), encoding="utf-8") as f:
+            target = f.read().strip()
+    except OSError:
+        return
+    if not target or not os.path.isfile(target):
+        return
+    try:
+        if os.path.samefile(target, sys.executable):
+            return
+    except OSError:
+        pass
+    if sys.platform.startswith("win") and os.path.basename(sys.executable).lower() == "pythonw.exe":
+        alt = os.path.join(os.path.dirname(target), "pythonw.exe")      # keep "no console window"
+        if os.path.isfile(alt):
+            target = alt
+    env = dict(os.environ, NCZ_PY_REEXEC="1", NCZ_ORIG_PYTHON=sys.executable)
+    argv = [target, os.path.abspath(__file__)] + sys.argv[1:]
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(argv, env=env, close_fds=True)
+            sys.exit(0)
+        os.execve(target, argv, env)
+    except Exception:
+        pass        # the other Python can't start: keep running on this one
+
+_ncz_py_reexec()
 # before the Qt imports: the helper only needs ctypes, and loading PyQt6 made every invite lookup slower
 if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the running game's Steam rich presence "connect" text
     import ctypes
@@ -25676,7 +25717,7 @@ def _restart_icon():
         icon.addPixmap(pm, mode)
     return icon
 
-def restart_launcher(window, use_demo=False):
+def restart_launcher(window, use_demo=False, python=None):
     """Starts a fresh copy of the launcher and closes this one. The new copy takes over through the normal
     'a newer launcher replaces the running one' path, so it waits for this process to let go of the instance lock.
     use_demo=True (the top-right restart button) starts demo.py instead of main.py when running from source."""
@@ -25685,11 +25726,14 @@ def restart_launcher(window, use_demo=False):
     if "--launch-game" in args:                                               # don't start the game again after a restart
         _i = args.index("--launch-game")
         del args[_i:_i + 2]
-    cmd = [sys.executable] + args if frozen else [sys.executable] + _launcher_script_args() + args     # cached compile
+    exe = python or sys.executable        # python=...: restart on that interpreter (Settings > Python version)
+    cmd = [exe] + args if frozen else [exe] + _launcher_script_args() + args     # cached compile
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
     if use_demo and not frozen and not os.environ.get("APPIMAGE") and os.path.isfile(demo):
-        cmd = [sys.executable, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
+        cmd = [exe, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
     env = dict(os.environ)
+    if python:
+        env.pop("NCZ_PY_REEXEC", None)      # going back to the original Python: don't redirect again
     if frozen:
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # a onefile build must unpack itself again
     kwargs = {}
@@ -53408,7 +53452,7 @@ _DEP_CORE = [("PyQt6", "PyQt6"), ("psutil", "psutil"), ("rarfile", "rarfile"),
              ("playwright", "playwright"), ("pywin32", "win32api")]
 _DEP_OPTIONAL = [("pypresence", "pypresence"), ("libtorrent", "libtorrent"), ("pynput", "pynput"),
                  ("nudenet", "nudenet"), ("vgamepad", "vgamepad"),
-                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("librsync", "librsync")]
+                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("python-rsync", "pyrsync")]
 _DEP_WIN_ONLY = {"pywin32", "vgamepad"}
 
 def _dep_have(module):
@@ -53635,6 +53679,273 @@ class _DepPanel(QFrame):
             summary = f"Install failed: {e}"
         self._finished.emit(summary)
 
+# ── Settings: Python version (run the launcher on a private Python 3.12) ──
+# python-rsync (the librsync binding behind "Get different files") has builds up to Python 3.12 only. This downloads a
+# standalone CPython 3.12 (python-build-standalone) into the launcher's data folder, installs the launcher's packages into it
+# and records its path in python_override.txt; the first lines of main.py then start the launcher with it. Your own Python
+# is never touched, and "Switch back" removes the override.
+_PY_REPO = "https://api.github.com/repos/astral-sh/python-build-standalone"
+
+def _py_home():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "python312")
+
+def _py_exe_in(home):
+    for rel in (("python.exe",), ("bin", "python3.12"), ("bin", "python3"), ("bin", "python")):
+        pth = os.path.join(home, *rel)
+        if os.path.isfile(pth):
+            return pth
+    return None
+
+def _py_set_override(path):
+    f = _ncz_py_override_file()
+    if path:
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(path)
+    else:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+def _py_triple():
+    import platform
+    arch = {"amd64": "x86_64", "x86_64": "x86_64", "x64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64",
+            "x86": "i686", "i386": "i686", "i686": "i686"}.get(platform.machine().lower())
+    if not arch:
+        raise RuntimeError("Unsupported processor: " + platform.machine())
+    if sys.platform.startswith("win"):
+        return arch + "-pc-windows-msvc"
+    if sys.platform == "darwin":
+        return arch + "-apple-darwin"
+    return arch + "-unknown-linux-gnu"
+
+def _py_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _py_pick_asset(names, triple):
+    """(name) of the newest CPython 3.12 install archive for `triple`; a full build is preferred over a stripped one."""
+    pat = re.compile(r"^cpython-3\.12\.(\d+)\+\d+-" + re.escape(triple) + r"(?:-shared)?-install_only(_stripped)?\.tar\.gz$")
+    best = None
+    for n in names:
+        m = pat.match(str(n or ""))
+        if m:
+            key = (int(m.group(1)), 0 if m.group(2) else 1)
+            if best is None or key > best[0]:
+                best = (key, n)
+    return best[1] if best else None
+
+def _py_find_asset():
+    triple = _py_triple()
+    rel = _py_json(_PY_REPO + "/releases/latest")
+    for page in range(1, 9):
+        assets = _py_json(f"{_PY_REPO}/releases/{rel['id']}/assets?per_page=100&page={page}")
+        if not assets:
+            break
+        name = _py_pick_asset([a.get("name") for a in assets], triple)
+        if name:
+            return name, next(a["browser_download_url"] for a in assets if a.get("name") == name)
+        if len(assets) < 100:
+            break
+    raise RuntimeError("Couldn't find a Python 3.12 download for this system (" + triple + ").")
+
+def _py_extract(archive, home):
+    import tarfile
+    tmp = home + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    with tarfile.open(archive, "r:gz") as tf:
+        try:
+            tf.extractall(tmp, filter="data")
+        except TypeError:           # an older Python without extraction filters
+            tf.extractall(tmp)
+    src = os.path.join(tmp, "python")
+    if not os.path.isdir(src):
+        raise RuntimeError("The download didn't contain a python folder.")
+    shutil.rmtree(home, ignore_errors=True)
+    shutil.move(src, home)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not sys.platform.startswith("win"):
+        for n in os.listdir(os.path.join(home, "bin")):
+            try:
+                os.chmod(os.path.join(home, "bin", n), 0o755)
+            except OSError:
+                pass
+
+class _PyPanel(QFrame):
+    _line = pyqtSignal(str)
+    _finished = pyqtSignal(str, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Panel")
+        self._busy = False
+        pl = QVBoxLayout(self)
+        pl.setContentsMargins(22, 18, 22, 18)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel("Python version")
+        name.setObjectName("RowTitle")
+        desc = QLabel("Some packages (like python-rsync, used by \"Get different files\") only have ready-made builds up to "
+                      "Python 3.12. This downloads a private Python 3.12 (about 30 MB), installs the launcher's packages "
+                      "into it and runs the launcher on it from then on. Your own Python isn't changed. Needs internet.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        self.status = QLabel()
+        self.status.setObjectName("RowDesc")
+        self.status.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(desc)
+        text.addWidget(self.status)
+        self.btn = QPushButton()
+        self.btn.clicked.connect(self._click)
+        row.addLayout(text, 1)
+        row.addWidget(self.btn)
+        pl.addLayout(row)
+        self.log = _DepLogBox()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(150)
+        self.log.hide()
+        pl.addWidget(self.log)
+        self._line.connect(self.log.appendPlainText)
+        self._finished.connect(self._on_finished)
+        self.refresh()
+
+    def _mode(self):
+        if getattr(sys, "frozen", False) or os.environ.get("APPIMAGE"):
+            return "packaged"
+        if os.environ.get("NCZ_PY_REEXEC") and os.path.abspath(sys.executable).startswith(os.path.abspath(_py_home())):
+            return "private"
+        if sys.version_info[:2] == (3, 12):
+            return "native"
+        return "installed" if _py_exe_in(_py_home()) else "none"
+
+    def refresh(self):
+        import platform
+        ver, mode = platform.python_version(), self._mode()
+        text, label, enabled = {
+            "packaged": (f"Running on Python {ver}. Not available in the packaged build.", "Downgrade to Python 3.12", False),
+            "private": (f"Running on the private Python {ver}.", "Switch back to my Python", True),
+            "native": (f"Running on Python {ver}. Nothing to change.", "Downgrade to Python 3.12", False),
+            "installed": (f"Running on Python {ver}. A private Python 3.12 is already downloaded.", "Use Python 3.12", True),
+            "none": (f"Running on Python {ver}.", "Downgrade to Python 3.12", True),
+        }[mode]
+        self.status.setText(text)
+        self.btn.setText(label)
+        self.btn.setEnabled(enabled and not self._busy)
+
+    def _click(self):
+        if self._busy:
+            return
+        if self._mode() == "private":
+            self._switch_back()
+            return
+        self._busy = True
+        self.btn.setEnabled(False)
+        self.btn.setText("Working...")
+        self.log.clear()
+        self.log.show()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def _switch_back(self):
+        orig = os.environ.get("NCZ_ORIG_PYTHON") or ""
+        _py_set_override("")
+        if orig and os.path.isfile(orig):
+            restart_launcher(self.window(), python=orig)
+        else:
+            QMessageBox.information(self, "Python version",
+                                    "Done. Close the launcher and start it the way you normally do: it will use your own Python again.")
+            self.refresh()
+
+    def _run(self, cmd):
+        self._line.emit("> " + " ".join(os.path.basename(c) if i == 0 else c for i, c in enumerate(cmd)))
+        flags = 0x08000000 if sys.platform.startswith("win") else 0
+        p = subprocess.Popen(cmd, env=_dep_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=flags)
+        for line in p.stdout:
+            line = line.rstrip()
+            if line:
+                self._line.emit(line)
+        return p.wait() == 0
+
+    def _is_312(self, exe):
+        try:
+            flags = 0x08000000 if sys.platform.startswith("win") else 0
+            out = subprocess.run([exe, "-c", "import sys;print(sys.version_info[:2]==(3,12))"], capture_output=True,
+                                 text=True, timeout=60, env=_dep_env(), creationflags=flags)
+            return out.stdout.strip() == "True"
+        except Exception:
+            return False
+
+    def _download(self, url, dest):
+        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
+        with urllib.request.urlopen(req, timeout=60, context=_NCZ_SSL_CTX) as r, open(dest, "wb") as f:
+            total, done, shown = int(r.headers.get("Content-Length") or 0), 0, -1
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                pct = int(done * 100 / total) // 10 * 10 if total else -1
+                if pct != shown and pct >= 0:
+                    shown = pct
+                    self._line.emit(f"  {pct}%  ({done // (1024 * 1024)} MB)")
+
+    def _work(self):
+        try:
+            home = _py_home()
+            exe = _py_exe_in(home)
+            running_here = os.path.abspath(sys.executable).startswith(os.path.abspath(home))
+            if exe and not self._is_312(exe):
+                exe = None
+            if not exe:
+                if running_here:
+                    raise RuntimeError("The private Python is in use and doesn't start. Switch back first.")
+                self._line.emit("Looking for Python 3.12...")
+                name, url = _py_find_asset()
+                self._line.emit("Downloading " + name)
+                archive = home + ".tar.gz"
+                os.makedirs(os.path.dirname(archive), exist_ok=True)
+                self._download(url, archive)
+                self._line.emit("Unpacking...")
+                _py_extract(archive, home)
+                try:
+                    os.remove(archive)
+                except OSError:
+                    pass
+                exe = _py_exe_in(home)
+                if not exe or not self._is_312(exe):
+                    raise RuntimeError("The downloaded Python doesn't start.")
+            self._line.emit("Installing the launcher's packages into Python 3.12...")
+            pip = [exe, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location"]
+            self._run(pip + ["--upgrade", "pip"])
+            core = [pkg for pkg, _m in _dep_applicable(_DEP_CORE)]
+            opt = [pkg for pkg, _m in _dep_applicable(_DEP_OPTIONAL)]
+            failed = []
+            if core and not self._run(pip + ["--only-binary=:all:", *core]):
+                failed = [pkg for pkg in core if not self._run(pip + ["--only-binary=:all:", pkg])]
+            if failed:
+                raise RuntimeError("couldn't install " + ", ".join(failed) + " into Python 3.12, so nothing was switched.")
+            skipped = [pkg for pkg in opt if not self._run(pip + ["--only-binary=:all:", pkg])]
+            _py_set_override(exe)
+            note = (" Optional packages that couldn't be installed: " + ", ".join(skipped) + ".") if skipped else ""
+            self._finished.emit("Python 3.12 is ready." + note, True)
+        except Exception as e:
+            self._finished.emit(f"Failed: {e}", False)
+
+    def _on_finished(self, summary, ok):
+        self._busy = False
+        self.log.appendPlainText(summary)
+        self.refresh()
+        if ok:
+            ans = QMessageBox.question(self, "Python version", "Python 3.12 is ready. Restart the launcher now to run on it?")
+            if ans == QMessageBox.StandardButton.Yes:
+                restart_launcher(self.window())
+
 _dep_prev_settings_init = SettingsPage.__init__
 
 def _dep_settings_init(self, *a, **k):
@@ -53645,6 +53956,8 @@ def _dep_settings_init(self, *a, **k):
         idx = max(layout.count() - 1, 0)
         layout.insertSpacing(idx, 12)
         layout.insertWidget(idx + 1, panel)
+        layout.insertSpacing(idx + 2, 12)
+        layout.insertWidget(idx + 3, _PyPanel())
     except Exception:
         _log_exc("_dep_settings_init")
 
@@ -56085,13 +56398,18 @@ def _dg_ask_folder(parent, title):
 
 # --- signatures: the rdiff library (librsync) when it can be imported, else a built-in per-block hash ---
 def _dg_rs_sig(fh):
-    import librsync
+    """rdiff (librsync) signature of an open file via python-rsync: `pip install python-rsync`, imported as pyrsync."""
+    from pyrsync import get_signature_args, signature
+    fh.seek(0, 2)
+    size = fh.tell()
+    fh.seek(0)
     try:
-        out = librsync.signature(fh, block_size=_DG_BLOCK)
-    except TypeError:                       # older binding without the block_size argument
-        fh.seek(0)
-        out = librsync.signature(fh)
-    return out.read() if hasattr(out, "read") else bytes(out)
+        magic, block_len, strong_len = get_signature_args(size, 0, _DG_BLOCK, 0)
+    except TypeError:                       # older binding without the block_len argument
+        magic, block_len, strong_len = get_signature_args(size)
+    out = _dg_io.BytesIO()
+    signature(fh, out, strong_len, magic, block_len)
+    return out.getvalue()
 
 def _dg_builtin_sig(fh):
     h = _dg_hashlib.sha1()
@@ -56103,11 +56421,12 @@ def _dg_builtin_sig(fh):
     return h.digest()
 
 def _dg_method():
-    """'librsync-<version>' when the rdiff library works here, else 'builtin'. Both sides must use the same one."""
+    """'librsync-<version>' when python-rsync (pyrsync) works here, else 'builtin'. Both sides must use the same one;
+    if they don't match, the asker's launcher is told to redo it with the built-in signature."""
     try:
-        import librsync
+        import pyrsync
         _dg_rs_sig(_dg_io.BytesIO(b"probe"))
-        return "librsync-" + str(getattr(librsync, "__version__", "?"))
+        return "librsync-" + str(getattr(pyrsync, "__version__", "?"))
     except Exception:
         return "builtin"
 
@@ -56375,12 +56694,12 @@ def _dg_find_dir(title):
     return None
 
 # --- cloud: rides on the mod-share request/reply nodes, told apart by kind="diff" ---
-def cloud_diff_send_request(friend, title, blob, tag, count, ver=""):
+def cloud_diff_send_request(friend, title, blob, tag, count, ver="", direction="get"):
     token, uid = get_id_token()
     _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token), "DELETE")
     _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "PUT",
                {"kind": "diff", "appid": 0, "game": str(title)[:80], "username": _my_display_name(),
-                "m": tag, "n": int(count), "ver": str(ver or ""), "man": blob, "time": {".sv": "timestamp"}}, timeout=180)
+                "m": tag, "n": int(count), "ver": str(ver or ""), "dir": str(direction or "get"), "man": blob, "time": {".sv": "timestamp"}}, timeout=180)
 
 def cloud_diff_answer(requester, title, accepted, info=None):
     token, uid = get_id_token()
@@ -56397,9 +56716,10 @@ class _DgAskWorker(QThread):
     done = pyqtSignal(dict, str)         # friend's answer, error ("cancelled" / "timeout" / message)
     TIMEOUT = 40 * 60
 
-    def __init__(self, friend, name, title, root, parent=None):
+    def __init__(self, friend, name, title, root, parent=None, direction="get"):
         super().__init__(parent)
         self.friend, self.fname, self.title, self.root = friend, name, title, root
+        self.direction = direction
         self._cancel = False
 
     def cancel(self):
@@ -56418,7 +56738,7 @@ class _DgAskWorker(QThread):
                 if len(blob) > 8 * 1024 * 1024:
                     self.done.emit({}, "This game has too many files to compare through the cloud.")
                     return
-                cloud_diff_send_request(self.friend, self.title, blob, tag, len(man), _dg_game_version(self.title))
+                cloud_diff_send_request(self.friend, self.title, blob, tag, len(man), _dg_game_version(self.title), self.direction)
                 self.status.emit(f"Waiting for {self.fname} to answer... (they have to accept, then their launcher compares)", True)
                 t0, reply = time.time(), None
                 while time.time() - t0 < self.TIMEOUT:
@@ -56533,6 +56853,59 @@ def _dg_feed_wire(worker, feed):
     worker.prog.connect(lambda d, t: feed.progress.emit(d, t, 0.0))
     feed.cancel_cb = worker.cancel
 
+def _dg_pick_direction(self, title, friend_row):
+    """Two cards, you and the friend you picked (profile picture + username each). Click whoever has the newer files.
+    Returns "send" (I have the update), "get" (the friend has it) or None."""
+    fuid, fname, fstatus, fcolor, favatar = friend_row
+    my_name, my_avatar = load_profile_cache()
+    my_name = my_name or _my_display_name()
+    dlg = QDialog(self)
+    dlg.setWindowTitle("Who has the update?")
+    dlg.resize(460, 340)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(24, 22, 24, 20)
+    lay.setSpacing(12)
+    head = QLabel("Who has the update?")
+    head.setObjectName("PageTitle")
+    sub = QLabel(f"Pick whoever has the newer {title} files. Their launcher zips the files that are different and they "
+                 f"send the zip to the other person.")
+    sub.setObjectName("RowDesc")
+    sub.setWordWrap(True)
+    lay.addWidget(head)
+    lay.addWidget(sub)
+    me_card = _SyncFriendCard("me", my_name, "You", GREEN, my_avatar)
+    fr_card = _SyncFriendCard(fuid, fname, fstatus, fcolor, favatar)
+    cards, state = [me_card, fr_card], {"who": None}
+    go = QPushButton("Pick who has the update")
+    go.setObjectName("Primary")
+    go.setFixedHeight(34)
+    go.setEnabled(False)
+
+    def pick(who):
+        state["who"] = who
+        for c in cards:
+            c.set_selected(c.uid == who)
+        go.setEnabled(True)
+        go.setText("I have the update" if who == "me" else f"{fname} has the update")
+
+    for c in cards:
+        c.picked.connect(pick)
+        c.confirmed.connect(lambda who: (pick(who), dlg.accept()))
+        lay.addWidget(c)
+    lay.addStretch()
+    btns = QHBoxLayout()
+    btns.addStretch()
+    cancel = QPushButton("Cancel")
+    cancel.setFixedHeight(34)
+    cancel.clicked.connect(dlg.reject)
+    go.clicked.connect(dlg.accept)
+    btns.addWidget(cancel)
+    btns.addWidget(go)
+    lay.addLayout(btns)
+    if dlg.exec() != QDialog.DialogCode.Accepted or state["who"] is None:
+        return None
+    return "send" if state["who"] == "me" else "get"
+
 def _dg_begin(self, title):
     if not cloud_configured() or load_account() is None:
         QMessageBox.information(self, "Get different files",
@@ -56583,15 +56956,19 @@ def _dg_on_friends(self, title, root, friends, err):
         return
     found.sort(key=lambda r: (not r[5], r[2] == "Offline", r[1].lower()))
     rows = [(u, n, st if sure else f"{st} \u00b7 install not confirmed", c, av) for u, n, st, c, av, sure in found]
-    uid = _pick_sync_friend(self, rows, title, heading="Who has the update?",
-                            blurb=f"Pick the friend who has the newer {title} files you need. Their launcher compares their files "
-                                  f"with yours and zips the ones that are different, then they send you the zip.",
-                            ask="Get files from ",
+    uid = _pick_sync_friend(self, rows, title, heading="Pick a friend",
+                            blurb=f"Pick the friend you want to compare {title} files with. Next you choose who has the update: "
+                                  f"whoever has it zips the files that are different and sends them to the other.",
+                            ask="Compare with ",
                             note="Your friend needs the launcher open and has to accept. Comparing big games can take a few minutes.")
     if uid is None:
         return
-    name = next(r[1] for r in rows if r[0] == uid)
-    w = _DgAskWorker(uid, name, title, root, self)
+    row = next(r for r in rows if r[0] == uid)
+    name = row[1]
+    direction = _dg_pick_direction(self, title, row)
+    if direction is None:
+        return
+    w = _DgAskWorker(uid, name, title, root, self, direction)
     feed = _dg_card(self, title, name)
     _dg_feed_wire(w, feed)
     w.done.connect(lambda reply, e: _dg_asked(self, name, title, reply, e, root, feed))
@@ -56629,7 +57006,7 @@ def _dg_zip_here(self, name, title, root, reply, feed):
         feed.finished.emit(path)
         _dg_reveal(path)
         QMessageBox.information(self, "Get different files",
-                                f"Your {title} files are newer than {name}'s, so the zip was made here: {info['zipped']} "
+                                f"Your {title} update is ready: {info['zipped']} "
                                 f"file(s) ({_dg_mb(int(info.get('bytes') or 0))}) in your NCZ outputs folder. Send it to {name}.")
     w.done.connect(finished)
     self.__dict__.setdefault("_dg_keep", []).append(w)
@@ -56676,8 +57053,9 @@ class _DgMakeWorker(QThread):
     prog = pyqtSignal(object, object)
     done = pyqtSignal(dict, str)
 
-    def __init__(self, title, root, man, tag, parent=None, decide=False, my_ver="", their_ver=""):
+    def __init__(self, title, root, man, tag, parent=None, decide=False, my_ver="", their_ver="", handoff=False):
         super().__init__(parent)
+        self.handoff = handoff            # the asker has the update: send them this PC's manifest so they make the zip
         self.title, self.root, self.man, self.tag = title, root, man, tag
         self.decide, self.my_ver, self.their_ver = decide, my_ver, their_ver
         self._cancel = False
@@ -56694,8 +57072,8 @@ class _DgMakeWorker(QThread):
                 return
             info = {"changed": len(cmp_["differ"]), "new": len(cmp_["new"]), "removed": len(cmp_["removed"]),
                     "same": cmp_["same"], "zipped": 0, "bytes": 0}
-            if self.decide and (cmp_["differ"] or cmp_["new"] or cmp_["removed"]) and \
-                    not _dg_mine_is_newer(cmp_, self.my_ver, self.their_ver):
+            if (cmp_["differ"] or cmp_["new"] or cmp_["removed"]) and \
+                    (self.handoff or (self.decide and not _dg_mine_is_newer(cmp_, self.my_ver, self.their_ver))):
                 self.status.emit("Reading the rest of your files...", False)
                 mine = _dg_manifest(self.root, self.tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel,
                                     cache=cmp_["sigs"])
@@ -56736,9 +57114,14 @@ def _dg_handle_request(self, uid, d):
     self.friend_event.emit(name, f"wants to compare {game} files", uid)
     box = QMessageBox(self.window())
     box.setWindowTitle("Compare game files")
-    box.setText(f"{name} says you have the update for {game} and wants your files.\n\nYour launcher will compare your "
-                f"{game} files with theirs and zip the ones that are different into your NCZ outputs folder. Then you send "
-                f"the zip to {name}. Nothing is sent automatically. Continue?")
+    if str(d.get("dir") or "get") == "send":
+        box.setText(f"{name} has the update for {game} and wants to send you the files.\n\nYour launcher will compare your "
+                    f"{game} files with theirs. Then {name}'s launcher zips the files that are different and they send you "
+                    f"the zip. Nothing is sent automatically. Continue?")
+    else:
+        box.setText(f"{name} says you have the update for {game} and wants your files.\n\nYour launcher will compare your "
+                    f"{game} files with theirs and zip the ones that are different into your NCZ outputs folder. Then you send "
+                    f"the zip to {name}. Nothing is sent automatically. Continue?")
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.setDefaultButton(QMessageBox.StandardButton.No)
     if box.exec() != QMessageBox.StandardButton.Yes:
@@ -56759,7 +57142,7 @@ def _dg_handle_request(self, uid, d):
     except Exception:
         answer(False, {"reason": "bad_manifest"})
         return
-    w = _DgMakeWorker(game, root, man, req_tag, self)
+    w = _DgMakeWorker(game, root, man, req_tag, self, handoff=(str(d.get("dir") or "get") == "send"))
     feed = _dg_card(self.window(), game, name)
     _dg_feed_wire(w, feed)
     def finished(info, err):
@@ -56775,10 +57158,10 @@ def _dg_handle_request(self, uid, d):
         if info.get("handoff"):
             answer(True, {"direction": "asker_newer", "man": info["man"], "m": info["m"], "changed": info["changed"],
                           "new": info["new"], "zipped": 0})
-            feed.status_update.emit(f"{name}'s files are newer, so they make the zip")
+            feed.status_update.emit(f"{name} has the update and makes the zip")
             feed.finished.emit("")
             QMessageBox.information(self.window(), "Compare game files",
-                                    f"{name}'s {game} files are newer than yours, so their launcher will make the zip.")
+                                    f"{name} has the update for {game}, so their launcher will make the zip and send it to you.")
             return
         path = info.pop("path", None)
         answer(True, info)
