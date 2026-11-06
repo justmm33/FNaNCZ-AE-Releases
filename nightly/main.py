@@ -56462,9 +56462,20 @@ class _DgFeed(QObject):
         if self.cancel_cb:
             self.cancel_cb()
 
+def _dg_cover(title):
+    """Cover image path of a library game (matched loosely by title), "" if it has none."""
+    try:
+        want = _dg_norm(title)
+        for t, path in library_cover_paths().items():
+            if _dg_norm(t) == want:
+                return path
+    except Exception:
+        _log_exc("_dg_cover")
+    return ""
+
 class _DgUpdateCard(DownloadCard):
     def __init__(self, game, other, feed):
-        super().__init__("Creating update files", "", 0, "", None, worker=feed)
+        super().__init__("Creating update files", "", 0, _dg_cover(game), None, worker=feed)
         self.game, self.other = game, other
         self.pause_btn.hide()
         self.status_label.setText("Starting...")
@@ -56572,10 +56583,10 @@ def _dg_on_friends(self, title, root, friends, err):
         return
     found.sort(key=lambda r: (not r[5], r[2] == "Offline", r[1].lower()))
     rows = [(u, n, st if sure else f"{st} \u00b7 install not confirmed", c, av) for u, n, st, c, av, sure in found]
-    uid = _pick_sync_friend(self, rows, title, heading="Get different files",
-                            blurb=f"Pick a friend who has {title} installed. Their launcher compares their files with yours and "
-                                  f"zips the ones that are different, then they send you the zip.",
-                            ask="Compare with ",
+    uid = _pick_sync_friend(self, rows, title, heading="Who has the update?",
+                            blurb=f"Pick the friend who has the newer {title} files you need. Their launcher compares their files "
+                                  f"with yours and zips the ones that are different, then they send you the zip.",
+                            ask="Get files from ",
                             note="Your friend needs the launcher open and has to accept. Comparing big games can take a few minutes.")
     if uid is None:
         return
@@ -56656,7 +56667,7 @@ def _dg_asked(self, name, title, reply, err, root, feed):
     feed.finished.emit("")
     QMessageBox.information(self, "Get different files",
                             f"{name} made a zip with {n} file(s) ({_dg_mb(int(reply.get('bytes') or 0))}) that differ from "
-                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new. Their files are newer, so it's in their NCZ outputs "
+                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new. It's in their NCZ outputs "
                             f"folder. Ask them to send it to you.")
 
 # --- friend side: answers a diff request ---
@@ -56725,9 +56736,9 @@ def _dg_handle_request(self, uid, d):
     self.friend_event.emit(name, f"wants to compare {game} files", uid)
     box = QMessageBox(self.window())
     box.setWindowTitle("Compare game files")
-    box.setText(f"{name} wants to compare their {game} files with yours.\n\nYour launcher will zip the files that are "
-                f"different into an NCZ outputs folder. Whoever has the newer files makes the zip (you, or {name}) and "
-                f"sends it to the other. Nothing is sent automatically. Continue?")
+    box.setText(f"{name} says you have the update for {game} and wants your files.\n\nYour launcher will compare your "
+                f"{game} files with theirs and zip the ones that are different into your NCZ outputs folder. Then you send "
+                f"the zip to {name}. Nothing is sent automatically. Continue?")
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.setDefaultButton(QMessageBox.StandardButton.No)
     if box.exec() != QMessageBox.StandardButton.Yes:
@@ -56748,8 +56759,7 @@ def _dg_handle_request(self, uid, d):
     except Exception:
         answer(False, {"reason": "bad_manifest"})
         return
-    w = _DgMakeWorker(game, root, man, req_tag, self, decide=True, my_ver=_dg_game_version(game),
-                      their_ver=str(d.get("ver") or ""))
+    w = _DgMakeWorker(game, root, man, req_tag, self)
     feed = _dg_card(self.window(), game, name)
     _dg_feed_wire(w, feed)
     def finished(info, err):
