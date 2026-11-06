@@ -53452,7 +53452,7 @@ _DEP_CORE = [("PyQt6", "PyQt6"), ("psutil", "psutil"), ("rarfile", "rarfile"),
              ("playwright", "playwright"), ("pywin32", "win32api")]
 _DEP_OPTIONAL = [("pypresence", "pypresence"), ("libtorrent", "libtorrent"), ("pynput", "pynput"),
                  ("nudenet", "nudenet"), ("vgamepad", "vgamepad"),
-                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("python-rsync", "pyrsync")]
+                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("rdiff", "rdiff")]
 _DEP_WIN_ONLY = {"pywin32", "vgamepad"}
 
 def _dep_have(module):
