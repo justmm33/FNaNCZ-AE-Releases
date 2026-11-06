@@ -53408,7 +53408,7 @@ _DEP_CORE = [("PyQt6", "PyQt6"), ("psutil", "psutil"), ("rarfile", "rarfile"),
              ("playwright", "playwright"), ("pywin32", "win32api")]
 _DEP_OPTIONAL = [("pypresence", "pypresence"), ("libtorrent", "libtorrent"), ("pynput", "pynput"),
                  ("nudenet", "nudenet"), ("vgamepad", "vgamepad"),
-                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets")]
+                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("librsync", "librsync")]
 _DEP_WIN_ONLY = {"pywin32", "vgamepad"}
 
 def _dep_have(module):
@@ -56043,13 +56043,45 @@ _DG_SKIP_DIRS = {".git", "__pycache__"}
 _DG_SKIP_EXT = (".part", ".tmp")
 
 def _dg_norm(t):
-    return re.sub(r"\s*\(wine\)$", "", str(t or "").strip().lower())
+    """Title key that ignores case, spaces, punctuation and a trailing "(Wine)": "FNAF: Foo" == "fnaf foo"."""
+    base = re.sub(r"\s*\(wine\)$", "", str(t or "").strip(), flags=re.I).casefold()
+    return re.sub(r"[\W_]+", "", base) or base
 
 def _dg_outputs_dir():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
     d = os.path.join(base, "ncz", "outputs")
     os.makedirs(d, exist_ok=True)
     return d
+
+def _dg_paths_file():
+    return os.path.join(os.path.dirname(_dg_outputs_dir()), "diff_paths.json")
+
+def _dg_load_paths():
+    try:
+        with open(_dg_paths_file(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _dg_save_path(title, folder):
+    d = _dg_load_paths()
+    d[_dg_norm(title)] = os.path.abspath(folder)
+    try:
+        with open(_dg_paths_file(), "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        _log_exc("_dg_save_path")
+    _dg_inst_cache["key"] = None          # so friends see this game as installed on the next presence update
+
+def _dg_ask_folder(parent, title):
+    """The launcher couldn't locate the game: let the person point at its folder (remembered for next time)."""
+    start = (library_roots() or [os.path.expanduser("~")])[0]
+    d = QFileDialog.getExistingDirectory(parent, f"Where is {title} installed? Pick its game folder", start)
+    if d and os.path.isdir(d):
+        _dg_save_path(title, d)
+        return d
+    return None
 
 # --- signatures: the rdiff library (librsync) when it can be imported, else a built-in per-block hash ---
 def _dg_rs_sig(fh):
@@ -56231,40 +56263,114 @@ def _dg_installed_titles(titles):
     _dg_inst_cache.update(t=time.time(), key=key, v=out)
     return list(out)
 
+def _dg_steam_roots():
+    roots = []
+    def add(path):
+        try:
+            if path and os.path.isdir(path):
+                path = os.path.abspath(path)
+                if path not in roots:
+                    roots.append(path)
+        except OSError:
+            pass
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            add(winreg.QueryValueEx(k, "SteamPath")[0])
+    except Exception:    # expected: not Windows / Steam not installed
+        pass
+    for pth in (os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Steam"),
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Steam"),
+                "~/.steam/steam", "~/.local/share/Steam", "~/Library/Application Support/Steam",
+                "~/.var/app/com.valvesoftware.Steam/.local/share/Steam"):
+        add(os.path.expanduser(pth))
+    return roots
+
+def _dg_steam_dirs(appid, title):
+    """Steam install folders for a game: reads every Steam library (other drives too) and the game's appmanifest."""
+    out = []
+    for root in _dg_steam_roots():
+        libs = [root]
+        try:
+            with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+                libs += [m.group(1).replace("\\\\", "\\") for m in re.finditer(r'"path"\s+"([^"]+)"', f.read())]
+        except OSError:
+            pass
+        for lib in libs:
+            apps = os.path.join(lib, "steamapps")
+            try:
+                with open(os.path.join(apps, f"appmanifest_{appid}.acf"), encoding="utf-8", errors="replace") as f:
+                    m = re.search(r'"installdir"\s+"([^"]+)"', f.read())
+                if m:
+                    out.append(os.path.join(apps, "common", m.group(1)))
+            except OSError:
+                pass
+            out.append(os.path.join(apps, "common", str(title)))
+    return out
+
+def _dg_usable_dir(c):
+    try:
+        if not c or not os.path.isdir(c):
+            return False
+        ab = os.path.abspath(c)
+        if len(ab) <= 3 or ab == os.path.expanduser("~"):
+            return False
+        with os.scandir(c) as it:
+            return any(True for _ in it)          # an empty leftover folder is not an install
+    except OSError:
+        return False
+
 def _dg_find_dir(title):
     """Where a library game's files are on this PC (None if it can't be found)."""
     want, cands = _dg_norm(title), []
+    try:
+        if _dg_load_paths().get(want):
+            cands.append(_dg_load_paths()[want])          # a folder the person picked by hand wins
+    except Exception:
+        _log_exc("_dg_find_dir paths")
     for info in GAME_INFO.values():
         if _dg_norm(info["name"]) == want:
             cands += [installed_game_dir(info["name"]), wine_game_dir(info["name"])]
+    try:        # folder named after the title: how the launcher installs fan / store games ("Foo: Bar" -> "Foo Bar")
+        safe = sanitize_folder_name(str(title))
+        cands += [installed_game_dir(safe), wine_game_dir(safe)]
+    except Exception:
+        _log_exc("_dg_find_dir safe")
     try:
-        for r in library_roots():
+        roots = list(library_roots())
+    except Exception:
+        roots = []
+    for r in roots:                     # any folder in any library root that matches the title loosely
+        try:
             for e in os.listdir(r):
                 if _dg_norm(e) == want:
                     cands.append(os.path.join(r, e))
+        except OSError:
+            pass
+    try:
+        for g in load_custom_games():
+            if _dg_norm(g.get("title") or g.get("name")) == want and g.get("exe_path"):
+                cands.append(os.path.dirname(g["exe_path"]))
     except Exception:
-        pass
-    for g in load_custom_games():
-        if _dg_norm(g.get("title") or g.get("name")) == want and g.get("exe_path"):
-            cands.append(os.path.dirname(g["exe_path"]))
+        _log_exc("_dg_find_dir custom")
     try:
         for g in load_fan_library():
             if _dg_norm(g.get("title")) == want:
-                for k in ("install_dir", "dir", "path"):
-                    if g.get(k):
-                        cands.append(g[k])
                 if g.get("exe_path"):
                     cands.append(os.path.dirname(g["exe_path"]))
+                cands.append(_fan_game_dir(g["id"], g["title"]))
     except Exception:
-        pass
-    steam = [os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Steam"),
-             os.path.expanduser("~/.steam/steam"), os.path.expanduser("~/.local/share/Steam")]
-    for s in steam:
+        _log_exc("_dg_find_dir fan")
+    try:
         for g in load_steam_library():
             if _dg_norm(g.get("title")) == want:
-                cands.append(os.path.join(s, "steamapps", "common", g["title"]))
+                if g.get("exe_path"):
+                    cands.append(os.path.dirname(g["exe_path"]))
+                cands += _dg_steam_dirs(g.get("appid"), g["title"])
+    except Exception:
+        _log_exc("_dg_find_dir steam")
     for c in cands:
-        if c and os.path.isdir(c) and len(os.path.abspath(c)) > 3 and os.path.abspath(c) != os.path.expanduser("~"):
+        if _dg_usable_dir(c):
             return c
     return None
 
@@ -56423,8 +56529,14 @@ def _dg_begin(self, title):
         return
     root = _dg_find_dir(title)
     if not root:
-        QMessageBox.information(self, "Get different files", f"I couldn't find where {title} is installed on this PC.")
-        return
+        ans = QMessageBox.question(self, "Get different files",
+                                   f"I couldn't find where {title} is installed on this PC.\n\nPick its folder yourself? "
+                                   f"(It's remembered for next time.)")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        root = _dg_ask_folder(self, title)
+        if not root:
+            return
     keep = self.__dict__.setdefault("_dg_keep", [])
     w = WorkshopFriendsWorker(self)
     w.done.connect(lambda friends, err, t=title, r=root: _dg_on_friends(self, t, r, friends, err))
@@ -56436,23 +56548,30 @@ def _dg_on_friends(self, title, root, friends, err):
     if err:
         QMessageBox.warning(self, "Get different files", err)
         return
-    want, rows = _dg_norm(pretty_game_name(title)), []
+    def as_list(v):
+        return list(v.values()) if isinstance(v, dict) else (v if isinstance(v, list) else [])
+    want, found = _dg_norm(pretty_game_name(title)), []
     for uid, prof in (friends or {}).items():
         prof = prof or {}
-        lib = prof.get("installed")          # published by launchers that know which games are really installed
-        lib = list(lib.values()) if isinstance(lib, dict) else (lib if isinstance(lib, list) else [])
-        if want not in {_dg_norm(pretty_game_name(t)) for t in lib}:
+        installed = {_dg_norm(pretty_game_name(t)) for t in as_list(prof.get("installed"))}
+        owned = {_dg_norm(pretty_game_name(t)) for t in as_list(prof.get("library"))}
+        if want in installed:
+            sure = True
+        elif want in owned:      # has it in their library but their launcher didn't report it as installed (older launcher / folder not found)
+            sure = False
+        else:
             continue
         status, color = _friend_status(prof)
         try:
             avatar = _friend_avatar_file(uid, prof.get("photo"))
         except Exception:
             avatar = None
-        rows.append((uid, str(prof.get("username") or "Friend"), status, color, avatar))
-    if not rows:
-        QMessageBox.information(self, "Get different files", f"None of your friends have {title} installed (friends on an older launcher need to update before they show up).")
+        found.append((uid, str(prof.get("username") or "Friend"), status, color, avatar, sure))
+    if not found:
+        QMessageBox.information(self, "Get different files", f"None of your friends have {title} in their library (friends on an older launcher need to update before they show up).")
         return
-    rows.sort(key=lambda r: (r[2] == "Offline", r[1].lower()))
+    found.sort(key=lambda r: (not r[5], r[2] == "Offline", r[1].lower()))
+    rows = [(u, n, st if sure else f"{st} \u00b7 install not confirmed", c, av) for u, n, st, c, av, sure in found]
     uid = _pick_sync_friend(self, rows, title, heading="Get different files",
                             blurb=f"Pick a friend who has {title} installed. Their launcher compares their files with yours and "
                                   f"zips the ones that are different, then they send you the zip.",
@@ -56615,6 +56734,8 @@ def _dg_handle_request(self, uid, d):
         answer(False)
         return
     root = _dg_find_dir(game)
+    if not root:
+        root = _dg_ask_folder(self.window(), game)       # can't locate it automatically: let them point at the folder
     if not root:
         answer(False, {"reason": "not_installed"})
         return
