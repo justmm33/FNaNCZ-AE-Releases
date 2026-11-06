@@ -4119,8 +4119,8 @@ class CreditsPage(QWidget):
     CREDITS = (
         ("jsmm33", "FNaNCZ AE, FNaNCZ 2, and the Launcher itself", "jsmm33.png"),
         ("mr.fancypigeon", "Linux Script for FNaNCZ 1 and 2, Garry's Mod Addon Manager, and ideas", "pigeon.png"),
-        ("notacape", "NCZFront, Optimization and porting", "notacape.png"),
-        ("glimpsesofhope", "Terms and Conditions, Ideas", "kablooey.png"),
+        ("notacape", "NCZFront", "notacape.png"),
+        ("Kablooey", "Terms and Conditions, Ideas", "kablooey.png"),
     )
 
     @staticmethod
@@ -14618,13 +14618,14 @@ def cloud_publish_presence():
         username, avatar = load_profile_cache()
         username = username or (load_account() or {}).get("email", "").split("@")[0] or "Player"
         library = friends_library_titles()
+        installed = _dg_installed_titles(library)
         country = load_profile_country() or None
         ptime = profile_ptime_payload()
         try:
             avatar_sig = (avatar, os.path.getmtime(avatar)) if avatar and os.path.exists(avatar) else None
         except OSError:
             avatar_sig = None
-        sig = (uid, username, json.dumps(library, sort_keys=True, default=str), country,
+        sig = (uid, username, json.dumps(library, sort_keys=True, default=str), json.dumps(installed), country,
                json.dumps(ptime, sort_keys=True, default=str), avatar_sig)
         full = (sig != _presence_state["full_sig"]
                 or time.time() - _presence_state["full_at"] > PRESENCE_FULL_EVERY)
@@ -14634,7 +14635,7 @@ def cloud_publish_presence():
             "seen": {".sv": "timestamp"},
         }
         if full:
-            payload.update({"username": username, "library": library, "country": country, "ptime": ptime,
+            payload.update({"username": username, "library": library, "installed": installed, "country": country, "ptime": ptime,
                             "photo": None})
             if avatar_sig:
                 with open(avatar, "rb") as f:
@@ -19327,17 +19328,17 @@ class _SyncFriendCard(QFrame):
     def mouseDoubleClickEvent(self, _e):
         self.confirmed.emit(self.uid)
 
-def _pick_sync_friend(parent, rows, game):
+def _pick_sync_friend(parent, rows, game, heading="Sync mods with friend", blurb=None, ask="Ask ", note=None):
     """Card picker. rows = [(uid, name, status, color, avatar_path)]. Returns the chosen uid or None."""
     dlg = QDialog(parent)
-    dlg.setWindowTitle("Sync mods with friend")
+    dlg.setWindowTitle(heading)
     dlg.resize(580, 470)
     lay = QVBoxLayout(dlg)
     lay.setContentsMargins(24, 22, 24, 20)
     lay.setSpacing(12)
-    title = QLabel("Sync mods with friend")
+    title = QLabel(heading)
     title.setObjectName("PageTitle")
-    sub = QLabel(f"Request a friend to share their {game} mods with you, they have to accept first")
+    sub = QLabel(blurb or f"Request a friend to share their {game} mods with you, they have to accept first")
     sub.setObjectName("RowDesc")
     sub.setWordWrap(True)
     lay.addWidget(title)
@@ -19362,7 +19363,7 @@ def _pick_sync_friend(parent, rows, game):
         for c in cards:
             c.set_selected(c.uid == uid)
         go.setEnabled(True)
-        go.setText("Ask " + next(c.name for c in cards if c.uid == uid))
+        go.setText(ask + next(c.name for c in cards if c.uid == uid))
 
     for i, (uid, name, status, color, avatar) in enumerate(rows):
         c = _SyncFriendCard(uid, name, status, color, avatar)
@@ -19373,7 +19374,7 @@ def _pick_sync_friend(parent, rows, game):
     grid.setRowStretch((len(rows) + 1) // 2, 1)
     scroll.setWidget(holder)
     lay.addWidget(scroll, 1)
-    note = QLabel("Your friend needs the launcher open to answer. The request expires after 2 minutes.")
+    note = QLabel(note or "Your friend needs the launcher open to answer. The request expires after 2 minutes.")
     note.setObjectName("RowDesc")
     note.setWordWrap(True)
     lay.addWidget(note)
@@ -56026,6 +56027,677 @@ def _slr_settings_init(self, *a, **k):
         _log_exc("_slr_panel")
 
 SettingsPage.__init__ = _slr_settings_init
+
+
+# ── library cards: "Get different files" (compare a game's files with a friend's copy, zip the ones that differ) ──
+# The asker sends a manifest (size + rdiff signature hash per file) through the same Firebase nodes mod sharing uses
+# (kind="diff"). The friend's launcher compares it with their own copy and zips every file that is different or new
+# into <APPDATA>/ncz/outputs, then opens File Explorer on the zip. Nothing is uploaded: the friend sends the zip manually.
+import hashlib as _dg_hashlib
+import zipfile as _dg_zipfile
+import zlib as _dg_zlib
+import io as _dg_io
+
+_DG_BLOCK = 1024 * 1024
+_DG_SKIP_DIRS = {".git", "__pycache__"}
+_DG_SKIP_EXT = (".part", ".tmp")
+
+def _dg_norm(t):
+    return re.sub(r"\s*\(wine\)$", "", str(t or "").strip().lower())
+
+def _dg_outputs_dir():
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    d = os.path.join(base, "ncz", "outputs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+# --- signatures: the rdiff library (librsync) when it can be imported, else a built-in per-block hash ---
+def _dg_rs_sig(fh):
+    import librsync
+    try:
+        out = librsync.signature(fh, block_size=_DG_BLOCK)
+    except TypeError:                       # older binding without the block_size argument
+        fh.seek(0)
+        out = librsync.signature(fh)
+    return out.read() if hasattr(out, "read") else bytes(out)
+
+def _dg_builtin_sig(fh):
+    h = _dg_hashlib.sha1()
+    while True:
+        b = fh.read(_DG_BLOCK)
+        if not b:
+            break
+        h.update(_dg_hashlib.md5(b).digest())
+    return h.digest()
+
+def _dg_method():
+    """'librsync-<version>' when the rdiff library works here, else 'builtin'. Both sides must use the same one."""
+    try:
+        import librsync
+        _dg_rs_sig(_dg_io.BytesIO(b"probe"))
+        return "librsync-" + str(getattr(librsync, "__version__", "?"))
+    except Exception:
+        return "builtin"
+
+def _dg_file_sig(path, tag):
+    with open(path, "rb") as fh:
+        raw = _dg_rs_sig(fh) if tag.startswith("librsync") else _dg_builtin_sig(fh)
+    return _dg_hashlib.sha1(raw).hexdigest()[:20]
+
+def _dg_walk(root):
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _DG_SKIP_DIRS]
+        for f in files:
+            if f.lower().endswith(_DG_SKIP_EXT):
+                continue
+            p = os.path.join(base, f)
+            try:
+                if not os.path.islink(p):
+                    out[os.path.relpath(p, root).replace("\\", "/")] = (os.path.getsize(p), p)
+            except OSError:
+                pass
+    return out
+
+def _dg_manifest(root, tag, progress, cancel, cache=None):
+    files = _dg_walk(root)
+    total, done, man = (sum(s for s, _p in files.values()) or 1), 0, {}
+    for rel, (size, path) in files.items():
+        if cancel():
+            return None
+        try:
+            man[rel] = [size, (cache or {}).get(rel) or _dg_file_sig(path, tag), int(os.path.getmtime(path))]
+        except OSError:
+            pass
+        done += size
+        progress(done, total)
+    return man
+
+def _dg_pack(man):
+    return base64.b64encode(_dg_zlib.compress(json.dumps(man, separators=(",", ":")).encode("utf-8"), 6)).decode("ascii")
+
+def _dg_unpack(blob):
+    man = json.loads(_dg_zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
+    if not isinstance(man, dict):
+        raise ValueError("bad manifest")
+    return {str(k): v for k, v in man.items() if isinstance(v, list) and len(v) in (2, 3)}
+
+def _dg_compare(root, man, tag, progress, cancel):
+    """Files here that differ from (or are missing in) the asker's manifest. None if cancelled."""
+    mine = _dg_walk(root)
+    theirs_lc = {k.lower(): k for k in man}
+    total, done = (sum(s for s, _p in mine.values()) or 1), 0
+    differ, new, same, seen, sigs, newer, older = [], [], 0, set(), {}, 0, 0
+    for rel, (size, path) in mine.items():
+        if cancel():
+            return None
+        key = rel if rel in man else theirs_lc.get(rel.lower())
+        if key is None:
+            new.append(rel)
+        else:
+            seen.add(key)
+            ent = man[key]
+            try:
+                bad = size != ent[0]
+                if not bad:
+                    sigs[rel] = _dg_file_sig(path, tag)
+                    bad = sigs[rel] != ent[1]
+                if not bad:
+                    same += 1
+                else:
+                    differ.append(rel)
+                    if len(ent) > 2:
+                        mt = os.path.getmtime(path)
+                        newer += mt > ent[2] + 2
+                        older += mt < ent[2] - 2
+            except OSError:
+                differ.append(rel)
+        done += size
+        progress(done, total)
+    removed = [k for k in man if k not in seen]
+    return {"differ": differ, "new": new, "removed": removed, "same": same, "files": mine,
+            "sigs": sigs, "newer": newer, "older": older}
+
+def _dg_make_zip(title, cmp_, progress, cancel):
+    rels = cmp_["differ"] + cmp_["new"]
+    safe = re.sub(r"[^\w\-. ]+", "_", title).strip() or "game"
+    path = os.path.join(_dg_outputs_dir(), f"{safe}_update_{time.strftime('%Y%m%d-%H%M%S')}.zip")
+    files = cmp_["files"]
+    total, done, failed = (sum(files[r][0] for r in rels) or 1), 0, 0
+    with _dg_zipfile.ZipFile(path, "w", _dg_zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
+        for rel in rels:
+            if cancel():
+                break
+            try:
+                zf.write(files[rel][1], rel)
+            except OSError:
+                failed += 1
+            done += files[rel][0]
+            progress(done, total)
+        notes = [f"{title}: files that differ from the other copy ({len(cmp_['differ'])}) and new files ({len(cmp_['new'])})",
+                 "", "Differ:"] + cmp_["differ"] + ["", "New:"] + cmp_["new"] + \
+                ["", "Only in the other copy (not included, delete them if the update removed them):"] + cmp_["removed"]
+        zf.writestr("_ncz_file_list.txt", "\n".join(notes))
+    if cancel():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, 0, 0
+    return path, os.path.getsize(path), failed
+
+def _dg_game_version(title):
+    try:
+        for info in GAME_INFO.values():
+            if _dg_norm(info["name"]) == _dg_norm(title):
+                return get_installed_version(info["name"])
+    except Exception:
+        pass
+    return ""
+
+def _dg_mine_is_newer(cmp_, my_ver, their_ver):
+    try:
+        if my_ver and their_ver and my_ver != their_ver:
+            return bool(is_newer_version(my_ver, their_ver))
+    except Exception:
+        pass
+    return cmp_["newer"] + len(cmp_["new"]) >= cmp_["older"] + len(cmp_["removed"])
+
+def _dg_reveal(path):
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+    except Exception:
+        _log_exc("_dg_reveal")
+
+_dg_inst_cache = {"t": 0.0, "key": None, "v": []}
+
+def _dg_installed_titles(titles):
+    """Library games whose files are really on this PC (published to friends). Re-checked at most once a minute."""
+    key = tuple(titles)
+    if key == _dg_inst_cache["key"] and time.time() - _dg_inst_cache["t"] < 60:
+        return list(_dg_inst_cache["v"])
+    out = []
+    for t in titles:
+        try:
+            if _dg_find_dir(t):
+                out.append(t)
+        except Exception:
+            pass
+    _dg_inst_cache.update(t=time.time(), key=key, v=out)
+    return list(out)
+
+def _dg_find_dir(title):
+    """Where a library game's files are on this PC (None if it can't be found)."""
+    want, cands = _dg_norm(title), []
+    for info in GAME_INFO.values():
+        if _dg_norm(info["name"]) == want:
+            cands += [installed_game_dir(info["name"]), wine_game_dir(info["name"])]
+    try:
+        for r in library_roots():
+            for e in os.listdir(r):
+                if _dg_norm(e) == want:
+                    cands.append(os.path.join(r, e))
+    except Exception:
+        pass
+    for g in load_custom_games():
+        if _dg_norm(g.get("title") or g.get("name")) == want and g.get("exe_path"):
+            cands.append(os.path.dirname(g["exe_path"]))
+    try:
+        for g in load_fan_library():
+            if _dg_norm(g.get("title")) == want:
+                for k in ("install_dir", "dir", "path"):
+                    if g.get(k):
+                        cands.append(g[k])
+                if g.get("exe_path"):
+                    cands.append(os.path.dirname(g["exe_path"]))
+    except Exception:
+        pass
+    steam = [os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Steam"),
+             os.path.expanduser("~/.steam/steam"), os.path.expanduser("~/.local/share/Steam")]
+    for s in steam:
+        for g in load_steam_library():
+            if _dg_norm(g.get("title")) == want:
+                cands.append(os.path.join(s, "steamapps", "common", g["title"]))
+    for c in cands:
+        if c and os.path.isdir(c) and len(os.path.abspath(c)) > 3 and os.path.abspath(c) != os.path.expanduser("~"):
+            return c
+    return None
+
+# --- cloud: rides on the mod-share request/reply nodes, told apart by kind="diff" ---
+def cloud_diff_send_request(friend, title, blob, tag, count, ver=""):
+    token, uid = get_id_token()
+    _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token), "DELETE")
+    _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "PUT",
+               {"kind": "diff", "appid": 0, "game": str(title)[:80], "username": _my_display_name(),
+                "m": tag, "n": int(count), "ver": str(ver or ""), "man": blob, "time": {".sv": "timestamp"}}, timeout=180)
+
+def cloud_diff_answer(requester, title, accepted, info=None):
+    token, uid = get_id_token()
+    reply = {"kind": "diff", "game": str(title)[:80], "accepted": bool(accepted), "username": _my_display_name(),
+             "time": {".sv": "timestamp"}}
+    reply.update(info or {})
+    _http_json(_fdb(f"modshare_replies/{requester}/{uid}", token), "PUT", reply)
+    _http_json(_fdb(f"modshare_requests/{uid}/{requester}", token), "DELETE")
+
+# --- asker side ---
+class _DgAskWorker(QThread):
+    status = pyqtSignal(str, bool)       # text, busy
+    prog = pyqtSignal(object, object)
+    done = pyqtSignal(dict, str)         # friend's answer, error ("cancelled" / "timeout" / message)
+    TIMEOUT = 40 * 60
+
+    def __init__(self, friend, name, title, root, parent=None):
+        super().__init__(parent)
+        self.friend, self.fname, self.title, self.root = friend, name, title, root
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            tag = _dg_method()
+            for _attempt in range(2):
+                self.status.emit("Reading your files...", False)
+                man = _dg_manifest(self.root, tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
+                if man is None:
+                    self.done.emit({}, "cancelled")
+                    return
+                blob = _dg_pack(man)
+                if len(blob) > 8 * 1024 * 1024:
+                    self.done.emit({}, "This game has too many files to compare through the cloud.")
+                    return
+                cloud_diff_send_request(self.friend, self.title, blob, tag, len(man), _dg_game_version(self.title))
+                self.status.emit(f"Waiting for {self.fname} to answer... (they have to accept, then their launcher compares)", True)
+                t0, reply = time.time(), None
+                while time.time() - t0 < self.TIMEOUT:
+                    if self._cancel:
+                        cloud_modshare_cancel_request(self.friend)
+                        self.done.emit({}, "cancelled")
+                        return
+                    r = cloud_modshare_check_reply(self.friend)
+                    if isinstance(r, dict) and r.get("kind") == "diff":
+                        reply = r
+                        break
+                    self.msleep(2000)
+                if reply is None:
+                    cloud_modshare_cancel_request(self.friend)
+                    self.done.emit({}, "timeout")
+                    return
+                if reply.get("retry") == "builtin" and tag != "builtin":
+                    tag = "builtin"          # the friend has no rdiff library: both sides use the built-in signature
+                    continue
+                self.done.emit(reply, "")
+                return
+            self.done.emit({}, "The other launcher couldn't match the signature method.")
+        except Exception as e:
+            self.done.emit({}, str(e) or "Something went wrong.")
+
+class _DgFeed(QObject):
+    """Stands in for a download worker so a DownloadCard can show the update-file steps."""
+    progress = pyqtSignal(object, object, float)
+    status_update = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.cancel_cb = None
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        if self.cancel_cb:
+            self.cancel_cb()
+
+class _DgUpdateCard(DownloadCard):
+    def __init__(self, game, other, feed):
+        super().__init__("Creating update files", "", 0, "", None, worker=feed)
+        self.game, self.other = game, other
+        self.pause_btn.hide()
+        self.status_label.setText("Starting...")
+        self.info_label.setText(f"{game} with {other}")
+
+    def on_status_update(self, message):
+        self.info_label.setText(f"{self.game} with {self.other}: {message}")
+
+    def on_progress(self, done, total, _speed):
+        if total and total > 0:
+            pct = max(0, min(100, int(done * 100 / total)))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(pct)
+            self.status_label.setText(f"{pct}%")
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Working...")
+
+    def on_finished(self, path):
+        self.state = "done"
+        self.status_label.setText("Ready" if path else "Done")
+        self.status_label.setStyleSheet(f"color: {GREEN};")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.clear_btn.show()
+        try:
+            self.action_btn.clicked.disconnect()
+        except Exception:    # expected: nothing was connected
+            pass
+        if path:
+            self.action_btn.setText("Show zip")
+            self.action_btn.setEnabled(True)
+            self.action_btn.clicked.connect(lambda _c=False, p=path: _dg_reveal(p))
+        else:
+            self.action_btn.hide()
+
+    def cancel_download(self):
+        self.status_label.setText("Cancelling...")
+        self.action_btn.setEnabled(False)
+        self.worker.cancel()
+
+def _dg_card(win, game, other):
+    """Adds a "Creating update files" card to the Downloads tab and returns the feed that drives it."""
+    feed = _DgFeed()
+    try:
+        page = win.downloads_page
+        page.add_download_card(_DgUpdateCard(game, other, feed))
+        win.pages.setCurrentWidget(page)
+    except Exception:
+        _log_exc("_dg_card")
+    return feed
+
+def _dg_feed_wire(worker, feed):
+    worker.status.connect(lambda text, busy: (feed.status_update.emit(text), feed.progress.emit(0, 0 if busy else 100, 0.0)))
+    worker.prog.connect(lambda d, t: feed.progress.emit(d, t, 0.0))
+    feed.cancel_cb = worker.cancel
+
+def _dg_begin(self, title):
+    if not cloud_configured() or load_account() is None:
+        QMessageBox.information(self, "Get different files",
+                                "Log in to your account first (Account page), then add a friend with their friend code.")
+        return
+    root = _dg_find_dir(title)
+    if not root:
+        QMessageBox.information(self, "Get different files", f"I couldn't find where {title} is installed on this PC.")
+        return
+    keep = self.__dict__.setdefault("_dg_keep", [])
+    w = WorkshopFriendsWorker(self)
+    w.done.connect(lambda friends, err, t=title, r=root: _dg_on_friends(self, t, r, friends, err))
+    keep.append(w)
+    w.finished.connect(lambda w=w: keep.remove(w) if w in keep else None)
+    w.start()
+
+def _dg_on_friends(self, title, root, friends, err):
+    if err:
+        QMessageBox.warning(self, "Get different files", err)
+        return
+    want, rows = _dg_norm(pretty_game_name(title)), []
+    for uid, prof in (friends or {}).items():
+        prof = prof or {}
+        lib = prof.get("installed")          # published by launchers that know which games are really installed
+        lib = list(lib.values()) if isinstance(lib, dict) else (lib if isinstance(lib, list) else [])
+        if want not in {_dg_norm(pretty_game_name(t)) for t in lib}:
+            continue
+        status, color = _friend_status(prof)
+        try:
+            avatar = _friend_avatar_file(uid, prof.get("photo"))
+        except Exception:
+            avatar = None
+        rows.append((uid, str(prof.get("username") or "Friend"), status, color, avatar))
+    if not rows:
+        QMessageBox.information(self, "Get different files", f"None of your friends have {title} installed (friends on an older launcher need to update before they show up).")
+        return
+    rows.sort(key=lambda r: (r[2] == "Offline", r[1].lower()))
+    uid = _pick_sync_friend(self, rows, title, heading="Get different files",
+                            blurb=f"Pick a friend who has {title} installed. Their launcher compares their files with yours and "
+                                  f"zips the ones that are different, then they send you the zip.",
+                            ask="Compare with ",
+                            note="Your friend needs the launcher open and has to accept. Comparing big games can take a few minutes.")
+    if uid is None:
+        return
+    name = next(r[1] for r in rows if r[0] == uid)
+    w = _DgAskWorker(uid, name, title, root, self)
+    feed = _dg_card(self, title, name)
+    _dg_feed_wire(w, feed)
+    w.done.connect(lambda reply, e: _dg_asked(self, name, title, reply, e, root, feed))
+    self.__dict__.setdefault("_dg_keep", []).append(w)
+    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
+    w.start()
+
+def _dg_mb(n):
+    return f"{n / (1024 * 1024):.1f} MB" if n < 1024 ** 3 else f"{n / 1024 ** 3:.2f} GB"
+
+def _dg_zip_here(self, name, title, root, reply, feed):
+    try:
+        man = _dg_unpack(reply.get("man") or "")
+    except Exception:
+        feed.failed.emit(f"{name}'s file list was unreadable.")
+        QMessageBox.warning(self, "Get different files", f"{name}'s file list was unreadable.")
+        return
+    w = _DgMakeWorker(title, root, man, str(reply.get("m") or "builtin"), self)
+    _dg_feed_wire(w, feed)
+    def finished(info, err):
+        if err == "cancelled":
+            feed.failed.emit("CANCELLED")
+            return
+        if err:
+            feed.failed.emit(err)
+            QMessageBox.warning(self, "Get different files", err)
+            return
+        path = info.get("path")
+        if not path:
+            feed.status_update.emit("Files are identical")
+            feed.finished.emit("")
+            QMessageBox.information(self, "Get different files", f"{name}'s {title} files are identical to yours.")
+            return
+        feed.status_update.emit(f"{info['zipped']} file(s), {_dg_mb(int(info.get('bytes') or 0))}. Send the zip to {name}")
+        feed.finished.emit(path)
+        _dg_reveal(path)
+        QMessageBox.information(self, "Get different files",
+                                f"Your {title} files are newer than {name}'s, so the zip was made here: {info['zipped']} "
+                                f"file(s) ({_dg_mb(int(info.get('bytes') or 0))}) in your NCZ outputs folder. Send it to {name}.")
+    w.done.connect(finished)
+    self.__dict__.setdefault("_dg_keep", []).append(w)
+    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
+    w.start()
+
+def _dg_asked(self, name, title, reply, err, root, feed):
+    if err == "cancelled":
+        feed.failed.emit("CANCELLED")
+        return
+    if err == "timeout":
+        feed.failed.emit(f"{name} didn't answer in time.")
+        QMessageBox.information(self, "Get different files", f"{name} didn't answer in time.")
+        return
+    if err:
+        feed.failed.emit(err)
+        QMessageBox.warning(self, "Get different files", err)
+        return
+    if not reply.get("accepted"):
+        why = {"not_installed": f"{name} doesn't have {title} installed in a place the launcher can find."}.get(
+            reply.get("reason"), f"{name} declined.")
+        feed.failed.emit(why)
+        QMessageBox.information(self, "Get different files", why)
+        return
+    if reply.get("direction") == "asker_newer":
+        _dg_zip_here(self, name, title, root, reply, feed)
+        return
+    n = int(reply.get("zipped") or 0)
+    if not n:
+        feed.status_update.emit("Files are identical")
+        feed.finished.emit("")
+        QMessageBox.information(self, "Get different files", f"{name}'s {title} files are identical to yours.")
+        return
+    feed.status_update.emit(f"{name} made a zip of {n} file(s), {_dg_mb(int(reply.get('bytes') or 0))}. Ask them to send it")
+    feed.finished.emit("")
+    QMessageBox.information(self, "Get different files",
+                            f"{name} made a zip with {n} file(s) ({_dg_mb(int(reply.get('bytes') or 0))}) that differ from "
+                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new. Their files are newer, so it's in their NCZ outputs "
+                            f"folder. Ask them to send it to you.")
+
+# --- friend side: answers a diff request ---
+class _DgMakeWorker(QThread):
+    status = pyqtSignal(str, bool)
+    prog = pyqtSignal(object, object)
+    done = pyqtSignal(dict, str)
+
+    def __init__(self, title, root, man, tag, parent=None, decide=False, my_ver="", their_ver=""):
+        super().__init__(parent)
+        self.title, self.root, self.man, self.tag = title, root, man, tag
+        self.decide, self.my_ver, self.their_ver = decide, my_ver, their_ver
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            self.status.emit("Comparing files...", False)
+            cmp_ = _dg_compare(self.root, self.man, self.tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
+            if cmp_ is None:
+                self.done.emit({}, "cancelled")
+                return
+            info = {"changed": len(cmp_["differ"]), "new": len(cmp_["new"]), "removed": len(cmp_["removed"]),
+                    "same": cmp_["same"], "zipped": 0, "bytes": 0}
+            if self.decide and (cmp_["differ"] or cmp_["new"] or cmp_["removed"]) and \
+                    not _dg_mine_is_newer(cmp_, self.my_ver, self.their_ver):
+                self.status.emit("Reading the rest of your files...", False)
+                mine = _dg_manifest(self.root, self.tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel,
+                                    cache=cmp_["sigs"])
+                if mine is None:
+                    self.done.emit({}, "cancelled")
+                    return
+                blob = _dg_pack(mine)
+                if len(blob) > 8 * 1024 * 1024:
+                    self.done.emit({}, "This game has too many files to compare through the cloud.")
+                    return
+                info.update({"handoff": True, "man": blob, "m": self.tag})
+                self.done.emit(info, "")
+                return
+            if cmp_["differ"] or cmp_["new"]:
+                self.status.emit("Zipping the different files...", False)
+                path, size, failed = _dg_make_zip(self.title, cmp_, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
+                if path is None:
+                    self.done.emit({}, "cancelled")
+                    return
+                info.update({"zipped": len(cmp_["differ"]) + len(cmp_["new"]) - failed, "bytes": size, "path": path})
+            self.done.emit(info, "")
+        except Exception as e:
+            self.done.emit({}, str(e) or "Something went wrong.")
+
+def _dg_handle_request(self, uid, d):
+    shown = self.__dict__.setdefault("_dg_shown", set())
+    if uid in shown:
+        return
+    shown.add(uid)
+    game = str(d.get("game") or "a game")
+    def answer(accepted, info=None):
+        self._run(lambda: cloud_diff_answer(uid, game, accepted, info), lambda r, e: shown.discard(uid))
+    t = d.get("time")
+    if isinstance(t, (int, float)) and time.time() * 1000 - t > 15 * 60 * 1000:
+        answer(False)                                    # too old: the asker gave up long ago
+        return
+    name = self.friends.get(uid, {}).get("username") or d.get("username") or "A friend"
+    self.friend_event.emit(name, f"wants to compare {game} files", uid)
+    box = QMessageBox(self.window())
+    box.setWindowTitle("Compare game files")
+    box.setText(f"{name} wants to compare their {game} files with yours.\n\nYour launcher will zip the files that are "
+                f"different into an NCZ outputs folder. Whoever has the newer files makes the zip (you, or {name}) and "
+                f"sends it to the other. Nothing is sent automatically. Continue?")
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    if box.exec() != QMessageBox.StandardButton.Yes:
+        answer(False)
+        return
+    root = _dg_find_dir(game)
+    if not root:
+        answer(False, {"reason": "not_installed"})
+        return
+    req_tag, my_tag = str(d.get("m") or "builtin"), _dg_method()
+    if req_tag.startswith("librsync") and req_tag != my_tag:
+        answer(True, {"retry": "builtin", "zipped": 0})  # no matching rdiff library here: ask them to use the built-in one
+        return
+    try:
+        man = _dg_unpack(d.get("man") or "")
+    except Exception:
+        answer(False, {"reason": "bad_manifest"})
+        return
+    w = _DgMakeWorker(game, root, man, req_tag, self, decide=True, my_ver=_dg_game_version(game),
+                      their_ver=str(d.get("ver") or ""))
+    feed = _dg_card(self.window(), game, name)
+    _dg_feed_wire(w, feed)
+    def finished(info, err):
+        if err == "cancelled":
+            feed.failed.emit("CANCELLED")
+            answer(False)
+            return
+        if err:
+            feed.failed.emit(err)
+            QMessageBox.warning(self.window(), "Compare game files", err)
+            answer(False, {"reason": "error"})
+            return
+        if info.get("handoff"):
+            answer(True, {"direction": "asker_newer", "man": info["man"], "m": info["m"], "changed": info["changed"],
+                          "new": info["new"], "zipped": 0})
+            feed.status_update.emit(f"{name}'s files are newer, so they make the zip")
+            feed.finished.emit("")
+            QMessageBox.information(self.window(), "Compare game files",
+                                    f"{name}'s {game} files are newer than yours, so their launcher will make the zip.")
+            return
+        path = info.pop("path", None)
+        answer(True, info)
+        if path:
+            feed.status_update.emit(f"{info['zipped']} file(s), {_dg_mb(int(info.get('bytes') or 0))}. Send the zip to {name}")
+            feed.finished.emit(path)
+            _dg_reveal(path)
+            QMessageBox.information(self.window(), "Compare game files",
+                                    f"Done. {info['zipped']} file(s) went into a zip in your NCZ outputs folder. "
+                                    f"Send it to {name}.")
+        else:
+            feed.status_update.emit("Files are identical")
+            feed.finished.emit("")
+            QMessageBox.information(self.window(), "Compare game files", f"{name}'s files are identical to yours.")
+    w.done.connect(finished)
+    self.__dict__.setdefault("_dg_keep", []).append(w)
+    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
+    w.start()
+
+_dg_prev_modshare = FriendsPage._on_modshare_requests
+
+def _dg_on_modshare_requests(self, res, err):
+    if err or not res:
+        return _dg_prev_modshare(self, res, err)
+    diff = {u: d for u, d in res.items() if isinstance(d, dict) and d.get("kind") == "diff"}
+    _dg_prev_modshare(self, {u: d for u, d in res.items() if u not in diff}, err)
+    for u, d in diff.items():
+        _dg_handle_request(self, u, d)
+
+FriendsPage._on_modshare_requests = _dg_on_modshare_requests
+
+# --- the 3-dot menu entry ---
+_dg_prev_decorate = _lb_decorate
+
+def _dg_decorate(self, card, title):
+    _dg_prev_decorate(self, card, title)
+    if card.property("_dg_more") is not None:
+        return
+    card.setProperty("_dg_more", True)
+    try:
+        more = card.findChild(QPushButton, "MoreButton")
+        menu = more.menu() if more is not None else None
+        if menu is None:
+            return
+        act = menu.addAction("Get different files...")
+        act.triggered.connect(lambda _c=False: _dg_begin(self, title))
+    except Exception:
+        _log_exc("_dg_decorate")
+
+_lb_decorate = _dg_decorate
 
 
 if __name__ == "__main__":
