@@ -1,0 +1,1 @@
+["PyQt6", "psutil", "rarfile", "playwright", "pywin32","pypresence", "libtorrent", "pynput", "nudenet", "vgamepad","PyQt6-WebEngine","rdiff"]
