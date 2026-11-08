@@ -928,7 +928,7 @@ def _load_launcher_settings_file():
                 "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff",
                 "download_server": "1", "archive_tool": "", "discord_pfp_sync": True, "discord_pfp_hash": "",
                 "bp_on_startup": False, "bp_on_controller": True, "overlay_sound": True,
-                "shortcuts_open_launcher": False}
+                "shortcuts_open_launcher": True}
     path = get_launcher_settings_path()
     if os.path.exists(path):
         try:
@@ -960,8 +960,7 @@ def _load_launcher_settings_file():
                     settings["auto_update"] = loaded["auto_update"]
                 if isinstance(loaded.get("xwayland_mode"), bool):
                     settings["xwayland_mode"] = loaded["xwayland_mode"]
-                for _k in ("start_minimized", "close_to_tray", "bp_on_startup", "bp_on_controller", "overlay_sound",
-                           "shortcuts_open_launcher"):
+                for _k in ("start_minimized", "close_to_tray", "bp_on_startup", "bp_on_controller", "overlay_sound"):
                     if isinstance(loaded.get(_k), bool):
                         settings[_k] = loaded[_k]
                 if isinstance(loaded.get("nsfw_revealed"), bool):
@@ -3155,18 +3154,20 @@ def apply_startup_setting():
     except Exception:
         _log_exc("apply_startup_setting")
 
+def _ncz_cli_script_path():
+    """Where the NCZ command line tool lives. Windows: %ProgramData%/jsmm33/ncz-launcher/ncz_gm.py   Linux: /opt/ncz-games-launcher/ncz_gm.py"""
+    if sys.platform.startswith("win"):
+        return os.path.join(os.environ.get("ProgramData", "C:\\ProgramData"), "jsmm33", "ncz-launcher", "ncz_gm.py")
+    return "/opt/ncz-games-launcher/ncz_gm.py"
+
 def register_cli():
-    """Runs `py "<data folder>/NCZ_Games_Launcher/ncz_gm.py" install` on every launch, so the `ncz-gm` command stays on PATH.
-    Windows: %LOCALAPPDATA%\\NCZ_Games_Launcher\\ncz_gm.py   Linux: ~/.local/share/NCZ_Games_Launcher/ncz_gm.py"""
+    """Runs `py "<ncz_gm.py>" install` on every launch, so the `ncz-gm` command stays on PATH.
+    Windows: %ProgramData%/jsmm33/ncz-launcher/ncz_gm.py   Linux: /opt/ncz-games-launcher/ncz_gm.py"""
     if _ncz_profile or getattr(sys, "frozen", False):     # a packaged exe would register itself (`exe --cli`), which is wrong here
         return
     def _run():
         try:
-            if sys.platform.startswith("win"):
-                script = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
-                                      "NCZ_Games_Launcher", "ncz_gm.py")
-            else:
-                script = os.path.expanduser("~/.local/share/NCZ_Games_Launcher/ncz_gm.py")
+            script = _ncz_cli_script_path()
             if not os.path.isfile(script):                # not installed there: use the copy next to main.py
                 script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncz_gm.py")
             if not os.path.isfile(script):
@@ -38245,6 +38246,8 @@ class _ChessBoard(QWidget):
         self._ar_from, self._ar_to, self._ar_col = -1, -1, "#eb6150"
         self._anim = None                 # (from, to, piece, start time): the piece that is sliding to its new square
         self._skip_anim = False
+        self._pad_on = False              # controller cursor (Big Picture): shown after the pad is used, hidden by the mouse
+        self._kcur = -1                   # the square the controller cursor is on
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._anim_tick)
@@ -38447,7 +38450,79 @@ class _ChessBoard(QWidget):
             self._draw_arrow(p, self._ar_from, self._ar_to, self._ar_col, geo, 140)
         if self._drag >= 0 and self.pos.b[self._drag]:
             self._draw_piece(p, self.pos.b[self._drag], self._drag_xy.x(), self._drag_xy.y(), s * 1.12)
+        if self._pad_on and self._kcur >= 0 and self.hasFocus():      # controller cursor: accent-coloured frame on its square
+            x, y, _ = self._cell(self._kcur, geo)
+            acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+            pw = max(3.0, s * 0.07)
+            fill = QColor(acc)
+            fill.setAlpha(70)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRect(QRectF(x, y, s, s))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(acc, pw))
+            p.drawRect(QRectF(x + pw / 2, y + pw / 2, s - pw, s - pw))
         p.end()
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self.update()
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self.update()
+
+    # ── controller (Big Picture) ──
+    def _sq_disp(self, sq):
+        """(row, column) of a square as it is shown on screen (the board can be flipped)."""
+        r, c = divmod(sq, 8)
+        return (7 - r, 7 - c) if self.flipped else (r, c)
+
+    def _disp_sq(self, r, c):
+        if self.flipped:
+            r, c = 7 - r, 7 - c
+        return r * 8 + c
+
+    def pad_move(self, name):
+        """D-pad. The first press only shows the cursor. True when the cursor moved; False at the edge of the board, so the
+        caller can move the focus off the board (to the side panel's buttons)."""
+        if not self._pad_on or self._kcur < 0:
+            self._pad_on = True
+            if self._kcur < 0:
+                self._kcur = self.sel if self.sel >= 0 else self._disp_sq(6, 4)      # the bottom of the screen, e-file
+            self.update()
+            return True
+        r, c = self._sq_disp(self._kcur)
+        dr, dc = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}[name]
+        r, c = r + dr, c + dc
+        if not (0 <= r < 8 and 0 <= c < 8):
+            return False
+        self._kcur = self._disp_sq(r, c)
+        self.update()
+        return True
+
+    def pad_accept(self):
+        """A button: pick up the piece under the cursor, put the picked piece down on a legal square, or drop the pick."""
+        if not self._pad_on or self._kcur < 0:
+            self.pad_move("down")                     # just shows the cursor
+            return
+        if self.who is None:
+            return
+        sq = self._kcur
+        self._skip_anim = False
+        if self.arrows or self.marks:
+            self.arrows.clear()
+            self.marks.clear()
+        if self.sel >= 0 and sq == self.sel:
+            self.sel = -1
+        elif self.sel >= 0 and any(m[0] == self.sel and m[1] == sq for m in self._mv):
+            self._attempt(self.sel, sq, pad=True)
+            return
+        elif self._can_pick(sq):
+            self.sel = sq
+        else:
+            self.sel = -1
+        self.update()
 
     def _draw_arrow(self, p, f, t, col, geo, alpha):
         x1, y1, s = self._cell(f, geo)
@@ -38491,6 +38566,7 @@ class _ChessBoard(QWidget):
     def mousePressEvent(self, e):
         self.setFocus()
         self._skip_anim = False
+        self._pad_on = False
         if e.button() == Qt.MouseButton.RightButton:
             self.clear_selection()
             if self.premove:                                # right-click cancels a premove (like chess.com) and starts an arrow
@@ -38564,7 +38640,7 @@ class _ChessBoard(QWidget):
                 self.sel = -1 if sq >= 0 else self.sel
         self.update()
 
-    def _attempt(self, f, t):
+    def _attempt(self, f, t, pad=False):
         opts = [m for m in self._mv if m[0] == f and m[1] == t]
         if not opts:
             return
@@ -38574,7 +38650,12 @@ class _ChessBoard(QWidget):
             acts = {}
             for k in "QRBN":
                 acts[menu.addAction(f"{_CH_GLYPH[k]}\ufe0e  {_CH_PIECE_NAMES[k]}")] = k.lower()
-            chosen = menu.exec(QCursor.pos())
+            if pad:                                        # controller: in the middle of the board, queen already highlighted
+                menu.setActiveAction(menu.actions()[0])
+                at = self.mapToGlobal(self.rect().center()) - QPoint(menu.sizeHint().width() // 2, menu.sizeHint().height() // 2)
+            else:
+                at = QCursor.pos()
+            chosen = menu.exec(at)
             if chosen is None:
                 self.sel = -1
                 self.update()
@@ -40105,7 +40186,8 @@ class _ChessThemeDialog(QDialog):
             b.setToolTip(th["name"])
             b.setStyleSheet("QPushButton { background:transparent; border:3px solid transparent; border-radius:22px; }"
                             "QPushButton:hover { border:3px solid rgba(255,255,255,0.35); }"
-                            "QPushButton:checked { border:3px solid #ffffff; }")
+                            "QPushButton:checked { border:3px solid #ffffff; }"
+                            "QPushButton:focus { border:3px solid #81b64c; }")           # controller / keyboard focus
             b.clicked.connect(lambda _c=False, n=th["name"]: self._pick(n))
             self._grp.addButton(b)
             grid.addWidget(b, i // 3, i % 3, Qt.AlignmentFlag.AlignCenter)
@@ -40115,8 +40197,9 @@ class _ChessThemeDialog(QDialog):
         lay.addWidget(sc, 1)
         self.btn = QPushButton("Play with this theme")
         self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn.setStyleSheet("QPushButton { background:#81b64c; color:#ffffff; border:none; border-radius:10px; padding:12px 18px;"
-                               " font-size:15px; font-weight:700; } QPushButton:hover { background:#95c75f; }")
+        self.btn.setStyleSheet("QPushButton { background:#81b64c; color:#ffffff; border:3px solid transparent; border-radius:10px; padding:9px 15px;"
+                               " font-size:15px; font-weight:700; } QPushButton:hover { background:#95c75f; }"
+                               " QPushButton:focus { border:3px solid #ffffff; }")
         self.btn.clicked.connect(self.accept)
         lay.addWidget(self.btn)
         self.resize(860, 700)
@@ -40233,22 +40316,27 @@ def _ch_css(t=None):
 #ChessPage #ChClock[low="true"] {{ background:#c0392b; color:#ffffff; }}
 #ChessPage #ChCard {{ {glass} }}
 #ChessPage #ChPanel {{ {glass} }}
-#ChessPage QPushButton {{ background:{btn}; color:{txt}; border:none; border-radius:8px; padding:8px 14px; font-weight:600; }}
+#ChessPage QPushButton {{ background:{btn}; color:{txt}; border:2px solid transparent; border-radius:8px; padding:6px 12px; font-weight:600; }}
 #ChessPage QPushButton:hover {{ background:{btn_h}; }}
 #ChessPage QPushButton:disabled {{ background:{dis_bg}; color:{dis_tx}; }}
-#ChessPage QPushButton#ChGreen {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc}, stop:1 {acc_lo}); color:{on}; font-size:15px; padding:11px 14px; }}
+#ChessPage QPushButton#ChGreen {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc}, stop:1 {acc_lo}); color:{on}; font-size:15px; padding:9px 12px; }}
 #ChessPage QPushButton#ChGreen:hover {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc_h}, stop:1 {acc_h_lo}); }}
 #ChessPage QPushButton#ChGreen:disabled {{ background:{dis_bg}; color:{dis_tx}; }}
 #ChessPage QPushButton#ChDanger {{ background:rgba(229,72,77,0.22); color:{txt}; }}
 #ChessPage QPushButton#ChDanger:hover {{ background:rgba(229,72,77,0.45); }}
 #ChessPage QComboBox {{ background:{inp}; color:{txt}; border:1px solid {bor}; border-radius:8px; padding:6px 8px; min-height:22px; }}
 #ChessPage QComboBox QAbstractItemView {{ background:{pan}; color:{txt}; border:1px solid {bor}; selection-background-color:{acc}; selection-color:{on}; }}
-#ChessPage QCheckBox {{ color:{txt}; }}
+#ChessPage QCheckBox {{ color:{txt}; border:2px solid transparent; border-radius:6px; padding:1px 4px; }}
 #ChessPage QTextBrowser {{ background:{inp}; color:{sub}; border:1px solid {bor}; border-radius:10px; font-size:14px; padding:6px; }}
-#ChessPage QPushButton#ChSeg {{ background:rgba(255,255,255,0.08); color:{sub}; border-radius:18px; padding:8px 22px; font-size:14px; }}
+#ChessPage QPushButton#ChSeg {{ background:rgba(255,255,255,0.08); color:{sub}; border-radius:18px; padding:6px 20px; font-size:14px; }}
 #ChessPage QPushButton#ChSeg:hover {{ background:rgba(255,255,255,0.16); color:{txt}; }}
 #ChessPage QPushButton#ChSeg:checked {{ background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {acc}, stop:1 {acc_lo}); color:{on}; }}
 #ChessPage #ChTier {{ font-size:11px; font-weight:800; }}
+#ChessPage[padnav="true"] QPushButton:focus {{ border:2px solid {acc}; }}
+#ChessPage[padnav="true"] QPushButton#ChGreen:focus, #ChessPage[padnav="true"] QPushButton#ChSeg:checked:focus {{ border:2px solid {txt}; }}
+#ChessPage[padnav="true"] QComboBox:focus {{ border:2px solid {acc}; padding:5px 7px; }}
+#ChessPage[padnav="true"] QCheckBox:focus {{ border:2px solid {acc}; }}
+#ChessPage[padnav="true"] QTextBrowser:focus {{ border:2px solid {acc}; padding:5px; }}
 """
 
 # ── NCZ Chess: game review (PGN -> Chesskit through Playwright) ──
@@ -50116,17 +50204,13 @@ SettingsPage.showEvent = _ncz_settings_show
 
 
 # ── Settings: "NCZ Command Line Tool" (its own section, first on the page) ──
-# Install runs `py "%LOCALAPPDATA%/NCZ_Games_Launcher/ncz_gm.py" install` (Windows) / `python3 "$HOME/.local/share/
-# NCZ_Games_Launcher/ncz_gm.py" install` (Linux) and then opens a terminal that runs `ncz-gm`; Uninstall runs the same with `uninstall`.
+# Install runs `py "%ProgramData%/jsmm33/ncz-launcher/ncz_gm.py" install` (Windows) / `python3 "/opt/ncz-games-launcher/ncz_gm.py"
+# install` (Linux) and then opens a terminal that runs `ncz-gm`; Uninstall runs the same with `uninstall`.
 class _CliToolSignal(QObject):
     done = pyqtSignal(str, int, str)        # action, exit code (-1 = couldn't run), output
 
 def _cli_tool_script():
-    if sys.platform.startswith("win"):
-        p = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
-                         "NCZ_Games_Launcher", "ncz_gm.py")
-    else:
-        p = os.path.expanduser("~/.local/share/NCZ_Games_Launcher/ncz_gm.py")
+    p = _ncz_cli_script_path()
     if not os.path.isfile(p):                       # not copied there yet: the copy next to main.py does the same job
         alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncz_gm.py")
         if os.path.isfile(alt):
@@ -50503,7 +50587,16 @@ def _ncz_open_chess_bp(self):
 
     def restore():
         try:
+            page.setProperty("padnav", False)                  # back in the normal launcher: no focus outlines
+            page.restyle()
+        except Exception:
+            _log_exc("restore")
+        try:
             page.back_requested.disconnect(close_panel)
+        except Exception:    # expected: cleanup that may already be done
+            pass
+        try:
+            page.stack.currentChanged.disconnect(holder["on_stack"])
         except Exception:    # expected: cleanup that may already be done
             pass
         try:
@@ -50513,10 +50606,29 @@ def _ncz_open_chess_bp(self):
             _log_exc("restore")
         bp._ncz_chess_ent = None
 
+    def on_stack(i):                                         # a game started: the controller cursor goes to the board
+        if i == 1:
+            QTimer.singleShot(0, lambda: page.board.setFocus() if page.board.isVisible() else None)
+    page.stack.currentChanged.connect(on_stack)
+    holder["on_stack"] = on_stack
+    try:
+        page.setProperty("padnav", True)                       # the controller moves the focus: outline the focused item
+        page.restyle()
+    except Exception:
+        _log_exc("_ncz_open_chess_bp")
     page.back_requested.connect(close_panel)
     ent = bp._emb_open(page, "NCZ Chess", "chess", frac=(0.96, 0.94), on_close=restore)
     ent["close"] = close_panel
     holder["ent"] = bp._ncz_chess_ent = ent
+    try:
+        for lb in ent["panel"].findChildren(QLabel):          # the hint line at the bottom of the panel
+            if lb.text().startswith("D-pad / arrows"):
+                lb.setText("D-pad  Move      A  Pick up / put down      B  Drop the piece / Back      LB / RB  Browse moves      X  Flip board")
+                break
+        if page.stack.currentIndex() == 1:
+            QTimer.singleShot(60, lambda: page.board.setFocus() if page.board.isVisible() else None)
+    except Exception:
+        _log_exc("_ncz_open_chess_bp")
     try:
         _ch_sync_launcher_look(page)
     except Exception:
@@ -50528,6 +50640,56 @@ def _ncz_open_chess_bp(self):
 
 
 AdaptiveApp.open_chess = _ncz_open_chess_bp    # kept as patch chain: the wrapper calls the original inside a condition
+
+
+# Controller on the chess board (the panel above is a Big Picture embedded window, whose own pad handling only moves the focus
+# between buttons). D-pad moves a cursor over the squares and, at the edge of the board, on to the side panel's buttons;
+# A picks up / puts down; B drops the picked piece first and only then closes the panel; LB / RB step through the moves; X flips.
+_ncz_chpad_emb_act_o = _BigPicture._emb_act
+
+
+def _ncz_chess_pad(bp, ent, name):
+    page = ent["w"]
+    board, stack = getattr(page, "board", None), getattr(page, "stack", None)
+    if board is None or stack is None or stack.currentIndex() != 1 or not board.isVisible():
+        return False                                          # lobby / setup screens: the normal button navigation
+    cur = QApplication.focusWidget()
+    on_board = cur is board
+    if name in ("prev", "next"):
+        page._on_key(int(Qt.Key.Key_Left if name == "prev" else Qt.Key.Key_Right))
+        return True
+    if name == "x":
+        page._flip()
+        return True
+    if name in ("up", "down", "left", "right"):
+        if on_board:
+            return board.pad_move(name)                       # False at the edge: the focus moves on to the side panel
+        if cur is None or not ent["panel"].isAncestorOf(cur):
+            board.setFocus()
+            board.pad_move(name)
+            return True
+        return False
+    if on_board and name in ("accept", "start"):
+        board.pad_accept()
+        return True
+    if on_board and name == "back" and board.sel >= 0:
+        board.clear_selection()
+        return True
+    return False
+
+
+def _ncz_chpad_emb_act(self, name):
+    try:
+        ent = self._embs[-1] if self._embs else None
+        if ent is not None and ent.get("kind") == "chess" and QApplication.activePopupWidget() is None:
+            if _ncz_chess_pad(self, ent, name):
+                return
+    except Exception:
+        _log_exc("_ncz_chpad_emb_act")
+    return _ncz_chpad_emb_act_o(self, name)
+
+
+_BigPicture._emb_act = _ncz_chpad_emb_act
 
 
 # ── NCZ logo (assets/icon.png) in more places ──
@@ -53968,13 +54130,9 @@ SettingsPage.__init__ = _dep_settings_init
 # Shortcuts you create from a game's menu in the launcher start the game's exe on their own. The launcher no longer
 # adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
-    """Settings > "Game shortcuts open the launcher". On: library games' desktop shortcuts open the launcher in the tray,
-    which then starts the game (`--launch-game`). Off (default): shortcuts start the game's exe directly.
-    A Windows game on Linux, which needs Wine/Proton, always opens through the launcher."""
-    try:
-        return bool(load_launcher_settings().get("shortcuts_open_launcher", False))
-    except Exception:
-        return False
+    """Settings > "Game shortcuts open the launcher". Always on now (there is no switch): library games' desktop shortcuts open
+    the launcher in the tray, which then starts the game (`--launch-game`). The settings button only rewrites the shortcuts."""
+    return True
 
 def _sc_args_text(a):
     if not a:
@@ -54619,7 +54777,8 @@ AdaptiveApp.hideEvent = _mem_hide_event    # kept as patch chain: the base is in
 # Settings -> "Big Picture startup animation": pick the NCZ default, turn it off, or use your own. A custom animation is an image
 # file (GIF / WebP / APNG, or a PNG / JPG still) dropped in the "startup_animations" folder inside the launcher's settings folder
 # (Settings has an "Add custom animation" button and an "Open folder" button). An audio file with the SAME NAME (WAV / MP3 / OGG /
-# FLAC / M4A) next to it plays together with it. The default is assets/ncz_bigpicture_startup.gif + .wav.
+# FLAC / M4A) next to it plays together with it. The default is assets/ncz_bigpicture_startup.gif + .wav; its white is drawn in
+# the current accent colour (custom animations are left as they are).
 _NCZ_SU_IMG = (".gif", ".webp", ".apng", ".png", ".jpg", ".jpeg")
 _NCZ_SU_SND = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac")
 _NCZ_SU_DEFAULT = "ncz_bigpicture_startup"
@@ -54768,6 +54927,19 @@ class _NczSuSound:
         QTimer.singleShot(ms + 30, self.stop)
 
 
+def _ncz_su_tinted(pm, accent):
+    """The frame with its white turned into `accent`: the frame is multiplied by the accent colour (white -> accent, black stays
+    black, greys -> darker shades of the accent) and the original transparency is put back."""
+    img = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    p = QPainter(img)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply)
+    p.fillRect(img.rect(), accent)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)    # Multiply fills transparent pixels too: restore the alpha
+    p.drawPixmap(0, 0, pm)
+    p.end()
+    return QPixmap.fromImage(img)
+
+
 class _NczStartup(QWidget):
     """Covers Big Picture while the startup animation plays."""
     done = pyqtSignal()
@@ -54782,6 +54954,9 @@ class _NczStartup(QWidget):
         if not self._movie.isValid() or self._movie.frameCount() == 1:
             self._movie = None
             self._still = QPixmap(img)
+        # only the NCZ default animation is recoloured (white -> accent); a custom one the user added keeps its own colours
+        self._tint = os.path.normcase(os.path.abspath(img)) == \
+            os.path.normcase(os.path.abspath(os.path.join(ASSETS_DIR, _NCZ_SU_DEFAULT + ".gif")))
         self.setGeometry(host.rect())
         host.installEventFilter(self)
         self._fade = QVariantAnimation(self)
@@ -54919,6 +55094,8 @@ class _NczStartup(QWidget):
         p.fillRect(self.rect(), QColor(0, 0, 0))
         pm = self._movie.currentPixmap() if self._movie is not None else self._still
         w, h = self.width(), self.height()
+        if pm is not None and not pm.isNull() and self._tint:
+            pm = _ncz_su_tinted(pm, QApplication.palette().color(QPalette.ColorRole.Highlight))
         if pm is not None and not pm.isNull():
             s = pm.size().scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding)       # cover the screen, like Steam
             p.drawPixmap(QRectF((w - s.width()) / 2.0, (h - s.height()) / 2.0, s.width(), s.height()), pm, QRectF(pm.rect()))
@@ -56027,11 +56204,11 @@ WorkshopPage._make_game_card = _ld_ws_make_game_card
 
 
 # ── Settings: "Game shortcuts open the launcher" (its own section, first on the page) ──
-# On: the desktop shortcut of every game in your library is rewritten to `main.py --launch-game <title>`: the launcher opens
+# Always on (the button is "Rewrite", which rewrites the shortcuts again): the desktop shortcut of every game in your library is rewritten to `main.py --launch-game <title>`: the launcher opens
 # in the tray and then starts the game. Every OTHER launcher-routed game shortcut (not in your library) goes back to starting
-# its .exe itself. Off: all launcher-routed game shortcuts go back to their .exe. The original of each rewritten shortcut is
+# its .exe itself. The original of each rewritten shortcut is
 # kept in <settings folder>/desktop_shortcuts/slr_<hash>.orig.<ext>, so it is put back exactly as it was.
-# While it is on, the launcher re-checks the Desktop a little after it starts (the library may have changed).
+# The launcher re-checks the Desktop a little after it starts (the library may have changed).
 _SLR = {"busy": False, "sig": None}
 
 class _SlrSignal(QObject):
@@ -56320,15 +56497,33 @@ def _slr_startup_sync(window, tries=0):
         _log_exc("_slr_startup_sync")
 
 def _slr_panel(sp):
+    """Settings > "Game shortcuts open the launcher": always on, so the button is a Rewrite button instead of On / Off."""
     if sp.__dict__.get("_slr_panel") is not None:
         return
-    spec = (("Game shortcuts open the launcher",
-             "On: the desktop shortcuts of the games in your library open the launcher in the tray, which then starts the game. "
-             "Shortcuts of games that aren't in your library go back to starting their .exe. "
-             "Off: every game shortcut starts its .exe directly.",
-             "shortcuts_open_launcher",
-             lambda: _slr_run(bool(load_launcher_settings().get("shortcuts_open_launcher", False)), sp.window())),)
-    _ncz_make_panel(sp, spec, "_slr_panel")                      # the section sorter puts it under its own header, first on the page
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row, col = QHBoxLayout(), QVBoxLayout()
+    col.setSpacing(2)
+    t = QLabel("Game shortcuts open the launcher")
+    t.setObjectName("RowTitle")
+    d = QLabel("Always on: the desktop shortcuts of the games in your library open the launcher in the tray, which then "
+               "starts the game. Shortcuts of games that aren't in your library go back to starting their .exe. "
+               "Press Rewrite to rewrite your desktop shortcuts now.")
+    d.setObjectName("RowDesc")
+    d.setWordWrap(True)
+    col.addWidget(t)
+    col.addWidget(d)
+    b = QPushButton("Rewrite")
+    b.setFixedWidth(160)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.clicked.connect(lambda _c=False: _slr_run(True, sp.window()))
+    row.addLayout(col, 1)
+    row.addWidget(b)
+    pl.addLayout(row)
+    sp._content_layout.addWidget(panel)                          # the section sorter puts it under its own header, first on the page
+    sp._slr_panel = panel
 
 _slr_prev_settings_init = SettingsPage.__init__
 
@@ -56359,7 +56554,6 @@ _DG_SKIP_DIRS = {".git", "__pycache__"}
 _DG_SKIP_EXT = (".part", ".tmp")
 _DG_MIN_DELTA = 2 * _DG_BLOCK         # smaller files are always sent whole
 _DG_DELTA_MAGIC = b"NCZD1"
-_DG_DELTA_MAX_RATIO = 0.6             # if a patch would be bigger than this share of the file, send the whole file
 _DG_DELTA_DIR = "_ncz_deltas/"
 _DG_META = "_ncz_update.json"
 
@@ -56677,7 +56871,7 @@ def _dg_make_zip(title, cmp_, progress, cancel):
     path = os.path.join(_dg_outputs_dir(), f"{safe}_update_{time.strftime('%Y%m%d-%H%M%S')}.zip")
     files, other, blk = cmp_["files"], cmp_.get("other") or {}, cmp_.get("blk") or {}
     plan, failed, cancelled = {}, 0, False
-    cand = [r for r in cmp_["differ"] if len(other.get(r) or []) > 3 and files[r][0] >= _DG_MIN_DELTA]
+    cand = [r for r in cmp_["differ"] if r in other and files[r][0] >= _DG_MIN_DELTA]
     total = (sum(files[r][0] for r in cand if r not in blk) + sum(files[r][0] for r in rels)) or 1
     done = 0
     for rel in cand:                                        # decide: patch or whole file
@@ -56689,8 +56883,8 @@ def _dg_make_zip(title, cmp_, progress, cancel):
             if rel not in blk:
                 done += files[rel][0]
                 progress(done, total)
-            same, carried = _dg_delta_plan(digs, other[rel][3])
-            if any(same) and carried <= files[rel][0] * _DG_DELTA_MAX_RATIO:
+            same, _carried = _dg_delta_plan(digs, other[rel][3] if len(other[rel]) > 3 else "")
+            if any(same):
                 plan[rel] = (sg, same)
         except OSError:
             pass
