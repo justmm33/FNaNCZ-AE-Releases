@@ -9,6 +9,7 @@ Flow
   * Sign in  -> Firebase email/password login. An account that already has a profile in the database passes.
                 An account with no profile yet (a new one) goes through the Discord check first.
   * Create Account -> the same Discord check runs BEFORE the account is created.
+  * New accounts (any way of making one) need an invite code or a preapproved email: see approve_account().
   * Discord check -> pypresence reads which Discord user is logged in locally and compares the id with
                 BANNED_DISCORD_IDS. Banned: message, webhook alert, closes after 3 s, no sign-in on later starts.
   * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py, ncz_gm.py and assets/ from
@@ -43,7 +44,7 @@ from PyQt6.QtCore import (Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QEas
 from PyQt6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont, QFontDatabase, QFontMetricsF, QIcon,
                          QLinearGradient, QRadialGradient, QBrush, QPen, QCursor, QTextOption, QImage)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton, QGraphicsOpacityEffect,
-                             QMessageBox)
+                             QMessageBox, QInputDialog)
 
 # ------------------------------------------------------------------------------------------------ config
 FIREBASE_API_KEY = "AIzaSyBEphV3IipXeUUIpgP6XYrtPG3RrZ-wPt4"
@@ -548,6 +549,40 @@ def db_create_profile(uid, token, username=None, photo_png=None):
     if photo_png:
         payload["photo"] = base64.b64encode(photo_png).decode("ascii")
     _http_json(_profile_url(uid, token), "PATCH", payload)
+
+
+def _db_put(path, value, token):
+    base = FIREBASE_DB_URL.rstrip("/")
+    return _http_json(f"{base}/{path}.json?auth={urllib.parse.quote(token, safe='')}", "PUT", value)
+
+
+def _denied(e):
+    return str(e) == CLOUD_ERRORS["Permission denied"]
+
+
+def approve_account(uid, token, code=""):
+    """Sets approved_users/<uid> = true. The database rules only allow that when the account's email is in
+    approved_emails, or after the account claimed an invite code (invites/<code>/claimedBy + invite_claims/<uid>).
+    -> True when approved, False when not preapproved and the code is missing/invalid/already used."""
+    u = urllib.parse.quote(uid, safe="")
+    try:
+        _db_put(f"approved_users/{u}", True, token)           # preapproved email: no code needed
+        return True
+    except CloudError as e:
+        if not _denied(e):
+            raise                                              # offline etc: not the same as "not approved"
+    code = (code or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code):
+        return False
+    try:
+        _db_put(f"invites/{code}/claimedBy", uid, token)
+        _db_put(f"invite_claims/{u}", code, token)
+        _db_put(f"approved_users/{u}", True, token)
+        return True
+    except CloudError as e:
+        if not _denied(e):
+            raise
+        return False
 
 
 def discord_profile_name(name):
@@ -2231,10 +2266,12 @@ class LoginWindow(QWidget):
         # signed in, but no database record: this is a brand-new account, so it goes through the Discord check
         self._new_account_gate(lambda: self._register_profile(r))
 
-    def _register_profile(self, r):
+    def _register_profile(self, r, code=""):
         self._busy("Setting up your account...")
 
         def job():
+            if not approve_account(r["uid"], r["token"], code):
+                return None                      # not preapproved and no valid invite code
             if WRITE_PROFILE_FOR_NEW_ACCOUNTS:
                 if r.get("discord_id"):          # signed up with Discord: take over its username and picture
                     db_create_profile(r["uid"], r["token"], discord_profile_name(r.get("discord_username")),
@@ -2243,7 +2280,21 @@ class LoginWindow(QWidget):
                     db_create_profile(r["uid"], r["token"])
             return r["account"]
 
-        self._run(job, self._let_pass)
+        self._run(job, lambda account: self._registered(r, account, code))
+
+    def _registered(self, r, account, code):
+        if account:
+            self._let_pass(account)
+            return
+        self._idle()
+        text = "Creating an account needs an invite code (or a preapproved email).\nEnter your invite code:"
+        if code:
+            text = "That invite code isn't valid or was already used.\n\n" + text
+        code, ok = QInputDialog.getText(self, "Invite code", text)
+        if ok and code.strip():
+            self._register_profile(r, code.strip())
+        else:
+            self.set_status("You need an invite code or a preapproved email to create an account.")
 
     def on_social(self, name):
         global user_email
@@ -2305,13 +2356,7 @@ class LoginWindow(QWidget):
         def after_check():
             self._busy("Creating your account...")
 
-            def job():
-                r = fb_auth(email, pw, create=True)
-                if WRITE_PROFILE_FOR_NEW_ACCOUNTS:
-                    db_create_profile(r["uid"], r["token"])
-                return r["account"]
-
-            self._run(job, self._let_pass)
+            self._run(lambda: fb_auth(email, pw, create=True), self._register_profile)     # then the invite/approval gate
 
         self._new_account_gate(after_check)          # the check happens before the account exists
 
