@@ -585,6 +585,34 @@ def approve_account(uid, token, code=""):
         return False
 
 
+def invite_status(code):
+    """Checks an invite code BEFORE any account exists. Reads only invites/<code>/createdBy (the code exists) and
+    invites/<code>/claimedBy (already used), both without logging in; the database rules must allow those two reads.
+    -> "ok" | "used" | "invalid" | "unknown" (the rules don't allow those reads, so it can't verify)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code or ""):
+        return "invalid"
+    base = FIREBASE_DB_URL.rstrip("/")
+    q = urllib.parse.quote(code, safe="")
+    try:
+        created = _http_json(f"{base}/invites/{q}/createdBy.json")
+        claimed = _http_json(f"{base}/invites/{q}/claimedBy.json")
+    except CloudError as e:
+        if _denied(e):
+            return "unknown"
+        raise
+    if created is None:
+        return "invalid"
+    if claimed:
+        return "used"
+    return "ok"
+
+
+def fb_delete_account(token):
+    """Removes a just-created account again (used when its invite code couldn't be claimed)."""
+    _http_json(FIREBASE_AUTH_URL.format(action="delete", key=urllib.parse.quote(FIREBASE_API_KEY, safe="")),
+               "POST", {"idToken": token})
+
+
 def discord_profile_name(name):
     """Discord username -> a username main.py accepts (3-20 characters: letters, numbers, _ . -)."""
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(name or ""))[:20]
@@ -1718,6 +1746,9 @@ class LoginWindow(QWidget):
         self.lbl_pw = self._label("Password", 641, 680, 180, 40, W.Light,
                                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                   fit=("Password", 128), cap=31)
+        self.lbl_invite = self._label("Invite Code", 641, 742, 190, 40, W.Light,
+                                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                      fit=("Invite Code", 160), cap=31)
         self.lbl_status = self._label("", 602, 733, 760, 44, W.Normal, Qt.AlignmentFlag.AlignCenter,
                                       fit=None, cap=21)
         self.lbl_handle = self._label(HANDLE_TEXT, 35, 1016, 320, 36, W.Normal,
@@ -1732,11 +1763,16 @@ class LoginWindow(QWidget):
         self.email = QLineEdit(self)
         self.pw = QLineEdit(self)
         self.pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.invite = QLineEdit(self)                 # Create Account only: shown right under Password
+        self.invite.setMaxLength(64)
+        self.invite.setPlaceholderText("Required to create an account")
         self.email.setMaxLength(254)
         self._track(self.email, 860, 621, 416, 39, 23, W.Normal, 0.5)
         self._track(self.pw, 827, 683, 436, 39, 23, W.Normal, 0.5)
+        self._track(self.invite, 827, 745, 436, 39, 23, W.Normal, 0.5)
         self.email.returnPressed.connect(self._email_enter)
-        self.pw.returnPressed.connect(self.on_primary)
+        self.pw.returnPressed.connect(self._pw_enter)
+        self.invite.returnPressed.connect(self.on_primary)
 
         self.btn_primary = PrimaryButton("Sign in", self)
         self.btn_primary.clicked.connect(self.on_primary)
@@ -1770,9 +1806,10 @@ class LoginWindow(QWidget):
         self._track(self.btn_min, DW - 132, 16, 54, 40, 0, W.Normal, 0)
         self._track(self.btn_close, DW - 72, 16, 54, 40, 0, W.Normal, 0)
 
-        self._dynamic = (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_create, self.btn_forgot,
+        self._dynamic = (self.lbl_email, self.lbl_pw, self.email, self.pw, self.lbl_invite, self.invite,
+                         self.btn_create, self.btn_forgot,
                          self.btn_back, self.btn_primary, self.lbl_status, self.progress, *self._social_buttons)
-        self._shake_set = (self.lbl_email, self.lbl_pw, self.email, self.pw)
+        self._shake_set = (self.lbl_email, self.lbl_pw, self.email, self.pw, self.lbl_invite, self.invite)
         self._shake_dx = 0.0
         self._shake_t0 = -10.0
 
@@ -1788,7 +1825,7 @@ class LoginWindow(QWidget):
         self._mx = self._my = 0.0
         self._spot = QPointF(DW / 2, DH / 2)
         self._hover = {self.btn_primary: 0.0}
-        self._focus = {self.email: 0.0, self.pw: 0.0}
+        self._focus = {self.email: 0.0, self.pw: 0.0, self.invite: 0.0}
         self._ban_t = 0.0
         self._logo_reveal = 0.0
         self._timer = QTimer(self)
@@ -1817,6 +1854,12 @@ class LoginWindow(QWidget):
 
     def _track(self, widget, x, y, w, h, px, weight, radius):
         self._items.append((widget, x, y, w, h, px, weight, radius))
+
+    def _move_item(self, widget, y, h):
+        for i, it in enumerate(self._items):
+            if it[0] is widget:
+                self._items[i] = (it[0], it[1], y, it[3], h, it[5], it[6], it[7])
+                return
 
     def _label(self, text, x, y, w, h, weight, align, fit, cap):
         lab = QLabel(text, self)
@@ -2162,7 +2205,7 @@ class LoginWindow(QWidget):
             self._shake()
 
     def _set_inputs_enabled(self, on):
-        for wd in (self.email, self.pw, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back,
+        for wd in (self.email, self.pw, self.invite, self.btn_primary, self.btn_create, self.btn_forgot, self.btn_back,
                    *self._social_buttons):
             wd.setEnabled(on)
 
@@ -2182,14 +2225,15 @@ class LoginWindow(QWidget):
                      self.btn_primary, self.lbl_status, *self._social_buttons),
             "downloading": (self.progress,),
             "launching": (self.progress,),
-            "create": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.btn_back, self.btn_primary,
-                       self.lbl_status, *self._social_buttons),
+            "create": (self.lbl_email, self.lbl_pw, self.email, self.pw, self.lbl_invite, self.invite,
+                       self.btn_back, self.btn_primary, self.lbl_status, *self._social_buttons),
             "forgot": (self.lbl_email, self.email, self.btn_back, self.btn_primary, self.lbl_status),
             "dl_error": (self.btn_primary, self.lbl_status),
             "banned": (),
         }[self.state]
         for wd in self._dynamic:
             wd.setVisible(wd in visible)
+        self._move_item(self.lbl_status, 786 if self.state == "create" else 733, 28 if self.state == "create" else 44)
         self.btn_primary.setText({"dl_error": "Retry", "create": "Create Account",
                                   "forgot": "Send reset link"}.get(self.state, "Sign in"))
         self.lbl_title.setText(TITLES[self.state])
@@ -2260,17 +2304,23 @@ class LoginWindow(QWidget):
         if r["exists"]:
             self._let_pass(r["account"])             # already in the database -> straight through
             return
+        code, created = r.get("invite_code", ""), r.get("created", False)
         if r.get("discord_id"):                      # signed up with Discord: already checked against the ban list
-            self._register_profile(r)
+            self._register_profile(r, code, created)
             return
         # signed in, but no database record: this is a brand-new account, so it goes through the Discord check
-        self._new_account_gate(lambda: self._register_profile(r))
+        self._new_account_gate(lambda: self._register_profile(r, code, created))
 
-    def _register_profile(self, r, code=""):
+    def _register_profile(self, r, code="", created=False):
         self._busy("Setting up your account...")
 
         def job():
             if not approve_account(r["uid"], r["token"], code):
+                if created:                      # made just now for this invite code: don't leave it behind
+                    try:
+                        fb_delete_account(r["token"])
+                    except CloudError:
+                        pass
                 return None                      # not preapproved and no valid invite code
             if WRITE_PROFILE_FOR_NEW_ACCOUNTS:
                 if r.get("discord_id"):          # signed up with Discord: take over its username and picture
@@ -2280,13 +2330,16 @@ class LoginWindow(QWidget):
                     db_create_profile(r["uid"], r["token"])
             return r["account"]
 
-        self._run(job, lambda account: self._registered(r, account, code))
+        self._run(job, lambda account: self._registered(r, account, code, created))
 
-    def _registered(self, r, account, code):
+    def _registered(self, r, account, code, created=False):
         if account:
             self._let_pass(account)
             return
         self._idle()
+        if created:                                  # the account was removed again: no popup, just say why
+            self.set_status("That invite code isn't valid or was already used.")
+            return
         text = "Creating an account needs an invite code (or a preapproved email).\nEnter your invite code:"
         if code:
             text = "That invite code isn't valid or was already used.\n\n" + text
@@ -2305,6 +2358,13 @@ class LoginWindow(QWidget):
         if name == "discord" and not DISCORD_AUTH_ENDPOINT:
             self.set_status("Discord sign-in isn't set up yet.")
             return
+        if self.state == "create":                       # Create Account screen: valid code BEFORE the browser opens
+            self._require_invite(lambda code: self._start_social(name, cfg, code))
+        else:
+            self._start_social(name, cfg, "")
+
+    def _start_social(self, name, cfg, code):
+        global user_email
         user_email = f"{cfg['label']} sign-in"          # shown in the ban alert until the real email is known
         _oauth_cancel.clear()
 
@@ -2314,6 +2374,7 @@ class LoginWindow(QWidget):
             def job():
                 r = social_sign_in(name, _oauth_cancel)
                 r["exists"] = db_profile_exists(r["uid"], r["token"])
+                r["invite_code"], r["created"] = code, bool(code)
                 return r
 
             self._run(job, self._social_signed_in)
@@ -2330,6 +2391,32 @@ class LoginWindow(QWidget):
             self.ban(did, action="sign in to")
             return
         self._signed_in(r)                               # same path as email/password: profile check, Discord gate for new accounts
+
+    def _require_invite(self, on_ok):
+        """Create Account screen: the invite code is checked first; on_ok(code) only runs for a valid, unused code."""
+        code = self.invite.text().strip()
+        if not code:
+            self.set_status("Enter your invite code.")
+            self.invite.setFocus()
+            return
+        self._busy("Checking invite code...")
+        self._run(lambda: invite_status(code), lambda st: self._invite_checked(st, code, on_ok))
+
+    def _invite_checked(self, st, code, on_ok):
+        if st == "ok":
+            on_ok(code)
+            return
+        self._idle()
+        self.set_status({"used": "That invite code was already used.",
+                         "unknown": "Couldn't verify the invite code (the database rules don't allow the invite check)."
+                         }.get(st, "That invite code isn't valid."))
+        self.invite.setFocus()
+
+    def _pw_enter(self):
+        if self.state == "create":
+            self.invite.setFocus()
+        else:
+            self.on_primary()
 
     def _email_enter(self):
         if self.state == "forgot":
@@ -2353,12 +2440,15 @@ class LoginWindow(QWidget):
         global user_email
         user_email = email
 
-        def after_check():
-            self._busy("Creating your account...")
+        def with_code(code):
+            def after_check():
+                self._busy("Creating your account...")
+                self._run(lambda: fb_auth(email, pw, create=True),
+                          lambda r: self._register_profile(r, code, True))     # claims the code right after sign-up
 
-            self._run(lambda: fb_auth(email, pw, create=True), self._register_profile)     # then the invite/approval gate
+            self._new_account_gate(after_check)          # the Discord check also happens before the account exists
 
-        self._new_account_gate(after_check)          # the check happens before the account exists
+        self._require_invite(with_code)                  # invalid / used code -> nothing is created
 
     def _new_account_gate(self, on_ok, strict=True, action="make an account in"):
         self._busy("Checking...")
@@ -2400,6 +2490,7 @@ class LoginWindow(QWidget):
         except OSError:
             pass
         self.pw.clear()
+        self.invite.clear()
         self._busy_flag = False
         self.set_status("")
         if install_complete():
