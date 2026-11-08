@@ -293,47 +293,6 @@ class _LazyModule:
         return getattr(importlib.import_module(self.__dict__["_ncz_name"]), attr)
 
 zipfile = _LazyModule("zipfile")
-
-# ── Python override: Settings > "Python version" can switch the launcher to a private Python 3.12 ──
-# python_override.txt (next to launcher.json) holds that interpreter's path. This runs before anything heavy is imported:
-# if the file points at another Python than the one running now, the launcher is started again with it and this process ends.
-def _ncz_py_override_file():
-    if sys.platform.startswith("win"):
-        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")), "NCZ_Games_Launcher")
-    else:
-        base = os.path.expanduser("~/.config/NCZ_Games_Launcher")
-    return os.path.join(base, "python_override.txt")
-
-def _ncz_py_reexec():
-    if getattr(sys, "frozen", False) or os.environ.get("NCZ_PY_REEXEC") or "--ncz-rp-helper" in sys.argv:
-        return
-    try:
-        with open(_ncz_py_override_file(), encoding="utf-8") as f:
-            target = f.read().strip()
-    except OSError:
-        return
-    if not target or not os.path.isfile(target):
-        return
-    try:
-        if os.path.samefile(target, sys.executable):
-            return
-    except OSError:
-        pass
-    if sys.platform.startswith("win") and os.path.basename(sys.executable).lower() == "pythonw.exe":
-        alt = os.path.join(os.path.dirname(target), "pythonw.exe")      # keep "no console window"
-        if os.path.isfile(alt):
-            target = alt
-    env = dict(os.environ, NCZ_PY_REEXEC="1", NCZ_ORIG_PYTHON=sys.executable)
-    argv = [target, os.path.abspath(__file__)] + sys.argv[1:]
-    try:
-        if sys.platform.startswith("win"):
-            subprocess.Popen(argv, env=env, close_fds=True)
-            sys.exit(0)
-        os.execve(target, argv, env)
-    except Exception:
-        pass        # the other Python can't start: keep running on this one
-
-_ncz_py_reexec()
 # before the Qt imports: the helper only needs ctypes, and loading PyQt6 made every invite lookup slower
 if "--ncz-rp-helper" in sys.argv:           # Steamworks helper: prints the running game's Steam rich presence "connect" text
     import ctypes
@@ -2754,7 +2713,7 @@ def find_server2_redist_folder(exe, up=3, down=3):
         if level and (_too_broad(base) or not os.path.isdir(base)):
             break
         for root, dirs, _files in os.walk(base):
-            depth = 0 if root == base else os.path.relpath(root, base).count(os.sep) + 1
+            depth = 0 if root == base else _safe_relpath(root, base).count(os.sep) + 1
             for d in sorted(dirs):
                 if d.lower() == SERVER2_REDIST_DIRNAME.lower():
                     return os.path.join(root, d)
@@ -12108,7 +12067,7 @@ PW_BUTTON_TEXT = "DOWNLOAD HERE"                       # button on the game page
 PW_BLOCKED_HOSTS = ("megadb.net",)           # buttons leading here are skipped for the next DOWNLOAD HERE button
 PW_RELAY_HOSTS = ("filecrypt.cc",)                     # link-container sites: you solve the captcha in the browser window
 PW_RELAY_BUTTONS = 'button.download, a.download, [onclick*="openLink"]'  # link buttons on the container page
-PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to", "pixeldrain.com", "itsfileditchfiles.st")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
+PW_ALLOWED_HOSTS = ("gofile.io", "bzzhr.to", "pixeldrain.com")           # file hosts; PW_BASE_URL's site is allowed too, anything else is closed
 PW_HEADLESS = True                                     # True hides the browser; it only pops up while you solve a captcha
 PW_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/124.0.0.0 Safari/537.36")
@@ -12261,7 +12220,7 @@ PW_LABEL_JS = r"""el => {
         node = p;
     }
     const h = node.outerHTML;
-    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h), pixeldrain: /pixel\s*-?drain/i.test(h), fileditch: /file\s*-?ditch/i.test(h)};
+    return {mega: /mega\s*-?db/i.test(h), bzzhr: /bzzhr/i.test(h), gofile: /go\s*-?file/i.test(h), pixeldrain: /pixel\s*-?drain/i.test(h)};
 }"""
 
 def _pw_host_ok(url, hosts):
@@ -12488,16 +12447,13 @@ def _pw_find_link(self, start_url):
                             bad |= {i for i, f in enumerate(flags) if f["mega"]}
                         order = ([i for i, f in enumerate(flags) if f["bzzhr"]] +
                                  [i for i, f in enumerate(flags) if f["pixeldrain"]] +
-                                 [i for i, f in enumerate(flags) if f["gofile"]] +
-                                 [i for i, f in enumerate(flags) if f.get("fileditch")] + list(range(n)))
+                                 [i for i, f in enumerate(flags) if f["gofile"]] + list(range(n)))
                         if any(f["bzzhr"] for f in flags):
                             self.status_update.emit("Found a BZZHR button, using it...")
                         elif any(f["pixeldrain"] for f in flags):
                             self.status_update.emit("No BZZHR button, using Pixeldrain...")
                         elif any(f["gofile"] for f in flags):
                             self.status_update.emit("No BZZHR or Pixeldrain button, using GoFile...")
-                        elif any(f.get("fileditch") for f in flags):
-                            self.status_update.emit("No BZZHR, Pixeldrain or GoFile button, using Fileditch...")
                     idx = next((i for i in (order or range(n)) if i not in bad), None) if n else 0
                     if idx is None:
                         raise RuntimeError("No other DOWNLOAD HERE button found.")
@@ -12533,16 +12489,6 @@ def _pw_find_link(self, start_url):
             if not target:
                 raise RuntimeError("Couldn't reach a valid download link.")
 
-            if _pw_on(target.url, ("itsfileditchfiles.st",)):
-                # Fileditch has a Cloudflare check that blocks Playwright's Chromium, so (like server 3) the page is
-                # opened in your own browser; you pass the check, "⬇️ Download" is pressed for you, the launcher takes the link.
-                fd_url = target.url
-                try:
-                    target.close()
-                except Exception:    # expected: cleanup that may already be done
-                    pass
-                self.status_update.emit("Fileditch has a Cloudflare check, opening it in your browser...")
-                return _pw_s3_capture_in_browser(self, fd_url, auto_click=True)
             self.status_update.emit("Getting file link...")
             mega = _pw_on(target.url, PW_MEGADB)
             if mega:
@@ -13068,53 +13014,23 @@ class _MiniWS:
         except Exception:    # expected: cleanup that may already be done
             pass
 
-def _pw_close_browser(proc):
-    """Closes the browser started for a capture, with all of its processes (on Linux the main process is often a
-    launcher script and Chrome's helpers live on, so the whole process group is ended)."""
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
-        else:
-            import signal
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:    # expected: still shutting down
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
-    except Exception:    # expected: cleanup that may already be done
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30, auto_click=False):
+def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30):
     """Opens url in your real, normally launched Chrome / Edge / Brave and does NOT automate it at all (no Playwright
     attached to the page, no navigation by script), so Cloudflare's captcha sees a normal browser. The launcher only
     listens on the browser-level DevTools port for 'a download is about to start': that event carries the download
     link. The browser's own download is denied, the link + the browser's cookies / user agent are copied, and
-    (url, headers) is returned so the launcher downloads the file itself.
-    auto_click: once the page shows a button that says Download (so any Cloudflare check is already passed), it is
-    pressed with a real browser-level mouse click (no script on the page, no Runtime.enable), a few tries at most."""
+    (url, headers) is returned so the launcher downloads the file itself."""
     exe = _pw_real_browser_exe()
     if not exe:
-        raise RuntimeError("Couldn't find Chrome, Edge or Brave on this PC. Install one of them for this server.")
+        raise RuntimeError("Couldn't find Chrome, Edge or Brave on this PC. Install one of them for server 3.")
     port = _pw_free_port()
     profile = os.path.join(os.path.dirname(get_launcher_settings_path()), "server3_browser_profile")   # kept, so a solved captcha is remembered
     os.makedirs(profile, exist_ok=True)
     self.status_update.emit("Opening the page in your browser. Finish the captcha / verification there...")
     proc = subprocess.Popen([exe, f"--remote-debugging-port={port}", f"--remote-debugging-address=127.0.0.1",
                              f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", url],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=(os.name != "nt"))    # own process group, so it can be closed whole
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     ws = None
-    click = {"ws": None, "page": None, "last": 0.0, "n": 0}
     try:
         info = None
         for _ in range(60):          # wait for the debug port to come up
@@ -13149,56 +13065,6 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30, auto_cli
         # Browser-level only: deny the browser's own download, but report it (with its link) first
         call("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": True})
 
-        click_host = (urllib.parse.urlparse(url).hostname or "").lower()
-        click_js = r"""(() => {
-            const re = /^\s*(\u2B07\uFE0F?\s*)?download\s*$/i;
-            const txt = e => (e.innerText || e.value || "").trim();
-            let el = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].find(e => re.test(txt(e)));
-            if (!el) el = [...document.querySelectorAll('div,span,p')].find(e => !e.children.length && re.test(txt(e)));
-            if (!el) return null;
-            el.scrollIntoView({block: 'center'});
-            const r = el.getBoundingClientRect();
-            if (r.width < 2 || r.height < 2) return null;
-            return [r.left + r.width / 2, r.top + r.height / 2];
-        })()"""
-        def page_call(method, params):
-            w = click["ws"]
-            ids["n"] += 1
-            mid = ids["n"]
-            w.send(json.dumps({"id": mid, "method": method, "params": params}))
-            end = time.time() + 5
-            while time.time() < end:
-                m = w.recv(0.5)
-                if m:
-                    d = json.loads(m)
-                    if d.get("id") == mid:
-                        return d.get("result") or {}
-            return {}
-        def try_click():
-            """Looks for the Download button on the page in the browser and presses it with a real mouse click."""
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
-                pages = [t for t in json.loads(r.read().decode()) if t.get("type") == "page"
-                         and (urllib.parse.urlparse(str(t.get("url", ""))).hostname or "").lower().endswith(click_host)]
-            if not pages:
-                return
-            pg = pages[-1]
-            if click["page"] != pg["id"]:
-                if click["ws"]:
-                    click["ws"].close()
-                u = urllib.parse.urlparse(pg["webSocketDebuggerUrl"])
-                click["ws"] = _MiniWS(u.hostname, u.port, u.path)
-                click["page"] = pg["id"]
-            val = ((page_call("Runtime.evaluate", {"expression": click_js, "returnByValue": True}).get("result") or {}).get("value"))
-            if not val:
-                return
-            x, y = val
-            self.status_update.emit("Pressing Download...")
-            page_call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
-            page_call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
-            page_call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
-            click["n"] += 1
-            click["last"] = time.time() + 4      # give the download a few seconds before looking again
-
         dl_url = ""
         deadline = time.time() + wait_minutes * 60
         while not dl_url:
@@ -13206,12 +13072,6 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30, auto_cli
                 raise RuntimeError("CANCELLED")
             if time.time() > deadline:
                 raise RuntimeError("No download started in the browser window.")
-            if auto_click and click["n"] < 5 and time.time() - click["last"] > 1.5:
-                click["last"] = time.time()
-                try:
-                    try_click()
-                except Exception:    # expected: page navigating, or the browser not ready yet
-                    click["ws"], click["page"] = None, None
             if proc.poll() is not None:
                 raise RuntimeError("The browser window was closed before a download started.")
             m = ws.recv(0.5)
@@ -13247,11 +13107,9 @@ def _pw_s3_capture_in_browser(self, url, cookies=None, wait_minutes=30, auto_cli
         if ws:
             ws.close()
         try:
-            if click["ws"]:
-                click["ws"].close()
+            proc.terminate()
         except Exception:    # expected: cleanup that may already be done
             pass
-        _pw_close_browser(proc)
 
 def _pw_find_link_s3(self, start_url):
     """Server 3. Stays in the hidden Playwright browser (Download, Download) until the site redirects away from the
@@ -13380,7 +13238,7 @@ def _find_setup_exe(folder):
     """setup.exe (or the shallowest setup*.exe) inside the game folder, else None."""
     best = None
     for root, dirs, files in os.walk(folder):
-        depth = os.path.relpath(root, folder).count(os.sep) + (0 if root == folder else 1)
+        depth = _safe_relpath(root, folder).count(os.sep) + (0 if root == folder else 1)
         if depth > 2:
             dirs[:] = []
             continue
@@ -13511,7 +13369,7 @@ def _pick_game_exe(folder, title, max_depth=4):
     tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
     best, best_key = None, None
     for root, dirs, files in os.walk(folder):
-        depth = 0 if root == folder else os.path.relpath(root, folder).count(os.sep) + 1
+        depth = 0 if root == folder else _safe_relpath(root, folder).count(os.sep) + 1
         dirs[:] = [d for d in dirs if not any(s in d.lower() for s in _SETUP_SKIP_DIRS)] if depth < max_depth else []
         for f in files:
             low = f.lower()
@@ -14348,7 +14206,7 @@ def _game_name_for_args(args):
             return _canonical_title(known[norm])
         for root in library_roots():
             if norm.startswith(os.path.normcase(root) + os.sep):
-                first = os.path.relpath(full, root).split(os.sep)[0]
+                first = _safe_relpath(full, root).split(os.sep)[0]
                 for info in GAME_INFO.values():
                     if first.lower().startswith(info["name"].lower()):
                         return _canonical_title(info["name"])
@@ -14659,14 +14517,13 @@ def cloud_publish_presence():
         username, avatar = load_profile_cache()
         username = username or (load_account() or {}).get("email", "").split("@")[0] or "Player"
         library = friends_library_titles()
-        installed = _dg_installed_titles(library)
         country = load_profile_country() or None
         ptime = profile_ptime_payload()
         try:
             avatar_sig = (avatar, os.path.getmtime(avatar)) if avatar and os.path.exists(avatar) else None
         except OSError:
             avatar_sig = None
-        sig = (uid, username, json.dumps(library, sort_keys=True, default=str), json.dumps(installed), country,
+        sig = (uid, username, json.dumps(library, sort_keys=True, default=str), country,
                json.dumps(ptime, sort_keys=True, default=str), avatar_sig)
         full = (sig != _presence_state["full_sig"]
                 or time.time() - _presence_state["full_at"] > PRESENCE_FULL_EVERY)
@@ -14676,7 +14533,7 @@ def cloud_publish_presence():
             "seen": {".sv": "timestamp"},
         }
         if full:
-            payload.update({"username": username, "library": library, "installed": installed, "country": country, "ptime": ptime,
+            payload.update({"username": username, "library": library, "country": country, "ptime": ptime,
                             "photo": None})
             if avatar_sig:
                 with open(avatar, "rb") as f:
@@ -18791,7 +18648,7 @@ def _gmod_in_library(root):
         return False
     for lib in library_roots():
         try:
-            rel = os.path.relpath(os.path.abspath(root), os.path.abspath(lib))
+            rel = _safe_relpath(os.path.abspath(root), os.path.abspath(lib))
         except ValueError:      # different drive on Windows
             continue
         parts = [p for p in rel.replace("\\", "/").split("/") if p]
@@ -19369,17 +19226,17 @@ class _SyncFriendCard(QFrame):
     def mouseDoubleClickEvent(self, _e):
         self.confirmed.emit(self.uid)
 
-def _pick_sync_friend(parent, rows, game, heading="Sync mods with friend", blurb=None, ask="Ask ", note=None):
+def _pick_sync_friend(parent, rows, game):
     """Card picker. rows = [(uid, name, status, color, avatar_path)]. Returns the chosen uid or None."""
     dlg = QDialog(parent)
-    dlg.setWindowTitle(heading)
+    dlg.setWindowTitle("Sync mods with friend")
     dlg.resize(580, 470)
     lay = QVBoxLayout(dlg)
     lay.setContentsMargins(24, 22, 24, 20)
     lay.setSpacing(12)
-    title = QLabel(heading)
+    title = QLabel("Sync mods with friend")
     title.setObjectName("PageTitle")
-    sub = QLabel(blurb or f"Request a friend to share their {game} mods with you, they have to accept first")
+    sub = QLabel(f"Request a friend to share their {game} mods with you, they have to accept first")
     sub.setObjectName("RowDesc")
     sub.setWordWrap(True)
     lay.addWidget(title)
@@ -19404,7 +19261,7 @@ def _pick_sync_friend(parent, rows, game, heading="Sync mods with friend", blurb
         for c in cards:
             c.set_selected(c.uid == uid)
         go.setEnabled(True)
-        go.setText(ask + next(c.name for c in cards if c.uid == uid))
+        go.setText("Ask " + next(c.name for c in cards if c.uid == uid))
 
     for i, (uid, name, status, color, avatar) in enumerate(rows):
         c = _SyncFriendCard(uid, name, status, color, avatar)
@@ -19415,7 +19272,7 @@ def _pick_sync_friend(parent, rows, game, heading="Sync mods with friend", blurb
     grid.setRowStretch((len(rows) + 1) // 2, 1)
     scroll.setWidget(holder)
     lay.addWidget(scroll, 1)
-    note = QLabel(note or "Your friend needs the launcher open to answer. The request expires after 2 minutes.")
+    note = QLabel("Your friend needs the launcher open to answer. The request expires after 2 minutes.")
     note.setObjectName("RowDesc")
     note.setWordWrap(True)
     lay.addWidget(note)
@@ -24247,7 +24104,7 @@ def _find_game_exe(folder):
         return None
     best, best_key = None, None
     for root, _dirs, files in os.walk(folder):
-        depth = os.path.relpath(root, folder).count(os.sep) if root != folder else 0
+        depth = _safe_relpath(root, folder).count(os.sep) if root != folder else 0
         if depth > 3:
             continue
         for f in files:
@@ -25717,7 +25574,7 @@ def _restart_icon():
         icon.addPixmap(pm, mode)
     return icon
 
-def restart_launcher(window, use_demo=False, python=None):
+def restart_launcher(window, use_demo=False):
     """Starts a fresh copy of the launcher and closes this one. The new copy takes over through the normal
     'a newer launcher replaces the running one' path, so it waits for this process to let go of the instance lock.
     use_demo=True (the top-right restart button) starts demo.py instead of main.py when running from source."""
@@ -25726,14 +25583,11 @@ def restart_launcher(window, use_demo=False, python=None):
     if "--launch-game" in args:                                               # don't start the game again after a restart
         _i = args.index("--launch-game")
         del args[_i:_i + 2]
-    exe = python or sys.executable        # python=...: restart on that interpreter (Settings > Python version)
-    cmd = [exe] + args if frozen else [exe] + _launcher_script_args() + args     # cached compile
+    cmd = [sys.executable] + args if frozen else [sys.executable] + _launcher_script_args() + args     # cached compile
     demo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo.py")
     if use_demo and not frozen and not os.environ.get("APPIMAGE") and os.path.isfile(demo):
-        cmd = [exe, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
+        cmd = [sys.executable, demo]        # demo.py (sign-in / installer) starts main.py itself once signed in
     env = dict(os.environ)
-    if python:
-        env.pop("NCZ_PY_REEXEC", None)      # going back to the original Python: don't redirect again
     if frozen:
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # a onefile build must unpack itself again
     kwargs = {}
@@ -33515,6 +33369,15 @@ def _ss_resolve(paths, anchors):
         out.append((root, bool(p.get("file"))))
     return out
 
+def _safe_relpath(path, start=os.curdir):
+    """os.path.relpath that never raises: on Windows it fails when the paths are on different drives
+    ('path is on mount C:, start on mount F:'), so fall back to the absolute path."""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        return os.path.abspath(path)
+
+
 def _ss_to_anchor(path, anchors):
     """The anchor that contains path (the deepest one wins) -> (anchor, 'rel/path'), or None."""
     path = os.path.normcase(os.path.abspath(path))
@@ -33528,7 +33391,7 @@ def _ss_to_anchor(path, anchors):
                 best = (name, b)
     if best is None:
         return None
-    rel = os.path.relpath(path, best[1])
+    rel = _safe_relpath(path, best[1])
     return best[0], ("" if rel == "." else rel.replace(os.sep, "/"))
 
 def _ss_prefix_from_launch(args, env, exe_hint=None):
@@ -33565,7 +33428,7 @@ def _ss_collect(entries):
                 p = os.path.join(dp, fn)
                 if os.path.islink(p):
                     continue
-                out.append((f"{i}/" + os.path.relpath(p, root).replace(os.sep, "/"), p))
+                out.append((f"{i}/" + _safe_relpath(p, root).replace(os.sep, "/"), p))
             if len(out) > _SS_MAX_FILES:
                 raise CloudError("Too many files to keep in the cloud. Pick a smaller save folder.", "TOO_BIG")
     out.sort()
@@ -33759,7 +33622,7 @@ def _ss_detect(name, anchors, t0):
         for dp, dns, fns in os.walk(root):
             if time.time() > deadline or visited > 150000:
                 break
-            rel_dir = os.path.relpath(dp, root)
+            rel_dir = _safe_relpath(dp, root)
             pdir = [] if rel_dir == "." else rel_dir.split(os.sep)
             dns[:] = [d for d in dns if d.lower() not in _SS_JUNK_DIRS
                       and not (not pdir and d.lower() in _SS_SKIP_TOP)
@@ -52882,7 +52745,7 @@ def _ext_title_for_path(path, idx):
         return idx["folders"][best]
     for root in idx["roots"]:
         if norm.startswith(root):
-            rel = os.path.relpath(path, root[:-1]).split(os.sep)
+            rel = _safe_relpath(path, root[:-1]).split(os.sep)
             if len(rel) < 2 or rel[0] == "..":
                 return None                  # a loose file in the library folder, not a game's folder
             first = rel[0]
@@ -53452,7 +53315,7 @@ _DEP_CORE = [("PyQt6", "PyQt6"), ("psutil", "psutil"), ("rarfile", "rarfile"),
              ("playwright", "playwright"), ("pywin32", "win32api")]
 _DEP_OPTIONAL = [("pypresence", "pypresence"), ("libtorrent", "libtorrent"), ("pynput", "pynput"),
                  ("nudenet", "nudenet"), ("vgamepad", "vgamepad"),
-                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets"), ("rdiff", "rdiff")]
+                 ("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets")]
 _DEP_WIN_ONLY = {"pywin32", "vgamepad"}
 
 def _dep_have(module):
@@ -53679,273 +53542,6 @@ class _DepPanel(QFrame):
             summary = f"Install failed: {e}"
         self._finished.emit(summary)
 
-# ── Settings: Python version (run the launcher on a private Python 3.12) ──
-# python-rsync (the librsync binding behind "Get different files") has builds up to Python 3.12 only. This downloads a
-# standalone CPython 3.12 (python-build-standalone) into the launcher's data folder, installs the launcher's packages into it
-# and records its path in python_override.txt; the first lines of main.py then start the launcher with it. Your own Python
-# is never touched, and "Switch back" removes the override.
-_PY_REPO = "https://api.github.com/repos/astral-sh/python-build-standalone"
-
-def _py_home():
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "python312")
-
-def _py_exe_in(home):
-    for rel in (("python.exe",), ("bin", "python3.12"), ("bin", "python3"), ("bin", "python")):
-        pth = os.path.join(home, *rel)
-        if os.path.isfile(pth):
-            return pth
-    return None
-
-def _py_set_override(path):
-    f = _ncz_py_override_file()
-    if path:
-        os.makedirs(os.path.dirname(f), exist_ok=True)
-        with open(f, "w", encoding="utf-8") as fh:
-            fh.write(path)
-    else:
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-
-def _py_triple():
-    import platform
-    arch = {"amd64": "x86_64", "x86_64": "x86_64", "x64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64",
-            "x86": "i686", "i386": "i686", "i686": "i686"}.get(platform.machine().lower())
-    if not arch:
-        raise RuntimeError("Unsupported processor: " + platform.machine())
-    if sys.platform.startswith("win"):
-        return arch + "-pc-windows-msvc"
-    if sys.platform == "darwin":
-        return arch + "-apple-darwin"
-    return arch + "-unknown-linux-gnu"
-
-def _py_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30, context=_NCZ_SSL_CTX) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def _py_pick_asset(names, triple):
-    """(name) of the newest CPython 3.12 install archive for `triple`; a full build is preferred over a stripped one."""
-    pat = re.compile(r"^cpython-3\.12\.(\d+)\+\d+-" + re.escape(triple) + r"(?:-shared)?-install_only(_stripped)?\.tar\.gz$")
-    best = None
-    for n in names:
-        m = pat.match(str(n or ""))
-        if m:
-            key = (int(m.group(1)), 0 if m.group(2) else 1)
-            if best is None or key > best[0]:
-                best = (key, n)
-    return best[1] if best else None
-
-def _py_find_asset():
-    triple = _py_triple()
-    rel = _py_json(_PY_REPO + "/releases/latest")
-    for page in range(1, 9):
-        assets = _py_json(f"{_PY_REPO}/releases/{rel['id']}/assets?per_page=100&page={page}")
-        if not assets:
-            break
-        name = _py_pick_asset([a.get("name") for a in assets], triple)
-        if name:
-            return name, next(a["browser_download_url"] for a in assets if a.get("name") == name)
-        if len(assets) < 100:
-            break
-    raise RuntimeError("Couldn't find a Python 3.12 download for this system (" + triple + ").")
-
-def _py_extract(archive, home):
-    import tarfile
-    tmp = home + ".new"
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
-    with tarfile.open(archive, "r:gz") as tf:
-        try:
-            tf.extractall(tmp, filter="data")
-        except TypeError:           # an older Python without extraction filters
-            tf.extractall(tmp)
-    src = os.path.join(tmp, "python")
-    if not os.path.isdir(src):
-        raise RuntimeError("The download didn't contain a python folder.")
-    shutil.rmtree(home, ignore_errors=True)
-    shutil.move(src, home)
-    shutil.rmtree(tmp, ignore_errors=True)
-    if not sys.platform.startswith("win"):
-        for n in os.listdir(os.path.join(home, "bin")):
-            try:
-                os.chmod(os.path.join(home, "bin", n), 0o755)
-            except OSError:
-                pass
-
-class _PyPanel(QFrame):
-    _line = pyqtSignal(str)
-    _finished = pyqtSignal(str, bool)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("Panel")
-        self._busy = False
-        pl = QVBoxLayout(self)
-        pl.setContentsMargins(22, 18, 22, 18)
-        row = QHBoxLayout()
-        text = QVBoxLayout()
-        text.setSpacing(2)
-        name = QLabel("Python version")
-        name.setObjectName("RowTitle")
-        desc = QLabel("Some packages (like python-rsync, used by \"Get different files\") only have ready-made builds up to "
-                      "Python 3.12. This downloads a private Python 3.12 (about 30 MB), installs the launcher's packages "
-                      "into it and runs the launcher on it from then on. Your own Python isn't changed. Needs internet.")
-        desc.setObjectName("RowDesc")
-        desc.setWordWrap(True)
-        self.status = QLabel()
-        self.status.setObjectName("RowDesc")
-        self.status.setWordWrap(True)
-        text.addWidget(name)
-        text.addWidget(desc)
-        text.addWidget(self.status)
-        self.btn = QPushButton()
-        self.btn.clicked.connect(self._click)
-        row.addLayout(text, 1)
-        row.addWidget(self.btn)
-        pl.addLayout(row)
-        self.log = _DepLogBox()
-        self.log.setReadOnly(True)
-        self.log.setMaximumHeight(150)
-        self.log.hide()
-        pl.addWidget(self.log)
-        self._line.connect(self.log.appendPlainText)
-        self._finished.connect(self._on_finished)
-        self.refresh()
-
-    def _mode(self):
-        if getattr(sys, "frozen", False) or os.environ.get("APPIMAGE"):
-            return "packaged"
-        if os.environ.get("NCZ_PY_REEXEC") and os.path.abspath(sys.executable).startswith(os.path.abspath(_py_home())):
-            return "private"
-        if sys.version_info[:2] == (3, 12):
-            return "native"
-        return "installed" if _py_exe_in(_py_home()) else "none"
-
-    def refresh(self):
-        import platform
-        ver, mode = platform.python_version(), self._mode()
-        text, label, enabled = {
-            "packaged": (f"Running on Python {ver}. Not available in the packaged build.", "Downgrade to Python 3.12", False),
-            "private": (f"Running on the private Python {ver}.", "Switch back to my Python", True),
-            "native": (f"Running on Python {ver}. Nothing to change.", "Downgrade to Python 3.12", False),
-            "installed": (f"Running on Python {ver}. A private Python 3.12 is already downloaded.", "Use Python 3.12", True),
-            "none": (f"Running on Python {ver}.", "Downgrade to Python 3.12", True),
-        }[mode]
-        self.status.setText(text)
-        self.btn.setText(label)
-        self.btn.setEnabled(enabled and not self._busy)
-
-    def _click(self):
-        if self._busy:
-            return
-        if self._mode() == "private":
-            self._switch_back()
-            return
-        self._busy = True
-        self.btn.setEnabled(False)
-        self.btn.setText("Working...")
-        self.log.clear()
-        self.log.show()
-        threading.Thread(target=self._work, daemon=True).start()
-
-    def _switch_back(self):
-        orig = os.environ.get("NCZ_ORIG_PYTHON") or ""
-        _py_set_override("")
-        if orig and os.path.isfile(orig):
-            restart_launcher(self.window(), python=orig)
-        else:
-            QMessageBox.information(self, "Python version",
-                                    "Done. Close the launcher and start it the way you normally do: it will use your own Python again.")
-            self.refresh()
-
-    def _run(self, cmd):
-        self._line.emit("> " + " ".join(os.path.basename(c) if i == 0 else c for i, c in enumerate(cmd)))
-        flags = 0x08000000 if sys.platform.startswith("win") else 0
-        p = subprocess.Popen(cmd, env=_dep_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=flags)
-        for line in p.stdout:
-            line = line.rstrip()
-            if line:
-                self._line.emit(line)
-        return p.wait() == 0
-
-    def _is_312(self, exe):
-        try:
-            flags = 0x08000000 if sys.platform.startswith("win") else 0
-            out = subprocess.run([exe, "-c", "import sys;print(sys.version_info[:2]==(3,12))"], capture_output=True,
-                                 text=True, timeout=60, env=_dep_env(), creationflags=flags)
-            return out.stdout.strip() == "True"
-        except Exception:
-            return False
-
-    def _download(self, url, dest):
-        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
-        with urllib.request.urlopen(req, timeout=60, context=_NCZ_SSL_CTX) as r, open(dest, "wb") as f:
-            total, done, shown = int(r.headers.get("Content-Length") or 0), 0, -1
-            while True:
-                chunk = r.read(256 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                pct = int(done * 100 / total) // 10 * 10 if total else -1
-                if pct != shown and pct >= 0:
-                    shown = pct
-                    self._line.emit(f"  {pct}%  ({done // (1024 * 1024)} MB)")
-
-    def _work(self):
-        try:
-            home = _py_home()
-            exe = _py_exe_in(home)
-            running_here = os.path.abspath(sys.executable).startswith(os.path.abspath(home))
-            if exe and not self._is_312(exe):
-                exe = None
-            if not exe:
-                if running_here:
-                    raise RuntimeError("The private Python is in use and doesn't start. Switch back first.")
-                self._line.emit("Looking for Python 3.12...")
-                name, url = _py_find_asset()
-                self._line.emit("Downloading " + name)
-                archive = home + ".tar.gz"
-                os.makedirs(os.path.dirname(archive), exist_ok=True)
-                self._download(url, archive)
-                self._line.emit("Unpacking...")
-                _py_extract(archive, home)
-                try:
-                    os.remove(archive)
-                except OSError:
-                    pass
-                exe = _py_exe_in(home)
-                if not exe or not self._is_312(exe):
-                    raise RuntimeError("The downloaded Python doesn't start.")
-            self._line.emit("Installing the launcher's packages into Python 3.12...")
-            pip = [exe, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location"]
-            self._run(pip + ["--upgrade", "pip"])
-            core = [pkg for pkg, _m in _dep_applicable(_DEP_CORE)]
-            opt = [pkg for pkg, _m in _dep_applicable(_DEP_OPTIONAL)]
-            failed = []
-            if core and not self._run(pip + ["--only-binary=:all:", *core]):
-                failed = [pkg for pkg in core if not self._run(pip + ["--only-binary=:all:", pkg])]
-            if failed:
-                raise RuntimeError("couldn't install " + ", ".join(failed) + " into Python 3.12, so nothing was switched.")
-            skipped = [pkg for pkg in opt if not self._run(pip + ["--only-binary=:all:", pkg])]
-            _py_set_override(exe)
-            note = (" Optional packages that couldn't be installed: " + ", ".join(skipped) + ".") if skipped else ""
-            self._finished.emit("Python 3.12 is ready." + note, True)
-        except Exception as e:
-            self._finished.emit(f"Failed: {e}", False)
-
-    def _on_finished(self, summary, ok):
-        self._busy = False
-        self.log.appendPlainText(summary)
-        self.refresh()
-        if ok:
-            ans = QMessageBox.question(self, "Python version", "Python 3.12 is ready. Restart the launcher now to run on it?")
-            if ans == QMessageBox.StandardButton.Yes:
-                restart_launcher(self.window())
-
 _dep_prev_settings_init = SettingsPage.__init__
 
 def _dep_settings_init(self, *a, **k):
@@ -53956,8 +53552,6 @@ def _dep_settings_init(self, *a, **k):
         idx = max(layout.count() - 1, 0)
         layout.insertSpacing(idx, 12)
         layout.insertWidget(idx + 1, panel)
-        layout.insertSpacing(idx + 2, 12)
-        layout.insertWidget(idx + 3, _PyPanel())
     except Exception:
         _log_exc("_dep_settings_init")
 
@@ -56340,1238 +55934,6 @@ def _slr_settings_init(self, *a, **k):
         _log_exc("_slr_panel")
 
 SettingsPage.__init__ = _slr_settings_init
-
-
-# ── library cards: "Get different files" (compare a game's files with a friend's copy, zip the ones that differ) ──
-# The asker sends a manifest (size + rdiff signature hash per file) through the same Firebase nodes mod sharing uses
-# (kind="diff"). The friend's launcher compares it with their own copy and zips every file that is different or new
-# into <APPDATA>/ncz/outputs, then opens File Explorer on the zip. Nothing is uploaded: the friend sends the zip manually.
-# Big files that only changed in places go in the zip as small block patches instead of whole files; the receiver
-# installs the zip with "Apply update zip..." (3-dot menu), which copies the whole files and patches the rest.
-import hashlib as _dg_hashlib
-import zipfile as _dg_zipfile
-import zlib as _dg_zlib
-import io as _dg_io
-import struct as _dg_struct
-
-_DG_BLOCK = 1024 * 1024
-_DG_SKIP_DIRS = {".git", "__pycache__"}
-_DG_SKIP_EXT = (".part", ".tmp")
-_DG_MIN_DELTA = 2 * _DG_BLOCK         # smaller files are always sent whole
-_DG_DELTA_MAGIC = b"NCZD1"
-_DG_DELTA_MAX_RATIO = 0.6             # if a patch would be bigger than this share of the file, send the whole file
-_DG_DELTA_DIR = "_ncz_deltas/"
-_DG_META = "_ncz_update.json"
-
-# >>> ncz-delta-core (pure functions, no Qt)
-class _DgCancelled(Exception):
-    pass
-
-def _dg_sig_blocks(path, want_blocks=True):
-    """(file signature, [first 8 bytes of the md5 of every 1 MB block]) from ONE read pass.
-    The file signature is the same value the old built-in method produced, so old and new launchers still agree."""
-    h, digs = _dg_hashlib.sha1(), []
-    with open(path, "rb") as fh:
-        while True:
-            b = fh.read(_DG_BLOCK)
-            if not b:
-                break
-            d = _dg_hashlib.md5(b).digest()
-            h.update(d)
-            if want_blocks:
-                digs.append(d[:8])
-    return _dg_hashlib.sha1(h.digest()).hexdigest()[:20], digs
-
-class _DgSigStream:
-    """Computes the same file signature while the bytes are being written (used to verify a patched file)."""
-    def __init__(self):
-        self.h, self.buf = _dg_hashlib.sha1(), bytearray()
-
-    def feed(self, data):
-        self.buf += data
-        while len(self.buf) >= _DG_BLOCK:
-            self.h.update(_dg_hashlib.md5(bytes(self.buf[:_DG_BLOCK])).digest())
-            del self.buf[:_DG_BLOCK]
-
-    def result(self):
-        if self.buf:
-            self.h.update(_dg_hashlib.md5(bytes(self.buf)).digest())
-            self.buf.clear()
-        return _dg_hashlib.sha1(self.h.digest()).hexdigest()[:20]
-
-def _dg_delta_plan(digs, other_b64):
-    """Per block of the NEW file: True when the other copy already has the same block at the same place.
-    Returns (same-flags, bytes the patch has to carry as new data)."""
-    try:
-        other = base64.b64decode(other_b64)
-    except Exception:
-        other = b""
-    n = len(other) // 8
-    same = [i < n and other[i * 8:i * 8 + 8] == d for i, d in enumerate(digs)]
-    return same, sum(1 for s in same if not s) * _DG_BLOCK
-
-def _dg_write_delta(out, path, size, sig, same, cancel=None):
-    """Writes a patch: COPY ranges the other copy already has, DATA runs for the blocks that changed."""
-    out.write(_DG_DELTA_MAGIC + _dg_struct.pack("<QI", size, _DG_BLOCK) + sig.encode("ascii"))
-    with open(path, "rb") as fh:
-        i, n = 0, len(same)
-        while i < n:
-            j = i
-            while j < n and same[j] == same[i]:
-                j += 1
-            start = i * _DG_BLOCK
-            length = min(j * _DG_BLOCK, size) - start
-            if same[i]:
-                out.write(_dg_struct.pack("<BQQ", 1, start, length))
-            else:
-                out.write(_dg_struct.pack("<BQ", 2, length))
-                fh.seek(start)
-                left = length
-                while left > 0:
-                    if cancel and cancel():
-                        raise _DgCancelled()
-                    b = fh.read(min(left, 4 * _DG_BLOCK))
-                    if not b:
-                        raise OSError("the file changed while it was being read")
-                    out.write(b)
-                    left -= len(b)
-            i = j
-    out.write(b"\x00")
-
-def _dg_read_exact(fh, n):
-    buf = b""
-    while len(buf) < n:
-        b = fh.read(n - len(buf))
-        if not b:
-            raise ValueError("the patch file is cut off")
-        buf += b
-    return buf
-
-def _dg_apply_delta(old_path, delta_fh, new_path, progress=None, cancel=None):
-    """old file + patch -> new_path. Raises ValueError when the result doesn't match what the patch expects."""
-    if _dg_read_exact(delta_fh, len(_DG_DELTA_MAGIC)) != _DG_DELTA_MAGIC:
-        raise ValueError("not a patch file")
-    size, blk = _dg_struct.unpack("<QI", _dg_read_exact(delta_fh, 12))
-    if blk != _DG_BLOCK:
-        raise ValueError("patch uses a different block size")
-    want = _dg_read_exact(delta_fh, 20).decode("ascii")
-    ss, written = _DgSigStream(), 0
-    with open(old_path, "rb") as old, open(new_path, "wb") as out:
-        while True:
-            op = _dg_read_exact(delta_fh, 1)[0]
-            if op == 0:
-                break
-            if op == 1:
-                off, left = _dg_struct.unpack("<QQ", _dg_read_exact(delta_fh, 16))
-                old.seek(off)
-                src_fh = old
-            elif op == 2:
-                left, = _dg_struct.unpack("<Q", _dg_read_exact(delta_fh, 8))
-                src_fh = delta_fh
-            else:
-                raise ValueError("bad patch file")
-            while left > 0:
-                if cancel and cancel():
-                    raise _DgCancelled()
-                b = src_fh.read(min(left, 4 * _DG_BLOCK))
-                if not b:
-                    raise ValueError("your old file is shorter than the patch expects" if op == 1 else "the patch file is cut off")
-                out.write(b)
-                ss.feed(b)
-                left -= len(b)
-                written += len(b)
-                if progress:
-                    progress(len(b))
-    if written != size or ss.result() != want:
-        raise ValueError("the patched file doesn't match. Your old file isn't the version this patch was made for")
-# <<< ncz-delta-core
-
-def _dg_norm(t):
-    """Title key that ignores case, spaces, punctuation and a trailing "(Wine)": "FNAF: Foo" == "fnaf foo"."""
-    base = re.sub(r"\s*\(wine\)$", "", str(t or "").strip(), flags=re.I).casefold()
-    return re.sub(r"[\W_]+", "", base) or base
-
-def _dg_outputs_dir():
-    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    d = os.path.join(base, "ncz", "outputs")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _dg_paths_file():
-    return os.path.join(os.path.dirname(_dg_outputs_dir()), "diff_paths.json")
-
-def _dg_load_paths():
-    try:
-        with open(_dg_paths_file(), encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-def _dg_save_path(title, folder):
-    d = _dg_load_paths()
-    d[_dg_norm(title)] = os.path.abspath(folder)
-    try:
-        with open(_dg_paths_file(), "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
-    except OSError:
-        _log_exc("_dg_save_path")
-    _dg_inst_cache["key"] = None          # so friends see this game as installed on the next presence update
-
-def _dg_ask_folder(parent, title):
-    """The launcher couldn't locate the game: let the person point at its folder (remembered for next time)."""
-    start = (library_roots() or [os.path.expanduser("~")])[0]
-    d = QFileDialog.getExistingDirectory(parent, f"Where is {title} installed? Pick its game folder", start)
-    if d and os.path.isdir(d):
-        _dg_save_path(title, d)
-        return d
-    return None
-
-# --- signatures: the rdiff library (librsync) when it can be imported, else a built-in per-block hash ---
-def _dg_rs_sig(fh):
-    """rdiff (librsync) signature of an open file via python-rsync: `pip install python-rsync`, imported as pyrsync."""
-    from pyrsync import get_signature_args, signature
-    fh.seek(0, 2)
-    size = fh.tell()
-    fh.seek(0)
-    try:
-        magic, block_len, strong_len = get_signature_args(size, 0, _DG_BLOCK, 0)
-    except TypeError:                       # older binding without the block_len argument
-        magic, block_len, strong_len = get_signature_args(size)
-    out = _dg_io.BytesIO()
-    signature(fh, out, strong_len, magic, block_len)
-    return out.getvalue()
-
-def _dg_builtin_sig(fh):
-    h = _dg_hashlib.sha1()
-    while True:
-        b = fh.read(_DG_BLOCK)
-        if not b:
-            break
-        h.update(_dg_hashlib.md5(b).digest())
-    return h.digest()
-
-def _dg_method():
-    """'blk1' = per-1-MB-block signatures (no extra library needed). 'builtin' is the same file signature without
-    the block list, which is what older launchers send, so they still work (whole files only)."""
-    return "blk1"
-
-def _dg_file_sig(path, tag):
-    return _dg_sig_blocks(path, False)[0]
-
-def _dg_walk(root):
-    out = {}
-    for base, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in _DG_SKIP_DIRS]
-        for f in files:
-            if f.lower().endswith(_DG_SKIP_EXT):
-                continue
-            p = os.path.join(base, f)
-            try:
-                if not os.path.islink(p):
-                    out[os.path.relpath(p, root).replace("\\", "/")] = (os.path.getsize(p), p)
-            except OSError:
-                pass
-    return out
-
-def _dg_manifest(root, tag, progress, cancel, cache=None):
-    files = _dg_walk(root)
-    total, done, man = (sum(s for s, _p in files.values()) or 1), 0, {}
-    for rel, (size, path) in files.items():
-        if cancel():
-            return None
-        try:
-            mt = int(os.path.getmtime(path))
-            if (cache or {}).get(rel):
-                man[rel] = [size, cache[rel], mt]           # identical to the other copy: no block list needed
-            else:
-                sg, digs = _dg_sig_blocks(path, size >= _DG_MIN_DELTA)
-                man[rel] = [size, sg, mt] + ([base64.b64encode(b"".join(digs)).decode("ascii")] if digs else [])
-        except OSError:
-            pass
-        done += size
-        progress(done, total)
-    return man
-
-def _dg_pack(man):
-    """Entries are [size, sig, mtime(, block list)]. Block lists travel under one extra key, so older launchers
-    (which only read 2-3 item lists) simply ignore them."""
-    plain, blocks = {}, {}
-    for k, v in man.items():
-        if len(v) > 3:
-            blocks[k], v = v[3], v[:3]
-        plain[k] = v
-    if blocks:
-        plain["\x00b"] = blocks
-    return base64.b64encode(_dg_zlib.compress(json.dumps(plain, separators=(",", ":")).encode("utf-8"), 6)).decode("ascii")
-
-def _dg_pack_capped(man, cap=8 * 1024 * 1024):
-    """Packed manifest, dropping the block lists (whole-file mode) if it would be too big. None if still too big."""
-    blob = _dg_pack(man)
-    if len(blob) > cap:
-        blob = _dg_pack({k: v[:3] for k, v in man.items()})
-    return blob if len(blob) <= cap else None
-
-def _dg_unpack(blob):
-    raw = json.loads(_dg_zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("bad manifest")
-    blocks = raw.get("\x00b") if isinstance(raw.get("\x00b"), dict) else {}
-    out = {}
-    for k, v in raw.items():
-        if isinstance(v, list) and len(v) in (2, 3):
-            v = list(v)
-            if len(v) == 3 and isinstance(blocks.get(k), str):
-                v.append(blocks[k])
-            out[str(k)] = v
-    return out
-
-def _dg_compare(root, man, tag, progress, cancel):
-    """Files here that differ from (or are missing in) the asker's manifest. None if cancelled."""
-    mine = _dg_walk(root)
-    theirs_lc = {k.lower(): k for k in man}
-    total, done = (sum(s for s, _p in mine.values()) or 1), 0
-    differ, new, same, seen, sigs, newer, older = [], [], 0, set(), {}, 0, 0
-    other, blk = {}, {}
-    for rel, (size, path) in mine.items():
-        if cancel():
-            return None
-        key = rel if rel in man else theirs_lc.get(rel.lower())
-        if key is None:
-            new.append(rel)
-        else:
-            seen.add(key)
-            ent = man[key]
-            try:
-                bad = size != ent[0]
-                if not bad:
-                    sg, digs = _dg_sig_blocks(path, size >= _DG_MIN_DELTA and len(ent) > 3)
-                    bad = sg != ent[1]
-                    if not bad:
-                        sigs[rel] = sg                      # identical: remembered so the handoff manifest can skip it
-                    elif digs:
-                        blk[rel] = (sg, digs)               # reused by the zip step, saves another full read
-                if not bad:
-                    same += 1
-                else:
-                    differ.append(rel)
-                    other[rel] = ent
-                    if len(ent) > 2:
-                        mt = os.path.getmtime(path)
-                        newer += mt > ent[2] + 2
-                        older += mt < ent[2] - 2
-            except OSError:
-                differ.append(rel)
-                other[rel] = ent
-        done += size
-        progress(done, total)
-    removed = [k for k in man if k not in seen]
-    return {"differ": differ, "new": new, "removed": removed, "same": same, "files": mine,
-            "sigs": sigs, "newer": newer, "older": older, "other": other, "blk": blk}
-
-def _dg_make_zip(title, cmp_, progress, cancel):
-    """Zip with the whole new files, except big files the other copy already has most of: those go in as small
-    patches (_ncz_deltas/<file>.nczd) that the other launcher's "Apply update zip" turns back into the new file."""
-    rels = cmp_["differ"] + cmp_["new"]
-    safe = re.sub(r"[^\w\-. ]+", "_", title).strip() or "game"
-    path = os.path.join(_dg_outputs_dir(), f"{safe}_update_{time.strftime('%Y%m%d-%H%M%S')}.zip")
-    files, other, blk = cmp_["files"], cmp_.get("other") or {}, cmp_.get("blk") or {}
-    plan, failed, cancelled = {}, 0, False
-    cand = [r for r in cmp_["differ"] if len(other.get(r) or []) > 3 and files[r][0] >= _DG_MIN_DELTA]
-    total = (sum(files[r][0] for r in cand if r not in blk) + sum(files[r][0] for r in rels)) or 1
-    done = 0
-    for rel in cand:                                        # decide: patch or whole file
-        if cancel():
-            cancelled = True
-            break
-        try:
-            sg, digs = blk.get(rel) or _dg_sig_blocks(files[rel][1])
-            if rel not in blk:
-                done += files[rel][0]
-                progress(done, total)
-            same, carried = _dg_delta_plan(digs, other[rel][3])
-            if any(same) and carried <= files[rel][0] * _DG_DELTA_MAX_RATIO:
-                plan[rel] = (sg, same)
-        except OSError:
-            pass
-    meta = {"v": 2, "title": title, "full": [], "delta": [], "removed": list(cmp_["removed"])}
-    with _dg_zipfile.ZipFile(path, "w", _dg_zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
-        for rel in ([] if cancelled else rels):
-            if cancel():
-                cancelled = True
-                break
-            try:
-                if rel in plan:
-                    zname = _DG_DELTA_DIR + rel + ".nczd"
-                    with zf.open(zname, "w", force_zip64=True) as out:
-                        _dg_write_delta(out, files[rel][1], files[rel][0], plan[rel][0], plan[rel][1], cancel)
-                    meta["delta"].append({"rel": rel, "z": zname, "size": files[rel][0], "sig": plan[rel][0]})
-                else:
-                    zf.write(files[rel][1], rel)
-                    meta["full"].append(rel)
-            except _DgCancelled:
-                cancelled = True
-                break
-            except OSError:
-                failed += 1
-            done += files[rel][0]
-            progress(done, total)
-        notes = [f"{title}: files that differ from the other copy ({len(cmp_['differ'])}) and new files ({len(cmp_['new'])})",
-                 f"{len(plan)} of them are small patches (_ncz_deltas folder), the rest are whole files.",
-                 "Use 'Apply update zip...' in the game's 3-dot menu in the launcher to install this zip.",
-                 "", "Differ:"] + cmp_["differ"] + ["", "New:"] + cmp_["new"] + \
-                ["", "Only in the other copy (not included, delete them if the update removed them):"] + cmp_["removed"]
-        zf.writestr("_ncz_file_list.txt", "\n".join(notes))
-        zf.writestr(_DG_META, json.dumps(meta))
-    cmp_["n_delta"] = len(meta["delta"])
-    if cancelled or cancel():
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return None, 0, 0
-    return path, os.path.getsize(path), failed
-
-# >>> ncz-apply-core (pure function, no Qt)
-def _dg_apply_zip(zip_path, root, progress, cancel):
-    """Installs an update zip made by _dg_make_zip into the game folder. Returns (whole files, patched files, [problems])."""
-    root = os.path.abspath(root)
-    problems, nfull, npatch = [], 0, 0
-
-    def dest_of(rel):
-        d = os.path.abspath(os.path.join(root, *[p for p in rel.replace("\\", "/").split("/") if p]))
-        if d != root and not d.startswith(root + os.sep):
-            raise ValueError("unsafe path in the zip")
-        return d
-
-    with _dg_zipfile.ZipFile(zip_path) as zf:
-        names = set(zf.namelist())
-        if _DG_META in names:
-            meta = json.loads(zf.read(_DG_META).decode("utf-8"))
-            full, deltas = list(meta.get("full") or []), list(meta.get("delta") or [])
-        else:                                               # a zip made by the older version: whole files only
-            full = [n for n in names if not n.endswith("/") and not n.startswith("_ncz_")]
-            deltas = []
-        total = (sum(zf.getinfo(r).file_size for r in full if r in names) + sum(int(d.get("size") or 0) for d in deltas)) or 1
-        state = {"done": 0}
-
-        def tick(n):
-            state["done"] += n
-            progress(state["done"], total)
-
-        for rel in full:
-            if cancel():
-                raise _DgCancelled()
-            try:
-                if rel not in names:
-                    raise ValueError("missing from the zip")
-                dest = dest_of(rel)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                tmp = dest + ".ncz_new"
-                with zf.open(rel) as src_fh, open(tmp, "wb") as out:
-                    while True:
-                        b = src_fh.read(4 * _DG_BLOCK)
-                        if not b:
-                            break
-                        out.write(b)
-                        tick(len(b))
-                os.replace(tmp, dest)
-                nfull += 1
-            except _DgCancelled:
-                raise
-            except Exception as e:
-                problems.append(f"{rel}: {e}")
-        for d in deltas:
-            if cancel():
-                raise _DgCancelled()
-            rel, tmp = str(d.get("rel") or ""), None
-            try:
-                dest = dest_of(rel)
-                if not os.path.isfile(dest):
-                    raise ValueError("your copy doesn't have this file, so the patch can't be applied")
-                tmp = dest + ".ncz_new"
-                with zf.open(d["z"]) as dfh:
-                    _dg_apply_delta(dest, dfh, tmp, tick, cancel)
-                os.replace(tmp, dest)
-                npatch += 1
-            except _DgCancelled:
-                raise
-            except Exception as e:
-                problems.append(f"{rel}: {e}")
-            finally:
-                if tmp and os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-    return nfull, npatch, problems
-# <<< ncz-apply-core
-
-def _dg_game_version(title):
-    try:
-        for info in GAME_INFO.values():
-            if _dg_norm(info["name"]) == _dg_norm(title):
-                return get_installed_version(info["name"])
-    except Exception:
-        pass
-    return ""
-
-def _dg_mine_is_newer(cmp_, my_ver, their_ver):
-    try:
-        if my_ver and their_ver and my_ver != their_ver:
-            return bool(is_newer_version(my_ver, their_ver))
-    except Exception:
-        pass
-    return cmp_["newer"] + len(cmp_["new"]) >= cmp_["older"] + len(cmp_["removed"])
-
-def _dg_reveal(path):
-    try:
-        if sys.platform.startswith("win"):
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path)])
-    except Exception:
-        _log_exc("_dg_reveal")
-
-_dg_inst_cache = {"t": 0.0, "key": None, "v": []}
-
-def _dg_installed_titles(titles):
-    """Library games whose files are really on this PC (published to friends). Re-checked at most once a minute."""
-    key = tuple(titles)
-    if key == _dg_inst_cache["key"] and time.time() - _dg_inst_cache["t"] < 60:
-        return list(_dg_inst_cache["v"])
-    out = []
-    for t in titles:
-        try:
-            if _dg_find_dir(t):
-                out.append(t)
-        except Exception:
-            pass
-    _dg_inst_cache.update(t=time.time(), key=key, v=out)
-    return list(out)
-
-def _dg_steam_roots():
-    roots = []
-    def add(path):
-        try:
-            if path and os.path.isdir(path):
-                path = os.path.abspath(path)
-                if path not in roots:
-                    roots.append(path)
-        except OSError:
-            pass
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
-            add(winreg.QueryValueEx(k, "SteamPath")[0])
-    except Exception:    # expected: not Windows / Steam not installed
-        pass
-    for pth in (os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Steam"),
-                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Steam"),
-                "~/.steam/steam", "~/.local/share/Steam", "~/Library/Application Support/Steam",
-                "~/.var/app/com.valvesoftware.Steam/.local/share/Steam"):
-        add(os.path.expanduser(pth))
-    return roots
-
-def _dg_steam_dirs(appid, title):
-    """Steam install folders for a game: reads every Steam library (other drives too) and the game's appmanifest."""
-    out = []
-    for root in _dg_steam_roots():
-        libs = [root]
-        try:
-            with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
-                libs += [m.group(1).replace("\\\\", "\\") for m in re.finditer(r'"path"\s+"([^"]+)"', f.read())]
-        except OSError:
-            pass
-        for lib in libs:
-            apps = os.path.join(lib, "steamapps")
-            try:
-                with open(os.path.join(apps, f"appmanifest_{appid}.acf"), encoding="utf-8", errors="replace") as f:
-                    m = re.search(r'"installdir"\s+"([^"]+)"', f.read())
-                if m:
-                    out.append(os.path.join(apps, "common", m.group(1)))
-            except OSError:
-                pass
-            out.append(os.path.join(apps, "common", str(title)))
-    return out
-
-def _dg_usable_dir(c):
-    try:
-        if not c or not os.path.isdir(c):
-            return False
-        ab = os.path.abspath(c)
-        if len(ab) <= 3 or ab == os.path.expanduser("~"):
-            return False
-        with os.scandir(c) as it:
-            return any(True for _ in it)          # an empty leftover folder is not an install
-    except OSError:
-        return False
-
-def _dg_find_dir(title):
-    """Where a library game's files are on this PC (None if it can't be found)."""
-    want, cands = _dg_norm(title), []
-    try:
-        if _dg_load_paths().get(want):
-            cands.append(_dg_load_paths()[want])          # a folder the person picked by hand wins
-    except Exception:
-        _log_exc("_dg_find_dir paths")
-    for info in GAME_INFO.values():
-        if _dg_norm(info["name"]) == want:
-            cands += [installed_game_dir(info["name"]), wine_game_dir(info["name"])]
-    try:        # folder named after the title: how the launcher installs fan / store games ("Foo: Bar" -> "Foo Bar")
-        safe = sanitize_folder_name(str(title))
-        cands += [installed_game_dir(safe), wine_game_dir(safe)]
-    except Exception:
-        _log_exc("_dg_find_dir safe")
-    try:
-        roots = list(library_roots())
-    except Exception:
-        roots = []
-    for r in roots:                     # any folder in any library root that matches the title loosely
-        try:
-            for e in os.listdir(r):
-                if _dg_norm(e) == want:
-                    cands.append(os.path.join(r, e))
-        except OSError:
-            pass
-    try:
-        for g in load_custom_games():
-            if _dg_norm(g.get("title") or g.get("name")) == want and g.get("exe_path"):
-                cands.append(os.path.dirname(g["exe_path"]))
-    except Exception:
-        _log_exc("_dg_find_dir custom")
-    try:
-        for g in load_fan_library():
-            if _dg_norm(g.get("title")) == want:
-                if g.get("exe_path"):
-                    cands.append(os.path.dirname(g["exe_path"]))
-                cands.append(_fan_game_dir(g["id"], g["title"]))
-    except Exception:
-        _log_exc("_dg_find_dir fan")
-    try:
-        for g in load_steam_library():
-            if _dg_norm(g.get("title")) == want:
-                if g.get("exe_path"):
-                    cands.append(os.path.dirname(g["exe_path"]))
-                cands += _dg_steam_dirs(g.get("appid"), g["title"])
-    except Exception:
-        _log_exc("_dg_find_dir steam")
-    for c in cands:
-        if _dg_usable_dir(c):
-            return c
-    return None
-
-# --- cloud: rides on the mod-share request/reply nodes, told apart by kind="diff" ---
-def cloud_diff_send_request(friend, title, blob, tag, count, ver="", direction="get"):
-    token, uid = get_id_token()
-    _http_json(_fdb(f"modshare_replies/{uid}/{friend}", token), "DELETE")
-    _http_json(_fdb(f"modshare_requests/{friend}/{uid}", token), "PUT",
-               {"kind": "diff", "appid": 0, "game": str(title)[:80], "username": _my_display_name(),
-                "m": tag, "n": int(count), "ver": str(ver or ""), "dir": str(direction or "get"), "man": blob, "time": {".sv": "timestamp"}}, timeout=180)
-
-def cloud_diff_answer(requester, title, accepted, info=None):
-    token, uid = get_id_token()
-    reply = {"kind": "diff", "game": str(title)[:80], "accepted": bool(accepted), "username": _my_display_name(),
-             "time": {".sv": "timestamp"}}
-    reply.update(info or {})
-    _http_json(_fdb(f"modshare_replies/{requester}/{uid}", token), "PUT", reply)
-    _http_json(_fdb(f"modshare_requests/{uid}/{requester}", token), "DELETE")
-
-# --- asker side ---
-class _DgAskWorker(QThread):
-    status = pyqtSignal(str, bool)       # text, busy
-    prog = pyqtSignal(object, object)
-    done = pyqtSignal(dict, str)         # friend's answer, error ("cancelled" / "timeout" / message)
-    TIMEOUT = 40 * 60
-
-    def __init__(self, friend, name, title, root, parent=None, direction="get"):
-        super().__init__(parent)
-        self.friend, self.fname, self.title, self.root = friend, name, title, root
-        self.direction = direction
-        self._cancel = False
-
-    def cancel(self):
-        self._cancel = True
-
-    def run(self):
-        try:
-            tag = _dg_method()
-            for _attempt in range(2):
-                self.status.emit("Reading your files...", False)
-                man = _dg_manifest(self.root, tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
-                if man is None:
-                    self.done.emit({}, "cancelled")
-                    return
-                blob = _dg_pack_capped(man)
-                if blob is None:
-                    self.done.emit({}, "This game has too many files to compare through the cloud.")
-                    return
-                cloud_diff_send_request(self.friend, self.title, blob, tag, len(man), _dg_game_version(self.title), self.direction)
-                self.status.emit(f"Waiting for {self.fname} to answer... (they have to accept, then their launcher compares)", True)
-                t0, reply = time.time(), None
-                while time.time() - t0 < self.TIMEOUT:
-                    if self._cancel:
-                        cloud_modshare_cancel_request(self.friend)
-                        self.done.emit({}, "cancelled")
-                        return
-                    r = cloud_modshare_check_reply(self.friend)
-                    if isinstance(r, dict) and r.get("kind") == "diff":
-                        reply = r
-                        break
-                    self.msleep(2000)
-                if reply is None:
-                    cloud_modshare_cancel_request(self.friend)
-                    self.done.emit({}, "timeout")
-                    return
-                if reply.get("retry") == "builtin" and tag != "builtin":
-                    tag = "builtin"          # the friend has no rdiff library: both sides use the built-in signature
-                    continue
-                self.done.emit(reply, "")
-                return
-            self.done.emit({}, "The other launcher couldn't match the signature method.")
-        except Exception as e:
-            self.done.emit({}, str(e) or "Something went wrong.")
-
-class _DgFeed(QObject):
-    """Stands in for a download worker so a DownloadCard can show the update-file steps."""
-    progress = pyqtSignal(object, object, float)
-    status_update = pyqtSignal(str)
-    finished = pyqtSignal(str)
-    failed = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.cancel_cb = None
-
-    def start(self):
-        pass
-
-    def cancel(self):
-        if self.cancel_cb:
-            self.cancel_cb()
-
-def _dg_cover(title):
-    """Cover image path of a library game (matched loosely by title), "" if it has none."""
-    try:
-        want = _dg_norm(title)
-        for t, path in library_cover_paths().items():
-            if _dg_norm(t) == want:
-                return path
-    except Exception:
-        _log_exc("_dg_cover")
-    return ""
-
-class _DgUpdateCard(DownloadCard):
-    def __init__(self, game, other, feed, title="Creating update files"):
-        super().__init__(title, "", 0, _dg_cover(game), None, worker=feed)
-        self.game, self.other = game, other
-        self.pause_btn.hide()
-        self.status_label.setText("Starting...")
-        self.info_label.setText(f"{game} with {other}")
-
-    def on_status_update(self, message):
-        self.info_label.setText(f"{self.game} with {self.other}: {message}")
-
-    def on_progress(self, done, total, _speed):
-        if total and total > 0:
-            pct = max(0, min(100, int(done * 100 / total)))
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(pct)
-            self.status_label.setText(f"{pct}%")
-        else:
-            self.progress_bar.setRange(0, 0)
-            self.status_label.setText("Working...")
-
-    def on_finished(self, path):
-        self.state = "done"
-        self.status_label.setText("Ready" if path else "Done")
-        self.status_label.setStyleSheet(f"color: {GREEN};")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
-        self.clear_btn.show()
-        try:
-            self.action_btn.clicked.disconnect()
-        except Exception:    # expected: nothing was connected
-            pass
-        if path:
-            self.action_btn.setText("Show zip")
-            self.action_btn.setEnabled(True)
-            self.action_btn.clicked.connect(lambda _c=False, p=path: _dg_reveal(p))
-        else:
-            self.action_btn.hide()
-
-    def cancel_download(self):
-        self.status_label.setText("Cancelling...")
-        self.action_btn.setEnabled(False)
-        self.worker.cancel()
-
-def _dg_card(win, game, other, title="Creating update files"):
-    """Adds a "Creating update files" card to the Downloads tab and returns the feed that drives it."""
-    feed = _DgFeed()
-    try:
-        page = win.downloads_page
-        page.add_download_card(_DgUpdateCard(game, other, feed, title))
-        win.pages.setCurrentWidget(page)
-    except Exception:
-        _log_exc("_dg_card")
-    return feed
-
-def _dg_feed_wire(worker, feed):
-    worker.status.connect(lambda text, busy: (feed.status_update.emit(text), feed.progress.emit(0, 0 if busy else 100, 0.0)))
-    worker.prog.connect(lambda d, t: feed.progress.emit(d, t, 0.0))
-    feed.cancel_cb = worker.cancel
-
-def _dg_pick_direction(self, title, friend_row):
-    """Two cards, you and the friend you picked (profile picture + username each). Click whoever has the newer files.
-    Returns "send" (I have the update), "get" (the friend has it) or None."""
-    fuid, fname, fstatus, fcolor, favatar = friend_row
-    my_name, my_avatar = load_profile_cache()
-    my_name = my_name or _my_display_name()
-    dlg = QDialog(self)
-    dlg.setWindowTitle("Who has the update?")
-    dlg.resize(460, 340)
-    lay = QVBoxLayout(dlg)
-    lay.setContentsMargins(24, 22, 24, 20)
-    lay.setSpacing(12)
-    head = QLabel("Who has the update?")
-    head.setObjectName("PageTitle")
-    sub = QLabel(f"Pick whoever has the newer {title} files. Their launcher zips the files that are different and they "
-                 f"send the zip to the other person.")
-    sub.setObjectName("RowDesc")
-    sub.setWordWrap(True)
-    lay.addWidget(head)
-    lay.addWidget(sub)
-    me_card = _SyncFriendCard("me", my_name, "You", GREEN, my_avatar)
-    fr_card = _SyncFriendCard(fuid, fname, fstatus, fcolor, favatar)
-    cards, state = [me_card, fr_card], {"who": None}
-    go = QPushButton("Pick who has the update")
-    go.setObjectName("Primary")
-    go.setFixedHeight(34)
-    go.setEnabled(False)
-
-    def pick(who):
-        state["who"] = who
-        for c in cards:
-            c.set_selected(c.uid == who)
-        go.setEnabled(True)
-        go.setText("I have the update" if who == "me" else f"{fname} has the update")
-
-    for c in cards:
-        c.picked.connect(pick)
-        c.confirmed.connect(lambda who: (pick(who), dlg.accept()))
-        lay.addWidget(c)
-    lay.addStretch()
-    btns = QHBoxLayout()
-    btns.addStretch()
-    cancel = QPushButton("Cancel")
-    cancel.setFixedHeight(34)
-    cancel.clicked.connect(dlg.reject)
-    go.clicked.connect(dlg.accept)
-    btns.addWidget(cancel)
-    btns.addWidget(go)
-    lay.addLayout(btns)
-    if dlg.exec() != QDialog.DialogCode.Accepted or state["who"] is None:
-        return None
-    return "send" if state["who"] == "me" else "get"
-
-def _dg_begin(self, title):
-    if not cloud_configured() or load_account() is None:
-        QMessageBox.information(self, "Get different files",
-                                "Log in to your account first (Account page), then add a friend with their friend code.")
-        return
-    root = _dg_find_dir(title)
-    if not root:
-        ans = QMessageBox.question(self, "Get different files",
-                                   f"I couldn't find where {title} is installed on this PC.\n\nPick its folder yourself? "
-                                   f"(It's remembered for next time.)")
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        root = _dg_ask_folder(self, title)
-        if not root:
-            return
-    keep = self.__dict__.setdefault("_dg_keep", [])
-    w = WorkshopFriendsWorker(self)
-    w.done.connect(lambda friends, err, t=title, r=root: _dg_on_friends(self, t, r, friends, err))
-    keep.append(w)
-    w.finished.connect(lambda w=w: keep.remove(w) if w in keep else None)
-    w.start()
-
-def _dg_on_friends(self, title, root, friends, err):
-    if err:
-        QMessageBox.warning(self, "Get different files", err)
-        return
-    def as_list(v):
-        return list(v.values()) if isinstance(v, dict) else (v if isinstance(v, list) else [])
-    want, found = _dg_norm(pretty_game_name(title)), []
-    for uid, prof in (friends or {}).items():
-        prof = prof or {}
-        installed = {_dg_norm(pretty_game_name(t)) for t in as_list(prof.get("installed"))}
-        owned = {_dg_norm(pretty_game_name(t)) for t in as_list(prof.get("library"))}
-        if want in installed:
-            sure = True
-        elif want in owned:      # has it in their library but their launcher didn't report it as installed (older launcher / folder not found)
-            sure = False
-        else:
-            continue
-        status, color = _friend_status(prof)
-        try:
-            avatar = _friend_avatar_file(uid, prof.get("photo"))
-        except Exception:
-            avatar = None
-        found.append((uid, str(prof.get("username") or "Friend"), status, color, avatar, sure))
-    if not found:
-        QMessageBox.information(self, "Get different files", f"None of your friends have {title} in their library (friends on an older launcher need to update before they show up).")
-        return
-    found.sort(key=lambda r: (not r[5], r[2] == "Offline", r[1].lower()))
-    rows = [(u, n, st if sure else f"{st} \u00b7 install not confirmed", c, av) for u, n, st, c, av, sure in found]
-    uid = _pick_sync_friend(self, rows, title, heading="Pick a friend",
-                            blurb=f"Pick the friend you want to compare {title} files with. Next you choose who has the update: "
-                                  f"whoever has it zips the files that are different and sends them to the other.",
-                            ask="Compare with ",
-                            note="Your friend needs the launcher open and has to accept. Comparing big games can take a few minutes.")
-    if uid is None:
-        return
-    row = next(r for r in rows if r[0] == uid)
-    name = row[1]
-    direction = _dg_pick_direction(self, title, row)
-    if direction is None:
-        return
-    w = _DgAskWorker(uid, name, title, root, self, direction)
-    feed = _dg_card(self, title, name)
-    _dg_feed_wire(w, feed)
-    w.done.connect(lambda reply, e: _dg_asked(self, name, title, reply, e, root, feed))
-    self.__dict__.setdefault("_dg_keep", []).append(w)
-    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
-    w.start()
-
-def _dg_mb(n):
-    return f"{n / (1024 * 1024):.1f} MB" if n < 1024 ** 3 else f"{n / 1024 ** 3:.2f} GB"
-
-def _dg_zip_here(self, name, title, root, reply, feed):
-    try:
-        man = _dg_unpack(reply.get("man") or "")
-    except Exception:
-        feed.failed.emit(f"{name}'s file list was unreadable.")
-        QMessageBox.warning(self, "Get different files", f"{name}'s file list was unreadable.")
-        return
-    w = _DgMakeWorker(title, root, man, str(reply.get("m") or "builtin"), self)
-    _dg_feed_wire(w, feed)
-    def finished(info, err):
-        if err == "cancelled":
-            feed.failed.emit("CANCELLED")
-            return
-        if err:
-            feed.failed.emit(err)
-            QMessageBox.warning(self, "Get different files", err)
-            return
-        path = info.get("path")
-        if not path:
-            feed.status_update.emit("Files are identical")
-            feed.finished.emit("")
-            QMessageBox.information(self, "Get different files", f"{name}'s {title} files are identical to yours.")
-            return
-        feed.status_update.emit(f"{info['zipped']} file(s), {_dg_mb(int(info.get('bytes') or 0))}. Send the zip to {name}")
-        feed.finished.emit(path)
-        _dg_reveal(path)
-        QMessageBox.information(self, "Get different files",
-                                f"Your {title} update is ready: {info['zipped']} "
-                                f"file(s) ({_dg_mb(int(info.get('bytes') or 0))}) in your NCZ outputs folder"
-                                f"{(', ' + str(info['deltas']) + ' of them as small patches') if info.get('deltas') else ''}. "
-                                f"Send it to {name}.")
-    w.done.connect(finished)
-    self.__dict__.setdefault("_dg_keep", []).append(w)
-    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
-    w.start()
-
-def _dg_asked(self, name, title, reply, err, root, feed):
-    if err == "cancelled":
-        feed.failed.emit("CANCELLED")
-        return
-    if err == "timeout":
-        feed.failed.emit(f"{name} didn't answer in time.")
-        QMessageBox.information(self, "Get different files", f"{name} didn't answer in time.")
-        return
-    if err:
-        feed.failed.emit(err)
-        QMessageBox.warning(self, "Get different files", err)
-        return
-    if not reply.get("accepted"):
-        why = {"not_installed": f"{name} doesn't have {title} installed in a place the launcher can find."}.get(
-            reply.get("reason"), f"{name} declined.")
-        feed.failed.emit(why)
-        QMessageBox.information(self, "Get different files", why)
-        return
-    if reply.get("direction") == "asker_newer":
-        _dg_zip_here(self, name, title, root, reply, feed)
-        return
-    n = int(reply.get("zipped") or 0)
-    if not n:
-        feed.status_update.emit("Files are identical")
-        feed.finished.emit("")
-        QMessageBox.information(self, "Get different files", f"{name}'s {title} files are identical to yours.")
-        return
-    feed.status_update.emit(f"{name} made a zip of {n} file(s), {_dg_mb(int(reply.get('bytes') or 0))}. Ask them to send it")
-    feed.finished.emit("")
-    QMessageBox.information(self, "Get different files",
-                            f"{name} made a zip with {n} file(s) ({_dg_mb(int(reply.get('bytes') or 0))}) that differ from "
-                            f"yours: {reply.get('changed', 0)} changed, {reply.get('new', 0)} new"
-                            f"{(', ' + str(reply['deltas']) + ' of them as small patches') if reply.get('deltas') else ''}. "
-                            f"It's in their NCZ outputs folder. Ask them to send it to you, then use 'Apply update zip...' "
-                            f"in the game's 3-dot menu.")
-
-# --- friend side: answers a diff request ---
-class _DgMakeWorker(QThread):
-    status = pyqtSignal(str, bool)
-    prog = pyqtSignal(object, object)
-    done = pyqtSignal(dict, str)
-
-    def __init__(self, title, root, man, tag, parent=None, decide=False, my_ver="", their_ver="", handoff=False):
-        super().__init__(parent)
-        self.handoff = handoff            # the asker has the update: send them this PC's manifest so they make the zip
-        self.title, self.root, self.man, self.tag = title, root, man, tag
-        self.decide, self.my_ver, self.their_ver = decide, my_ver, their_ver
-        self._cancel = False
-
-    def cancel(self):
-        self._cancel = True
-
-    def run(self):
-        try:
-            self.status.emit("Comparing files...", False)
-            cmp_ = _dg_compare(self.root, self.man, self.tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
-            if cmp_ is None:
-                self.done.emit({}, "cancelled")
-                return
-            info = {"changed": len(cmp_["differ"]), "new": len(cmp_["new"]), "removed": len(cmp_["removed"]),
-                    "same": cmp_["same"], "zipped": 0, "bytes": 0}
-            if (cmp_["differ"] or cmp_["new"] or cmp_["removed"]) and \
-                    (self.handoff or (self.decide and not _dg_mine_is_newer(cmp_, self.my_ver, self.their_ver))):
-                self.status.emit("Reading the rest of your files...", False)
-                mine = _dg_manifest(self.root, self.tag, lambda d, t: self.prog.emit(d, t), lambda: self._cancel,
-                                    cache=cmp_["sigs"])
-                if mine is None:
-                    self.done.emit({}, "cancelled")
-                    return
-                blob = _dg_pack_capped(mine)
-                if blob is None:
-                    self.done.emit({}, "This game has too many files to compare through the cloud.")
-                    return
-                info.update({"handoff": True, "man": blob, "m": self.tag})
-                self.done.emit(info, "")
-                return
-            if cmp_["differ"] or cmp_["new"]:
-                self.status.emit("Zipping the different files...", False)
-                path, size, failed = _dg_make_zip(self.title, cmp_, lambda d, t: self.prog.emit(d, t), lambda: self._cancel)
-                if path is None:
-                    self.done.emit({}, "cancelled")
-                    return
-                info.update({"zipped": len(cmp_["differ"]) + len(cmp_["new"]) - failed, "bytes": size, "path": path,
-                             "deltas": int(cmp_.get("n_delta") or 0)})
-            self.done.emit(info, "")
-        except Exception as e:
-            self.done.emit({}, str(e) or "Something went wrong.")
-
-def _dg_handle_request(self, uid, d):
-    shown = self.__dict__.setdefault("_dg_shown", set())
-    if uid in shown:
-        return
-    shown.add(uid)
-    game = str(d.get("game") or "a game")
-    def answer(accepted, info=None):
-        self._run(lambda: cloud_diff_answer(uid, game, accepted, info), lambda r, e: shown.discard(uid))
-    t = d.get("time")
-    if isinstance(t, (int, float)) and time.time() * 1000 - t > 15 * 60 * 1000:
-        answer(False)                                    # too old: the asker gave up long ago
-        return
-    name = self.friends.get(uid, {}).get("username") or d.get("username") or "A friend"
-    self.friend_event.emit(name, f"wants to compare {game} files", uid)
-    box = QMessageBox(self.window())
-    box.setWindowTitle("Compare game files")
-    if str(d.get("dir") or "get") == "send":
-        box.setText(f"{name} has the update for {game} and wants to send you the files.\n\nYour launcher will compare your "
-                    f"{game} files with theirs. Then {name}'s launcher zips the files that are different and they send you "
-                    f"the zip. Nothing is sent automatically. Continue?")
-    else:
-        box.setText(f"{name} says you have the update for {game} and wants your files.\n\nYour launcher will compare your "
-                    f"{game} files with theirs and zip the ones that are different into your NCZ outputs folder. Then you send "
-                    f"the zip to {name}. Nothing is sent automatically. Continue?")
-    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-    box.setDefaultButton(QMessageBox.StandardButton.No)
-    if box.exec() != QMessageBox.StandardButton.Yes:
-        answer(False)
-        return
-    root = _dg_find_dir(game)
-    if not root:
-        root = _dg_ask_folder(self.window(), game)       # can't locate it automatically: let them point at the folder
-    if not root:
-        answer(False, {"reason": "not_installed"})
-        return
-    req_tag, my_tag = str(d.get("m") or "builtin"), _dg_method()
-    if req_tag.startswith("librsync"):
-        answer(True, {"retry": "builtin", "zipped": 0})  # an older launcher used librsync signatures: ask it to resend the built-in kind
-        return
-    try:
-        man = _dg_unpack(d.get("man") or "")
-    except Exception:
-        answer(False, {"reason": "bad_manifest"})
-        return
-    w = _DgMakeWorker(game, root, man, req_tag, self, handoff=(str(d.get("dir") or "get") == "send"))
-    feed = _dg_card(self.window(), game, name)
-    _dg_feed_wire(w, feed)
-    def finished(info, err):
-        if err == "cancelled":
-            feed.failed.emit("CANCELLED")
-            answer(False)
-            return
-        if err:
-            feed.failed.emit(err)
-            QMessageBox.warning(self.window(), "Compare game files", err)
-            answer(False, {"reason": "error"})
-            return
-        if info.get("handoff"):
-            answer(True, {"direction": "asker_newer", "man": info["man"], "m": info["m"], "changed": info["changed"],
-                          "new": info["new"], "zipped": 0})
-            feed.status_update.emit(f"{name} has the update and makes the zip")
-            feed.finished.emit("")
-            QMessageBox.information(self.window(), "Compare game files",
-                                    f"{name} has the update for {game}, so their launcher will make the zip and send it to you.")
-            return
-        path = info.pop("path", None)
-        answer(True, info)
-        if path:
-            feed.status_update.emit(f"{info['zipped']} file(s), {_dg_mb(int(info.get('bytes') or 0))}. Send the zip to {name}")
-            feed.finished.emit(path)
-            _dg_reveal(path)
-            QMessageBox.information(self.window(), "Compare game files",
-                                    f"Done. {info['zipped']} file(s) went into a zip in your NCZ outputs folder"
-                                    f"{(' (' + str(info['deltas']) + ' as small patches)') if info.get('deltas') else ''}. "
-                                    f"Send it to {name}.")
-        else:
-            feed.status_update.emit("Files are identical")
-            feed.finished.emit("")
-            QMessageBox.information(self.window(), "Compare game files", f"{name}'s files are identical to yours.")
-    w.done.connect(finished)
-    self.__dict__.setdefault("_dg_keep", []).append(w)
-    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
-    w.start()
-
-class _DgApplyWorker(QThread):
-    status = pyqtSignal(str, bool)
-    prog = pyqtSignal(object, object)
-    done = pyqtSignal(dict, str)
-
-    def __init__(self, zip_path, root, parent=None):
-        super().__init__(parent)
-        self.zip_path, self.root, self._cancel = zip_path, root, False
-
-    def cancel(self):
-        self._cancel = True
-
-    def run(self):
-        try:
-            self.status.emit("Installing the update files...", False)
-            nfull, npatch, problems = _dg_apply_zip(self.zip_path, self.root, lambda d, t: self.prog.emit(d, t),
-                                                    lambda: self._cancel)
-            self.done.emit({"full": nfull, "patched": npatch, "problems": problems}, "")
-        except _DgCancelled:
-            self.done.emit({}, "cancelled")
-        except Exception as e:
-            self.done.emit({}, str(e) or "Something went wrong.")
-
-def _dg_apply_begin(self, title):
-    """3-dot menu > Apply update zip...: installs a zip made by 'Get different files' into this game's folder."""
-    start = _dg_outputs_dir()
-    zp, _f = QFileDialog.getOpenFileName(self, f"Pick the {title} update zip", start, "Zip files (*.zip)")
-    if not zp:
-        return
-    try:
-        with _dg_zipfile.ZipFile(zp) as zf:
-            ok = _DG_META in zf.namelist() or "_ncz_file_list.txt" in zf.namelist()
-            meta = json.loads(zf.read(_DG_META).decode("utf-8")) if _DG_META in zf.namelist() else {}
-    except Exception:
-        ok, meta = False, {}
-    if not ok:
-        QMessageBox.warning(self, "Apply update zip", "That zip wasn't made by 'Get different files'.")
-        return
-    if meta.get("title") and _dg_norm(meta["title"]) != _dg_norm(title):
-        ans = QMessageBox.question(self, "Apply update zip",
-                                   f"This zip is for \"{meta['title']}\", not {title}. Install it into {title} anyway?")
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-    root = _dg_find_dir(title) or _dg_ask_folder(self, title)
-    if not root:
-        return
-    n_full, n_delta = len(meta.get("full") or []), len(meta.get("delta") or [])
-    ans = QMessageBox.question(self, "Apply update zip",
-                               f"Install this update into:\n{root}\n\n"
-                               f"{n_full if meta else 'The'} whole file(s) get replaced"
-                               f"{(' and ' + str(n_delta) + ' file(s) get patched') if n_delta else ''}. Patched files are checked "
-                               f"before they replace yours. Close the game first. Continue?")
-    if ans != QMessageBox.StandardButton.Yes:
-        return
-    w = _DgApplyWorker(zp, root, self)
-    feed = _dg_card(self.window(), title, "the update zip", "Applying update files")
-    _dg_feed_wire(w, feed)
-
-    def finished(info, err):
-        if err == "cancelled":
-            feed.failed.emit("CANCELLED")
-            return
-        if err:
-            feed.failed.emit(err)
-            QMessageBox.warning(self, "Apply update zip", err)
-            return
-        probs = info.get("problems") or []
-        feed.status_update.emit(f"{info['full']} copied, {info['patched']} patched" + (f", {len(probs)} problem(s)" if probs else ""))
-        feed.finished.emit("")
-        msg = f"Done. {info['full']} file(s) copied and {info['patched']} patched."
-        if probs:
-            msg += "\n\nThese could not be installed (your old files for them were left untouched):\n" + "\n".join(probs[:12])
-            if len(probs) > 12:
-                msg += f"\n...and {len(probs) - 12} more"
-            QMessageBox.warning(self, "Apply update zip", msg)
-        else:
-            QMessageBox.information(self, "Apply update zip", msg)
-    w.done.connect(finished)
-    self.__dict__.setdefault("_dg_keep", []).append(w)
-    w.finished.connect(lambda w=w: self._dg_keep.remove(w) if w in self._dg_keep else None)
-    w.start()
-
-_dg_prev_modshare = FriendsPage._on_modshare_requests
-
-def _dg_on_modshare_requests(self, res, err):
-    if err or not res:
-        return _dg_prev_modshare(self, res, err)
-    diff = {u: d for u, d in res.items() if isinstance(d, dict) and d.get("kind") == "diff"}
-    _dg_prev_modshare(self, {u: d for u, d in res.items() if u not in diff}, err)
-    for u, d in diff.items():
-        _dg_handle_request(self, u, d)
-
-FriendsPage._on_modshare_requests = _dg_on_modshare_requests
-
-# --- the 3-dot menu entry ---
-_dg_prev_decorate = _lb_decorate
-
-def _dg_decorate(self, card, title):
-    _dg_prev_decorate(self, card, title)
-    if card.property("_dg_more") is not None:
-        return
-    card.setProperty("_dg_more", True)
-    try:
-        more = card.findChild(QPushButton, "MoreButton")
-        menu = more.menu() if more is not None else None
-        if menu is None:
-            return
-        act = menu.addAction("Get different files...")
-        act.triggered.connect(lambda _c=False: _dg_begin(self, title))
-        act2 = menu.addAction("Apply update zip...")
-        act2.triggered.connect(lambda _c=False: _dg_apply_begin(self, title))
-    except Exception:
-        _log_exc("_dg_decorate")
-
-_lb_decorate = _dg_decorate
 
 
 if __name__ == "__main__":
