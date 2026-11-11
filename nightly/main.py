@@ -396,7 +396,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
     QAbstractItemView, QTabWidget
 )
-from PyQt6.QtCore import QDate, QDateTime, QTime, QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import QEvent, QDate, QDateTime, QTime, QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
     import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
@@ -940,8 +940,8 @@ def _load_launcher_settings_file():
                     settings["dark_mode"] = mode
                 if loaded.get("wine_d3d") in ("default", "wined3d", "dxvk", "dxvk_vkd3d"):
                     settings["wine_d3d"] = loaded["wine_d3d"]
-                if loaded.get("currency") in ("EGP", "QAR", "USD", "SAR", "AED", "EUR"):
-                    settings["currency"] = loaded["currency"]
+                if isinstance(loaded.get("currency"), str) and re.fullmatch(r"[A-Z]{3}", loaded["currency"]):
+                    settings["currency"] = loaded["currency"]       # any currency from the list (CURRENCIES is defined later)
                 if loaded.get("library_sort") in ("custom", "az"):
                     settings["library_sort"] = loaded["library_sort"]
                 if isinstance(loaded.get("install_dir"), str):
@@ -1465,7 +1465,7 @@ COUNTRIES = dict(x.split(":", 1) for x in (
     "CY:Cyprus|CZ:Czechia|DK:Denmark|DJ:Djibouti|DM:Dominica|DO:Dominican Republic|EC:Ecuador|EG:Egypt|"
     "SV:El Salvador|GQ:Equatorial Guinea|ER:Eritrea|EE:Estonia|SZ:Eswatini|ET:Ethiopia|FJ:Fiji|FI:Finland|FR:France|"
     "GA:Gabon|GM:Gambia|GE:Georgia|DE:Germany|GH:Ghana|GR:Greece|GD:Grenada|GT:Guatemala|GN:Guinea|GW:Guinea-Bissau|"
-    "GY:Guyana|HT:Haiti|HN:Honduras|HU:Hungary|IS:Iceland|IN:India|ID:Indonesia|IR:Iran|IQ:Iraq|IE:Ireland|IT:Italy|"
+    "GY:Guyana|HT:Haiti|HN:Honduras|HU:Hungary|IS:Iceland|IN:India|ID:Indonesia|IR:Iran|IQ:Iraq|IE:Ireland|IL:Israel|IT:Italy|"
     "JM:Jamaica|JP:Japan|JO:Jordan|KZ:Kazakhstan|KE:Kenya|KI:Kiribati|XK:Kosovo|KW:Kuwait|KG:Kyrgyzstan|LA:Laos|"
     "LV:Latvia|LB:Lebanon|LS:Lesotho|LR:Liberia|LY:Libya|LI:Liechtenstein|LT:Lithuania|LU:Luxembourg|MG:Madagascar|"
     "MW:Malawi|MY:Malaysia|MV:Maldives|ML:Mali|MT:Malta|MH:Marshall Islands|MR:Mauritania|MU:Mauritius|MX:Mexico|"
@@ -1486,6 +1486,42 @@ QATAR_FLAG_URL = ("https://thumb.wikimedia.org/wikipedia/commons/thumb/3/3e/Flag
                   "3840px-Flag_of_Qatar_%283-2%29.svg.png?utm_source=commons.wikimedia.org"
                   "&utm_campaign=index&utm_content=thumbnail")
 FLAG_URL_OVERRIDES = {"QA": QATAR_FLAG_URL, "QAR": QATAR_FLAG_URL}   # country / currency code -> exact image URL
+
+# Flags drawn in code (no download): the white stripe is a soft grey so it doesn't glare on the dark UI.
+# Plain 3:2 rectangles - round_flag_pixmap adds the rounded corners and outline afterwards.
+_FLAG_WHITE = "#D9D9D9"
+DRAWN_FLAGS = {"AE", "PS"}
+
+def _draw_flag_file(code, path):
+    """Paints the UAE / Palestine flag (480x320, 3:2) and saves it as a PNG. True on success."""
+    W, H = 480, 320
+    img = QImage(W, H, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    try:
+        p.setPen(Qt.PenStyle.NoPen)
+        third = H / 3.0
+        if code == "AE":
+            stripes = ("#00732F", _FLAG_WHITE, "#000000")
+        else:   # PS
+            stripes = ("#000000", _FLAG_WHITE, "#009736")
+        for i, col in enumerate(stripes):
+            p.setBrush(QColor(col))
+            p.drawRect(QRectF(0, i * third, W, third + 1))
+        p.setBrush(QColor("#EF3340" if code == "AE" else "#EE2A35"))
+        if code == "AE":
+            p.drawRect(QRectF(0, 0, W / 4.0, H))
+        else:
+            tri = QPainterPath()
+            tri.moveTo(0, 0)
+            tri.lineTo(W / 2.0, H / 2.0)
+            tri.lineTo(0, H)
+            tri.closeSubpath()
+            p.drawPath(tri)
+    finally:
+        p.end()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return img.save(path, "PNG")
 
 def _fetch_flag_override(code, path):
     """Downloads the override flag, shrinks it (the source is 3840 px wide) and caches it. True on success."""
@@ -1515,7 +1551,7 @@ def _fetch_flag_override(code, path):
     return img.save(path, "PNG")
 
 def _country_flag_path(code):
-    suffix = "_custom2" if code in FLAG_URL_OVERRIDES else ""
+    suffix = "_custom2" if code in FLAG_URL_OVERRIDES else ("_drawn1" if code in DRAWN_FLAGS else "")
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "flags", f"country_{code}{suffix}.png")
 
 def get_country_flag_file(code):
@@ -1526,6 +1562,13 @@ def get_country_flag_file(code):
     path = _country_flag_path(code)
     if os.path.exists(path) and os.path.getsize(path) > 100:
         return path
+    if code in DRAWN_FLAGS:
+        try:
+            if _draw_flag_file(code, path):
+                return path
+        except Exception:
+            _log_exc("get_country_flag_file drawn")
+        return ""
     if code in FLAG_URL_OVERRIDES:
         try:
             if _fetch_flag_override(code, path):
@@ -1544,6 +1587,112 @@ def get_country_flag_file(code):
     except Exception:    # expected: offline or the server did not answer
         pass
     return ""
+
+# ── a country flag to the left of a username (the country on that person's profile) ──
+# _set_name_flag(label, name, code) paints "<flag> name" at once when the flag is already cached; otherwise the flag is
+# downloaded in the background (never on the GUI thread) and the label is repainted when it arrives.
+class _FlagBridge(QObject):
+    call = pyqtSignal(object)
+
+_flag_bridge = None
+_flag_waiters = {}          # code -> repaint callbacks waiting for that download
+_flag_failed = {}           # code -> time.time() before which a failed download is not retried
+def _flag_img_html(code, h=14):
+    """The flag drawn exactly like the Store's currency flags (round_flag_pixmap: whole 3:2 flag, rounded corners, thin
+    outline, crisp on HiDPI), as an <img> a label can hold. '' when the code is unknown or the flag isn't downloaded yet."""
+    code = str(code or "").upper()
+    if code not in COUNTRIES:
+        return ""
+    src = _country_flag_path(code)
+    try:
+        if not (os.path.exists(src) and os.path.getsize(src) > 100):
+            return ""
+        dpr = _screen_dpr()
+        png = os.path.join(os.path.dirname(src), f"round_{os.path.splitext(os.path.basename(src))[0]}_{h}_{int(round(dpr * 100))}.png")
+        if not (os.path.exists(png) and os.path.getmtime(png) >= os.path.getmtime(src)):
+            pix = round_flag_pixmap(src, h)
+            if pix is None or not pix.save(png, "PNG"):
+                return ""
+    except Exception:
+        return ""
+    return (f'<img src="{QUrl.fromLocalFile(png).toString()}" width="{int(round(h * 1.5))}" height="{h}" '
+            f'style="vertical-align:middle">&nbsp;&nbsp;')
+
+def _flag_fetch_async(code, repaint):
+    global _flag_bridge
+    if time.time() < _flag_failed.get(code, 0):
+        return
+    if _flag_bridge is None:
+        _flag_bridge = _FlagBridge()
+        _flag_bridge.call.connect(lambda fn: fn())
+    waiting = _flag_waiters.get(code)
+    if waiting is not None:
+        waiting.append(repaint)
+        return
+    _flag_waiters[code] = [repaint]
+    def work():
+        try:
+            ok = bool(get_country_flag_file(code))
+        except Exception:
+            ok = False
+        if not ok:
+            _flag_failed[code] = time.time() + 300
+        def done():
+            for fn in _flag_waiters.pop(code, []):
+                try:
+                    fn()
+                except RuntimeError:        # the label was deleted in the meantime
+                    pass
+                except Exception:
+                    _log_exc("flag repaint")
+        _flag_bridge.call.emit(done)
+    threading.Thread(target=work, daemon=True).start()
+
+def _client_img_html(kind, h=14):
+    """Little phone ("mobile") / globe ("web") symbol after a name, as an <img> with a leading gap. It is drawn by
+    overlay.client_icon_pixmap (the same symbol the toasts use) and cached as a PNG. '' when there is none."""
+    if kind not in ("mobile", "web"):
+        return ""
+    try:
+        from overlay import client_icon_pixmap    # lazy; an older overlay.py without it just shows no symbol
+        dpr = _screen_dpr()
+        png = os.path.join(os.path.dirname(get_launcher_settings_path()), "flags",
+                           f"client_v1_{kind}_{h}_{int(round(dpr * 100))}.png")
+        if not (os.path.exists(png) and os.path.getsize(png) > 0):
+            os.makedirs(os.path.dirname(png), exist_ok=True)
+            if not client_icon_pixmap(kind, h, "#9aa0a6", dpr).save(png, "PNG"):
+                return ""
+    except Exception:
+        return ""
+    return (f'&nbsp;&nbsp;<img src="{QUrl.fromLocalFile(png).toString()}" width="{h}" height="{h}" '
+            f'style="vertical-align:middle">')
+
+def _set_name_flag(label, name, code, h=14, client=None):
+    """Sets `label` to the flag of country `code` followed by `name` (just the name when there is no country), then a
+    phone / globe symbol when `client` is "mobile" / "web" (that person is online on the phone app / the website)."""
+    name = str(name or "")
+    code = str(code or "").upper()
+    tail = _client_img_html(client, h) if client else ""
+    def plain():
+        if tail:
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(html_lib.escape(name) + tail)
+        else:
+            label.setTextFormat(Qt.TextFormat.AutoText)
+            label.setText(name)
+    if code not in COUNTRIES:
+        plain()
+        return
+    def paint():
+        img = _flag_img_html(code, h)
+        if img:
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(img + html_lib.escape(name) + tail)
+        else:
+            plain()
+    paint()
+    if not _flag_img_html(code, h):
+        _flag_fetch_async(code, paint)
 
 # ── country auto-detected from the IP address when the account has none (never overrides your own choice)
 _country_auto_state = {"uid": None, "next": 0.0}
@@ -3429,6 +3578,20 @@ class SettingsPage(QWidget):
         title = QLabel("Settings")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
+        layout.addSpacing(14)
+        self._set_search = QLineEdit()
+        self._set_search.setObjectName("Search")
+        self._set_search.setPlaceholderText("Search settings")
+        self._set_search.setClearButtonEnabled(True)
+        self._set_search.setFixedHeight(36)
+        self._set_search.setProperty("ncz_settings_search", True)
+        self._set_search.textChanged.connect(lambda _t: _ncz_search_apply(self))
+        layout.addWidget(self._set_search)
+        self._set_search_empty = QLabel("No settings match your search.")
+        self._set_search_empty.setObjectName("RowDesc")
+        self._set_search_empty.setProperty("ncz_settings_search_empty", True)
+        self._set_search_empty.hide()
+        layout.addWidget(self._set_search_empty)
         layout.addSpacing(22)
 
         panel = QFrame()
@@ -3656,13 +3819,9 @@ class SettingsPage(QWidget):
         cur_desc.setObjectName("RowDesc")
         cur_text.addWidget(cur_name)
         cur_text.addWidget(cur_desc)
-        self.currency_combo = QComboBox()
-        self.currency_combo.setFixedWidth(200)
-        for code, label in CURRENCIES.items():
-            self.currency_combo.addItem(label, code)
-        idx = self.currency_combo.findData(load_launcher_settings().get("currency", "EGP"))
-        self.currency_combo.setCurrentIndex(max(idx, 0))
-        self.currency_combo.currentIndexChanged.connect(self.on_currency_changed)
+        self.currency_combo = CurrencyPickerButton(load_launcher_settings().get("currency", "EGP"))
+        self.currency_combo.setFixedWidth(260)
+        self.currency_combo.changed.connect(self.on_currency_changed)
         cur_row.addLayout(cur_text, 1)
         cur_row.addWidget(self.currency_combo)
         cur_panel_layout.addLayout(cur_row)
@@ -5508,10 +5667,55 @@ def fetch_steam_description(appid):
     return html_lib.unescape(re.sub(r"<[^>]+>", " ", text)).strip()
 
 # Steam only sells in a few currencies (no EGP), so prices are fetched in USD and converted.
-CURRENCIES = {"EGP": "Egyptian Pound (EGP)", "QAR": "Qatari Riyal (QAR)",
-              "USD": "US Dollar (USD)", "SAR": "Saudi Riyal (SAR)",
-              "AED": "Emirati Dirham (AED)", "EUR": "Euro (EUR)"}
-FALLBACK_RATES = {"USD": 1.0, "EGP": 48.0, "QAR": 3.64, "SAR": 3.75, "AED": 3.6725, "EUR": 0.92}
+# CODE:Name:Plural (blank = Name + "s"):flag country code. Every currency open.er-api.com publishes a rate for.
+_CURRENCY_TABLE = """AED:Emirati Dirham::AE|AFN:Afghan Afghani::AF|ALL:Albanian Lek:Albanian Leke:AL|AMD:Armenian Dram::AM|
+ANG:Netherlands Antillean Guilder::CW|AOA:Angolan Kwanza::AO|ARS:Argentine Peso::AR|AUD:Australian Dollar::AU|
+AWG:Aruban Florin::AW|AZN:Azerbaijani Manat::AZ|BAM:Bosnia-Herzegovina Convertible Mark::BA|BBD:Barbadian Dollar::BB|
+BDT:Bangladeshi Taka:Bangladeshi Taka:BD|BGN:Bulgarian Lev:Bulgarian Leva:BG|BHD:Bahraini Dinar::BH|BIF:Burundian Franc::BI|
+BMD:Bermudian Dollar::BM|BND:Brunei Dollar::BN|BOB:Bolivian Boliviano::BO|BRL:Brazilian Real:Brazilian Reais:BR|
+BSD:Bahamian Dollar::BS|BTN:Bhutanese Ngultrum::BT|BWP:Botswana Pula:Botswana Pula:BW|BYN:Belarusian Ruble::BY|
+BZD:Belize Dollar::BZ|CAD:Canadian Dollar::CA|CDF:Congolese Franc::CD|CHF:Swiss Franc::CH|CLP:Chilean Peso::CL|
+CNY:Chinese Yuan:Chinese Yuan:CN|COP:Colombian Peso::CO|CRC:Costa Rican Colon::CR|CUP:Cuban Peso::CU|
+CVE:Cape Verdean Escudo::CV|CZK:Czech Koruna:Czech Koruny:CZ|DJF:Djiboutian Franc::DJ|DKK:Danish Krone:Danish Kroner:DK|
+DOP:Dominican Peso::DO|DZD:Algerian Dinar::DZ|EGP:Egyptian Pound::EG|ERN:Eritrean Nakfa::ER|ETB:Ethiopian Birr::ET|
+EUR:Euro:Euros:EU|FJD:Fijian Dollar::FJ|FKP:Falkland Islands Pound::FK|GBP:British Pound::GB|GEL:Georgian Lari::GE|
+GHS:Ghanaian Cedi::GH|GIP:Gibraltar Pound::GI|GMD:Gambian Dalasi::GM|GNF:Guinean Franc::GN|GTQ:Guatemalan Quetzal::GT|
+GYD:Guyanese Dollar::GY|HKD:Hong Kong Dollar::HK|HNL:Honduran Lempira::HN|HTG:Haitian Gourde::HT|
+HUF:Hungarian Forint:Hungarian Forint:HU|IDR:Indonesian Rupiah:Indonesian Rupiah:ID|ILS:Israeli New Shekel::IL|
+INR:Indian Rupee::IN|IQD:Iraqi Dinar::IQ|IRR:Iranian Rial::IR|ISK:Icelandic Krona:Icelandic Kronur:IS|
+JMD:Jamaican Dollar::JM|JOD:Jordanian Dinar::JO|JPY:Japanese Yen:Japanese Yen:JP|KES:Kenyan Shilling::KE|
+KGS:Kyrgyzstani Som:Kyrgyzstani Som:KG|KHR:Cambodian Riel::KH|KMF:Comorian Franc::KM|KPW:North Korean Won:North Korean Won:KP|
+KRW:South Korean Won:South Korean Won:KR|KWD:Kuwaiti Dinar::KW|KYD:Cayman Islands Dollar::KY|KZT:Kazakhstani Tenge:Kazakhstani Tenge:KZ|
+LAK:Lao Kip:Lao Kip:LA|LBP:Lebanese Pound::LB|LKR:Sri Lankan Rupee::LK|LRD:Liberian Dollar::LR|LSL:Lesotho Loti:Lesotho Maloti:LS|
+LYD:Libyan Dinar::LY|MAD:Moroccan Dirham::MA|MDL:Moldovan Leu:Moldovan Lei:MD|MGA:Malagasy Ariary:Malagasy Ariary:MG|
+MKD:Macedonian Denar::MK|MMK:Myanmar Kyat::MM|MNT:Mongolian Tugrik::MN|MOP:Macanese Pataca::MO|MRU:Mauritanian Ouguiya::MR|
+MUR:Mauritian Rupee::MU|MVR:Maldivian Rufiyaa::MV|MWK:Malawian Kwacha:Malawian Kwacha:MW|MXN:Mexican Peso::MX|
+MYR:Malaysian Ringgit:Malaysian Ringgit:MY|MZN:Mozambican Metical::MZ|NAD:Namibian Dollar::NA|NGN:Nigerian Naira:Nigerian Naira:NG|
+NIO:Nicaraguan Cordoba::NI|NOK:Norwegian Krone:Norwegian Kroner:NO|NPR:Nepalese Rupee::NP|NZD:New Zealand Dollar::NZ|
+OMR:Omani Rial::OM|PAB:Panamanian Balboa::PA|PEN:Peruvian Sol::PE|PGK:Papua New Guinean Kina:Papua New Guinean Kina:PG|
+PHP:Philippine Peso::PH|PKR:Pakistani Rupee::PK|PLN:Polish Zloty::PL|PYG:Paraguayan Guarani::PY|QAR:Qatari Riyal::QA|
+RON:Romanian Leu:Romanian Lei:RO|RSD:Serbian Dinar::RS|RUB:Russian Ruble::RU|RWF:Rwandan Franc::RW|SAR:Saudi Riyal::SA|
+SBD:Solomon Islands Dollar::SB|SCR:Seychellois Rupee::SC|SDG:Sudanese Pound::SD|SEK:Swedish Krona:Swedish Kronor:SE|
+SGD:Singapore Dollar::SG|SHP:Saint Helena Pound::SH|SLE:Sierra Leonean Leone::SL|SOS:Somali Shilling::SO|
+SRD:Surinamese Dollar::SR|SSP:South Sudanese Pound::SS|STN:Sao Tome and Principe Dobra::ST|SYP:Syrian Pound::SY|
+SZL:Swazi Lilangeni:Swazi Emalangeni:SZ|THB:Thai Baht:Thai Baht:TH|TJS:Tajikistani Somoni::TJ|TMT:Turkmenistani Manat::TM|
+TND:Tunisian Dinar::TN|TOP:Tongan Paanga:Tongan Paanga:TO|TRY:Turkish Lira:Turkish Lira:TR|TTD:Trinidad and Tobago Dollar::TT|
+TWD:New Taiwan Dollar::TW|TZS:Tanzanian Shilling::TZ|UAH:Ukrainian Hryvnia::UA|UGX:Ugandan Shilling::UG|USD:US Dollar::US|
+UYU:Uruguayan Peso::UY|UZS:Uzbekistani Som:Uzbekistani Som:UZ|VES:Venezuelan Bolivar::VE|VND:Vietnamese Dong:Vietnamese Dong:VN|
+VUV:Vanuatu Vatu:Vanuatu Vatu:VU|WST:Samoan Tala:Samoan Tala:WS|XAF:Central African CFA Franc::CM|XCD:East Caribbean Dollar::AG|
+XOF:West African CFA Franc::SN|XPF:CFP Franc::PF|YER:Yemeni Rial::YE|ZAR:South African Rand:South African Rand:ZA|
+ZMW:Zambian Kwacha:Zambian Kwacha:ZM|ZWL:Zimbabwean Dollar::ZW""".replace("\n", "")
+
+_CURRENCY_ROWS = [r.split(":") for r in _CURRENCY_TABLE.split("|")]
+CURRENCIES = {c: f"{n} ({c})" for c, n, _pl, _cc in sorted(_CURRENCY_ROWS, key=lambda r: r[1].lower())}
+_CURRENCY_FLAG_CC = {c: cc for c, _n, _pl, cc in _CURRENCY_ROWS}      # currency -> country code for its flag (flagcdn)
+FALLBACK_RATES = {"USD": 1.0, "EGP": 48.0, "QAR": 3.64, "SAR": 3.75, "AED": 3.6725, "EUR": 0.92,
+                  "GBP": 0.79, "ILS": 3.7, "TRY": 34.0, "INR": 84.0, "JPY": 150.0, "CAD": 1.37, "AUD": 1.52,
+                  "CHF": 0.88, "CNY": 7.2, "BRL": 5.6, "MXN": 19.5, "KWD": 0.307, "BHD": 0.376, "OMR": 0.385,
+                  "JOD": 0.709, "RUB": 95.0, "PLN": 4.0, "KRW": 1380.0}
+_ZERO_DECIMAL = {"EGP", "JPY", "KRW", "VND", "IDR", "CLP", "PYG", "UGX", "RWF", "KMF", "XAF", "XOF", "XPF", "GNF",
+                 "BIF", "DJF", "IRR", "IQD", "LBP", "LAK", "MGA", "MMK", "SOS", "TZS", "UZS", "VUV", "HUF", "COP",
+                 "KHR", "MNT", "SYP", "YER", "KPW", "ISK"}
 _rates_cache = {"time": 0, "rates": dict(FALLBACK_RATES)}
 
 def get_usd_rates():
@@ -5521,24 +5725,28 @@ def get_usd_rates():
     try:
         data = json.loads(_http_get("https://open.er-api.com/v6/latest/USD", timeout=8).decode("utf-8"))
         live = data.get("rates") or {}
-        rates = {c: float(live.get(c) or FALLBACK_RATES[c]) for c in CURRENCIES}
+        rates = {}
+        for c in CURRENCIES:
+            r = live.get(c) or _rates_cache["rates"].get(c) or FALLBACK_RATES.get(c)
+            if r:
+                rates[c] = float(r)
         _rates_cache.update(time=time.time(), rates=rates)
     except Exception:    # expected: offline or the server did not answer
         pass
     return _rates_cache["rates"]
 
-CURRENCY_NAMES = {   # code -> (singular, plural)
-    "EGP": ("Egyptian Pound", "Egyptian Pounds"), "QAR": ("Qatari Riyal", "Qatari Riyals"),
-    "USD": ("US Dollar", "US Dollars"), "SAR": ("Saudi Riyal", "Saudi Riyals"),
-    "AED": ("Emirati Dirham", "Emirati Dirhams"), "EUR": ("Euro", "Euros"),
-}
+CURRENCY_NAMES = {c: (n, pl or n + "s") for c, n, pl, _cc in _CURRENCY_ROWS}    # code -> (singular, plural)
+
+def _currency_amount_text(amount, currency):
+    text = f"{amount:,.0f}" if currency in _ZERO_DECIMAL else f"{amount:,.2f}"
+    return text[:-3] if text.endswith(".00") else text
 
 def format_price(usd, currency):
     """'250 Qatari Riyals' - the exact converted amount with the full currency name."""
-    amount = usd if currency == "USD" else usd * get_usd_rates().get(currency, FALLBACK_RATES[currency])
-    text = f"{amount:,.0f}" if currency == "EGP" else f"{amount:,.2f}"
-    if "." in text and text.endswith(".00"):
-        text = text[:-3]
+    rate = 1.0 if currency == "USD" else get_usd_rates().get(currency) or FALLBACK_RATES.get(currency)
+    if not rate:                                   # no rate known (offline, rare currency): show the USD price
+        return f"{_currency_amount_text(usd, 'USD')} US Dollars"
+    text = _currency_amount_text(usd * rate, currency)
     singular, plural = CURRENCY_NAMES.get(currency, (currency, currency))
     return f"{text} {singular if text == '1' else plural}"
 
@@ -5546,6 +5754,157 @@ FLAG_WIKI_FILES = {   # currency -> Wikipedia / Wikimedia Commons flag file
     "EGP": "Flag_of_Egypt.svg", "QAR": "Flag_of_Qatar.svg", "USD": "Flag_of_the_United_States.svg",
     "SAR": "Flag_of_Saudi_Arabia.svg", "AED": "Flag_of_the_United_Arab_Emirates.svg", "EUR": "Flag_of_Europe.svg",
 }
+
+
+class _CurFlagSignals(QObject):
+    flag = pyqtSignal(str, str)          # currency code, flag file
+
+
+class CurrencyDialog(QDialog):
+    """Every currency in a list with a search bar (matches the name or the code)."""
+    def __init__(self, parent=None, current=""):
+        super().__init__(parent)
+        self.setWindowTitle("Currency")
+        self.resize(380, 520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 16)
+        lay.setSpacing(10)
+        hint = QLabel("Store prices are converted from USD, so they're approximate.")
+        hint.setWordWrap(True)
+        hint.setObjectName("RowDesc")
+        lay.addWidget(hint)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search currencies (name or code)")
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search)
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(30, 20))
+        blank = QPixmap(30, 20)
+        blank.fill(Qt.GlobalColor.transparent)
+        blank_icon = QIcon(blank)                      # keeps the names aligned until a flag arrives
+        self._items, self._closed, todo = {}, False, []
+        for code, label in CURRENCIES.items():
+            it = QListWidgetItem(blank_icon, label)
+            it.setData(Qt.ItemDataRole.UserRole, code)
+            self.list.addItem(it)
+            self._items[code] = it
+            if code == current:
+                self.list.setCurrentItem(it)
+            fp = _flag_cache_path(code)
+            if os.path.exists(fp) and os.path.getsize(fp) > 100:
+                self._set_flag(code, fp)               # already downloaded
+            else:
+                todo.append(code)
+        if self.list.currentItem() is None:
+            self.list.setCurrentRow(0)
+        self.list.scrollToItem(self.list.currentItem())
+        lay.addWidget(self.list, 1)
+        self._sig = _CurFlagSignals(self)
+        self._sig.flag.connect(self._set_flag)
+        if todo:                                       # the rest download on worker threads, then pop in
+            pool = ThreadPoolExecutor(max_workers=6)
+            for code in todo:
+                pool.submit(self._fetch_flag, code)
+            pool.shutdown(wait=False)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Select")
+        save.setObjectName("Primary")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+        self.search.textChanged.connect(self._filter)
+        self.search.returnPressed.connect(self._pick_first)
+        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
+        self.search.setFocus()
+
+    def _fetch_flag(self, code):
+        try:
+            path = get_flag_file(code)
+            if path and not self._closed:
+                self._sig.flag.emit(code, path)
+        except RuntimeError:    # expected: the dialog was closed while this was downloading
+            pass
+        except Exception:
+            pass
+
+    def _set_flag(self, code, path):
+        it = self._items.get(code)
+        pm = round_flag_pixmap(path, 20) if it is not None else None
+        if pm is not None:
+            it.setIcon(QIcon(pm))
+
+    def done(self, r):
+        self._closed = True
+        super().done(r)
+
+    def _filter(self, text):
+        words = text.strip().lower().split()
+        first = None
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            hay = it.text().lower()
+            hide = bool(words) and not all(w in hay for w in words)
+            it.setHidden(hide)
+            if not hide and first is None:
+                first = it
+        cur = self.list.currentItem()
+        if first is not None and (cur is None or cur.isHidden()):
+            self.list.setCurrentItem(first)
+
+    def _pick_first(self):
+        cur = self.list.currentItem()
+        if cur is not None and not cur.isHidden():
+            self.accept()
+
+    def code(self):
+        it = self.list.currentItem()
+        return str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
+
+
+class CurrencyPickerButton(QPushButton):
+    """Looks like the old drop-down; opens CurrencyDialog. Same currentData() as the combo it replaces."""
+    changed = pyqtSignal()
+
+    def __init__(self, code="EGP", parent=None):
+        super().__init__(parent)
+        self._code = code if code in CURRENCIES else "EGP"
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("QPushButton { text-align: left; padding-left: 12px; padding-right: 12px; }")
+        self.clicked.connect(self._pick)
+        self._refresh()
+
+    def currentData(self):
+        return self._code
+
+    def _refresh(self):
+        label = CURRENCIES.get(self._code, self._code)
+        self.setToolTip(label)
+        fp = _flag_cache_path(self._code)
+        if os.path.exists(fp) and os.path.getsize(fp) > 100:
+            pm = round_flag_pixmap(fp, 16)
+            if pm is not None:
+                self.setIcon(QIcon(pm))
+                self.setIconSize(QSize(24, 16))
+        self.setText(QFontMetrics(self.font()).elidedText(label, Qt.TextElideMode.ElideRight, max(40, self.width() - 70)) + "  \u25be")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._refresh()
+
+    def _pick(self):
+        dlg = CurrencyDialog(self.window(), self._code)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            code = dlg.code()
+            if code and code != self._code:
+                self._code = code
+                self._refresh()
+                self.changed.emit()
+
 
 def _flag_cache_path(code):
     suffix = "_custom2" if code in FLAG_URL_OVERRIDES else ""
@@ -5555,6 +5914,22 @@ def get_flag_file(code):
     """Official flag from Wikimedia Commons (rendered as a PNG), downloaded once and cached. '' if unavailable."""
     name = FLAG_WIKI_FILES.get(code)
     if not name:
+        cc = _CURRENCY_FLAG_CC.get(code)
+        if not cc:
+            return ""
+        path = _flag_cache_path(code)
+        if os.path.exists(path) and os.path.getsize(path) > 100:
+            return path
+        try:
+            raw = _http_get(f"https://flagcdn.com/w160/{cc.lower()}.png",
+                            headers={"User-Agent": "NCZ-Games-Launcher/1.0 (flag icons)"}, timeout=8)
+            if not QImage.fromData(raw).isNull():
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(raw)
+                return path
+        except Exception:    # expected: offline or the server did not answer
+            pass
         return ""
     path = _flag_cache_path(code)
     if os.path.exists(path) and os.path.getsize(path) > 200:
@@ -6881,7 +7256,7 @@ class StoreDetailPage(QWidget):
     def _show_requirements(self, d):
         reqs, system = d.get("reqs") or {}, d.get("system") or {}
         mn, rc = reqs.get("minimum") or [], reqs.get("recommended") or []
-        pc = [p for p in (system.get("cpu"), system.get("gpu")) if p]
+        pc = [p for p in (system.get("cpu"), system.get("gpu_label") or system.get("gpu")) if p]
         if system.get("ram_gb"):
             pc.append(f"{_fmt_gb(system['ram_gb'])} GB RAM")
         if system.get("free_gb"):
@@ -7219,6 +7594,97 @@ GREEN = "#22c55e"
 ORANGE = "#f59e0b"
 RED = "#f44336"
 
+# ── Mouse side buttons (Back / Forward) navigate between launcher pages like a browser ──
+class _MouseNavFilter(QObject):
+    """App-wide filter: the mouse's side buttons go back / forward through the pages the user visited in the main window."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.history = [app.pages.currentWidget()]
+        self.pos = 0
+        self._moving = False
+        app.pages.currentChanged.connect(self._changed)
+        QApplication.instance().installEventFilter(self)
+
+    def _changed(self, _i):
+        if self._moving:
+            return
+        w = self.app.pages.currentWidget()
+        if w is None or (0 <= self.pos < len(self.history) and self.history[self.pos] is w):
+            return
+        del self.history[self.pos + 1:]          # a new visit drops the "forward" branch, like a browser
+        self.history.append(w)
+        self.pos = len(self.history) - 1
+        if len(self.history) > 50:
+            del self.history[0]
+            self.pos -= 1
+
+    def _resolve(self, w):
+        """A lazy-page placeholder may have been replaced by the real page since it was recorded."""
+        stack = self.app.pages
+        try:
+            if stack.indexOf(w) >= 0:
+                return w
+        except RuntimeError:                      # the placeholder was deleted
+            pass
+        for name, ent in self.app.__dict__.get("_lazy_pages", {}).items():
+            if ent["ph"] is w:
+                page = self.app.__dict__.get(name)
+                if page is not None and stack.indexOf(page) >= 0:
+                    return page
+        return None
+
+    def _go(self, step):
+        target = self.pos + step
+        while 0 <= target < len(self.history):
+            w = self._resolve(self.history[target])
+            if w is not None:
+                self.history[target] = w
+                self.pos = target
+                self._moving = True
+                try:
+                    self.app.pages.setCurrentWidget(w)
+                finally:
+                    self._moving = False
+                self._sync_nav(w)
+                return True
+            del self.history[target]              # page no longer exists
+            if step < 0:
+                self.pos -= 1
+                target -= 1
+        return False
+
+    def _sync_nav(self, w):
+        app = self.app
+        try:
+            idx = app.pages.indexOf(w)
+            if w is app.__dict__.get("store_detail_page"):
+                idx = 4                           # the game page belongs to the Store tab
+            btn = app.nav_group.button(idx)
+            if btn is None:
+                for tab in app.__dict__.get("_profile_tabs", {}).values():
+                    if tab.get("page") is w:
+                        btn = tab.get("btn")
+            if btn is not None:
+                btn.setChecked(True)
+        except RuntimeError:
+            pass
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.MouseButtonPress:
+            return False
+        b = ev.button()
+        if b not in (Qt.MouseButton.BackButton, Qt.MouseButton.ForwardButton):
+            return False
+        try:
+            if not isinstance(obj, QWidget) or obj.window() is not self.app or not self.app.isActiveWindow():
+                return False                      # dialogs, overlays and Big Picture keep their own handling
+            if QApplication.activePopupWidget() is not None:
+                return False
+            return self._go(-1 if b == Qt.MouseButton.BackButton else 1)
+        except RuntimeError:
+            return False
+
 class AdaptiveApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -7323,6 +7789,7 @@ class AdaptiveApp(QMainWindow):
         self._init_lb()
         self._init_ext()
         self._init_ncz_su()
+        self._init_mouse_nav()
 
     # ── sidebar ──
     def make_nav_button(self, text, checkable=False):
@@ -8049,8 +8516,8 @@ class AdaptiveApp(QMainWindow):
             btn_action.setEnabled(False)
             btn_action.setCursor(Qt.CursorShape.ArrowCursor)
             btn_action.setStyleSheet("QPushButton { background: #1b1b1f; color: #5d5d66; border: 1px solid #26262c; }")
-            self.set_card_status(game_id, "Releases 5 Dec 2026", ORANGE)
-            release = QDateTime(QDate(2026, 12, 5), QTime(0, 0, 0))      # local time
+            self.set_card_status(game_id, "Releases 4 Dec 2026", ORANGE)
+            release = QDateTime(QDate(2026, 12, 4), QTime(0, 0, 0))      # local time
             def tick(b=btn_action, rel=release):
                 left = QDateTime.currentDateTime().secsTo(rel)
                 if left <= 0:
@@ -8146,6 +8613,14 @@ class AdaptiveApp(QMainWindow):
                 direct = os.path.join(d, k)
                 return direct if os.path.exists(direct) else _find_game_exe(d)
             _add_shortcut_action(self, self.cards[-1][0], title_text, exe_fn, cover=image_filename, key=game_id)
+        elif game_id == "nczfront":       # a web game: no exe, no desktop shortcut / launch options, only "Add to Steam"
+            _as_add_menu(self, self.cards[-1][0], title_text, lambda: "", image_filename, game_id)
+        elif game_id in ("chess", "nczreturn"):       # no exe either: the 3-dot button comes back with only "Add to Steam"
+            _card = self.cards[-1][0]
+            _more = _card.findChild(QPushButton, "MoreButton")
+            if _more is not None:
+                _more.show()
+            _as_add_menu(self, _card, title_text, lambda: "", image_filename, game_id)
 
     # ── Steam games in the library ──
     def create_steam_card(self, appid, title_text, cover_path):
@@ -9911,7 +10386,7 @@ class AdaptiveApp(QMainWindow):
             idx = header.indexOf(self.search_edit)
             combo = QComboBox()
             combo.setFixedHeight(36)
-            combo.setToolTip("Show favorites, recently played or hidden games. Use a game's ••• menu to favorite or hide it.")
+            combo.setToolTip("Smart collections (recently played, played this week, most played, never played), favorites or hidden games. Use a game's ••• menu to favorite or hide it.")
             for label, key in _LB_VIEWS:
                 combo.addItem(label, key)
             def changed(_i):
@@ -9936,6 +10411,12 @@ class AdaptiveApp(QMainWindow):
             _log_exc("_init_ext")
 
     # ── Settings: startup animation panel ──
+
+    def _init_mouse_nav(self):
+        try:
+            self._mouse_nav = _MouseNavFilter(self)
+        except Exception:
+            _log_exc("_init_mouse_nav")
 
     def _init_ncz_su(self):
         try:
@@ -15665,6 +16146,32 @@ def _friend_status(d):
         return "Online", GREEN
     return "Offline", "#888888"
 
+_CLIENT_ALIASES = {"mobile": "mobile", "phone": "mobile", "android": "mobile", "ios": "mobile",
+                   "web": "web", "browser": "web", "website": "web"}
+
+def _friend_client(d):
+    """"mobile" / "web" when this friend is online on the phone app / the website, else None (offline, or on the desktop
+    launcher). Reads public/<uid>/client ("mobile", "web", "desktop") or a "clients" list / {name: true} map; a person who
+    is also on the desktop launcher gets no symbol."""
+    if not isinstance(d, dict) or not _friend_is_fresh(d):
+        return None
+    raw = d.get("client")
+    if raw is None:
+        raw = d.get("clients")
+    if isinstance(raw, dict):
+        raw = [k for k, v in raw.items() if v]
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return None
+    kinds = [str(x).strip().lower() for x in raw]
+    if "desktop" in kinds:
+        return None
+    for k in kinds:
+        if k in _CLIENT_ALIASES:
+            return _CLIENT_ALIASES[k]
+    return None
+
 def _friend_avatar_file(uid, photo):
     raw = _decode_photo(photo)
     if not raw:
@@ -17059,11 +17566,11 @@ class FriendsPage(QWidget):
         if self._prev_last is None:
             self._detect_messages(last)      # baseline only; _poll_messages raises the notifications
         # Every 10 s: only tear down and rebuild the rows (widgets + avatar files) when what they show changed.
-        req_sig = [(uid, d.get("username")) for uid, d in self.requests.items()]
+        req_sig = [(uid, d.get("username"), d.get("country")) for uid, d in self.requests.items()]
         if req_sig != getattr(self, "_req_sig", None):
             self._req_sig = req_sig
             self._rebuild_requests()
-        row_sig = sorted((uid, d.get("username"), d.get("photo"), _friend_status(d)) for uid, d in self.friends.items())
+        row_sig = sorted((uid, d.get("username"), d.get("photo"), d.get("country"), _friend_status(d)) for uid, d in self.friends.items())
         if row_sig != getattr(self, "_row_sig", None):
             self._row_sig = row_sig
             self._rebuild_rows()
@@ -17149,6 +17656,7 @@ class FriendsPage(QWidget):
         for uid, d in self.requests.items():
             row = QHBoxLayout()
             name = QLabel(d.get("username") or "Unknown")
+            _set_name_flag(name, d.get("username") or "Unknown", d.get("country"), 14)
             accept = QPushButton("Accept")
             accept.setObjectName("Primary")
             decline = QPushButton("Decline")
@@ -17220,6 +17728,7 @@ class FriendsPage(QWidget):
         c.setSpacing(4)
         n = QLabel(name)
         n.setStyleSheet("font-size: 16px; font-weight: bold; background: transparent;")
+        _set_name_flag(n, name, d.get("country"), 16, client=_friend_client(d))
         sr = QHBoxLayout()
         sr.setSpacing(8)
         dot = QFrame()
@@ -17281,7 +17790,16 @@ class FriendsPage(QWidget):
         self.p_status.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         ll.addWidget(self.p_name)
         ll.addWidget(self.p_status)
-        ll.addSpacing(16)
+        ll.addSpacing(8)
+        self.p_view_btn = QPushButton("View Profile")           # same profile tab the group member list opens
+        self.p_view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.p_view_btn.setFixedHeight(34)
+        self.p_view_btn.clicked.connect(lambda _=False: self._open_friend_profile())
+        ll.addWidget(self.p_view_btn)
+        self.p_avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.p_avatar.setToolTip("View profile")
+        self.p_avatar.mousePressEvent = lambda e: self._open_friend_profile() if e.button() == Qt.MouseButton.LeftButton else None
+        ll.addSpacing(8)
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(128,128,128,0.28); border: none;")
@@ -17425,6 +17943,12 @@ class FriendsPage(QWidget):
         self._poll_typing()
         self._run(lambda: cloud_fetch_covers(uid), lambda r, e: self._on_covers(uid, r))
 
+    def _open_friend_profile(self):
+        uid = self.current_uid
+        app = self.window()
+        if uid and hasattr(app, "open_profile_tab"):
+            app.open_profile_tab(uid, self.friends.get(uid))
+
     def close_friend(self):
         self.chat_timer.stop()
         self.typing_timer.stop()
@@ -17437,7 +17961,8 @@ class FriendsPage(QWidget):
     def _fill_profile(self):
         d = self.friends.get(self.current_uid, {})
         name = d.get("username") or "Unknown"
-        self.p_name.setText(name)
+        _set_name_flag(self.p_name, name, d.get("country"), 22, client=_friend_client(d))
+        self.p_name.setToolTip(COUNTRIES.get(str(d.get("country") or "").upper(), ""))
         status, color = _friend_status(d)
         self.p_status.setText(f"\u25CF  {status}")
         self.p_status.setStyleSheet(f"color: {color}; font-size: 14px; background: transparent;")
@@ -25913,19 +26438,23 @@ def _overlay_classify(text):
     return msg, ""
 
 class _OvImageBridge(QObject):
-    done = pyqtSignal(str, str, str, str, str, str)  # name, highlight, avatar, prefix, picture path ("" = none), badge path
+    done = pyqtSignal(str, str, str, str, str, str, str)  # name, highlight, avatar, prefix, picture path ("" = none), badge path, client
 
 _ov_image_bridge = None
 
-def _overlay_show(name, hl, avatar, prefix, image=None, badge=None):
+def _overlay_show(name, hl, avatar, prefix, image=None, badge=None, client=None):
     _overlay.set_mode("window")          # no injected game running: use the window toast
     try:
-        _overlay.notify_playing(name, hl, avatar, prefix, image=image or None, badge=badge or None)
-    except TypeError:                    # an older overlay.py without the sender badge
+        _overlay.notify_playing(name, hl, avatar, prefix, image=image or None, badge=badge or None,
+                                client=client or None)
+    except TypeError:                    # an older overlay.py without the mobile / web symbol
         try:
-            _overlay.notify_playing(name, hl, avatar, prefix, image=image or None)
-        except TypeError:                # an older overlay.py without picture support
-            _overlay.notify_playing(name, hl, avatar, prefix)
+            _overlay.notify_playing(name, hl, avatar, prefix, image=image or None, badge=badge or None)
+        except TypeError:                # an older overlay.py without the sender badge
+            try:
+                _overlay.notify_playing(name, hl, avatar, prefix, image=image or None)
+            except TypeError:            # an older overlay.py without picture support
+                _overlay.notify_playing(name, hl, avatar, prefix)
 
 class _OvInviteBridge(QObject):
     done = pyqtSignal(str, str, str, str, str)      # sender name, game, avatar path, cover path, join link
@@ -28671,6 +29200,7 @@ def _grp_msgrow_init(self, chat, m, me, mine):
     outer = self.layout()
     if not mine:                                    # sender name above other people's bubbles
         lab = QLabel(chat.names.get(uid) or "Unknown")
+        _set_name_flag(lab, chat.names.get(uid) or "Unknown", (getattr(chat, "countries", None) or {}).get(uid), 12)
         color = (getattr(chat, "name_colors", None) or {}).get(uid)
         lab.setStyleSheet("font-size:11px; font-weight:bold;" + (f"color:{color};" if color else ""))
         for i in range(outer.count()):
@@ -29413,7 +29943,7 @@ class GroupChatPage(QWidget):
         sig = json.dumps([sorted(members.items()),
                           [(u, bool(isinstance(tos.get(u), (int, float)) and tos[u] / 1000.0 > now)) for u in sorted(members)],
                           [(u, _friend_status(self.profiles.get(u) or {})[0], _grp_name_of(self.profiles.get(u)),
-                            len((self.profiles.get(u) or {}).get("photo") or "")) for u in sorted(members)]])
+                            len((self.profiles.get(u) or {}).get("photo") or ""), (self.profiles.get(u) or {}).get("country")) for u in sorted(members)]])
         if sig == self._members_sig:
             return
         self._members_sig = sig
@@ -29457,6 +29987,7 @@ class GroupChatPage(QWidget):
         c = QVBoxLayout()
         c.setSpacing(0)
         n = QLabel(name + ("  \u23F3" if timed_out else ""))
+        _set_name_flag(n, name + ("  \u23F3" if timed_out else ""), p.get("country"), 14)
         rc = GROUP_ROLE_COLOR[role]
         n.setStyleSheet("font-weight:bold;" + (f"color:{rc};" if rc and not offline else "") +
                         ("color:#888888;" if offline else ""))
@@ -29693,6 +30224,7 @@ class GroupChatPage(QWidget):
         cv = self.chat_view
         cv.other_uid = "group:" + self.gid
         cv.avatars, cv.avatar_letters = self._chat_avatars()
+        cv.countries = {u: (p or {}).get("country") for u, p in self.profiles.items()}
         self._av_sig = self._av_sig_of()
         cv.set_messages(self._me, self._msgs, self._chat_names())
 
@@ -41264,7 +41796,15 @@ class NczChessPage(QWidget):
             self.lobby_tabs.append(b)
         seg.addStretch(1)
         col.addLayout(seg)
-        self.lobby_stack.addWidget(self._build_lobby_play())
+        _play = self._build_lobby_play()
+        _play.setContentsMargins(0, 0, 8, 0)          # room for the scrollbar
+        _play_sa = QScrollArea()                      # cards keep their natural size and scroll when the page is short (Classic's top bar leaves less height)
+        _play_sa.setWidgetResizable(True)
+        _play_sa.setFrameShape(QFrame.Shape.NoFrame)
+        _play_sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _play_sa.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        _play_sa.setWidget(_play)
+        self.lobby_stack.addWidget(_play_sa)
         self.lobby_stack.addWidget(self._build_bots_page())
         col.addWidget(self.lobby_stack, 1)
         return page
@@ -41839,6 +42379,19 @@ class NczChessPage(QWidget):
             self._render_inbox(self._inbox_data)         # unchanged: nothing was downloaded, just redraw from the last copy
         self.bg.run(fn, cb)
 
+    @staticmethod
+    def _when_html(ts):
+        """'Nov 11, 2026 · 3:45 PM' (local time) from a server timestamp in ms, as a muted second line ('' when unknown)."""
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return ""
+        try:
+            t = time.localtime(ts / 1000.0)
+            hour = t.tm_hour % 12 or 12
+            txt = f"{time.strftime('%b', t)} {t.tm_mday}, {t.tm_year} \u00B7 {hour}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+        except Exception:
+            return ""
+        return f"<br><span style='color:{_ch_theme().get('subtext', '#aaaaaa')}; font-size:12px;'>{txt}</span>"
+
     def _render_inbox(self, data):
         now = _ch_server_now()
         items = []
@@ -41849,7 +42402,7 @@ class NczChessPage(QWidget):
             if info.get("kind") == "invite" and isinstance(ts, (int, float)) and now - ts > _CH_INVITE_TTL_MS:
                 continue
             items.append((gid, info))
-        sig = repr(sorted((g, i.get("kind"), i.get("opp")) for g, i in items))
+        sig = repr(sorted((g, i.get("kind"), i.get("opp"), i.get("ts")) for g, i in items))
         if sig == self._last_inbox:
             return
         self._last_inbox = sig
@@ -41865,7 +42418,7 @@ class NczChessPage(QWidget):
             rl = QHBoxLayout(row)
             rl.setContentsMargins(12, 8, 12, 8)
             if info.get("kind") == "invite":
-                lab = QLabel(f"<b>{html_lib.escape(opp)}</b> challenged you ({html_lib.escape(str(info.get('tc') or ''))})")
+                lab = QLabel(f"<b>{html_lib.escape(opp)}</b> challenged you ({html_lib.escape(str(info.get('tc') or ''))}){self._when_html(info.get('ts'))}")
                 lab.setTextFormat(Qt.TextFormat.RichText)
                 ok = QPushButton("Accept")
                 ok.setObjectName("ChGreen")
@@ -41877,7 +42430,7 @@ class NczChessPage(QWidget):
                 rl.addWidget(ok)
                 rl.addWidget(no)
             else:
-                lab = QLabel(f"Game vs <b>{html_lib.escape(opp)}</b>")
+                lab = QLabel(f"Game vs <b>{html_lib.escape(opp)}</b>{self._when_html(info.get('ts'))}")
                 lab.setTextFormat(Qt.TextFormat.RichText)
                 go = QPushButton("Open")
                 go.clicked.connect(lambda _c=False, g=gid, i=info: self.open_online(g, i.get("oppUid", "")))
@@ -42022,6 +42575,7 @@ class NczChessPage(QWidget):
         self.moves_view = QTextBrowser()
         self.moves_view.setOpenLinks(False)
         self.moves_view.anchorClicked.connect(self._on_anchor)
+        self.moves_view.setMinimumHeight(90)
         pl.addWidget(self.moves_view, 1)
 
         nav = QHBoxLayout()
@@ -43562,7 +44116,7 @@ def _fits_cache_path():
 
 def _fits_signature():
     sp = get_system_specs()
-    return f"v2|{sp.get('cpu')}|{sp.get('gpu')}|{round(sp.get('ram_gb') or 0)}|{round(sp.get('free_gb') or 0)}"
+    return f"v3|{sp.get('cpu')}|{sp.get('gpu')}|{round(sp.get('vram_gb') or 0)}|{round(sp.get('ram_gb') or 0)}|{round(sp.get('free_gb') or 0)}"
 
 def _fits_load():
     if _steam_req_cache.get("_loaded"):
@@ -43635,7 +44189,7 @@ def _store_modes_init(self, *a, **k):
     self._mode_buttons = {}
     for key, label, tip in (("trending", "Trending", "What Steam is selling most right now"),
                             ("popular", "Most Popular", "Most reviewed games on Steam"),
-                            ("works", "Works on your PC", "Only games whose RAM, storage, processor and graphics needs fit this PC")):
+                            ("works", "Works on your PC", "Only games whose RAM, storage, processor, graphics card, video memory and DirectX needs fit this PC")):
         b = QPushButton(label)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setFixedHeight(32)
@@ -43844,30 +44398,290 @@ def _hw_req_options(items, kind):
                     found.append((s, t))
     return found
 
-_hw_prev_assess = assess_requirements
+_hw_prev_assess = assess_requirements       # the RAM + free disk check
+
+# ── measuring the graphics card: real video memory (registry / nvidia-smi / sysfs), integrated or not, DirectX level ──
+_HW_FAKE_GPU = re.compile(r"microsoft basic|remote|virtual|parsec|displaylink|citrix|meta virtual|vmware|virtualbox|hyper-v|idd", re.I)
+
+def _hw_is_integrated(name):
+    n = (name or "").lower()
+    if re.search(r"\barc\s*[ab]\d{3}\b", n):
+        return False                                                   # Intel Arc cards are discrete
+    if re.search(r"\b(uhd|iris|hd graphics|intel\(r\) graphics|intel graphics|arc graphics|apple|adreno|mali)\b", n) or \
+            (n.startswith("intel") and "arc" not in n):
+        return True
+    if re.search(r"radeon\W*(?:\(tm\)\W*)?graphics\b", n) and not re.search(r"\brx\b|\bpro\b", n):
+        return True                                                    # "AMD Radeon(TM) Graphics" = the CPU's graphics
+    if re.search(r"\b\d{3}m\b", n) and re.search(r"radeon", n) and not re.search(r"\brx\b", n):
+        return True                                                    # Radeon 680M / 780M ...
+    if re.search(r"vega\s*(3|6|7|8|10|11)\b", n):
+        return True
+    return False
+
+def _hw_detect_gpus():
+    """[{'name', 'vram_gb' (0 = unknown), 'integrated'}] read from the machine. Safe to call in a thread."""
+    gpus = []
+    smi = []
+    for line in _run_quiet(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"], timeout=8).splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 2:
+            try:
+                smi.append((parts[0], float(parts[1]) / 1024.0))
+            except ValueError:
+                pass
+    try:
+        if sys.platform.startswith("win"):
+            reg = {}
+            ps = ("$k='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*'; "
+                  "Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DriverDesc } | ForEach-Object { "
+                  "$m=$_.'HardwareInformation.qwMemorySize'; "
+                  "if($m -is [byte[]]){ $m=[BitConverter]::ToUInt64(($m+@(0,0,0,0,0,0,0,0))[0..7],0) }; "
+                  "[pscustomobject]@{n=$_.DriverDesc;m=[string]$m} } | ConvertTo-Json -Compress")
+            raw = _run_quiet(["powershell", "-NoProfile", "-Command", ps], timeout=10)
+            if raw:
+                data = json.loads(raw)
+                for row in (data if isinstance(data, list) else [data]):
+                    try:
+                        reg[str(row.get("n"))] = float(row.get("m") or 0) / 1024 ** 3
+                    except (TypeError, ValueError):
+                        pass
+            wmi = _run_quiet(["powershell", "-NoProfile", "-Command",
+                              "Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)|$($_.AdapterRAM)\" }"], timeout=10)
+            for line in wmi.splitlines():
+                name, _sep, ram = line.strip().partition("|")
+                if not name or _HW_FAKE_GPU.search(name):
+                    continue
+                vram = reg.get(name) or 0.0
+                if not vram:
+                    try:
+                        vram = float(ram) / 1024 ** 3            # 32-bit field: tops out at 4 GB, so only a fallback
+                    except ValueError:
+                        vram = 0.0
+                gpus.append({"name": name, "vram_gb": vram, "integrated": _hw_is_integrated(name)})
+        elif sys.platform.startswith("linux"):
+            import glob    # lazy: saves memory/startup until used
+            amd = []
+            for f in sorted(glob.glob("/sys/class/drm/card[0-9]/device/mem_info_vram_total")):
+                try:
+                    with open(f, encoding="utf-8") as fh:
+                        amd.append(int(fh.read().strip()) / 1024 ** 3)
+                except (OSError, ValueError):
+                    pass
+            for name in [n.strip() for n in (_hw_prev_specs().get("gpu") or "").split("|") if n.strip()]:
+                integrated = _hw_is_integrated(name)
+                vram = 0.0
+                if not integrated and re.search(r"amd|radeon|\brx\b", name, re.I) and amd:
+                    vram = amd.pop(0)
+                gpus.append({"name": name, "vram_gb": vram, "integrated": integrated})
+    except Exception:
+        _log_exc("_hw_detect_gpus")
+    for sname, svram in smi:                                      # nvidia-smi knows the exact memory of NVIDIA cards
+        hit = next((g for g in gpus if re.search(r"nvidia|geforce|rtx|gtx|quadro", g["name"], re.I)
+                    and _norm_title(sname)[-8:] == _norm_title(g["name"])[-8:] and not g.get("_smi")), None)
+        if hit is None:
+            hit = next((g for g in gpus if re.search(r"nvidia|geforce|rtx|gtx|quadro", g["name"], re.I) and not g.get("_smi")), None)
+        if hit is not None:
+            hit["vram_gb"], hit["_smi"] = svram, True
+        else:
+            gpus.append({"name": sname, "vram_gb": svram, "integrated": False, "_smi": True})
+    return gpus
+
+_hw_prev_specs = get_system_specs
+
+def get_system_specs():
+    """The earlier values plus the measured graphics cards (names, video memory, integrated or not)."""
+    sp = _hw_prev_specs()
+    if "gpus" not in sp:
+        gpus = _hw_detect_gpus()
+        if not gpus:
+            gpus = [{"name": n.strip(), "vram_gb": 0.0, "integrated": _hw_is_integrated(n)}
+                    for n in (sp.get("gpu") or "").split("|") if n.strip()]
+        sp["gpus"] = gpus
+        disc = [g["vram_gb"] for g in gpus if not g["integrated"] and g["vram_gb"]]
+        sp["vram_gb"] = max(disc) if disc else 0.0
+        sp["gpu_label"] = " | ".join(
+            (g["name"] + (f" ({_fmt_gb(g['vram_gb'])} GB)" if g["vram_gb"] and not g["integrated"] else "")) for g in gpus)
+        sp["gpu_label"] = sp["gpu_label"] or sp.get("gpu", "")
+    return sp
+
+# ── a much denser GPU ranking (relative speed, GTX 1060 6GB = 100); the old table is only the fallback ──
+_GPU2 = {
+    # NVIDIA
+    "gt 710": 5, "gt 730": 8, "gt 1030": 30, "gtx 650 ti": 24, "gtx 650": 17, "gtx 660 ti": 40, "gtx 660": 33, "gtx 670": 42,
+    "gtx 680": 48, "gtx 750 ti": 31, "gtx 750": 27, "gtx 760": 40, "gtx 770": 52, "gtx 780 ti": 76, "gtx 780": 62,
+    "gtx 950": 48, "gtx 960": 58, "gtx 970": 92, "gtx 980 ti": 140, "gtx 980": 105, "gtx titan x": 145,
+    "gtx 460": 20, "gtx 470": 30, "gtx 480": 40, "gtx 550 ti": 16, "gtx 560 ti": 33, "gtx 560": 27, "gtx 570": 40, "gtx 580": 48,
+    "gtx 1050 ti": 70, "gtx 1050": 55, "gtx 1060 3gb": 88, "gtx 1060": 100, "gtx 1070 ti": 165, "gtx 1070": 140,
+    "gtx 1080 ti": 240, "gtx 1080": 185, "gtx 1630": 45, "gtx 1650 super": 110, "gtx 1650": 85, "gtx 1660 super": 135,
+    "gtx 1660 ti": 140, "gtx 1660": 125, "rtx 2060 super": 180, "rtx 2060": 155, "rtx 2070 super": 210, "rtx 2070": 190,
+    "rtx 2080 ti": 290, "rtx 2080 super": 240, "rtx 2080": 230, "rtx 3050": 115, "rtx 3060 ti": 250, "rtx 3060": 190,
+    "rtx 3070 ti": 320, "rtx 3070": 290, "rtx 3080 ti": 430, "rtx 3080": 380, "rtx 3090 ti": 490, "rtx 3090": 450,
+    "rtx 4050": 190, "rtx 4060 ti": 290, "rtx 4060": 240, "rtx 4070 ti super": 470, "rtx 4070 ti": 410, "rtx 4070 super": 400,
+    "rtx 4070": 340, "rtx 4080 super": 500, "rtx 4080": 480, "rtx 4090": 700, "rtx 5050": 250, "rtx 5060 ti": 360,
+    "rtx 5060": 300, "rtx 5070 ti": 520, "rtx 5070": 400, "rtx 5080": 560, "rtx 5090": 800,
+    # AMD
+    "hd 5770": 15, "hd 5850": 26, "hd 5870": 33, "hd 6770": 17, "hd 6850": 22, "hd 6870": 28, "hd 6950": 33, "hd 6970": 38,
+    "hd 7750": 18, "hd 7770": 25, "hd 7790": 32, "hd 7850": 38, "hd 7870": 48, "hd 7950": 55, "hd 7970": 65,
+    "r7 250": 22, "r7 260x": 38, "r7 260": 35, "r7 360": 38, "r7 370": 50, "r9 270x": 55, "r9 270": 50, "r9 280x": 75,
+    "r9 280": 70, "r9 285": 75, "r9 290x": 120, "r9 290": 110, "r9 380x": 85, "r9 380": 75, "r9 390x": 130, "r9 390": 120,
+    "r9 fury x": 160, "r9 fury": 150, "rx 550": 35, "rx 560": 55, "rx 570": 95, "rx 580": 110, "rx 590": 125,
+    "rx 460": 45, "rx 470": 85, "rx 480": 100, "rx vega 56": 150, "rx vega 64": 170, "vega 56": 150, "vega 64": 170,
+    "radeon vii": 210, "rx 5500 xt": 100, "rx 5500": 95, "rx 5600 xt": 150, "rx 5700 xt": 195, "rx 5700": 180,
+    "rx 6400": 70, "rx 6500 xt": 100, "rx 6600 xt": 245, "rx 6600": 215, "rx 6650 xt": 255, "rx 6700 xt": 300,
+    "rx 6750 xt": 320, "rx 6700": 280, "rx 6800 xt": 430, "rx 6800": 380, "rx 6900 xt": 460, "rx 6950 xt": 490,
+    "rx 7600 xt": 280, "rx 7600": 250, "rx 7700 xt": 330, "rx 7800 xt": 400, "rx 7900 gre": 450, "rx 7900 xtx": 600,
+    "rx 7900 xt": 520, "rx 9060 xt": 330, "rx 9070 xt": 580, "rx 9070": 520,
+    # integrated
+    "vega 3": 12, "vega 6": 20, "vega 7": 22, "vega 8": 25, "vega 10": 28, "vega 11": 32,
+    "610m": 10, "660m": 28, "680m": 50, "740m": 35, "760m": 45, "780m": 65, "880m": 75, "890m": 85,
+    "uhd 600": 8, "uhd 605": 8, "uhd 610": 9, "uhd 615": 10, "uhd 617": 11, "uhd 620": 14, "uhd 630": 16, "uhd 730": 20,
+    "uhd 750": 25, "uhd 770": 25, "hd 2000": 3, "hd 2500": 4, "hd 3000": 4, "hd 4000": 6, "hd 4400": 8, "hd 4600": 9,
+    "hd 5000": 10, "hd 5500": 10, "hd 6000": 14, "hd 515": 9, "hd 520": 10, "hd 530": 13, "hd 610": 9, "hd 620": 12, "hd 630": 14,
+    "iris plus 640": 20, "iris plus 650": 22, "iris plus g7": 28, "iris xe": 40, "iris pro 580": 30, "iris 540": 20,
+    "arc a310": 45, "arc a380": 70, "arc a580": 150, "arc a750": 190, "arc a770": 210, "arc b570": 230, "arc b580": 260,
+    "arc graphics": 45,
+}
+_GPU2_KEYS = sorted(_GPU2, key=len, reverse=True)
+_GPU2_RX = {k: re.compile(r"(?<![a-z0-9])" + r"\s*".join(re.escape(w) for w in k.split()) + r"(?![0-9])") for k in _GPU2_KEYS}
+_hw_gpu_scores_v1 = _hw_gpu_scores
+
+def _hw_gpu_scores(text):
+    """Scores of the graphics card(s) named in the text: the dense table first, the older rough scorer as the fallback.
+    Laptop / Max-Q / mobile variants are scaled down (they run at lower power than the desktop chip of the same name)."""
+    t = (text or "").lower()
+    t = re.sub(r"\((?:r|tm)\)|geforce|nvidia|amd|advanced micro devices|corporation|series|graphics card", " ", t)
+    t = re.sub(r"\bradeon\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    out = []
+    for k in _GPU2_KEYS:
+        m = _GPU2_RX[k].search(t)
+        if m:
+            score = _GPU2[k]
+            tail = t[m.end():m.end() + 30]
+            if re.search(r"laptop|mobile|notebook|max-?q", t) or re.match(r"m\b", tail):
+                score *= 0.75 if re.search(r"max-?q", t) else 0.82
+            out.append(score)
+            t = t[:m.start()] + " " * (m.end() - m.start()) + t[m.end():]      # one name only matches once
+    if not out and re.search(r"radeon\W*(?:\(tm\)\W*)?graphics\s*$", (text or "").lower().strip()):
+        return [20]                                   # plain "AMD Radeon(TM) Graphics" = the CPU's built-in graphics
+    return out or _hw_gpu_scores_v1(text)
+
+def _hw2_dx_level(name):
+    """Highest DirectX the card supports (12 / 11 / 10), or None when unknown."""
+    n = (name or "").lower()
+    m = re.search(r"\b(?:gtx|gts|gt)\s*(\d{3,4})\b", n)
+    if m:
+        num = int(m.group(1))
+        return 12 if (num >= 600 or num >= 1000) else 11 if num >= 400 else 10
+    if re.search(r"\brtx\b", n):
+        return 12
+    if re.search(r"intel|\buhd\b|\biris\b", n) and not re.search(r"\barc\b", n):
+        m = re.search(r"\bhd graphics\s*(\d{3,4})\b", n)
+        if m:
+            num = int(m.group(1))
+            return 12 if (num >= 4200 or 500 <= num < 1000 or num == 5000) else 11
+        if re.search(r"\buhd\b|\biris\b", n):
+            return 12
+        return 10
+    m = re.search(r"\bhd\s*(\d{4})\b", n)
+    if m:                                                         # Radeon HD 5000 / 6000 = DX11, HD 7000+ = DX12
+        num = int(m.group(1))
+        return 12 if num >= 7000 else 11 if num >= 5000 else 10
+    if re.search(r"\b(rx|r[579])\s*\d|vega|radeon vii|\d{3}m\b|radeon graphics|\barc\b", n):
+        return 12
+    return None
+
+def _hw2_req_vram(items):
+    """Video memory (GB) the listed graphics requirement asks for, or None."""
+    best = None
+    pats = (re.compile(r"(\d+(?:[.,]\d+)?)\s*(gb|mb)\s*(?:of\s*)?(?:dedicated\s*)?(?:video\s*(?:ram|memory)|vram|graphics memory|gpu memory)", re.I),
+            re.compile(r"(?:video\s*(?:ram|memory)|vram|graphics memory|dedicated (?:video )?memory)\s*[:=]?\s*(?:of\s*)?(\d+(?:[.,]\d+)?)\s*(gb|mb)", re.I))
+    gfx = re.compile(r"graphics|video card|gpu|video", re.I)
+    for label, value in items or []:
+        text = f"{label}: {value}" if label else value
+        vals = []
+        for rx in pats:
+            for m in rx.finditer(text):
+                vals.append((float(m.group(1).replace(",", ".")), m.group(2).lower()))
+        if not vals and (gfx.search(label or "") or re.match(r"\s*(graphics|video card|gpu)\s*:", value or "", re.I)) \
+                and not re.search(r"memory|ram", label or "", re.I):
+            for m in re.finditer(r"\(?\b(\d+)\s*gb\b\)?", value or "", re.I):    # "GeForce GTX 970 (4GB)" / "RX 580 8GB"
+                vals.append((float(m.group(1)), "gb"))
+        for n, unit in vals:
+            gb = n / 1024 if unit == "mb" else n
+            if 0.1 <= gb <= 48:
+                best = gb if best is None else min(best, gb)       # several options listed: the smallest one is enough
+    return best
+
+def _hw2_req_dx(items):
+    for label, value in items or []:
+        if re.search(r"direct\s*x|graphics|video", label or "", re.I) or re.search(r"direct\s*x", value or "", re.I):
+            m = re.search(r"direct\s*x[^0-9]{0,25}(\d{1,2})(?:\.\d)?", f"{label} {value}", re.I)
+            if m and int(m.group(1)) in (9, 10, 11, 12):
+                return int(m.group(1))
+    return None
 
 def assess_requirements(reqs, platforms, system):
+    """RAM + free disk (the earlier check) plus processor, graphics card speed, video memory and DirectX support."""
     verdict, color, notes = _hw_prev_assess(reqs, platforms, system)
     mn, rc = (reqs or {}).get("minimum") or [], (reqs or {}).get("recommended") or []
-    my_cpu = _hw_cpu_score(system.get("cpu") or "")
-    my_gpus = _hw_gpu_scores(system.get("gpu") or "")
-    my_gpu = max(my_gpus) if my_gpus else None
     problems, below_rec, checked = [], [], []
-    for kind, mine, label, shown in (("cpu", my_cpu, "processor", _hw_short(system.get("cpu") or "")),
-                                     ("gpu", my_gpu, "graphics card", "")):
-        if mine is None:
-            continue
-        low = 0.85
-        min_opts = _hw_req_options(mn, kind) or _hw_req_options(rc, kind)
-        rec_opts = _hw_req_options(rc, kind)
-        if not min_opts:
-            continue
-        need, need_txt = min(min_opts)         # any one of the listed options is enough
-        checked.append(label)
-        if mine < need * low:
-            problems.append(f"your {label} is below the minimum ({_hw_short(need_txt)})")
-        elif rec_opts and mine < min(rec_opts)[0] * low:
-            below_rec.append(label)
+
+    # processor
+    my_cpu = _hw_cpu_score(system.get("cpu") or "")
+    cpu_min = _hw_req_options(mn, "cpu") or _hw_req_options(rc, "cpu")
+    if my_cpu is not None and cpu_min:
+        need, txt = min(cpu_min)
+        checked.append("processor")
+        rec = _hw_req_options(rc, "cpu")
+        if my_cpu < need * 0.85:
+            problems.append(f"your processor is below the minimum ({_hw_short(txt)})")
+        elif rec and my_cpu < min(rec)[0] * 0.85:
+            below_rec.append("processor")
+
+    # graphics card: every card in this PC, the best one counts
+    gpus = system.get("gpus") or [{"name": n.strip(), "vram_gb": 0.0, "integrated": _hw_is_integrated(n)}
+                                  for n in (system.get("gpu") or "").split("|") if n.strip()]
+    scored = []
+    for g in gpus:
+        sc = _hw_gpu_scores(g["name"])
+        if sc:
+            scored.append((max(sc), g))
+        elif g.get("vram_gb") and not g.get("integrated"):
+            scored.append((g["vram_gb"] * 22.0, g))                  # name not in any table: estimate from its video memory
+    my_gpu, best = max(scored, key=lambda x: x[0]) if scored else (None, None)
+    gpu_min = _hw_req_options(mn, "gpu") or _hw_req_options(rc, "gpu")
+    if my_gpu is not None and gpu_min:
+        need, txt = min(gpu_min)
+        checked.append("graphics card")
+        rec = _hw_req_options(rc, "gpu")
+        if my_gpu < need * 0.9:
+            problems.append(f"your graphics card is below the minimum ({_hw_short(txt)})")
+        elif rec and my_gpu < min(rec)[0] * 0.9:
+            below_rec.append("graphics card")
+
+    # video memory (measured: dedicated memory of the best card; shared with RAM on integrated graphics)
+    if gpus:
+        disc = [g["vram_gb"] for g in gpus if not g.get("integrated") and g.get("vram_gb")]
+        my_vram = max(disc) if disc else (min((system.get("ram_gb") or 0) * 0.5, 8.0) if all(g.get("integrated") for g in gpus) else 0)
+        vmin = _hw2_req_vram(mn) or _hw2_req_vram(rc)
+        vrec = _hw2_req_vram(rc)
+        if vmin and my_vram:
+            checked.append("video memory")
+            if my_vram < vmin * 0.9:
+                problems.append(f"your graphics card has about {_fmt_gb(my_vram)} GB of video memory and it needs {_fmt_gb(vmin)} GB")
+            elif vrec and my_vram < vrec * 0.9:
+                below_rec.append("video memory")
+
+    # DirectX
+    need_dx = _hw2_req_dx(mn) or _hw2_req_dx(rc)
+    if need_dx and gpus:
+        levels = [lv for lv in (_hw2_dx_level(g["name"]) for g in gpus) if lv]
+        if levels:
+            checked.append("DirectX")
+            if max(levels) < need_dx:
+                problems.append(f"your graphics card doesn't support DirectX {need_dx}")
+
     if problems:
         base = verdict[len("May struggle: "):] if color == RED and verdict.startswith("May struggle: ") else ""
         verdict, color = "May struggle: " + "; ".join(([base] if base else []) + problems), RED
@@ -43877,11 +44691,12 @@ def assess_requirements(reqs, platforms, system):
             verdict = (verdict + "; " + extra) if color == ORANGE else "Should run: meets the minimum, " + extra
             color = ORANGE
         elif checked and color is None:
-            verdict, color = "Looks OK for " + " and ".join(checked), GREEN
+            verdict, color = "Looks OK for " + ", ".join(checked), GREEN
         elif checked and color == GREEN:
-            verdict = "Looks OK for RAM, storage, " + " and ".join(checked)
+            verdict = "Looks OK for RAM, storage, " + ", ".join(checked)
     notes = [n for n in notes if not n.startswith("Only RAM and free disk")]
-    notes.insert(0, "Processor and graphics card are compared with an approximate ranking, so close calls are a guess.")
+    notes.insert(0, "Video memory and DirectX support come from your real hardware. Processor and graphics card speed are "
+                    "compared with a built-in ranking, so close calls are a guess.")
     return verdict, color, notes
 
 
@@ -50049,7 +50864,7 @@ def _ncz_organize(sp):
     for w in widgets:
         if w in hset:
             continue
-        if w.objectName() == "PageTitle":
+        if w.objectName() == "PageTitle" or w.property("ncz_settings_search") or w.property("ncz_settings_search_empty"):
             head.append(w)
             continue
         t = _ncz_block_title(w)
@@ -50070,6 +50885,7 @@ def _ncz_organize(sp):
     if desired != widgets:
         while lay.count():
             lay.takeAt(0)
+        sp.__dict__["_sq_spacers"] = {}                  # the old spacer items are gone (their ids can be reused)
         for w in desired:
             if w in head:
                 lay.addWidget(w)
@@ -50084,6 +50900,91 @@ def _ncz_organize(sp):
         lay.addStretch(1)
     for ci, ws in groups.items():                        # hide a section title when every panel under it is hidden
         _ncz_section_header(sp, _ncz_cat_name(ci)).setVisible(any(not w.isHidden() for w in ws))
+    try:
+        _ncz_search_apply(sp)                            # keep an active search filter after the layout was rebuilt
+    except Exception:
+        _log_exc("_ncz_search_apply")
+
+
+def _ncz_search_blob(w):
+    parts = []
+    try:
+        for c in w.findChildren(QLabel):
+            parts.append(c.text())
+        for c in w.findChildren(QAbstractButton):
+            parts.append(c.text())
+            parts.append(c.toolTip())
+        for c in w.findChildren(QComboBox):
+            parts.append(c.currentText())
+        for c in w.findChildren(QLineEdit):
+            parts.append(c.placeholderText())
+        parts.append(w.toolTip())
+        if isinstance(w, QLabel):
+            parts.append(w.text())
+    except RuntimeError:    # expected: the widget or object may already be deleted
+        pass
+    return re.sub(r"<[^>]+>", " ", " ".join(p for p in parts if p)).casefold()
+
+
+def _ncz_search_apply(sp):
+    """Settings search: hides every panel (and section title) that doesn't match all the typed words."""
+    lay = getattr(sp, "_content_layout", None)
+    edit = getattr(sp, "_set_search", None)
+    if lay is None or edit is None:
+        return
+    words = edit.text().casefold().split()
+    hid = sp.__dict__.setdefault("_sq_hid", [])
+    for w in hid:                                        # undo the previous filter (panels hidden by other code stay hidden)
+        try:
+            w.setVisible(True)
+        except RuntimeError:    # expected: the widget or object may already be deleted
+            pass
+    hid.clear()
+    widgets = [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() is not None]
+    groups, cur, shown = {}, None, 0
+    for w in widgets:
+        if w.objectName() == "NczSectionTitle":
+            cur = w
+            groups[cur] = []
+            continue
+        if w.objectName() == "PageTitle" or w.property("ncz_settings_search") or w.property("ncz_settings_search_empty"):
+            continue
+        title = _ncz_block_title(w)
+        if title is not None and cur is not None:
+            groups[cur].append(w)
+        if words and not w.isHidden():
+            blob = _ncz_search_blob(w) + " " + (cur.text().casefold() if cur is not None and title is not None else "")
+            if not all(x in blob for x in words):
+                w.setVisible(False)
+                hid.append(w)
+        if not w.isHidden():
+            shown += 1
+    for hdr, ws in groups.items():
+        hdr.setVisible(any(not w.isHidden() for w in ws))
+    empty = getattr(sp, "_set_search_empty", None)
+    if empty is not None:
+        empty.setVisible(bool(words) and shown == 0)
+    # the gaps between panels are separate spacer items: close the ones that follow a hidden widget
+    sizes = sp.__dict__.setdefault("_sq_spacers", {})
+    prev_hidden = False
+    for i in range(lay.count()):
+        item = lay.itemAt(i)
+        if item is None:
+            continue
+        w = item.widget()
+        if w is not None:
+            prev_hidden = w.isHidden()
+            continue
+        sp_item = item.spacerItem()
+        if sp_item is None:
+            continue
+        key = id(sp_item)
+        if key not in sizes:
+            sizes[key] = (sp_item.sizeHint().width(), sp_item.sizeHint().height())
+        ow, oh = sizes[key]
+        if oh > 0:
+            sp_item.changeSize(ow, 0 if (words and prev_hidden) else oh)
+    lay.invalidate()
 
 
 # ── the two new settings ──
@@ -50867,8 +51768,16 @@ def _track_playing(name, proc, folder=None):     # remembers when each game was 
     except Exception:
         _log_exc("_track_playing")
 
-_LB_VIEWS = (("All games", "all"), ("Favorites", "fav"), ("Recently played", "recent"), ("Hidden", "hidden"))
+# Smart collections: they fill themselves from what you play (last launch time + the playtime counter), no manual sorting.
+_LB_VIEWS = (("All games", "all"), ("Favorites", "fav"), ("Recently played", "recent"), ("Played this week", "week"),
+             ("Most played", "most"), ("Never played", "never"), ("Hidden", "hidden"))
 _lb_view = {"mode": "all"}
+
+def _lb_playtime(title):
+    try:
+        return _pt_total(title)
+    except Exception:
+        return 0
 
 def _lb_keep(title):
     m, meta = _lb_view["mode"], lbmeta()
@@ -50876,13 +51785,30 @@ def _lb_keep(title):
         return title in meta["fav"]
     if m == "hidden":
         return title in meta["hidden"]
+    if title in meta["hidden"]:
+        return False
     if m == "recent":
-        return lb_last(title) > 0 and title not in meta["hidden"]
-    return title not in meta["hidden"]
+        return lb_last(title) > 0
+    if m == "week":
+        return lb_last(title) >= time.time() - 7 * 86400
+    if m == "most":
+        return _lb_playtime(title) > 0
+    if m == "never":
+        return lb_last(title) == 0 and _lb_playtime(title) == 0
+    return True
+
+def _lb_sort_key(title):
+    """Sort key for the current view (None = keep the library's own order)."""
+    m = _lb_view["mode"]
+    if m in ("recent", "week"):
+        return -lb_last(title)
+    if m == "most":
+        return -_lb_playtime(title)
+    return None
 
 def _lb_sorted(items):
-    if _lb_view["mode"] == "recent":
-        return sorted(items, key=lambda it: -lb_last(it[1]))
+    if _lb_sort_key("") is not None:
+        return sorted(items, key=lambda it: _lb_sort_key(it[1]))
     return items
 
 def _lb_decorate(self, card, title):
@@ -51080,10 +52006,10 @@ def _act_detect(self):
             plays[uid] = play
             if prev_lib is not None:
                 if play and play != prev_play.get(uid, ""):
-                    new.append({"t": now, "u": uid, "n": name, "x": f"started playing {play}"})
+                    new.append({"t": now, "u": uid, "n": name, "x": f"started playing {play}", "g": play})
                 if uid in prev_lib:                       # a friend seen for the first time is only a baseline
                     for g in sorted(libs[uid] - prev_lib[uid]):
-                        new.append({"t": now, "u": uid, "n": name, "x": f"added {g} to their library"})
+                        new.append({"t": now, "u": uid, "n": name, "x": f"added {g} to their library", "g": g})
         self._act_lib, self._act_play = libs, plays
         if new:
             _act_add(new)
@@ -51091,6 +52017,111 @@ def _act_detect(self):
     except Exception:
         _log_exc("_act_detect")
     return _act_prev_detect(self)
+
+_ACT_GAME_RE = re.compile(r"^(?:started playing|added)\s+(.+?)(?:\s+to their library)?$")
+_ACT_COVER_W, _ACT_COVER_H = 44, 66
+
+def _act_game_of(it):
+    g = it.get("g")
+    if isinstance(g, str) and g.strip():
+        return g.strip()
+    m = _ACT_GAME_RE.match(str(it.get("x", "")))     # entries saved before the game name was stored
+    return m.group(1).strip() if m else ""
+
+def _act_cover_path(game):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "activity_covers",
+                        _hashlib.md5(game.casefold().encode("utf-8")).hexdigest()[:16] + ".png")
+
+class _ActCoverBus(QObject):
+    ready = pyqtSignal(str, str)           # game, cover file
+
+_act_state = {"bus": None, "pool": ThreadPoolExecutor(max_workers=3), "pending": set(), "missing": {}}
+
+def _act_bus():
+    if _act_state["bus"] is None:           # created on the GUI thread so the signal reaches it from the workers
+        _act_state["bus"] = _ActCoverBus()
+    return _act_state["bus"]
+
+def _act_find_cover_bytes(game):
+    """Vertical cover: SteamGridDB first when an API key is set (by Steam id, then by name); otherwise, or when
+    SteamGridDB has nothing, Steam's own portrait art."""
+    key = get_steamgriddb_key()
+    appid = 0
+    try:
+        appid = _as_find_appid(game, "")
+    except Exception:    # expected: offline or the server did not answer
+        pass
+    if key:
+        lookups = []
+        if appid:
+            lookups.append(lambda: fetch_sgdb_cover(appid, key))
+        lookups.append(lambda: _desk_sgdb_search(game, key))
+        for look in lookups:
+            try:
+                data = look()
+                if data and not QImage.fromData(data).isNull():
+                    return data
+            except Exception:    # expected: offline, bad key or the game isn't on SteamGridDB
+                pass
+    if appid:
+        urls = [f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"]
+        try:
+            urls += [u for u in steam_details_art_urls(appid) if u.endswith("library_600x900.jpg")]
+        except Exception:    # expected: offline or the server did not answer
+            pass
+        for url in urls:
+            data = _as_img(url)
+            if data and not QImage.fromData(data).isNull():
+                return data
+    return None
+
+def _act_cover_job(game):
+    path = _act_cover_path(game)
+    try:
+        data = _act_find_cover_bytes(game)
+        img = QImage.fromData(data) if data else QImage()
+        if img.isNull():
+            _act_state["missing"][game] = time.time()
+            return
+        img = img.scaled(240, 360, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        img = img.copy((img.width() - 240) // 2, (img.height() - 360) // 2, 240, 360)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if img.save(path, "PNG"):
+            _act_bus().ready.emit(game, path)
+    except Exception:
+        _log_exc("_act_cover_job")
+    finally:
+        _act_state["pending"].discard(game)
+
+def _act_cover_request(game):
+    """Cached cover file for the game, or '' while it is being looked up on a worker thread."""
+    path = _act_cover_path(game)
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return path
+    if game in _act_state["pending"] or time.time() - _act_state["missing"].get(game, 0) < 3600:
+        return ""
+    _act_state["pending"].add(game)
+    _act_state["pool"].submit(_act_cover_job, game)
+    return ""
+
+def _act_cover_pixmap(path, w=_ACT_COVER_W, h=_ACT_COVER_H):
+    src = QPixmap(path)
+    if src.isNull():
+        return None
+    dpr = _screen_dpr()
+    pw, ph = int(round(w * dpr)), int(round(h * dpr))
+    scaled = src.scaled(pw, ph, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(pw, ph)
+    out.fill(Qt.GlobalColor.transparent)
+    pt = QPainter(out)
+    pt.setRenderHint(QPainter.RenderHint.Antialiasing)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, pw, ph), 4 * dpr, 4 * dpr)
+    pt.setClipPath(clip)
+    pt.drawPixmap((pw - scaled.width()) // 2, (ph - scaled.height()) // 2, scaled)
+    pt.end()
+    out.setDevicePixelRatio(dpr)
+    return out
 
 def _act_refresh(self):
     box = self.__dict__.get("_act_box")
@@ -51100,19 +52131,52 @@ def _act_refresh(self):
         w = box.takeAt(0).widget()
         if w is not None:
             w.deleteLater()
+    self._act_covers = {}
     items = _act_load()[:8]
     if not items:
         l = QLabel("Nothing yet. What your friends play and add shows up here while the launcher is open.")
         l.setObjectName("RowDesc"); l.setWordWrap(True)
         box.addWidget(l)
     for it in items:
+        game = _act_game_of(it)
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 2, 0, 2)
+        hl.setSpacing(10)
+        if game:
+            cover = QLabel()
+            cover.setFixedSize(_ACT_COVER_W, _ACT_COVER_H)
+            cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cover.setStyleSheet("background: rgba(128,128,128,40); border-radius: 4px; color: gray; font-weight: 700;")
+            cover.setText(game[:1].upper())
+            path = _act_cover_request(game)
+            if path:
+                pm = _act_cover_pixmap(path)
+                if pm is not None:
+                    cover.setText("")
+                    cover.setPixmap(pm)
+            self._act_covers.setdefault(game, []).append(cover)
+            hl.addWidget(cover, 0, Qt.AlignmentFlag.AlignTop)
         l = QLabel(f"<b>{html_lib.escape(str(it.get('n', '')))}</b> {html_lib.escape(str(it.get('x', '')))}"
                    f" <span style='color:gray'>- {_act_ago(it.get('t', 0))}</span>")
         l.setTextFormat(Qt.TextFormat.RichText); l.setWordWrap(True)
-        box.addWidget(l)
+        hl.addWidget(l, 1, Qt.AlignmentFlag.AlignVCenter)
+        box.addWidget(row)
+
+def _act_on_cover(self, game, path):
+    pm = _act_cover_pixmap(path)
+    if pm is None:
+        return
+    for lbl in self.__dict__.get("_act_covers", {}).get(game, []):
+        try:
+            lbl.setText("")
+            lbl.setPixmap(pm)
+        except RuntimeError:    # expected: the widget or object may already be deleted
+            pass
 
 FriendsPage._detect_events = _act_detect
 FriendsPage._act_refresh = _act_refresh
+FriendsPage._act_on_cover = _act_on_cover
 
 _act_prev_init = FriendsPage.__init__
 
@@ -51127,6 +52191,7 @@ def _act_init(self, parent=None):
         self._act_box = QVBoxLayout(); self._act_box.setSpacing(4)
         pl.addLayout(self._act_box)
         lay.insertWidget(lay.indexOf(self.req_box) + 2, panel)
+        _act_bus().ready.connect(self._act_on_cover)
         self._act_refresh()
     except Exception:
         _log_exc("_act_init")
@@ -51513,8 +52578,8 @@ def _bpf_refresh(self):
     try:
         keep = self._items[self._sel]["card"] if self._items and self._sel < len(self._items) else None
         items = [i for i in self._items if _lb_keep(i["title"])]
-        if _lb_view["mode"] == "recent":
-            items.sort(key=lambda i: -lb_last(i["title"]))
+        if _lb_sort_key("") is not None:
+            items.sort(key=lambda i: _lb_sort_key(i["title"]))
         for i in items:
             if any(b.text().strip() == "Update" for b in i["card"].findChildren(QPushButton)):
                 i["status"] = "Update available"
@@ -52192,6 +53257,9 @@ def _bpg_paint_library(self, p, w, h, m, acc, k):
             p.setPen(QColor(200, 200, 220))
             msg = {"fav": "No favorites yet\nOpen a game's options (X) and pick Add to favorites",
                    "recent": "Nothing played yet\nGames you launch show up here",
+                   "week": "Nothing played this week\nGames you launch in the last 7 days show up here",
+                   "most": "No playtime yet\nYour most played games show up here",
+                   "never": "You've played everything\nGames you haven't launched yet show up here",
                    "hidden": "No hidden games"}.get(mode, "Nothing here")
             p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), msg)
         else:
@@ -55602,10 +56670,10 @@ def _st_short_price(usd, currency):
     try:
         if currency == "USD":
             return f"${usd:,.2f}"
-        amount = usd * get_usd_rates().get(currency, FALLBACK_RATES[currency])
-        text = f"{amount:,.0f}" if currency == "EGP" else f"{amount:,.2f}"
-        if text.endswith(".00"):
-            text = text[:-3]
+        rate = get_usd_rates().get(currency) or FALLBACK_RATES.get(currency)
+        if not rate:
+            return f"${usd:,.2f}"
+        text = _currency_amount_text(usd * rate, currency)
         return f"\u20ac{text}" if currency == "EUR" else f"{currency} {text}"
     except Exception:
         return f"${usd:,.2f}"
@@ -57766,6 +58834,3384 @@ def _dg_decorate(self, card, title):
         _log_exc("_dg_decorate")
 
 _lb_decorate = _dg_decorate
+
+
+# ── Add to Steam (non-Steam shortcut + artwork) ──
+# 3-dot menu > "Add to Steam" adds the game to Steam's library as a non-Steam game. Pressing Play in Steam runs the same
+# command as the game's desktop shortcut (`main.py --launch-game <title>`): the launcher opens in the tray and starts the game.
+# Artwork (portrait, wide, hero, logo, icon): SteamGridDB when an API key is set, otherwise Steam's own CDN.
+def _as_vdf_read(data):
+    """Binary VDF (shortcuts.vdf) -> nested dict."""
+    import struct    # lazy: saves memory/startup until used
+    pos = 0
+
+    def cstr():
+        nonlocal pos
+        end = data.index(b"\x00", pos)
+        s = data[pos:end].decode("utf-8", errors="replace")
+        pos = end + 1
+        return s
+
+    def obj():
+        nonlocal pos
+        out = {}
+        while pos < len(data):
+            t = data[pos]
+            pos += 1
+            if t == 8:
+                return out
+            k = cstr()
+            if t == 0:
+                out[k] = obj()
+            elif t == 1:
+                out[k] = cstr()
+            elif t == 2:
+                out[k] = struct.unpack_from("<I", data, pos)[0]
+                pos += 4
+            else:
+                raise ValueError(f"unknown VDF type {t}")
+        return out
+    return obj()
+
+def _as_vdf_write(d):
+    import struct    # lazy: saves memory/startup until used
+
+    def obj(o):
+        out = b""
+        for k, v in o.items():
+            kb = str(k).encode("utf-8") + b"\x00"
+            if isinstance(v, dict):
+                out += b"\x00" + kb + obj(v) + b"\x08"
+            elif isinstance(v, int):
+                out += b"\x02" + kb + struct.pack("<I", v & 0xFFFFFFFF)
+            else:
+                out += b"\x01" + kb + str(v).encode("utf-8") + b"\x00"
+        return out
+    return obj(d) + b"\x08"
+
+def _as_steam_config_dir():
+    """The config folder of the Steam account used most recently on this PC ('' when Steam isn't installed)."""
+    best = None
+    for root in _steam_root_dirs():
+        ud = os.path.join(root, "userdata")
+        try:
+            names = os.listdir(ud)
+        except OSError:
+            continue
+        for n in names:
+            cfg = os.path.join(ud, n, "config")
+            if not n.isdigit() or n == "0" or not os.path.isdir(cfg):
+                continue
+            lc = os.path.join(cfg, "localconfig.vdf")
+            m = os.path.getmtime(lc if os.path.exists(lc) else cfg)
+            if best is None or m > best[0]:
+                best = (m, cfg)
+    return best[1] if best else ""
+
+def _as_steam_running():
+    try:
+        if sys.platform.startswith("win"):
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"], capture_output=True, text=True,
+                                 timeout=10, creationflags=0x08000000).stdout
+            return "steam.exe" in out.lower()
+        return subprocess.run(["pgrep", "-x", "steam"], capture_output=True, timeout=5).returncode == 0
+    except Exception:    # expected: pgrep / tasklist may be missing
+        return False
+
+def _as_find_appid(title, key):
+    """Steam app id of the game (0 if it isn't a Steam game / can't be found)."""
+    if key and str(key).isdigit() and len(str(key)) <= 9:
+        return int(key)
+    found = _steam_appid_for_title(title)
+    if found:
+        return found
+    try:
+        raw = _http_get("https://store.steampowered.com/api/storesearch/?term=" + urllib.parse.quote(pretty_game_name(title), safe="")
+                        + "&l=english&cc=us", timeout=12)
+        want = _norm_title(pretty_game_name(title))
+        for it in json.loads(raw.decode("utf-8", errors="replace")).get("items") or []:
+            if _norm_title(it.get("name")) == want:
+                return int(it["id"])
+    except Exception:
+        _log_exc("_as_find_appid")
+    return 0
+
+def _as_img(url):
+    """Image bytes from a URL, or None (not an image / not there)."""
+    try:
+        b = _http_get(url, timeout=20)
+    except Exception:    # expected: 404 / offline
+        return None
+    return b if b and (b[:8] == b"\x89PNG\r\n\x1a\n" or b[:3] == b"\xff\xd8\xff" or b[:4] == b"RIFF" or b[:3] == b"GIF") else None
+
+def _as_sgdb_pick(path, key):
+    """Best-scored image of a SteamGridDB list endpoint, as bytes (None when there isn't one)."""
+    try:
+        for item in ((_sgdb_get_json(path, key) or {}).get("data") or []):
+            if isinstance(item, dict) and item.get("url"):
+                b = _as_img(item["url"])
+                if b:
+                    return b
+    except Exception:
+        _log_exc("_as_sgdb_pick")
+    return None
+
+def _as_save_art(folder, stem, data):
+    """Saves image bytes as <stem>.png / .jpg in Steam's grid folder (webp/gif are converted to png). Returns the path."""
+    ext = ".png" if data[:4] == b"\x89PNG" else ".jpg" if data[:3] == b"\xff\xd8\xff" else ""
+    if not ext:
+        from PyQt6.QtGui import QImage    # lazy: saves memory/startup until used
+        img = QImage()
+        if not img.loadFromData(data):
+            return ""
+        from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        data, ext = bytes(ba), ".png"
+    for old in (".png", ".jpg", ".jpeg", ".webp"):
+        try:
+            os.remove(os.path.join(folder, stem + old))
+        except OSError:    # expected: nothing to replace
+            pass
+    path = os.path.join(folder, stem + ext)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+# NCZ games (Five Nights at NCZ AE / 2, NCZFront): the logo and background are downloaded from the releases repository
+# first (<prefix>-logo.png, <prefix>-background.png); the 600x900 portrait cover is the one in assets/.
+_AS_NCZ_ART_BASE = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/"
+_AS_NCZ_ART = {"ae": ("fnanczae", "fnanczaecover.png"),
+               "ncz2": ("fnancz2", "fnancz2cover.png"),
+               "nczfront": ("nczfront", "nczfront-cover.png"),
+               "nczreturn": ("tr", "fnancz-tr.png"),
+               "chess": ("ch", "nczchess.png")}
+_AS_NCZ_ICON = {"ae": "ae-icon.png", "ncz2": "2-icon.png", "nczfront": "front-icon.png"}     # the Steam shortcut icon, same repository
+# Games whose art files don't follow the <prefix>-logo / <prefix>-background naming (and have no logo): the exact
+# files to download from the same repository, as piece -> file name.
+_AS_NCZ_FILES = {"nczreturn": {"logo": "nczfront-logo.png", "hero": "tr-bg.png", "icon": "tr-icon.png"},     # logo: NCZFront's
+                 "chess": {"logo": "nczfront-logo.png", "hero": "ch-bg.png", "icon": "ch-icon.png"}}
+
+def _as_fetch_ncz_art(key, cover):
+    """Artwork for an NCZ game: logo + background from the repository, portrait from assets/. Returns (art, src, missing)."""
+    prefix, cover_file = _AS_NCZ_ART[key]
+    art, src, missing = {}, {}, []
+    if key in _AS_NCZ_FILES:
+        pieces = list(_AS_NCZ_FILES[key].items())
+    else:
+        pieces = [("logo", f"{prefix}-logo.png"), ("hero", f"{prefix}-background.png")]
+        if _AS_NCZ_ICON.get(key):
+            pieces.append(("icon", _AS_NCZ_ICON[key]))
+    for name, fname in pieces:
+        b = _as_img(f"{_AS_NCZ_ART_BASE}{fname}")
+        if b:
+            art[name], src[name] = b, "NCZ repository"
+        else:
+            missing.append(fname)
+    if "hero" in art:                       # no separate wide capsule: the background doubles as one
+        art["w"], src["w"] = art["hero"], src["hero"]
+    path = cover if cover and os.path.isfile(cover) else asset_path(cover_file)
+    try:
+        with open(path, "rb") as f:
+            art["p"], src["p"] = f.read(), "assets"
+    except OSError:
+        _log_exc("_as_fetch_ncz_art cover")
+        missing.append(cover_file)
+    return art, src, missing
+
+def _as_fetch_art(title, appid, key, cover):
+    """{'p','w','hero','logo','icon'} -> image bytes (missing ones are absent), plus the source used per piece."""
+    art, src = {}, {}
+    sgdb = get_steamgriddb_key()
+    gid = None
+    if sgdb:
+        try:
+            game = sgdb_steam_game(appid, sgdb) if appid else None
+            if not game:
+                hits = sgdb_search_games(title, sgdb)
+                want = _norm_title(title)
+                game = next((h for h in hits if _norm_title(h.get("name")) == want), hits[0] if hits else None)
+            gid = game["id"] if game else None
+        except Exception:
+            _log_exc("_as_fetch_art")
+    if gid and sgdb:
+        for name, path in (("p", f"/grids/game/{gid}?dimensions={SGDB_PORTRAIT_SIZES}&types=static"),
+                           ("w", f"/grids/game/{gid}?dimensions=920x430,460x215&types=static"),
+                           ("hero", f"/heroes/game/{gid}?types=static"),
+                           ("logo", f"/logos/game/{gid}?types=static"),
+                           ("icon", f"/icons/game/{gid}?types=static")):
+            b = _as_sgdb_pick(path, sgdb)
+            if b:
+                art[name], src[name] = b, "SteamGridDB"
+    if appid:       # whatever SteamGridDB didn't have (or everything, with no key) comes from Steam's CDN
+        base = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/"
+        wanted = {"p": [base + "library_600x900.jpg"], "w": [base + "header.jpg"],
+                  "hero": [base + "library_hero.jpg"], "logo": [base + "logo.png"]}
+        for name, urls in wanted.items():
+            if name in art:
+                continue
+            for u in urls:
+                b = _as_img(u)
+                if b:
+                    art[name], src[name] = b, "Steam"
+                    break
+        if "p" not in art or "w" not in art:
+            for u in steam_details_art_urls(appid, portrait=("p" not in art)):
+                b = _as_img(u)
+                if not b:
+                    continue
+                name = "p" if u.endswith("library_600x900.jpg") else "w"
+                if name not in art:
+                    art[name], src[name] = b, "Steam"
+    if "p" not in art and cover and os.path.isfile(cover):      # last resort: the cover the launcher already shows
+        try:
+            with open(cover, "rb") as f:
+                art["p"], src["p"] = f.read(), "launcher cover"
+        except OSError:
+            _log_exc("_as_fetch_art cover")
+    return art, src
+
+_AS_COLLECTION = "NCZ GAMES"
+
+def _as_collection_add(cfg, appid, name=_AS_COLLECTION):
+    """Puts a non-Steam game into Steam's \"NCZ GAMES\" collection (cloudstorage/cloud-storage-namespace-1.json):
+    the one that already exists, else a new one. Steam must be closed (Add to Steam already makes sure of it).
+    Returns '' when done, otherwise a short reason."""
+    import secrets as _as_secrets    # lazy: saves memory/startup until used
+    path = os.path.join(cfg, "cloudstorage", "cloud-storage-namespace-1.json")
+    if not os.path.isfile(path):
+        return "Steam hasn't created its collections file yet"
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return "Steam's collections file isn't in the expected format"
+    bak = path + ".ncz_backup"
+    if not os.path.exists(bak):
+        shutil.copyfile(path, bak)
+    now = int(time.time())
+    top = 0
+    for item in data:
+        try:
+            top = max(top, int(item[1].get("version", 0) or 0))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            pass
+    found = None
+    for item in data:
+        try:
+            key, meta = item[0], item[1]
+            if not str(key).startswith("user-collections.") or meta.get("is_deleted") or not meta.get("value"):
+                continue
+            val = json.loads(meta["value"])
+            if str(val.get("name", "")).strip().lower() == name.lower():
+                found = (meta, val)
+                break
+        except (TypeError, ValueError, IndexError, AttributeError):
+            continue
+    if found:
+        meta, val = found
+        added = val.setdefault("added", [])
+        if appid not in added:
+            added.append(appid)
+        if appid in (val.get("removed") or []):
+            val["removed"] = [a for a in val["removed"] if a != appid]
+        meta["value"] = json.dumps(val, separators=(",", ":"))
+        meta["timestamp"] = now
+        meta["version"] = str(top + 1)
+        key = next(i[0] for i in data if i[1] is meta)
+    else:
+        cid = "uc-" + _as_secrets.token_hex(6)
+        key = "user-collections." + cid
+        val = {"id": cid, "name": name, "added": [appid], "removed": []}
+        data.append([key, {"key": key, "timestamp": now, "value": json.dumps(val, separators=(",", ":")),
+                           "version": str(top + 1), "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}])
+    tmp = path + ".ncz_tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    mod = os.path.join(cfg, "cloudstorage", "cloud-storage-namespace-1.modified.json")
+    try:                                      # Steam's list of keys changed here (only touched when it's the plain key list)
+        if os.path.isfile(mod):
+            with open(mod, encoding="utf-8") as f:
+                keys = json.load(f)
+            if isinstance(keys, list) and all(isinstance(k, str) for k in keys) and key not in keys:
+                with open(mod, "w", encoding="utf-8") as f:
+                    json.dump(keys + [key], f, separators=(",", ":"))
+    except Exception:
+        _log_exc("_as_collection_add modified")
+    return ""
+
+def _as_add_worker(title, exe, cover, key, cfg):
+    import zlib    # lazy: saves memory/startup until used
+    try:
+        argv, workdir = _ncz_game_launch_argv(title)       # same command as the desktop shortcut: launcher in the tray, then the game
+        exe_q = f'"{argv[0]}"'
+        opts = subprocess.list2cmdline(argv[1:]) if sys.platform.startswith("win") else shlex.join(argv[1:])
+        sid = (zlib.crc32((exe_q + title).encode("utf-8")) & 0xFFFFFFFF) | 0x80000000
+        missing = []
+        if key in _AS_NCZ_ART:      # NCZ games: download the repository artwork first, then add the shortcut
+            art, src, missing = _as_fetch_ncz_art(key, cover)
+        else:
+            appid = _as_find_appid(title, key)
+            art, src = _as_fetch_art(title, appid, key, cover)
+        grid = os.path.join(cfg, "grid")
+        os.makedirs(grid, exist_ok=True)
+        icon = ""
+        for name, stem in (("p", f"{sid}p"), ("w", f"{sid}"), ("hero", f"{sid}_hero"), ("logo", f"{sid}_logo"),
+                           ("icon", f"{sid}_icon")):
+            if name in art:
+                path = _as_save_art(grid, stem, art[name])
+                if name == "icon":
+                    icon = path
+        if not icon and exe and os.path.exists(exe):
+            icon = _exe_icon_png(exe, sanitize_folder_name(title) or "Game")
+        vdf = os.path.join(cfg, "shortcuts.vdf")
+        data = {"shortcuts": {}}
+        if os.path.isfile(vdf):
+            with open(vdf, "rb") as f:
+                raw = f.read()
+            if raw:
+                data = _as_vdf_read(raw)      # raises (and nothing is touched) if Steam's file isn't what we expect
+            bak = vdf + ".ncz_backup"
+            if not os.path.exists(bak):
+                shutil.copyfile(vdf, bak)
+        top = next((k for k in data if k.lower() == "shortcuts"), "shortcuts")
+        shortcuts = data.setdefault(top, {})
+        entry = {"appid": sid, "AppName": title, "Exe": exe_q, "StartDir": f'"{workdir}"', "icon": icon,
+                 "ShortcutPath": "", "LaunchOptions": opts, "IsHidden": 0, "AllowDesktopConfig": 1, "AllowOverlay": 1,
+                 "OpenVR": 0, "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0, "LastPlayTime": 0,
+                 "FlatpakAppID": "", "tags": {}}
+        existing = next((k for k, v in shortcuts.items() if isinstance(v, dict) and v.get("appid") == sid), None)
+        if existing is not None:
+            old = shortcuts[existing]
+            entry["LastPlayTime"] = old.get("LastPlayTime", 0)
+            entry["tags"] = old.get("tags", {})
+            shortcuts[existing] = entry
+        else:
+            nums = [int(k) for k in shortcuts if str(k).isdigit()]
+            shortcuts[str(max(nums) + 1 if nums else 0)] = entry
+        if isinstance(entry.get("tags"), dict) and _AS_COLLECTION not in entry["tags"].values():
+            entry["tags"][str(len(entry["tags"]))] = _AS_COLLECTION      # the older per-game tag, harmless next to the collection
+        tmp = vdf + ".ncz_tmp"
+        with open(tmp, "wb") as f:
+            f.write(_as_vdf_write(data))
+        os.replace(tmp, vdf)
+        try:
+            coll = _as_collection_add(cfg, sid)
+        except Exception as e:
+            _log_exc("_as_collection_add")
+            coll = f"{e}"
+        names = {"p": "portrait", "w": "wide", "hero": "hero", "logo": "logo", "icon": "icon"}
+        got = ", ".join(f"{names[n]} ({src[n]})" for n in names if n in art) or "none found"
+        msg = (f"{title} was {'updated in' if existing is not None else 'added to'} Steam.\n\nArtwork: {got}.\n\n"
+               "Restart Steam to see it. Pressing Play there opens the launcher in the tray and starts the game.")
+        msg += (f"\n\nIt's in your \"{_AS_COLLECTION}\" collection." if not coll
+                else f"\n\nCouldn't put it in the \"{_AS_COLLECTION}\" collection ({coll}).")
+        if missing:
+            msg += ("\n\nCouldn't get from the repository / assets: " + ", ".join(missing)
+                    + ". Check your connection and use Add to Steam again to retry.")
+        _as_signals.done.emit(msg, True)
+    except Exception as e:
+        _log_exc("_as_add_worker")
+        _as_signals.done.emit(f"Couldn't add {title} to Steam: {e}", False)
+
+class _AsSignals(QObject):
+    done = pyqtSignal(str, bool)
+
+_as_signals = _AsSignals()
+_as_parent = {"w": None}
+
+def _as_show(msg, ok):
+    (QMessageBox.information if ok else QMessageBox.warning)(_as_parent["w"], "Add to Steam", msg)
+
+_as_signals.done.connect(_as_show)
+
+def add_game_to_steam(app, title, exe, cover="", key=None):
+    cfg = _as_steam_config_dir()
+    if not cfg:
+        QMessageBox.warning(app, "Add to Steam", "Couldn't find Steam on this PC (no signed-in account folder in its userdata).\n"
+                            "Install Steam and sign in once, then try again.")
+        return
+    while _as_steam_running():      # Steam rewrites shortcuts.vdf when it closes, which would drop the new entry
+        r = QMessageBox.question(app, "Add to Steam",
+                                 "Steam is running. Close it completely (right-click its tray icon > Exit), then click Retry.",
+                                 QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel)
+        if r != QMessageBox.StandardButton.Retry:
+            return
+    _as_parent["w"] = app
+    threading.Thread(target=_as_add_worker, args=(title, exe, cover, key, cfg), daemon=True).start()
+
+_as_prev_add_shortcut = _add_shortcut_action
+
+def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="", key=None):
+    _as_prev_add_shortcut(app, card, title, exe_fn, tool_fn, cover, key)
+    _as_add_menu(app, card, title, exe_fn, cover, key)
+
+def _as_add_menu(app, card, title, exe_fn, cover="", key=None):
+    """Adds "Add to Steam" to a card's 3-dot menu (once)."""
+    try:
+        more = card.findChild(QPushButton, "MoreButton") if card is not None else None
+        menu = more.menu() if more else None
+        if menu is None or any(a.text() == "Add to Steam" for a in menu.actions()):
+            return
+        act = menu.addAction("Add to Steam")
+        act.setToolTip("Adds this game to your Steam library with its artwork (SteamGridDB if you set a key, else Steam's)")
+        act.triggered.connect(lambda _c=False: add_game_to_steam(app, title, exe_fn(), cover, key))
+    except Exception:
+        _log_exc("_add_shortcut_action steam")
+
+
+# ── voice chat (WebRTC) + online on PC / Web / Mobile ──
+# Voice: the audio goes straight between the players (WebRTC, peer to peer). Firebase is only the "phone line" that carries
+# the short connection handshake (offer / answer / ICE), so it adds no delay to the voice itself.
+#   engine    : a hidden QtWebEngine page (the browser's own WebRTC: echo cancellation, noise suppression, Opus)
+#   signaling : Realtime Database, vc/rooms/<room>/{members,signals}, vc/ring/<callee> (see voice-chat-rules.json)
+#   rooms     : dm_<chat id> for a friend call, grp_<gid> for a group voice channel (mesh, up to VC_MAX people)
+# Status: the PC launcher is public/<uid>/seen (as before); the website and the phone app write
+# public/<uid>/devices/<web|mobile> = {seen: server timestamp, idle: bool} on the same ~30 s heartbeat.
+import html as _vc_html
+
+VC_MAX = 8                       # mesh: everybody sends their audio to everybody, so keep rooms small
+VC_RING_SECONDS = 45
+VC_MEMBER_FRESH_MS = 75000       # a member whose heartbeat is older than this crashed / lost connection
+VC_STUN = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]
+
+# ── online on PC / Web / Mobile ──
+_VC_DEVICE_LABEL = {"pc": "PC", "web": "Web", "mobile": "Mobile"}
+
+def _friend_devices(d):
+    """Devices a friend is online on right now, e.g. ['pc', 'mobile']."""
+    out = []
+    if not isinstance(d, dict):
+        return out
+    if _friend_is_fresh(d):
+        out.append("pc")
+    dev = d.get("devices")
+    if isinstance(dev, dict):
+        now = time.time() * 1000 + _clock_skew["ms"]
+        for k in ("web", "mobile"):
+            v = dev.get(k)
+            seen = v.get("seen") if isinstance(v, dict) else None
+            if isinstance(seen, (int, float)) and seen > 0 and -30000 < now - seen < FRIEND_ONLINE_WINDOW_MS:
+                out.append(k)
+    return out
+
+def _vc_device_text(d):
+    return " + ".join(_VC_DEVICE_LABEL[k] for k in _friend_devices(d))
+
+_vc_prev_friend_status = _friend_status
+
+def _friend_status(d):      # online on Web / Mobile only still counts as online (text stays "Online" / "Idle")
+    s, c = _vc_prev_friend_status(d)
+    if s == "Offline":
+        dev = d.get("devices") if isinstance(d, dict) else None
+        live = [k for k in _friend_devices(d) if k != "pc"]
+        if live:
+            if all(isinstance(dev.get(k), dict) and dev[k].get("idle") is True for k in live):
+                return "Idle", "#3b82f6"
+            return "Online", GREEN
+    return s, c
+
+_vc_prev_fo_status = _fo_status
+
+def _fo_status(d):
+    t, col, grp = _vc_prev_fo_status(d)
+    if grp == 1:
+        tag = _vc_device_text(d)
+        if tag:
+            t = f"{t} \u00b7 {tag}"
+    return t, col, grp
+
+_vc_prev_profile_from_public = profile_info_from_public
+
+def profile_info_from_public(uid, d, raw_covers=None):
+    info = _vc_prev_profile_from_public(uid, d, raw_covers)
+    try:
+        tag = _vc_device_text(d)
+        if tag and info.get("status") != "Offline":
+            info["sub"] = f"Online on {tag}"
+    except Exception:
+        _log_exc("profile_info_from_public devices")
+    return info
+
+# ── voice settings (Settings > Voice) ──
+_VC_DEFAULTS = {"voice_ns": "standard",       # off | standard | high
+                "voice_echo": True, "voice_agc": True,
+                "voice_gate": True, "voice_gate_auto": True, "voice_gate_db": -50,
+                "voice_in_vol": 100, "voice_out_vol": 100, "voice_in_dev": "", "voice_out_dev": "", "voice_sounds": True}
+
+def _vc_get(key):
+    return load_launcher_settings().get(key, _VC_DEFAULTS[key])
+
+def _vc_set(key, value):
+    st = dict(load_launcher_settings())
+    st[key] = value
+    save_launcher_settings(st)
+    mgr = _voice.get("mgr")
+    if mgr is not None:
+        mgr.apply_audio()
+
+def _vc_audio_json():
+    g = _vc_get
+    return json.dumps({"ns": str(g("voice_ns")), "echo": bool(g("voice_echo")), "agc": bool(g("voice_agc")),
+                       "gate": bool(g("voice_gate")), "auto": bool(g("voice_gate_auto")), "db": float(g("voice_gate_db")),
+                       "inVol": max(0.0, float(g("voice_in_vol")) / 100.0), "outVol": max(0.0, float(g("voice_out_vol")) / 100.0),
+                       "inDev": str(g("voice_in_dev") or ""), "outDev": str(g("voice_out_dev") or "")})
+
+# ── join / leave sounds (Discord style): the same two sounds are used when YOU join / leave and when somebody ELSE does ──
+# Joining = two quick rising notes, leaving = two quick falling notes. They are synthesized once (no files shipped); to use
+# your own, put join.wav / leave.wav in assets/voice/sounds/ and they replace these.
+_vc_snd = {"fx": {}, "broken": False, "last": {}}
+_VC_SND_NOTES = {"join": ((659.25, 0.00, 0.12), (987.77, 0.08, 0.20)),       # (frequency Hz, start s, length s)
+                 "leave": ((783.99, 0.00, 0.12), (523.25, 0.08, 0.20)),
+                 # ringtones (frequency, start, length, decay): incoming = a four-note bell phrase, outgoing = the soft two-tone "ringback"
+                 "ring_in": ((880.00, 0.00, 0.55, 5.0), (659.25, 0.22, 0.55, 5.0), (880.00, 0.44, 0.55, 5.0), (659.25, 0.66, 0.70, 4.0)),
+                 "ring_out": ((440.0, 0.00, 1.00, 2.5), (480.0, 0.00, 1.00, 2.5))}
+_VC_SND_LEN = {"ring_in": 2.0, "ring_out": 3.0}           # total length: the silence after the notes is part of the ring pattern
+
+def _vc_synth(kind):
+    rate = 44100
+    notes = _VC_SND_NOTES[kind]
+    n = int(rate * max(max(nt[1] + nt[2] for nt in notes) + 0.04, _VC_SND_LEN.get(kind, 0.0)))
+    buf = [0.0] * n
+    for nt in notes:
+        freq, st, ln = nt[0], nt[1], nt[2]
+        decay = nt[3] if len(nt) > 3 else 15.0
+        s0 = int(st * rate)
+        for i in range(int(ln * rate)):
+            if s0 + i >= n:
+                break
+            t = i / rate
+            env = min(1.0, t / 0.005) * _math.exp(-t * decay)               # soft attack (no click), round decay
+            ph = 2 * _math.pi * freq * t
+            buf[s0 + i] += (_math.sin(ph) + 0.30 * _math.sin(2 * ph) + 0.07 * _math.sin(3 * ph)) * env
+    peak = max(1e-9, max(abs(v) for v in buf))
+    data = b"".join(_struct.pack("<h", int(max(-1.0, min(1.0, v / peak * 0.85)) * 32767)) for v in buf)
+    return data, rate
+
+def _vc_sound_path(kind):
+    custom = os.path.join(asset_path("voice"), "sounds", kind + ".wav")
+    if os.path.exists(custom):
+        return custom
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "voice_sounds")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, kind + "_v1.wav")
+    if not os.path.exists(path):
+        data, rate = _vc_synth(kind)
+        with _wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(data)
+    return path
+
+def _vc_stop(kind):
+    """Cuts a ringtone short (answered / declined / hung up)."""
+    try:
+        fx = _vc_snd["fx"].get(kind)
+        if fx is not None:
+            fx.stop()
+    except Exception:
+        pass
+
+def _vc_play(kind, force=False):
+    """kind = 'join', 'leave', 'ring_in' or 'ring_out'. Join / leave are silent when turned off in Settings > Voice; ringtones
+    (force=True) always play. The same sound twice within 0.4 s plays once. Put ring_in.wav / ring_out.wav in
+    assets/voice/sounds/ to use your own ringtone."""
+    try:
+        if kind not in _VC_SND_NOTES or _vc_snd["broken"] or (not force and not _vc_get("voice_sounds")):
+            return
+        now = time.time()
+        if now - _vc_snd["last"].get(kind, 0.0) < 0.4:
+            return
+        _vc_snd["last"][kind] = now
+        vol = max(0.0, min(1.0, 0.6 * float(_vc_get("voice_out_vol")) / 100.0))
+        path = _vc_sound_path(kind)
+        if _lx_cli_available():
+            _lx_cli_play(path, vol)
+            return
+        fx = _vc_snd["fx"].get(kind)
+        if fx is None:
+            from PyQt6.QtMultimedia import QSoundEffect    # lazy: saves memory/startup until used
+            fx = QSoundEffect()
+            fx.setSource(QUrl.fromLocalFile(path))
+            _vc_snd["fx"][kind] = fx
+        if fx.status().name == "Error":
+            _lx_cli_play(path, vol)                        # Linux: QtMultimedia can't open the device
+            return
+        fx.setVolume(vol)
+        fx.play()
+    except Exception:
+        if sys.platform.startswith("linux"):
+            try:
+                _lx_cli_play(_vc_sound_path(kind), 0.5)
+            except Exception:
+                _log_exc("_vc_play")
+        else:
+            _vc_snd["broken"] = True      # no QtMultimedia / no audio device: stay silent instead of erroring
+
+
+# ── the WebRTC page (runs hidden inside QtWebEngine) ──
+# Mic -> gain -> high-pass -> noise gate / expander (an AudioWorklet, so it runs on the audio thread and is never throttled)
+# -> the track that is sent to everybody. Chromium's own noise suppression / echo cancellation / AGC sit in front of that.
+_VC_HTML = r"""<!doctype html><html><body><script>
+const WORKLET = `
+class Gate extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.p = {gate: true, auto: true, db: -50, high: false, report: false};
+    this.g = 0; this.hold = 0; this.nf = -70; this.open = false; this.n = 0;
+    this.port.onmessage = e => Object.assign(this.p, e.data);
+  }
+  process(inputs, outputs) {
+    const i = inputs[0] && inputs[0][0], o = outputs[0] && outputs[0][0];
+    if (!o) return true;
+    if (!i) { o.fill(0); return true; }
+    let s = 0; for (let k = 0; k < i.length; k++) s += i[k] * i[k];
+    const rms = Math.sqrt(s / i.length), db = rms > 1e-6 ? 20 * Math.log10(rms) : -120;
+    const dt = i.length / sampleRate, p = this.p;
+    if (db < this.nf) this.nf = db; else if (!this.open) this.nf = Math.min(this.nf + 4 * dt, db);
+    this.nf = Math.max(-90, Math.min(-40, this.nf));
+    const thr = (p.gate && !p.auto) ? p.db : Math.max(-75, Math.min(-30, this.nf + 10));
+    const was = this.open;
+    if (db >= thr) { this.hold = 0.25; this.open = true; }
+    else { this.hold -= dt; if (this.hold <= 0) this.open = false; }
+    let target = 1;
+    if (!this.open) target = p.gate ? 0 : (p.high ? 0.06 : 1);
+    const a = 1 - Math.exp(-dt / (target > this.g ? 0.003 : 0.08));
+    this.g += (target - this.g) * a;
+    for (let k = 0; k < i.length; k++) o[k] = i[k] * this.g;
+    if (this.open !== was) this.port.postMessage({o: this.open});
+    if (p.report && ++this.n % 12 === 0) this.port.postMessage({l: db, thr: thr, o: this.open});
+    return true;
+  }
+}
+registerProcessor("ncz-gate", Gate);
+`;
+const NCZ = (() => {
+  let cfg = {iceServers: [{urls: ["stun:stun.l.google.com:19302"]}], bundlePolicy: "max-bundle"};
+  const aud = {ns: "standard", echo: true, agc: true, gate: true, auto: true, db: -50, inVol: 1, outVol: 1, inDev: "", outDev: ""};
+  let raw = null, local = null, track = null, ctx = null, node = null, gIn = null, hp = null, srcN = null;
+  let wReady = false, muted = false, deaf = false, readyP = null, report = false, built = "";
+   const srvm = {};      // peers an admin server-muted: their audio stays off here whatever their own client does
+  const vols = {}, peers = {}, pend = {}, meters = {};
+  const send = o => console.log("NCZVC:" + JSON.stringify(o));
+  const key = () => [aud.inDev, aud.echo, aud.agc, aud.ns !== "off"].join("|");
+  function meter(id, stream) {
+    try {
+      ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+      ctx.resume();
+      const an = ctx.createAnalyser(); an.fftSize = 512;
+      ctx.createMediaStreamSource(stream).connect(an);
+      meters[id] = {an: an, buf: new Uint8Array(an.fftSize), on: false, hold: 0};
+    } catch (e) {}
+  }
+  setInterval(() => {
+    for (const id in meters) {
+      const m = meters[id]; m.an.getByteTimeDomainData(m.buf);
+      let s = 0; for (const v of m.buf) { const x = (v - 128) / 128; s += x * x; }
+      let on = Math.sqrt(s / m.buf.length) > 0.02 && !(id === "me" && muted);
+      if (on) m.hold = 4; else if (m.hold > 0) { m.hold--; on = true; }
+      if (on !== m.on) { m.on = on; send({t: "speak", uid: id, on: on}); }
+    }
+  }, 120);
+  setInterval(async () => {
+    for (const u in peers) {
+      const pc = peers[u].pc;
+      if (pc.connectionState !== "connected") continue;
+      try {
+        const st = await pc.getStats(); let rtt = null;
+        st.forEach(r => { if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime != null) rtt = r.currentRoundTripTime; });
+        if (rtt != null) send({t: "ping", uid: u, ms: Math.round(rtt * 1000)});
+      } catch (e) {}
+    }
+  }, 2500);
+  function sink(a) {
+    if (aud.outDev && a.setSinkId && a._sink !== aud.outDev) { a._sink = aud.outDev; a.setSinkId(aud.outDev).catch(() => {}); }
+  }
+  function push() {
+    if (gIn) gIn.gain.value = aud.inVol;
+    if (hp) hp.frequency.value = aud.ns === "high" ? 120 : (aud.ns === "standard" ? 70 : 10);
+    if (node) node.port.postMessage({gate: aud.gate, auto: aud.auto, db: aud.db, high: aud.ns === "high", report: report});
+    for (const u in peers) {
+      const a = peers[u].audio;
+      if (a) { a.volume = Math.min(1, aud.outVol * ((u in vols) ? vols[u] : 1)); sink(a); }
+    }
+  }
+  function dispose() {
+    try { if (srcN) srcN.disconnect(); if (gIn) gIn.disconnect(); if (hp) hp.disconnect(); if (node) node.disconnect(); } catch (e) {}
+    if (raw) raw.getTracks().forEach(t => t.stop());
+    if (local && local !== raw) local.getTracks().forEach(t => t.stop());
+    raw = local = track = node = gIn = hp = srcN = null; delete meters["me"];
+  }
+  async function devices() {
+    try {
+      const l = await navigator.mediaDevices.enumerateDevices();
+      const f = k => l.filter(d => d.kind === k).map(d => [d.deviceId, d.label || k]);
+      send({t: "devices", ins: f("audioinput"), outs: f("audiooutput")});
+    } catch (e) {}
+  }
+  async function build() {
+    dispose();
+    const a = {echoCancellation: aud.echo, noiseSuppression: aud.ns !== "off", autoGainControl: aud.agc, channelCount: 1};
+    if (aud.inDev) a.deviceId = {exact: aud.inDev};
+    try { raw = await navigator.mediaDevices.getUserMedia({audio: a}); }
+    catch (e) {
+      if (!aud.inDev) throw e;
+      aud.inDev = ""; delete a.deviceId;
+      raw = await navigator.mediaDevices.getUserMedia({audio: a});
+    }
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)({latencyHint: "interactive"});
+    await ctx.resume();
+    try {
+      if (!wReady) {
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: "application/javascript"})));
+        wReady = true;
+      }
+      srcN = ctx.createMediaStreamSource(raw);
+      gIn = ctx.createGain();
+      hp = ctx.createBiquadFilter(); hp.type = "highpass";
+      node = new AudioWorkletNode(ctx, "ncz-gate", {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1]});
+      const dest = ctx.createMediaStreamDestination();
+      srcN.connect(gIn); gIn.connect(hp); hp.connect(node); node.connect(dest);
+      node.port.onmessage = e => {
+        const d = e.data;
+        if (d.l !== undefined) send({t: "level", db: d.l, thr: d.thr, o: d.o});
+        else if (d.o !== undefined) send({t: "speak", uid: "me", on: d.o && !muted});
+      };
+      local = dest.stream;
+    } catch (e) {
+      send({t: "log", msg: "worklet unavailable: " + e});
+      local = raw; node = null; meter("me", raw);
+    }
+    track = local.getAudioTracks()[0];
+    track.enabled = !muted;
+    built = key();
+    push();
+    devices();
+  }
+  function close(uid) {
+    const p = peers[uid]; if (!p) return;
+    try { p.pc.close(); } catch (e) {}
+    if (p.audio) { p.audio.srcObject = null; p.audio.remove(); }
+    delete meters[uid]; delete peers[uid];
+  }
+  function mk(uid) {
+    close(uid);
+    const pc = new RTCPeerConnection(cfg), p = {pc: pc, queue: [], audio: null};
+    peers[uid] = p;
+    local.getTracks().forEach(t => pc.addTrack(t, local));
+    pc.onicecandidate = e => { if (e.candidate) send({t: "sig", to: uid, type: "ice", data: JSON.stringify(e.candidate)}); };
+    pc.ontrack = e => {
+      if (p.audio) return;
+      const a = document.createElement("audio");
+      a.autoplay = true; a.srcObject = e.streams[0]; a.muted = deaf || !!srvm[uid];
+      a.volume = Math.min(1, aud.outVol * ((uid in vols) ? vols[uid] : 1));
+      document.body.appendChild(a); p.audio = a; sink(a);
+      meter(uid, e.streams[0]);
+    };
+    pc.onconnectionstatechange = () => send({t: "state", uid: uid, s: pc.connectionState});
+    return p;
+  }
+  async function flush(uid) {
+    const p = peers[uid];
+    while (p && p.queue.length) { try { await p.pc.addIceCandidate(p.queue.shift()); } catch (e) {} }
+  }
+  return {
+    init(ice, audJson) {
+      try { cfg.iceServers = JSON.parse(ice); } catch (e) {}
+      try { Object.assign(aud, JSON.parse(audJson)); } catch (e) {}
+      if (readyP) { push(); send({t: "ready"}); return; }
+      readyP = (async () => {
+        try { await build(); }
+        catch (e) {
+          send({t: "error", msg: "Couldn't use the microphone (" + (e.name || e) + "). Check that one is plugged in and allowed."});
+          readyP = null; return false;
+        }
+        send({t: "ready"}); return true;
+      })();
+    },
+    async audio(j) {
+      try { Object.assign(aud, JSON.parse(j)); } catch (e) { return; }
+      if (!local) return;
+      if (built !== key()) {
+        try {
+          await build();
+          for (const u in peers) peers[u].pc.getSenders().forEach(s => { if (s.track && s.track.kind === "audio") s.replaceTrack(track).catch(() => {}); });
+        } catch (e) { send({t: "log", msg: "rebuild: " + e}); }
+      } else push();
+    },
+    report(on) { report = on; push(); },
+    devices: devices,
+    async offer(uid) {
+      if (!readyP || !(await readyP)) return;
+      try {
+        const p = mk(uid), o = await p.pc.createOffer();
+        await p.pc.setLocalDescription(o);
+        send({t: "sig", to: uid, type: "offer", data: JSON.stringify(p.pc.localDescription)});
+      } catch (e) { send({t: "log", msg: "offer: " + e}); }
+    },
+    async sig(from, type, data) {
+      if (!readyP || !(await readyP)) return;
+      let d; try { d = JSON.parse(data); } catch (e) { return; }
+      try {
+        if (type === "offer") {
+          const p = mk(from);
+          await p.pc.setRemoteDescription(d);
+          for (const c of (pend[from] || [])) p.queue.push(c);
+          delete pend[from];
+          await flush(from);
+          const a = await p.pc.createAnswer();
+          await p.pc.setLocalDescription(a);
+          send({t: "sig", to: from, type: "answer", data: JSON.stringify(p.pc.localDescription)});
+        } else if (type === "answer") {
+          const p = peers[from];
+          if (!p || p.pc.signalingState !== "have-local-offer") return;
+          await p.pc.setRemoteDescription(d); await flush(from);
+        } else if (type === "ice") {
+          const p = peers[from];
+          if (p && p.pc.remoteDescription) { try { await p.pc.addIceCandidate(d); } catch (e) {} }
+          else if (p) p.queue.push(d);
+          else (pend[from] = pend[from] || []).push(d);
+        }
+      } catch (e) { send({t: "log", msg: type + ": " + e}); }
+    },
+    drop(uid) { close(uid); delete pend[uid]; },
+    mute(on) { muted = on; if (track) track.enabled = !on; if (on) send({t: "speak", uid: "me", on: false}); },
+    deafen(on) { deaf = on; for (const u in peers) if (peers[u].audio) peers[u].audio.muted = on || !!srvm[u]; },
+    srvMute(uid, on) { srvm[uid] = !!on; if (peers[uid] && peers[uid].audio) peers[uid].audio.muted = deaf || !!on; },
+    vol(uid, v) { vols[uid] = v; push(); },
+    closePeers() { for (const u of Object.keys(peers)) close(u); },
+    stop() {
+      for (const u of Object.keys(peers)) close(u);
+      dispose();
+      try { if (ctx) ctx.close(); } catch (e) {}
+      ctx = null; wReady = false; readyP = null; muted = false; deaf = false; report = false; built = "";
+      for (const k in srvm) delete srvm[k];
+      for (const k in meters) delete meters[k];
+    }
+  };
+})();
+</script></body></html>"""
+
+
+class _VcEngine(QObject):
+    """Owns the hidden WebRTC page. Events from the page arrive as dicts on `event` (GUI thread)."""
+    event = pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self._view = self._page = self._profile = None
+        self._loaded = False
+        self._pending = []
+
+    def alive(self):
+        return self._view is not None
+
+    def _ensure(self):
+        if self._view is not None:
+            return
+        from PyQt6.QtCore import QUrl                                           # lazy: Chromium only loads for the first call
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+        eng = self
+
+        class _Page(QWebEnginePage):
+            def javaScriptConsoleMessage(self, level, message, line, src):
+                if message.startswith("NCZVC:"):
+                    try:
+                        eng.event.emit(json.loads(message[6:]))
+                    except Exception:
+                        _log_exc("voice console message")
+
+        self._profile = QWebEngineProfile(self)                                 # off the record: nothing is stored
+        page = _Page(self._profile, self)
+        page.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        if hasattr(page, "permissionRequested"):                                # Qt 6.8+
+            def on_perm(perm):
+                try:
+                    kind = perm.permissionType().name
+                except Exception:
+                    kind = ""
+                (perm.grant if "MediaAudioCapture" in kind else perm.deny)()
+            page.permissionRequested.connect(on_perm)
+        else:
+            Feat = QWebEnginePage.Feature
+
+            def on_feat(origin, feat):
+                ok = feat in (Feat.MediaAudioCapture,)
+                page.setFeaturePermission(origin, feat, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+                                          if ok else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+            page.featurePermissionRequested.connect(on_feat)
+        view = QWebEngineView()
+        view.setPage(page)
+        self._view, self._page = view, page
+
+        def loaded(_ok):
+            self._loaded = True
+            try:
+                page.setLifecycleState(QWebEnginePage.LifecycleState.Active)    # never freeze the page while a call runs
+            except Exception:
+                _log_exc("voice lifecycle")
+            for js in self._pending:
+                page.runJavaScript(js)
+            self._pending = []
+        page.loadFinished.connect(loaded)
+        page.setHtml(_VC_HTML, QUrl("https://ncz-voice.invalid/"))              # https origin = secure context for the mic
+
+    def run(self, js):
+        self._ensure()
+        if self._loaded:
+            self._page.runJavaScript(js)
+        else:
+            self._pending.append(js)
+
+    def call(self, fn, *args):
+        self.run(f"NCZ.{fn}({', '.join(json.dumps(a) for a in args)})")
+
+    def teardown(self):
+        """Frees Chromium again once the call is over."""
+        if self._view is None:
+            return
+        try:
+            self._page.runJavaScript("NCZ.stop()")
+        except Exception:
+            _log_exc("voice teardown")
+        view, page, prof = self._view, self._page, self._profile
+        self._view = self._page = self._profile = None
+        self._loaded, self._pending = False, []
+        QTimer.singleShot(400, lambda: (page.deleteLater(), view.deleteLater(), prof.deleteLater()))
+
+
+def _vc_ice_servers():
+    servers = [{"urls": VC_STUN}]
+    try:        # optional relay for networks that block direct connections: settings key "voice_turn"
+        t = load_launcher_settings().get("voice_turn")
+        if isinstance(t, dict) and t.get("urls"):
+            servers.append({"urls": t["urls"], "username": t.get("username", ""), "credential": t.get("credential", "")})
+    except Exception:
+        _log_exc("_vc_ice_servers")
+    return servers
+
+def _vc_fresh(m):
+    hb = m.get("hb") if isinstance(m, dict) else None
+    return isinstance(hb, (int, float)) and abs(time.time() * 1000 + _clock_skew["ms"] - hb) < VC_MEMBER_FRESH_MS
+
+
+class VoiceManager(QObject):
+    changed = pyqtSignal()
+    level = pyqtSignal(float, float, bool)      # mic level (dB), the threshold in use (dB), gate open
+    devices_found = pyqtSignal(list, list)      # [[id, label]], [[id, label]]
+    _job = pyqtSignal(object)                   # run a callable on the GUI thread
+
+    def __init__(self):
+        super().__init__()
+        self.engine = _VcEngine()
+        self.engine.event.connect(self._on_js)
+        self._job.connect(lambda fn: fn())
+        self._pool = ThreadPoolExecutor(max_workers=4)
+        self.active = None
+        self.notice = ""
+        self.testing = False
+        self.ping = None
+        self._avatars = {}
+        self._incoming = None           # the open "incoming call" dialog
+        self._ring_busy = False
+        self._ring_timer = None
+        self._ring_seen = None
+
+    # -- who am I
+    def _me(self):
+        acct = load_account() or {}
+        name = load_profile_cache()[0] or acct.get("email", "").split("@")[0] or "Player"
+        return acct.get("uid", ""), name
+
+    def room_of(self, kind, key):
+        if kind == "dm":
+            uid, _n = self._me()
+            return "dm_" + _chat_id(uid, key)
+        return "grp_" + key
+
+    def in_room(self, room):
+        return bool(self.active and self.active["room"] == room)
+
+    # -- people shown in the UI
+    def avatar_of(self, uid):
+        if uid in self._avatars:
+            return self._avatars[uid]
+        self._avatars[uid] = None
+
+        def work():
+            path = None
+            try:
+                d = _friends_last_good.get(uid)
+                if not isinstance(d, dict) or not d.get("photo"):
+                    token, _u = get_id_token()
+                    d = _http_json(_fdb(f"public/{uid}", token))
+                if isinstance(d, dict) and d.get("photo"):
+                    path = _friend_avatar_file(uid, d["photo"])
+            except Exception:    # expected: offline / no picture
+                pass
+
+            def done():
+                self._avatars[uid] = path
+                self.changed.emit()
+            self._job.emit(done)
+        threading.Thread(target=work, daemon=True).start()
+        return None
+
+    def participants(self):
+        s = self.active
+        out = []
+        if not s:
+            return out
+        mine = load_profile_cache()[1]
+        out.append({"uid": s["me"], "name": s["name"], "avatar": mine if mine and os.path.exists(mine) else None,
+                    "muted": s["muted"], "deaf": s["deaf"], "speak": bool(s["speak"].get("me")) and not s["muted"],
+                    "me": True, "ringing": False, "smuted": s["srv_m"] and not s["srv_d"], "sdeaf": s["srv_d"],
+                    "can_mod": False})
+        for uid, p in s["peers"].items():
+            e_ = s["smod"].get(uid) or {}
+            sm_, sd_ = bool(e_.get("m")), bool(e_.get("d"))
+            out.append({"uid": uid, "name": p["name"], "avatar": self.avatar_of(uid), "muted": p.get("muted", False) or sm_ or sd_,
+                        "deaf": p.get("deaf", False) or sd_, "speak": p["speak"] and not (p.get("muted", False) or sm_ or sd_),
+                        "me": False, "ringing": False, "smuted": sm_ and not sd_, "sdeaf": sd_,
+                        "can_mod": self.can_moderate(uid), "role": s["roles"].get(uid) or "member"})
+        if s["ring_to"] and not s["answered"]:
+            out.append({"uid": s["ring_to"], "name": s["label"], "avatar": self.avatar_of(s["ring_to"]), "muted": False,
+                        "deaf": False, "speak": False, "me": False, "ringing": True})
+        return out
+
+    # -- start / stop
+    def call_friend(self, uid, name):
+        me, _n = self._me()
+        if not me or not cloud_configured():
+            QMessageBox.information(_invite_main_window(), "Voice call", "Sign in first to use voice calls.")
+            return
+        self.join(self.room_of("dm", uid), "dm", name, ring_to=uid)
+
+    def join_group(self, gid, name):
+        self.join("grp_" + gid, "group", name)
+
+    def join(self, room, kind, label, ring_to=None):
+        if self.active:
+            if self.active["room"] == room:
+                return
+            self.leave()
+        me, myname = self._me()
+        if not me or not cloud_configured():
+            QMessageBox.information(_invite_main_window(), "Voice", "Sign in first to use voice chat.")
+            return
+        try:
+            import PyQt6.QtWebEngineWidgets    # noqa: F401  (just checking it is installed)
+        except Exception:
+            QMessageBox.warning(_invite_main_window(), "Voice",
+                                "Voice chat needs PyQt6-WebEngine (the same package NCZFront uses).\npip install PyQt6-WebEngine")
+            return
+        s = {"room": room, "kind": kind, "label": label, "me": me, "name": myname, "ring_to": ring_to,
+             "stop": threading.Event(), "t": None, "peers": {}, "ready": False, "muted": False, "deaf": False,
+             "pre_muted": False, "retries": {}, "answered": ring_to is None, "t0": time.time(), "offerer": set(),
+             "speak": {}, "expanded": True, "pings": {}, "seeded": False, "snd_joined": False,
+             "roles": {}, "smod": {}, "srv_m": False, "srv_d": False, "smod_hold": 0.0, "roles_at": 0.0}
+        self.active, self.notice, self.ping = s, "", None
+        self.engine.call("init", json.dumps(_vc_ice_servers()), _vc_audio_json())
+        threading.Thread(target=self._run, args=(s,), daemon=True).start()
+        if ring_to:                                      # the caller hears the ringback until they pick up / it is declined
+            if getattr(self, "_rb", None) is None:
+                self._rb = QTimer(self)
+                self._rb.setInterval(3000)
+                self._rb.timeout.connect(self._ringback)
+            self._rb.start()
+            self._ringback()
+        self.changed.emit()
+
+    def _ringback(self):
+        s = self.active
+        if s and s["ring_to"] and not s["answered"]:
+            _vc_play("ring_out", force=True)
+        else:
+            if getattr(self, "_rb", None) is not None:
+                self._rb.stop()
+            _vc_stop("ring_out")
+
+    def leave(self, notice=""):
+        s = self.active
+        if not s:
+            return
+        self.active = None
+        if getattr(self, "_rb", None) is not None:
+            self._rb.stop()
+        _vc_stop("ring_out")
+        if s.get("snd_joined"):
+            _vc_play("leave")
+        s["stop"].set()
+        self.notice = notice
+        if self.testing:                                # the Settings mic test keeps running
+            self.engine.call("closePeers")
+        else:
+            self.engine.teardown()
+        threading.Thread(target=self._cleanup, args=(s,), daemon=True).start()
+        self.changed.emit()
+        if notice:
+            QTimer.singleShot(5000, self._clear_notice)
+
+    def _clear_notice(self):
+        if not self.active and self.notice:
+            self.notice = ""
+            self.changed.emit()
+
+    def set_expanded(self, on):
+        if self.active:
+            self.active["expanded"] = bool(on)
+            self.changed.emit()
+
+    def toggle_mute(self):
+        s = self.active
+        if s and (s.get("srv_m") or s.get("srv_d")):        # an admin server-muted you: only they can undo it
+            return
+        if s:
+            s["muted"] = not s["muted"]
+            if not s["muted"] and s["deaf"]:            # unmuting while deafened undeafens too
+                s["deaf"] = False
+                self.engine.call("deafen", False)
+            self.engine.call("mute", s["muted"])
+            self._pool.submit(self._push_flags, s)
+            self.changed.emit()
+
+    def toggle_deafen(self):
+        s = self.active
+        if s and s.get("srv_d"):
+            return
+        if s:
+            s["deaf"] = not s["deaf"]
+            self.engine.call("deafen", s["deaf"])
+            if s["deaf"]:                               # deafened = muted too, like Discord
+                s["pre_muted"] = s["muted"]
+                s["muted"] = True
+            else:
+                s["muted"] = s["pre_muted"]
+            self.engine.call("mute", s["muted"])
+            self._pool.submit(self._push_flags, s)
+            self.changed.emit()
+
+    # -- server mute / server deafen / disconnect (group admins and the owner)
+    # Stored in vcmod/<gid>/<uid> = {m: server muted, d: server deafened, k: server time of a "disconnect"}. The person's own
+    # client obeys it, and everybody else keeps that person's audio off on their side too.
+    def my_role(self):
+        s = self.active
+        return ((s["roles"].get(s["me"]) if s else None) or "member")
+
+    def can_moderate(self, uid):
+        s = self.active
+        if not s or s["kind"] != "group" or uid == s["me"]:
+            return False
+        mine = GROUP_RANK.get(self.my_role(), 0)
+        return mine >= 2 and mine > GROUP_RANK.get(s["roles"].get(uid) or "member", 0)
+
+    def _mod_failed(self, e):
+        QMessageBox.warning(_invite_main_window(), "Voice",
+                            f"That didn't go through ({e}).\nThe database needs the 'vcmod' rule for group voice moderation.")
+
+    def set_server_state(self, uid, mute=None, deaf=None):
+        s = self.active
+        if not s or not self.can_moderate(uid):
+            return
+        cur = dict(s["smod"].get(uid) or {})
+        if mute is not None:
+            cur["m"] = bool(mute)
+        if deaf is not None:
+            cur["d"] = bool(deaf)
+        new = {k: v for k, v in cur.items() if v}
+        if new:
+            s["smod"][uid] = new
+        else:
+            s["smod"].pop(uid, None)
+        s["smod_hold"] = time.time() + 3
+        gid = s["room"][4:]
+
+        def work():
+            try:
+                token, _me = get_id_token()
+                url = _fdb(f"vcmod/{gid}/{uid}", token)
+                if new:
+                    _http_json(url, "PUT", new)
+                else:
+                    _http_json(url, "DELETE")
+            except Exception as e:
+                self._job.emit(lambda err=e: self._mod_failed(err))
+        self._pool.submit(work)
+        self.changed.emit()
+
+    def disconnect_user(self, uid):
+        s = self.active
+        if not s or not self.can_moderate(uid):
+            return
+        gid = s["room"][4:]
+
+        def work():
+            try:
+                token, _me = get_id_token()
+                _http_json(_fdb(f"vcmod/{gid}/{uid}", token), "PATCH", {"k": {".sv": "timestamp"}})
+            except Exception as e:
+                self._job.emit(lambda err=e: self._mod_failed(err))
+        self._pool.submit(work)
+
+    def _enforce(self, s):
+        """Applies what the admins set for ME: kick, server mute, server deafen."""
+        e = s["smod"].get(s["me"]) or {}
+        k = e.get("k")
+        if isinstance(k, (int, float)) and s["t"] is not None and k > s["t"]:
+            self.leave("An admin disconnected you from voice.")
+            return
+        sd = bool(e.get("d"))
+        sm = bool(e.get("m")) or sd
+        pm, pd = s["srv_m"], s["srv_d"]
+        if (sm, sd) == (pm, pd):
+            return
+        if sm and not pm:
+            s["own_muted"] = s["muted"]
+        if sd and not pd:
+            s["own_deaf"] = s["deaf"]
+        s["srv_m"], s["srv_d"] = sm, sd
+        if sm:
+            s["muted"] = True
+        elif pm:
+            s["muted"] = s.get("own_muted", False)
+        if sd:
+            s["deaf"] = True
+        elif pd:
+            s["deaf"] = s.get("own_deaf", False)
+        self.engine.call("deafen", s["deaf"])
+        self.engine.call("mute", s["muted"])
+        self._pool.submit(self._push_flags, s)
+
+    def _push_flags(self, s):
+        try:
+            token, me = get_id_token()
+            _http_json(_fdb(f"vc/rooms/{s['room']}/members/{me}", token), "PATCH", {"muted": s["muted"], "deaf": s["deaf"]})
+        except Exception:    # expected: offline; the next heartbeat round carries on
+            pass
+
+    # -- Settings > Voice
+    def apply_audio(self):
+        if self.engine.alive():
+            self.engine.call("audio", _vc_audio_json())
+
+    def start_test(self):
+        self.testing = True
+        self.engine.call("init", json.dumps(_vc_ice_servers()), _vc_audio_json())
+        self.engine.call("report", True)
+
+    def stop_test(self):
+        self.testing = False
+        if self.engine.alive():
+            self.engine.call("report", bool(self.active) and False)
+            if not self.active:
+                self.engine.teardown()
+
+    def set_report(self, on):
+        if self.engine.alive():
+            self.engine.call("report", bool(on))
+
+    # -- Firebase signaling (worker thread)
+    def _cleanup(self, s):
+        try:
+            token, me = get_id_token()
+            room = s["room"]
+            _http_json(_fdb(f"vc/rooms/{room}/members/{me}", token), "DELETE")
+            _http_json(_fdb(f"vc/rooms/{room}/signals/{me}", token), "DELETE")
+            if s["ring_to"] and not s["answered"]:
+                _http_json(_fdb(f"vc/ring/{s['ring_to']}", token), "DELETE")
+        except Exception:    # expected: offline; stale entries are ignored by their old heartbeat
+            pass
+
+    def _fail(self, s, msg):
+        def go():
+            if self.active is s:
+                self.leave(msg)
+        self._job.emit(go)
+
+    def _run(self, s):
+        me, room = s["me"], s["room"]
+        try:
+            token, _u = get_id_token()
+            _http_json(_fdb(f"vc/rooms/{room}/signals/{me}", token), "DELETE")          # leftovers of an earlier call
+            _http_json(_fdb(f"vc/rooms/{room}/members/{me}", token), "PUT",
+                       {"name": s["name"], "t": {".sv": "timestamp"}, "hb": {".sv": "timestamp"},
+                        "muted": False, "deaf": False})
+            s["t"] = _http_json(_fdb(f"vc/rooms/{room}/members/{me}/t", token))
+            if s["ring_to"]:
+                _http_json(_fdb(f"vc/ring/{s['ring_to']}", token), "PUT",
+                           {"from": me, "name": s["name"], "room": room, "at": {".sv": "timestamp"}})
+        except Exception as e:
+            self._fail(s, f"Couldn't start the call: {e}")
+            return
+        last_hb, fast_until = time.time(), time.time() + 25
+        while not s["stop"].is_set():
+            try:
+                token, _u = get_id_token()
+                if time.time() - last_hb > 20:
+                    _http_json(_fdb(f"vc/rooms/{room}/members/{me}", token), "PATCH", {"hb": {".sv": "timestamp"}})
+                    last_hb = time.time()
+                members = _http_json(_fdb(f"vc/rooms/{room}/members", token))
+                sigs = _http_json(_fdb(f"vc/rooms/{room}/signals/{me}", token))
+                ringing = True
+                if s["ring_to"] and not s["answered"]:
+                    try:
+                        r = _http_json(_fdb(f"vc/ring/{s['ring_to']}", token))
+                        ringing = isinstance(r, dict) and r.get("from") == me
+                    except Exception:    # the database rules may not let the caller read the callee's ring node: keep ringing until the timeout
+                        ringing = True
+                members = members if isinstance(members, dict) else {}
+                sigs = sigs if isinstance(sigs, dict) else {}
+                if sigs and not s["stop"].is_set():
+                    _http_json(_fdb(f"vc/rooms/{room}/signals/{me}", token), "PATCH", {k: None for k in sigs})
+                extra = {}
+                if s["kind"] == "group":
+                    gid = room[4:]
+                    try:
+                        sm = _http_json(_fdb(f"vcmod/{gid}", token))
+                        extra["smod"] = sm if isinstance(sm, dict) else {}
+                    except Exception:    # expected: the vcmod rule isn't installed yet, or a bad moment on the network
+                        pass
+                    if time.time() - s["roles_at"] > 20:
+                        s["roles_at"] = time.time()
+                        try:
+                            rl = _http_json(_fdb(f"groups/{gid}/members", token))
+                            if isinstance(rl, dict):
+                                extra["roles"] = {u: r for u, r in rl.items() if r in GROUP_RANK}
+                        except Exception:    # expected: offline
+                            s["roles_at"] = time.time() - 15
+                self._job.emit(lambda m=members, g=sigs, r=ringing, x=extra: self._apply(s, m, g, r, x))
+            except CloudError:
+                pass        # a bad moment on the network: the next round retries
+            except Exception:
+                _log_exc("voice loop")
+            busy = time.time() < fast_until or any(p["state"] != "connected" for p in s["peers"].values())
+            s["stop"].wait(0.7 if busy else 2.5)
+
+    def _post_sig(self, s, to, typ, data):
+        try:
+            token, me = get_id_token()
+            _http_json(_fdb(f"vc/rooms/{s['room']}/signals/{to}", token), "POST",
+                       {"from": me, "type": typ, "data": data, "t": {".sv": "timestamp"}})
+        except Exception:
+            _log_exc("voice post signal")
+
+    # -- GUI thread: one round of signaling results
+    def _apply(self, s, members, sigs, ringing, extra=None):
+        if self.active is not s:
+            return
+        me = s["me"]
+        if extra:
+            if "roles" in extra:
+                s["roles"] = extra["roles"]
+            if "smod" in extra and time.time() >= s["smod_hold"]:
+                s["smod"] = {u: v for u, v in extra["smod"].items() if isinstance(v, dict)}
+            self._enforce(s)
+            if self.active is not s:
+                return
+        fresh = {u: m for u, m in members.items() if u != me and isinstance(m, dict) and _vc_fresh(m)}
+        if len(fresh) + 1 > VC_MAX and not s["peers"]:
+            self.leave(f"This voice room is full ({VC_MAX} people).")
+            return
+        for uid, m in fresh.items():
+            p = s["peers"].get(uid)
+            if p is None:
+                p = s["peers"][uid] = {"name": str(m.get("name") or "Friend")[:30], "state": "new", "speak": False}
+                if s["seeded"]:
+                    _vc_play("join")
+                if s["ring_to"] == uid:
+                    s["answered"] = True
+                mt = m.get("t") if isinstance(m.get("t"), (int, float)) else 0
+                if s["t"] is not None and (mt, uid) < (s["t"], me):     # they were here first: I send the offer
+                    s["offerer"].add(uid)
+                    self.engine.call("offer", uid)
+            p["muted"], p["deaf"] = bool(m.get("muted")), bool(m.get("deaf"))
+            e_ = s["smod"].get(uid) or {}
+            p["smuted"], p["sdeaf"] = bool(e_.get("m")), bool(e_.get("d"))
+            off_ = p["smuted"] or p["sdeaf"]
+            if p.get("_sm") != off_:                  # keep a server-muted person's audio off on this side too
+                p["_sm"] = off_
+                self.engine.call("srvMute", uid, off_)
+        s["seeded"] = True
+        for uid in [u for u in s["peers"] if u not in fresh]:
+            _vc_play("leave")                                 # somebody else left: the same sound as when you leave
+            self.engine.call("drop", uid)
+            s["peers"].pop(uid, None)
+            s["speak"].pop(uid, None)
+            s["pings"].pop(uid, None)
+            s["offerer"].discard(uid)
+            if s["kind"] == "dm" and s["answered"] and not s["peers"]:
+                self.leave(f"{s['label']} left the call.")
+                return
+        for key in sorted(sigs):
+            v = sigs[key]
+            if isinstance(v, dict) and isinstance(v.get("from"), str) and isinstance(v.get("data"), str):
+                self.engine.call("sig", v["from"], str(v.get("type") or ""), v["data"])
+        if s["ring_to"] and not s["answered"]:
+            if not ringing:
+                self.leave(f"{s['label']} declined the call.")
+                return
+            if time.time() - s["t0"] > VC_RING_SECONDS:
+                self.leave(f"{s['label']} didn't answer.")
+                return
+        self.changed.emit()
+
+    def _on_js(self, ev):
+        s = self.active
+        t = ev.get("t")
+        if t == "log":
+            _log_exc("voice js: " + str(ev.get("msg")))
+            return
+        if t == "level":
+            self.level.emit(float(ev.get("db", -120)), float(ev.get("thr", -50)), bool(ev.get("o")))
+            return
+        if t == "devices":
+            self.devices_found.emit(list(ev.get("ins") or []), list(ev.get("outs") or []))
+            return
+        if t == "error":
+            msg = str(ev.get("msg") or "Voice error.")
+            self.testing = False
+            if s:
+                self.leave()
+            elif self.engine.alive():
+                self.engine.teardown()
+            QMessageBox.warning(_invite_main_window(), "Voice", msg)
+            return
+        if not s:
+            return
+        if t == "sig":
+            self._pool.submit(self._post_sig, s, str(ev.get("to")), str(ev.get("type")), str(ev.get("data")))
+        elif t == "ready":
+            s["ready"] = True
+            if not s["snd_joined"]:
+                s["snd_joined"] = True
+                _vc_play("join")
+            self.changed.emit()
+        elif t == "ping":
+            s["pings"][ev.get("uid")] = int(ev.get("ms", 0))
+            self.ping = int(sum(s["pings"].values()) / max(1, len(s["pings"])))
+            self.changed.emit()
+        elif t == "state":
+            uid, st = ev.get("uid"), ev.get("s")
+            p = s["peers"].get(uid)
+            if p:
+                p["state"] = st
+                if st == "failed" and uid in s["offerer"] and s["retries"].get(uid, 0) < 3:
+                    s["retries"][uid] = s["retries"].get(uid, 0) + 1
+                    QTimer.singleShot(1500, lambda u=uid: self.active is s and u in s["peers"] and self.engine.call("offer", u))
+                self.changed.emit()
+        elif t == "speak":
+            uid = ev.get("uid")
+            if uid == "me":
+                s["speak"]["me"] = bool(ev.get("on"))
+            elif uid in s["peers"]:
+                s["peers"][uid]["speak"] = bool(ev.get("on"))
+            self.changed.emit()
+
+    # -- ringing (callee side)
+    def start_ring_poller(self):
+        if self._ring_timer is not None:
+            return
+        self._ring_timer = QTimer(self)
+        self._ring_timer.setInterval(3000)
+        self._ring_timer.timeout.connect(self._poll_ring)
+        self._ring_timer.start()
+
+    def _poll_ring(self):
+        if self._ring_busy or _presence_state["offline"] or not cloud_configured() or load_account() is None:
+            return
+        self._ring_busy = True
+
+        def work():
+            r = None
+            try:
+                token, uid = get_id_token()
+                r = _http_json(_fdb(f"vc/ring/{uid}", token))
+            except Exception:    # expected: offline
+                pass
+            finally:
+                self._ring_busy = False
+            self._job.emit(lambda: self._ring_result(r))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ring_result(self, r):
+        ok = isinstance(r, dict) and isinstance(r.get("from"), str) and isinstance(r.get("room"), str)
+        if ok:
+            at = r.get("at")
+            now = time.time() * 1000 + _clock_skew["ms"]
+            ok = isinstance(at, (int, float)) and abs(now - at) < VC_RING_SECONDS * 1000
+        if not ok:
+            if self._incoming is not None:
+                self._incoming.missed()
+            return
+        if self.active or (self._incoming is not None and self._ring_seen == (r["from"], r.get("at"))):
+            return
+        self._ring_seen = (r["from"], r.get("at"))
+        dlg = _VcIncomingDialog(self, r["from"], str(r.get("name") or "A friend"), r["room"])
+        self._incoming = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def answer(self, room, name):
+        self._drop_ring()
+        self.join(room, "dm", name)
+
+    def _drop_ring(self):
+        def work():
+            try:
+                token, uid = get_id_token()
+                _http_json(_fdb(f"vc/ring/{uid}", token), "DELETE")
+            except Exception:    # expected: offline
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def decline(self):
+        self._drop_ring()
+
+
+_voice = {"mgr": None, "bar": None, "panel": None, "stage": None}
+
+def get_voice():
+    if _voice["mgr"] is None:
+        _voice["mgr"] = VoiceManager()
+    return _voice["mgr"]
+
+
+# ── Discord-style voice UI ──
+#   _VcPanel          : the "Voice Connected" card at the bottom left (signal + channel, noise suppression, disconnect,
+#                       your avatar with mute / deafen / settings), click the top part to open the call view
+#   _VcStage          : the call view (participant tiles with speaking rings, round mic / deafen / disconnect buttons)
+#   _VcIncomingDialog : the incoming call pop-up (pulsing avatar, green accept / red decline)
+#   _VcSettings       : Settings > Voice (devices, volumes, noise suppression, noise gate with the live input meter)
+from PyQt6.QtCore import QPointF
+from PyQt6.QtGui import QFontMetricsF
+
+_DC = {"bg": "#1e1f22", "panel": "#232428", "card": "#2b2d31", "hover": "#35373c", "line": "#3f4147",
+       "text": "#f2f3f5", "sub": "#b5bac1", "green": "#23a559", "red": "#ed4245", "orange": "#f0b232"}
+_DC_AVATAR_COLORS = ["#5865f2", "#3ba55c", "#faa61a", "#eb459e", "#ed4245", "#1abc9c", "#9b59b6", "#e67e22"]
+
+
+def _vc_color_for(name):
+    return QColor(_DC_AVATAR_COLORS[sum(ord(c) for c in (name or "?")) % len(_DC_AVATAR_COLORS)])
+
+
+def _vc_pen(color, width, cap=Qt.PenCapStyle.RoundCap):
+    return QPen(QColor(color), width, Qt.PenStyle.SolidLine, cap, Qt.PenJoinStyle.RoundJoin)
+
+
+# Real vector icons (Material Design icons, Apache-2.0, 24x24 paths) rendered through QtSvg: filled, evenly weighted and crisp
+# at any size, instead of the old hand-drawn strokes.
+_VC_PATHS = {
+    "mic": "M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z",
+    "headset": "M12 1c-4.97 0-9 4.03-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7c0-4.97-4.03-9-9-9z",
+    "hangup": "M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.51-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z",
+    "answer": "M20.01 15.38c-1.23 0-2.42-.2-3.53-.56-.35-.12-.74-.03-1.01.24l-1.57 1.97c-2.83-1.35-5.48-3.9-6.89-6.83l1.95-1.66c.27-.28.35-.67.24-1.02-.37-1.11-.56-2.3-.56-3.53 0-.54-.45-.99-.99-.99H4.19C3.65 3 3 3.24 3 3.99 3 13.28 10.73 21 20.01 21c.71 0 .99-.63.99-1.18v-3.45c0-.54-.45-.99-.99-.99z",
+    "gear": "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z",
+    "wave": "M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z",
+    "speaker": "M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z",
+    "shield": "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z",
+    "dots": "M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z",
+    "mic_off": "M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z",
+}
+_vc_svg_cache = {}
+_vc_svg_ok = [True]
+
+def _vc_svg_renderer(kind, color):
+    key = (kind, QColor(color).name())
+    r = _vc_svg_cache.get(key)
+    if r is None and _vc_svg_ok[0]:
+        try:
+            from PyQt6.QtSvg import QSvgRenderer
+            from PyQt6.QtCore import QByteArray
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+                   f'<path fill="{key[1]}" d="{_VC_PATHS[kind]}"/></svg>')
+            r = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+            if not r.isValid():
+                r = None
+        except Exception:
+            _vc_svg_ok[0] = False         # QtSvg missing: fall back to the old drawn icons
+            r = None
+        _vc_svg_cache[key] = r
+    return r
+
+
+def _vc_icon(kind, color="#dbdee1", size=16):
+    """A QIcon of one of the call icons (for menus)."""
+    dpr = _screen_dpr()
+    pm = QPixmap(int(size * dpr), int(size * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    _vc_draw_icon(p, kind, size / 2.0, size / 2.0, size * 1.1, QColor(color))
+    p.end()
+    return QIcon(pm)
+
+
+def _vc_draw_icon(p, kind, cx, cy, size, color, slash=False, gap=None):
+    """Draws one of Discord's call icons (drawn with paths, no image files) centered on cx, cy."""
+    p.save()
+    p.translate(cx, cy)
+    k = size / 24.0
+    p.scale(k, k)
+    col = QColor(color)
+    no_pen, no_brush = Qt.PenStyle.NoPen, Qt.BrushStyle.NoBrush
+    p.setPen(no_pen)
+    p.setBrush(no_brush)
+    _svg = _vc_svg_renderer(kind, col) if kind in _VC_PATHS else None
+    if _svg is not None:
+        _svg.render(p, QRectF(-12, -12, 24, 24))
+    elif kind == "mic":
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(-3.5, -10, 7, 13), 3.5, 3.5)
+        p.setBrush(no_brush)
+        p.setPen(_vc_pen(col, 2))
+        path = QPainterPath()
+        path.moveTo(-7, -1)
+        path.cubicTo(-7, 6.5, 7, 6.5, 7, -1)
+        p.drawPath(path)
+        p.drawLine(QPointF(0, 6), QPointF(0, 10))
+        p.drawLine(QPointF(-3.5, 10), QPointF(3.5, 10))
+    elif kind == "headset":
+        p.setPen(_vc_pen(col, 2.2))
+        path = QPainterPath()
+        path.moveTo(-8.5, 3)
+        path.cubicTo(-8.5, -13, 8.5, -13, 8.5, 3)
+        p.drawPath(path)
+        p.setPen(no_pen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(-11, 1, 5.5, 10), 2.4, 2.4)
+        p.drawRoundedRect(QRectF(5.5, 1, 5.5, 10), 2.4, 2.4)
+    elif kind in ("hangup", "answer"):
+        if kind == "answer":
+            p.rotate(135)
+        p.setPen(_vc_pen(col, 3.6))
+        path = QPainterPath()
+        path.moveTo(-9.5, 2)
+        path.cubicTo(-9.5, -5, 9.5, -5, 9.5, 2)
+        p.drawPath(path)
+        p.drawLine(QPointF(-9.5, 2), QPointF(-9.5, 5.5))
+        p.drawLine(QPointF(9.5, 2), QPointF(9.5, 5.5))
+    elif kind == "gear":
+        p.setPen(_vc_pen(col, 2.4))
+        p.drawEllipse(QPointF(0, 0), 4.6, 4.6)
+        p.setPen(_vc_pen(col, 3.2, Qt.PenCapStyle.FlatCap))
+        for _i in range(8):
+            p.drawLine(QPointF(0, -7.2), QPointF(0, -10))
+            p.rotate(45)
+    elif kind == "bars":
+        p.setBrush(col)
+        for i in range(4):
+            h = 4 + i * 4
+            p.drawRoundedRect(QRectF(-8.8 + i * 4.8, 9 - h, 3.2, h), 1.2, 1.2)
+    elif kind == "wave":
+        p.setPen(_vc_pen(col, 2.3))
+        for x, hh in ((-8, 3), (-4, 7), (0, 10), (4, 6), (8, 3)):
+            p.drawLine(QPointF(x, -hh), QPointF(x, hh))
+    elif kind == "chevron":
+        p.setPen(_vc_pen(col, 2.4))
+        path = QPainterPath()
+        path.moveTo(-6, -2.5)
+        path.lineTo(0, 3.5)
+        path.lineTo(6, -2.5)
+        p.drawPath(path)
+    elif kind == "speaker":
+        p.setBrush(col)
+        path = QPainterPath()
+        for i, (x, y) in enumerate(((-9, -3.5), (-5, -3.5), (0, -8), (0, 8), (-5, 3.5), (-9, 3.5))):
+            path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.setBrush(no_brush)
+        p.setPen(_vc_pen(col, 2))
+        arc = QPainterPath()
+        arc.moveTo(4, -4.5)
+        arc.cubicTo(7.5, -2, 7.5, 2, 4, 4.5)
+        p.drawPath(arc)
+        arc2 = QPainterPath()
+        arc2.moveTo(6.5, -8)
+        arc2.cubicTo(12.5, -3.5, 12.5, 3.5, 6.5, 8)
+        p.drawPath(arc2)
+    if slash:
+        line = (QPointF(-9.5, -10), QPointF(9.5, 10))
+        if gap is not None:
+            p.setPen(_vc_pen(gap, 5.4))
+            p.drawLine(*line)
+        p.setPen(_vc_pen(_DC["red"], 2.4))
+        p.drawLine(*line)
+    p.restore()
+
+
+def _vc_paint_avatar(p, cx, cy, size, path, name, speak=False, dim=False):
+    r = size / 2.0
+    if speak:
+        rr = r + 2.5 + 1.5
+        p.setPen(_vc_pen(_DC["green"], 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), rr, rr)
+    pix = None
+    if path and os.path.exists(path):
+        try:
+            pix = CreditsPage.circular_pixmap(path, int(size))
+        except Exception:
+            pix = None
+    if pix is not None and not pix.isNull():
+        if dim:
+            p.setOpacity(0.5)
+        p.drawPixmap(int(cx - r), int(cy - r), pix)
+        p.setOpacity(1.0)
+        return
+    base = _vc_color_for(name)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(base.darker(160) if dim else base)
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    f = p.font()
+    f.setPixelSize(max(10, int(size * 0.42)))
+    f.setBold(True)
+    p.setFont(f)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(QRectF(cx - r, cy - r, size, size), Qt.AlignmentFlag.AlignCenter, (name or "?")[:1].upper())
+
+
+def _vc_state_text(s):
+    if s["ring_to"] and not s["answered"]:
+        return "Calling...", _DC["text"]
+    if not s["ready"]:
+        return "Connecting...", _DC["orange"]
+    peers = s["peers"]
+    if peers and not any(p["state"] == "connected" for p in peers.values()):
+        return "RTC Connecting", _DC["orange"]
+    return "Voice Connected", _DC["green"]
+
+
+class _VcRound(QPushButton):
+    """A round (call view) or flat square (panel) icon button painted like Discord's."""
+
+    def __init__(self, kind, size=48, flat=False, bg=None, parent=None):
+        super().__init__(parent)
+        self.kind, self.flat, self._bg, self.off = kind, flat, bg, False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_off(self, on):
+        on = bool(on)
+        if self.off != on:
+            self.off = on
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s, hov = self.width(), self.underMouse()
+        r = QRectF(0.5, 0.5, s - 1, s - 1)
+        slashable = self.kind in ("mic", "headset")
+        if self.flat:
+            gapc = QColor(_DC["line"] if hov else _DC["panel"])
+            if hov:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(gapc)
+                p.drawRoundedRect(r, 5, 5)
+            col = QColor(_DC["red"]) if (self.off and slashable) else QColor("#dbdee1" if hov else _DC["sub"])
+            size = s * 0.62
+        else:
+            if self._bg:
+                gapc = QColor(self._bg).lighter(112) if hov else QColor(self._bg)
+                col = QColor("#ffffff")
+            elif self.off:
+                gapc, col = QColor("#e3e5e8" if hov else "#ffffff"), QColor(_DC["bg"])
+            else:
+                gapc, col = QColor(_DC["hover"] if hov else _DC["card"]), QColor("#ffffff")
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(gapc)
+            p.drawEllipse(r)
+            size = s * 0.48
+        _vc_draw_icon(p, self.kind, s / 2.0, s / 2.0, size, col, slash=self.off and slashable, gap=gapc)
+
+
+class _VcIcon(QWidget):
+    def __init__(self, kind, size, color):
+        super().__init__()
+        self.kind, self.size_, self.color = kind, size, color
+        self.setFixedSize(size, size)
+
+    def set_color(self, color):
+        if color != self.color:
+            self.color = color
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _vc_draw_icon(p, self.kind, self.width() / 2.0, self.height() / 2.0, self.size_, self.color)
+
+
+class _VcClickable(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+class _VcAvatarWidget(QWidget):
+    def __init__(self, size):
+        super().__init__()
+        self._size = size
+        self.d = ("", "", False)
+        self.setFixedSize(size + 12, size + 12)
+
+    def set_data(self, path, name, speak):
+        d = (path or "", name or "", bool(speak))
+        if d != self.d:
+            self.d = d
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        _vc_paint_avatar(p, self.width() / 2.0, self.height() / 2.0, self._size, self.d[0], self.d[1], self.d[2])
+
+
+def _vc_elide(label, text, width):
+    label.setText(label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width))
+
+
+def _vc_open_settings(win):
+    """Settings button on the call panel: jumps to Settings > Voice."""
+    try:
+        get_voice().set_expanded(False)
+        win.nav_group.button(1).click()
+        sp, panel = win.settings_page, _voice.get("panel")
+        if panel is not None:
+            QTimer.singleShot(120, lambda: sp._scroll.ensureWidgetVisible(panel, 0, 24))
+    except Exception:
+        _log_exc("_vc_open_settings")
+
+
+def _vc_ns_menu(parent, anchor):
+    menu = QMenu(parent)
+    cur = str(_vc_get("voice_ns"))
+    for val, text in (("off", "None"), ("standard", "Standard"), ("high", "High")):
+        act = menu.addAction("Noise Suppression: " + text)
+        act.setCheckable(True)
+        act.setChecked(cur == val)
+        act.triggered.connect(lambda _c=False, v=val: _vc_set("voice_ns", v))
+    menu.exec(anchor.mapToGlobal(QPoint(0, -menu.sizeHint().height() - 4)))
+
+
+# ── the "Voice Connected" panel ──
+class _VcDot(QWidget):
+    """The green pulsing dot of the minimised call bar (same 1.6 s pulse as the web)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(10, 10)
+        self.phase = 0.0
+        self._t = QTimer(self)
+        self._t.setInterval(50)
+        self._t.timeout.connect(self._tick)
+        self._t.start()
+
+    def _tick(self):
+        if self.isVisible():
+            self.phase = (self.phase + 0.05 / 1.6) % 1.0
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QColor(_DC["green"])
+        c.setAlphaF(1.0 - 0.65 * (1.0 - abs(2.0 * self.phase - 1.0)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QRectF(0, 0, 10, 10))
+
+
+def _vc_web_state(s):
+    """(text, timer) exactly like the web call screen: Ringing... / Connecting... / Waiting for them... /
+    You're the only one here / Voice connected."""
+    t = int(max(0, time.time() - s["t0"]))
+    tm = f"{t // 60}:{t % 60:02d}"
+    peers = s["peers"]
+    if s["ring_to"] and not s["answered"] and not peers:
+        return "Ringing\u2026", ""
+    if not peers:
+        return ("Waiting for them\u2026", "") if s["kind"] == "dm" else ("You're the only one here", tm)
+    if not s["ready"] or not any(p["state"] == "connected" for p in peers.values()):
+        return "Connecting\u2026", ""
+    return "Voice connected", tm
+
+
+class _VcPanel(QFrame):
+    """The minimised call bar (same look as the web's): pulsing green dot, status + who, mute and hang up."""
+    W = 304
+
+    def __init__(self, mgr, win):
+        super().__init__(win)
+        self._mgr, self._win = mgr, win
+        self.setObjectName("VcPanel")
+        self.setFixedWidth(self.W)
+        self.setStyleSheet(f"QFrame#VcPanel {{ background: {_DC['panel']}; border: 1px solid {_DC['line']}; border-radius: 12px; }}"
+                           "QLabel { background: transparent; }")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 8, 10, 8)
+        row.setSpacing(8)
+        self.head_w = _VcClickable()
+        hl = QHBoxLayout(self.head_w)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(10)
+        self.dot = _VcDot()
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        self.state = QLabel("")
+        self.state.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {_DC['text']};")
+        self.sub = QLabel("")
+        self.sub.setStyleSheet(f"font-size: 12px; color: {_DC['sub']};")
+        col.addWidget(self.state)
+        col.addWidget(self.sub)
+        hl.addWidget(self.dot)
+        hl.addLayout(col, 1)
+        self.head_w.clicked.connect(self._toggle_stage)
+        self.mic_b = _VcRound("mic", 40)
+        self.leave_b = _VcRound("hangup", 40, bg=_DC["red"])
+        self.mic_b.clicked.connect(mgr.toggle_mute)
+        self.leave_b.setToolTip("Leave call")
+        self.leave_b.clicked.connect(lambda: mgr.leave())
+        row.addWidget(self.head_w, 1)
+        row.addWidget(self.mic_b)
+        row.addWidget(self.leave_b)
+        self._tm = QTimer(self)
+        self._tm.setInterval(1000)
+        self._tm.timeout.connect(lambda: self.isVisible() and self.refresh())
+        self._tm.start()
+        win.installEventFilter(self)
+        mgr.changed.connect(self.refresh)
+        self.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self._win and ev.type() == ev.Type.Resize and self.isVisible():
+            self._place()
+        return False
+
+    def _toggle_stage(self):
+        s = self._mgr.active
+        if s:
+            self._mgr.set_expanded(not s.get("expanded"))
+
+    def _place(self):
+        self.adjustSize()
+        self.move(16, max(0, self._win.height() - self.height() - 16))
+        self.raise_()
+
+    def refresh(self):
+        m = self._mgr
+        s = m.active
+        if not s and not m.notice:
+            self.hide()
+            return
+        if not s:                                        # a short notice after the call ended ("X left the call.")
+            self.state.setWordWrap(True)
+            self.state.setText(m.notice)
+            self.sub.hide()
+            self.dot.hide()
+            self.mic_b.hide()
+            self.leave_b.hide()
+            self.head_w.setCursor(Qt.CursorShape.ArrowCursor)
+            self.show()
+            self._place()
+            return
+        if s.get("expanded"):                            # the full call screen is open: the bar only shows when it is minimised
+            self.hide()
+            return
+        self.state.setWordWrap(False)
+        self.sub.show()
+        self.dot.show()
+        self.mic_b.show()
+        self.leave_b.show()
+        self.head_w.setCursor(Qt.CursorShape.PointingHandCursor)
+        text, _tm = _vc_web_state(s)
+        self.state.setText(text)
+        _vc_elide(self.sub, s["label"], 150)
+        me = next((p for p in m.participants() if p["me"]), None)
+        if me:
+            off = bool(me["muted"] or me["deaf"])
+            self.mic_b.kind = "mic"
+            self.mic_b.set_off(off)
+            self.mic_b.setToolTip("Unmute" if off else "Mute")
+        self.show()
+        self._place()
+
+
+# ── the call view ──
+class _VcTile(QWidget):
+    """One person on the call screen, drawn like the web's tile: flat card, green outline while speaking,
+    name pill bottom left, mute / deafen badges bottom right."""
+    menu_requested = pyqtSignal(object, QPoint)      # tile data, where to open the admin menu
+
+    def __init__(self):
+        super().__init__()
+        self.d = {}
+        self._hover = False
+        self.setMouseTracking(True)
+        self.setMinimumWidth(190)
+        self.setFixedHeight(170)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def _badge(self):
+        return QRectF(self.width() - 40, 10, 30, 30)
+
+    def enterEvent(self, ev):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, ev):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, ev):
+        if self.d.get("can_mod"):
+            right = ev.button() == Qt.MouseButton.RightButton
+            if right or (ev.button() == Qt.MouseButton.LeftButton and self._badge().contains(QPointF(ev.position()))):
+                self.menu_requested.emit(dict(self.d), ev.globalPosition().toPoint())
+                return
+        super().mousePressEvent(ev)
+
+    def set_data(self, d):
+        if d != self.d:
+            self.d = dict(d)
+            self.update()
+
+    def paintEvent(self, ev):
+        d = self.d
+        if not d:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        w, h = self.width(), self.height()
+        if d.get("ringing"):
+            p.setOpacity(0.7)
+        r = QRectF(1, 1, w - 2, h - 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(_DC["card"]))
+        p.drawRoundedRect(r, 14, 14)
+        if d.get("speak"):
+            p.setPen(QPen(QColor(_DC["green"]), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, 14, 14)
+        size = int(d.get("size") or 96)
+        flag = d.get("flag") or ""
+        cy = h / 2.0 - (8 if flag else 0)
+        _vc_paint_avatar(p, w / 2.0, cy, size, d.get("avatar"), d["name"])
+        f = p.font()
+        if flag:
+            f.setPixelSize(12)
+            f.setBold(False)
+            p.setFont(f)
+            p.setPen(QColor(_DC["sub"]))
+            p.drawText(QRectF(0, cy + size / 2 + 6, w, 18), Qt.AlignmentFlag.AlignCenter, flag)
+        # mute / deafen / admin badges, bottom right: 24 px dark circles with a red crossed icon
+        kinds = []
+        if d.get("muted"):
+            kinds.append("mic")
+        if d.get("deaf"):
+            kinds.append("headset")
+        if d.get("smuted") or d.get("sdeaf"):
+            kinds.append("shield")
+        bx = w - 8 - len(kinds) * 24 - max(0, len(kinds) - 1) * 4
+        for k in kinds:
+            c = QRectF(bx, h - 8 - 24, 24, 24)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 166))
+            p.drawEllipse(c)
+            if k == "shield":
+                _vc_draw_icon(p, "shield", c.center().x(), c.center().y(), 13, QColor(_DC["orange"]))
+            else:
+                _vc_draw_icon(p, k, c.center().x(), c.center().y(), 14, QColor(_DC["red"]), slash=True, gap=QColor(0, 0, 0))
+            bx += 28
+        # name pill, bottom left
+        f.setPixelSize(13)
+        f.setBold(True)
+        p.setFont(f)
+        fm = QFontMetricsF(f)
+        text = d["name"]
+        tw = min(fm.horizontalAdvance(text), w - 64 - 16)
+        pill = QRectF(8, h - 8 - 24, tw + 16, 24)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 153))
+        p.drawRoundedRect(pill, 6, 6)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(pill.left() + 8, pill.top(), tw + 4, pill.height()),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   fm.elidedText(text, Qt.TextElideMode.ElideRight, tw))
+        if d.get("can_mod") and self._hover:                    # admin menu button (right-click works too)
+            b = self._badge()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawEllipse(b)
+            _vc_draw_icon(p, "dots", b.center().x(), b.center().y(), 18, QColor("#ffffff"))
+
+
+class _VcStage(QFrame):
+    """The call screen, laid out like the web's: full window, dark, minimise + title on top, tiles in the middle,
+    status line, and a dark rounded bar with mic / deafen / voice settings / leave at the bottom."""
+
+    def __init__(self, mgr, win):
+        super().__init__(win)
+        self._mgr, self._win = mgr, win
+        self._ids, self._tiles, self._cols = [], [], 0
+        self.setObjectName("VcStage")
+        self.setStyleSheet(f"QFrame#VcStage {{ background: {_DC['bg']}; border: none; }}"
+                           "QLabel { background: transparent; }")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        top = QHBoxLayout()
+        top.setContentsMargins(10, 8, 10, 4)
+        top.setSpacing(8)
+        self.min_b = _VcRound("chevron", 30, flat=True)
+        self.min_b.setToolTip("Minimise")
+        self.min_b.clicked.connect(lambda: mgr.set_expanded(False))
+        self.title = QLabel("")
+        self.title.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        top.addWidget(self.min_b)
+        top.addWidget(self.title, 1)
+        v.addLayout(top)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(12, 12, 12, 12)
+        il.addStretch(1)
+        self.holder = QWidget()
+        self.grid = QGridLayout(self.holder)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(10)
+        il.addWidget(self.holder)
+        il.addStretch(1)
+        self.scroll.setWidget(inner)
+        v.addWidget(self.scroll, 1)
+        self.out = QLabel("")
+        self.out.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.out.setStyleSheet(f"font-size: 13px; color: {_DC['sub']}; padding-bottom: 10px;")
+        v.addWidget(self.out)
+        bar = QFrame()
+        bar.setObjectName("VcCtl")
+        bar.setStyleSheet("QFrame#VcCtl { background: #111214; border-top-left-radius: 22px; border-top-right-radius: 22px; }")
+        ctl = QHBoxLayout(bar)
+        ctl.setContentsMargins(10, 14, 10, 14)
+        ctl.setSpacing(16)
+        self.mic_b = _VcRound("mic", 52)
+        self.deaf_b = _VcRound("headset", 52)
+        self.set_b = _VcRound("gear", 52)
+        self.set_b.setToolTip("Voice settings")
+        self.leave_b = _VcRound("hangup", 52, bg=_DC["red"])
+        self.leave_b.setToolTip("Leave call")
+        self.mic_b.clicked.connect(mgr.toggle_mute)
+        self.deaf_b.clicked.connect(mgr.toggle_deafen)
+        self.set_b.clicked.connect(lambda: _vc_open_settings(win))
+        self.leave_b.clicked.connect(lambda: mgr.leave())
+        ctl.addStretch(1)
+        for b in (self.mic_b, self.deaf_b, self.set_b, self.leave_b):
+            ctl.addWidget(b)
+        ctl.addStretch(1)
+        v.addWidget(bar)
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._upd_out)
+        self._tick.start()
+        win.installEventFilter(self)
+        mgr.changed.connect(self.refresh)
+        self.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self._win and ev.type() == ev.Type.Resize and self.isVisible():
+            self._place()
+        return False
+
+    def _place(self):
+        self.setGeometry(0, 0, self._win.width(), self._win.height())
+        self.raise_()
+        if self._cols_now() != self._cols:
+            self._regrid()
+
+    def _cols_now(self):
+        n = len(self._tiles)
+        avail = max(0, self.width() - 24)
+        return max(1, min(max(n, 1), (avail + 10) // 240))      # same as the web's auto-fit columns of 230 px + 10 px gap
+
+    def _regrid(self):
+        for t in self._tiles:
+            self.grid.removeWidget(t)
+        for i in range(12):
+            self.grid.setColumnStretch(i, 0)
+        cols = self._cols_now()
+        self._cols = cols
+        for i, t in enumerate(self._tiles):
+            self.grid.addWidget(t, i // cols, i % cols)
+        for c in range(cols):
+            self.grid.setColumnStretch(c, 1)
+
+    def _tile_menu(self, d, gpos):
+        """Admin / owner menu for one person in the call: server mute, server deafen, disconnect."""
+        m = self._mgr
+        uid = d.get("uid")
+        if not m.active or not m.can_moderate(uid):
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { background: #111214; color: #dbdee1; border: 1px solid #1e1f22; padding: 4px; }"
+                           "QMenu::item { padding: 7px 22px 7px 10px; border-radius: 3px; }"
+                           "QMenu::item:selected { background: #4752c4; color: #ffffff; }"
+                           "QMenu::item:disabled { color: #80848e; }"
+                           "QMenu::separator { height: 1px; background: #2b2d31; margin: 4px 6px; }")
+        head = menu.addAction(f"{d.get('name', '')}  \u2014  {GROUP_ROLE_LABEL.get(d.get('role') or 'member', 'Member')}")
+        head.setEnabled(False)
+        menu.addSeparator()
+        on_m, on_d = bool(d.get("smuted")), bool(d.get("sdeaf"))
+        a_m = menu.addAction(_vc_icon("mic", _DC["red"] if not on_m else _DC["green"]),
+                             "Remove Server Mute" if on_m else "Server Mute")
+        a_d = menu.addAction(_vc_icon("headset", _DC["red"] if not on_d else _DC["green"]),
+                             "Remove Server Deafen" if on_d else "Server Deafen")
+        menu.addSeparator()
+        a_k = menu.addAction(_vc_icon("hangup", _DC["red"]), "Disconnect from Voice")
+        chosen = menu.exec(gpos)
+        if chosen is a_m:
+            m.set_server_state(uid, mute=not on_m)
+        elif chosen is a_d:
+            m.set_server_state(uid, deaf=not on_d)
+        elif chosen is a_k:
+            m.disconnect_user(uid)
+
+    def _rebuild(self, parts):
+        for t in self._tiles:
+            self.grid.removeWidget(t)
+            t.setParent(None)
+            t.deleteLater()
+        self._tiles = []
+        for _ in parts:
+            t = _VcTile()
+            t.menu_requested.connect(self._tile_menu)
+            self._tiles.append(t)
+        self._regrid()
+
+    def _upd_out(self):
+        s = self._mgr.active
+        if not s or not self.isVisible():
+            return
+        text, tm = _vc_web_state(s)
+        self.out.setText(text + (f" \u00b7 {tm}" if tm else ""))
+
+    def refresh(self):
+        m = self._mgr
+        s = m.active
+        if not s or not s.get("expanded"):
+            self.hide()
+            return
+        parts = m.participants()
+        ids = [p["uid"] + ("#r" if p["ringing"] else "") for p in parts]
+        rebuilt = ids != self._ids
+        if rebuilt:
+            self._ids = ids
+            self._rebuild(parts)
+        size = 96 if len(parts) <= 2 else 64
+        calling = bool(s["ring_to"] and not s["answered"])
+        for t, p in zip(self._tiles, parts):
+            d = dict(p)
+            d["size"] = size
+            d["flag"] = ("Ringing\u2026" if calling else "Not in the call") if p.get("ringing") else ""
+            t.set_data(d)
+        self.title.setText(s["label"])
+        me = next((p for p in parts if p["me"]), None)
+        if me:
+            srv = bool(me.get("smuted") or me.get("sdeaf"))
+            self.mic_b.set_off(me["muted"])
+            self.deaf_b.set_off(me["deaf"])
+            self.mic_b.setToolTip("An admin muted you" if srv else ("Unmute" if me["muted"] else "Mute"))
+            self.deaf_b.setToolTip("An admin deafened you" if me.get("sdeaf") else ("Undeafen" if me["deaf"] else "Deafen"))
+        if rebuilt or not self.isVisible():
+            self.show()
+            self._place()
+        self._upd_out()
+
+
+# ── the incoming call pop-up ──
+class _VcRinger(QWidget):
+    def __init__(self, name):
+        super().__init__()
+        self.name, self.path, self.phase = name, None, 0.0
+        self.setFixedSize(190, 150)
+
+    def tick(self):
+        self.phase = (self.phase + 0.0236) % 1.0
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        cx, cy, size = self.width() / 2.0, self.height() / 2.0, 96
+        t = self.phase                                   # one expanding green ring, like the web's pulse
+        c = QColor(_DC["green"])
+        c.setAlphaF(0.6 * (1.0 - t))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        rr = size / 2.0 + 22 * t
+        p.drawEllipse(QPointF(cx, cy), rr, rr)
+        _vc_paint_avatar(p, cx, cy, size, self.path, self.name)
+
+
+class _VcIncomingDialog(QDialog):
+    def __init__(self, mgr, caller_uid, name, room):
+        super().__init__(_invite_main_window())
+        self._mgr, self._room, self._name, self._uid = mgr, room, name, caller_uid
+        self.setWindowTitle("Incoming call")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(False)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("VcIn")
+        card.setFixedWidth(340)
+        card.setStyleSheet(f"QFrame#VcIn {{ background: {_DC['panel']}; border: 1px solid {_DC['line']}; border-radius: 18px; }}"
+                           "QLabel { background: transparent; }")
+        outer.addWidget(card)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(20, 26, 20, 26)
+        lay.setSpacing(10)
+        self.ringer = _VcRinger(name)
+        lay.addWidget(self.ringer, 0, Qt.AlignmentFlag.AlignHCenter)
+        title = QLabel(_vc_html.escape(name))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {_DC['text']};")
+        sub = QLabel("Incoming voice call\u2026")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet(f"font-size: 13px; color: {_DC['sub']};")
+        lay.addWidget(title)
+        lay.addWidget(sub)
+        lay.addSpacing(14)
+        row = QHBoxLayout()
+        row.setSpacing(44)
+        row.addStretch(1)
+        for kind, bg, fn in (("hangup", _DC["red"], self._decline), ("answer", _DC["green"], self._accept)):
+            b = _VcRound(kind, 64, bg=bg)
+            b.setToolTip("Decline" if kind == "hangup" else "Accept")
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._anim = QTimer(self)
+        self._anim.setInterval(33)
+        self._anim.timeout.connect(self.ringer.tick)
+        self._anim.start()
+        self._beep = QTimer(self)
+        self._beep.setInterval(2000)
+        self._beep.timeout.connect(lambda: _vc_play("ring_in", force=True))
+        self._beep.start()
+        _vc_play("ring_in", force=True)
+        mgr.changed.connect(self._upd)
+        self._upd()
+        self.adjustSize()
+        self._center()
+        QTimer.singleShot(VC_RING_SECONDS * 1000, self.missed)
+
+    def _center(self):
+        try:
+            g = _invite_main_window().frameGeometry()
+            self.move(g.center().x() - self.width() // 2, g.top() + 90)
+        except Exception:
+            _log_exc("_VcIncomingDialog._center")
+
+    def _upd(self):
+        try:
+            path = self._mgr.avatar_of(self._uid)
+            if path != self.ringer.path:
+                self.ringer.path = path
+                self.ringer.update()
+        except RuntimeError:
+            pass
+
+    def _finish(self):
+        self._beep.stop()
+        _vc_stop("ring_in")
+        self._anim.stop()
+        try:
+            self._mgr.changed.disconnect(self._upd)
+        except Exception:
+            pass
+        if self._mgr._incoming is self:
+            self._mgr._incoming = None
+        self.close()
+        self.deleteLater()
+
+    def _accept(self):
+        self._finish()
+        self._mgr.answer(self._room, self._name)
+
+    def _decline(self):
+        self._finish()
+        self._mgr.decline()
+
+    def missed(self):
+        if self._mgr._incoming is self:
+            self._finish()
+
+
+# ── Settings > Voice ──
+class _VcMeter(QWidget):
+    """Discord's input sensitivity bar: the live mic level with a draggable threshold handle on top of it."""
+    threshold_changed = pyqtSignal(float)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(34)
+        self.setMinimumWidth(260)
+        self._level, self._thr, self._open = -100.0, -50.0, False
+        self._gate, self._auto, self._drag = True, True, False
+
+    def set_level(self, db, thr, opened):
+        self._level = db if db > self._level else max(db, self._level - 7.0)       # fast attack, smooth fall
+        self._open = bool(opened)
+        if self._auto or not self._gate:
+            self._thr = max(-100.0, min(0.0, thr))
+        self.update()
+
+    def reset(self):
+        self._level, self._open = -100.0, False
+        self.update()
+
+    def set_gate(self, gate, auto):
+        self._gate, self._auto = bool(gate), bool(auto)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if (gate and not auto) else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_threshold(self, db):
+        self._thr = max(-100.0, min(0.0, float(db)))
+        self.update()
+
+    def _x(self, db):
+        x0, x1 = 10.0, self.width() - 10.0
+        return x0 + (max(-100.0, min(0.0, db)) + 100.0) / 100.0 * (x1 - x0)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        track = QRectF(10, h / 2.0 - 5, w - 20, 10)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(_DC["bg"]))
+        p.drawRoundedRect(track, 5, 5)
+        clip = QPainterPath()
+        clip.addRoundedRect(track, 5, 5)
+        p.setClipPath(clip)
+        lit = self._open or not self._gate
+        p.setBrush(QColor(_DC["green"] if lit else "#6d6f78"))
+        p.drawRect(QRectF(track.left(), track.top(), max(0.0, self._x(self._level) - track.left()), track.height()))
+        p.setClipping(False)
+        if self._gate:
+            tx = self._x(self._thr)
+            p.setBrush(QColor("#ffffff" if not self._auto else "#80848e"))
+            p.drawRoundedRect(QRectF(tx - 3, h / 2.0 - 11, 6, 22), 3, 3)
+
+    def _drag_to(self, x):
+        db = (x - 10.0) / max(1.0, self.width() - 20.0) * 100.0 - 100.0
+        self._thr = max(-100.0, min(0.0, db))
+        self.update()
+        self.threshold_changed.emit(self._thr)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._gate and not self._auto:
+            self._drag = True
+            self._drag_to(ev.position().x())
+
+    def mouseMoveEvent(self, ev):
+        if self._drag:
+            self._drag_to(ev.position().x())
+
+    def mouseReleaseEvent(self, ev):
+        self._drag = False
+
+
+_VC_NS_DESC = {"off": "No filtering: your microphone is sent exactly as it is picked up.",
+               "standard": "Filters steady background noise like fans, keyboard hum and air conditioning.",
+               "high": "Strongest filtering: also lowers everything that is not your voice between words."}
+
+
+class _VcSettings(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._mgr = get_voice()
+        self._pend, self._toggles, self._loading = {}, {}, False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        head = QLabel("Voice")
+        head.setStyleSheet("font-size: 20px; font-weight: bold;")
+        hint = QLabel("Microphone, noise suppression and noise gate for voice calls and group voice channels.")
+        hint.setObjectName("RowDesc")
+        hint.setWordWrap(True)
+        lay.addWidget(head)
+        lay.addWidget(hint)
+
+        # devices + volumes
+        f, v = self._panel()
+        self.in_combo, self.out_combo = QComboBox(), QComboBox()
+        for c, key in ((self.in_combo, "voice_in_dev"), (self.out_combo, "voice_out_dev")):
+            c.setFixedWidth(280)
+            c.addItem("Default", "")
+            c.activated.connect(lambda _i, c=c, k=key: _vc_set(k, c.currentData() or ""))
+        self._row(v, "Input Device", None, self.in_combo)
+        self._row(v, "Output Device", None, self.out_combo)
+        self.dev_hint = QLabel("Your devices are listed after the first microphone test or voice call.")
+        self.dev_hint.setObjectName("RowDesc")
+        self.dev_hint.setWordWrap(True)
+        v.addWidget(self.dev_hint)
+        self.in_vol = self._slider(v, "Input Volume", "voice_in_vol", 200)
+        self.out_vol = self._slider(v, "Output Volume", "voice_out_vol", 100)
+        lay.addWidget(f)
+
+        # noise suppression
+        f, v = self._panel()
+        t = QLabel("Noise Suppression")
+        t.setObjectName("RowTitle")
+        v.addWidget(t)
+        seg = QHBoxLayout()
+        seg.setSpacing(8)
+        self.ns_btns = {}
+        for val, text in (("off", "None"), ("standard", "Standard"), ("high", "High")):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setMinimumSize(110, 34)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, x=val: self._set_ns(x))
+            self.ns_btns[val] = b
+            seg.addWidget(b)
+        seg.addStretch(1)
+        v.addLayout(seg)
+        self.ns_desc = QLabel("")
+        self.ns_desc.setObjectName("RowDesc")
+        self.ns_desc.setWordWrap(True)
+        v.addWidget(self.ns_desc)
+        lay.addWidget(f)
+
+        # noise gate / input sensitivity
+        f, v = self._panel()
+        self.test_b = QPushButton("Let's Check")
+        self.test_b.setFixedWidth(160)
+        self.test_b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.test_b.clicked.connect(self._toggle_test)
+        self._row(v, "Noise Gate (Input Sensitivity)",
+                  "Your microphone only sends sound while it is louder than the line. Press Let's Check, talk, and drag "
+                  "the handle until it sits just above your background noise.", self.test_b)
+        self._row(v, "Noise Gate", "Silences your microphone when you are not talking.", self._tog("voice_gate", self._gate_changed))
+        self._row(v, "Automatically determine input sensitivity", "The launcher follows your background noise level for you.",
+                  self._tog("voice_gate_auto", self._gate_changed))
+        self.meter = _VcMeter()
+        self.meter.threshold_changed.connect(lambda db: self._later("voice_gate_db", round(db)))
+        v.addWidget(self.meter)
+        self.meter_l = QLabel("")
+        self.meter_l.setObjectName("RowDesc")
+        v.addWidget(self.meter_l)
+        lay.addWidget(f)
+
+        # echo + gain + reset
+        f, v = self._panel()
+        self._row(v, "Join & Leave Sounds", "Play a sound when you or somebody else joins or leaves a voice call.",
+                  self._tog("voice_sounds", lambda: _vc_play("join")))
+        self._row(v, "Echo Cancellation", "Stops your friends from hearing themselves through your speakers.", self._tog("voice_echo"))
+        self._row(v, "Automatic Gain Control", "Evens out how loud your voice is.", self._tog("voice_agc"))
+        reset = QPushButton("Reset voice settings")
+        reset.setFixedWidth(160)
+        reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset.clicked.connect(self._reset)
+        self._row(v, "Reset", "Put every voice setting back to its default.", reset)
+        lay.addWidget(f)
+
+        self._flush_t = QTimer(self)
+        self._flush_t.setSingleShot(True)
+        self._flush_t.setInterval(150)
+        self._flush_t.timeout.connect(self._flush)
+        self._poll = QTimer(self)
+        self._poll.setInterval(500)
+        self._poll.timeout.connect(self._sync_test)
+        self._mgr.level.connect(self._on_level)
+        self._mgr.devices_found.connect(self._on_devices)
+        self._load()
+        self._restyle()
+
+    # -- building blocks
+    def _panel(self):
+        f = QFrame()
+        f.setObjectName("Panel")
+        v = QVBoxLayout(f)
+        v.setContentsMargins(22, 18, 22, 18)
+        v.setSpacing(10)
+        return f, v
+
+    def _row(self, v, title, desc, widget):
+        row = QHBoxLayout()
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setObjectName("RowTitle")
+        col.addWidget(t)
+        if desc:
+            d = QLabel(desc)
+            d.setObjectName("RowDesc")
+            d.setWordWrap(True)
+            col.addWidget(d)
+        row.addLayout(col, 1)
+        row.addWidget(widget)
+        v.addLayout(row)
+
+    def _tog(self, key, after=None):
+        b = QPushButton()
+        b.setCheckable(True)
+        b.setFixedWidth(160)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def clicked():
+            b.setText("Enabled" if b.isChecked() else "Disabled")
+            _vc_set(key, b.isChecked())
+            if after:
+                after()
+        b.clicked.connect(clicked)
+        self._toggles[key] = b
+        return b
+
+    def _slider(self, v, title, key, maximum):
+        row = QHBoxLayout()
+        t = QLabel(title)
+        t.setObjectName("RowTitle")
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(0, maximum)
+        s.setFixedWidth(280)
+        val = QLabel("")
+        val.setFixedWidth(48)
+        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        def changed(x):
+            val.setText(f"{x}%")
+            if not self._loading:
+                self._later(key, x)
+        s.valueChanged.connect(changed)
+        s._val = val
+        row.addWidget(t, 1)
+        row.addWidget(s)
+        row.addWidget(val)
+        v.addLayout(row)
+        return s
+
+    def _restyle(self):
+        try:
+            acc = THEMES["dark"]["accent"]
+        except Exception:
+            acc = "#a666ff"
+        on = _on_accent()
+        for b in list(self.ns_btns.values()) + list(self._toggles.values()):
+            b.setStyleSheet(f"QPushButton:checked {{ background: {acc}; color: {on}; }}")
+        sl = (f"QSlider::groove:horizontal {{ background: #4e5058; height: 6px; border-radius: 3px; }}"
+              f"QSlider::sub-page:horizontal {{ background: {acc}; border-radius: 3px; }}"
+              f"QSlider::handle:horizontal {{ background: #ffffff; width: 16px; margin: -5px 0; border-radius: 8px; }}")
+        self.in_vol.setStyleSheet(sl)
+        self.out_vol.setStyleSheet(sl)
+
+    # -- settings <-> widgets
+    def _load(self):
+        self._loading = True
+        try:
+            for key, b in self._toggles.items():
+                b.setChecked(bool(_vc_get(key)))
+                b.setText("Enabled" if b.isChecked() else "Disabled")
+            ns = str(_vc_get("voice_ns"))
+            for val, b in self.ns_btns.items():
+                b.setChecked(val == ns)
+            self.ns_desc.setText(_VC_NS_DESC.get(ns, ""))
+            self.in_vol.setValue(int(_vc_get("voice_in_vol")))
+            self.out_vol.setValue(int(_vc_get("voice_out_vol")))
+            self.meter.set_threshold(float(_vc_get("voice_gate_db")))
+            self._gate_changed(apply=False)
+            cache = load_launcher_settings().get("voice_dev_cache")
+            if isinstance(cache, dict):
+                self._fill_devices(cache.get("ins") or [], cache.get("outs") or [])
+        finally:
+            self._loading = False
+
+    def _set_ns(self, val):
+        for v_, b in self.ns_btns.items():
+            b.setChecked(v_ == val)
+        self.ns_desc.setText(_VC_NS_DESC.get(val, ""))
+        _vc_set("voice_ns", val)
+
+    def _gate_changed(self, apply=True):
+        gate, auto = bool(_vc_get("voice_gate")), bool(_vc_get("voice_gate_auto"))
+        self.meter.set_gate(gate, auto)
+        self.meter_l.setText("Noise gate is off: everything your microphone hears is sent." if not gate else
+                             "Automatic: the line follows your background noise." if auto else
+                             "Manual: drag the handle to set the line (%d dB)." % round(float(_vc_get("voice_gate_db"))))
+
+    def _later(self, key, value):
+        self._pend[key] = value
+        self._flush_t.start()
+
+    def _flush(self):
+        pend, self._pend = self._pend, {}
+        if not pend:
+            return
+        st = dict(load_launcher_settings())
+        st.update(pend)
+        save_launcher_settings(st)
+        mgr = _voice.get("mgr")
+        if mgr is not None:
+            mgr.apply_audio()
+        if "voice_gate_db" in pend:
+            self._gate_changed(apply=False)
+
+    def _reset(self):
+        st = dict(load_launcher_settings())
+        st.update(_VC_DEFAULTS)
+        save_launcher_settings(st)
+        self._mgr.apply_audio()
+        self._load()
+
+    # -- devices, level, mic test
+    def _fill_devices(self, ins, outs):
+        for combo, key, items in ((self.in_combo, "voice_in_dev", ins), (self.out_combo, "voice_out_dev", outs)):
+            cur = str(_vc_get(key) or "")
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Default", "")
+            for it in items:
+                try:
+                    did, label = str(it[0]), str(it[1])
+                except Exception:
+                    continue
+                if did in ("default", "communications", ""):
+                    continue
+                combo.addItem(label, did)
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self.dev_hint.setVisible(self.in_combo.count() <= 1 and self.out_combo.count() <= 1)
+
+    def _on_devices(self, ins, outs):
+        try:
+            self._fill_devices(ins, outs)
+            st = dict(load_launcher_settings())
+            st["voice_dev_cache"] = {"ins": ins, "outs": outs}
+            save_launcher_settings(st)
+        except RuntimeError:     # expected: the page was deleted
+            pass
+
+    def _on_level(self, db, thr, opened):
+        try:
+            self.meter.set_level(db, thr, opened)
+        except RuntimeError:     # expected: the page was deleted
+            pass
+
+    def _toggle_test(self):
+        if self._mgr.testing:
+            self._mgr.stop_test()
+            self.meter.reset()
+        else:
+            self._mgr.start_test()
+        self._sync_test()
+
+    def _sync_test(self):
+        on = bool(self._mgr.testing)
+        self.test_b.setText("Stop Testing" if on else "Let's Check")
+        if not on and not self._mgr.active:
+            self.meter.reset()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._restyle()
+        self._poll.start()
+        if self._mgr.active and self._mgr.engine.alive():
+            self._mgr.set_report(True)
+
+    def hideEvent(self, ev):
+        super().hideEvent(ev)
+        self._poll.stop()
+        if self._mgr.testing:
+            self._mgr.stop_test()
+        elif self._mgr.active:
+            self._mgr.set_report(False)
+        self._sync_test()
+
+
+_vcs_prev_settings_init = SettingsPage.__init__
+
+def _vcs_settings_init(self, *a, **k):
+    _vcs_prev_settings_init(self, *a, **k)
+    try:
+        layout = self.layout()
+        panel = _VcSettings()
+        _voice["panel"] = panel
+        idx = max(layout.count() - 1, 0)
+        layout.insertSpacing(idx, 18)
+        layout.insertWidget(idx + 1, panel)
+    except Exception:
+        _log_exc("_vcs_settings_init")
+
+SettingsPage.__init__ = _vcs_settings_init
+
+
+def _vc_install(window):
+    try:
+        mgr = get_voice()
+        if _voice["stage"] is None:
+            _voice["stage"] = _VcStage(mgr, window)
+        if _voice["bar"] is None:
+            _voice["bar"] = _VcPanel(mgr, window)
+        mgr.start_ring_poller()
+    except Exception:
+        _log_exc("_vc_install")
+
+
+_vc_prev_build_main_window = _ncz_build_main_window
+
+def _ncz_build_main_window(app, launch_title="", hidden=False):
+    window = _vc_prev_build_main_window(app, launch_title, hidden)
+    _vc_install(window)
+    return window
+
+
+# ── Friends tab: "Voice call" on a friend's profile + the devices they are online on ──
+_vc_prev_fill_profile = FriendsPage._fill_profile
+
+def _vc_fill_profile(self):
+    _vc_prev_fill_profile(self)
+    try:
+        d = self.friends.get(self.current_uid, {})
+        tag = _vc_device_text(d)
+        if tag and not self.p_status.text().endswith("Offline"):
+            self.p_status.setText(self.p_status.text() + f"  \u00b7  {tag}")
+        if getattr(self, "_vc_call_btn", None) is None:
+            btn = QPushButton("Voice call")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedWidth(160)
+            btn.clicked.connect(lambda _c=False: _vc_friend_clicked(self))
+            lay = self.p_status.parentWidget().layout()
+            lay.insertWidget(lay.indexOf(self.p_status) + 1, btn, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._vc_call_btn = btn
+            get_voice().changed.connect(lambda: _vc_sync_friend_btn(self))
+        _vc_sync_friend_btn(self)
+    except Exception:
+        _log_exc("_fill_profile voice")
+
+def _vc_friend_clicked(page):
+    mgr = get_voice()
+    uid = page.current_uid
+    if not uid:
+        return
+    if mgr.in_room(mgr.room_of("dm", uid)):
+        mgr.leave()
+    else:
+        mgr.call_friend(uid, page.friends.get(uid, {}).get("username") or "Friend")
+
+def _vc_sync_friend_btn(page):
+    try:
+        btn = getattr(page, "_vc_call_btn", None)
+        if btn is None or not page.current_uid:
+            return
+        mgr = get_voice()
+        on = mgr.in_room(mgr.room_of("dm", page.current_uid))
+        btn.setText("End call" if on else "Voice call")
+        btn.setStyleSheet("QPushButton { background: #ef4444; color: white; border-radius: 8px; padding: 8px; font-weight: bold; }"
+                          if on else "")
+    except RuntimeError:    # expected: the page was deleted
+        pass
+
+FriendsPage._fill_profile = _vc_fill_profile
+
+
+# ── Group chats: "Join voice" + who is in the channel ──
+_vc_prev_group_init = GroupChatPage.__init__
+
+def _vc_group_init(self, fp):
+    _vc_prev_group_init(self, fp)
+    try:
+        head = self.layout().itemAt(0).layout()
+        self._vc_btn = QPushButton("Join voice")
+        self._vc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._vc_btn.clicked.connect(lambda _c=False: _vc_group_clicked(self))
+        head.insertWidget(head.indexOf(self.add_btn), self._vc_btn)
+        self._vc_who = QLabel("")
+        self._vc_who.setStyleSheet("color: #22c55e; font-size: 12px; background: transparent;")
+        self._vc_who.hide()
+        for i in range(head.count()):           # the title / subtitle column
+            col = head.itemAt(i).layout()
+            if col is not None and col.indexOf(self.h_sub) >= 0:
+                col.addWidget(self._vc_who)
+                break
+        get_voice().changed.connect(lambda: _vc_sync_group(self))
+        self._vc_timer = QTimer(self)
+        self._vc_timer.setInterval(4000)
+        self._vc_timer.timeout.connect(lambda: _vc_group_poll(self))
+        self._vc_timer.start()
+    except Exception:
+        _log_exc("GroupChatPage voice")
+
+def _vc_group_clicked(page):
+    mgr = get_voice()
+    if not page.gid:
+        return
+    if mgr.in_room("grp_" + page.gid):
+        mgr.leave()
+    else:
+        mgr.join_group(page.gid, (page.g or {}).get("name") or "Group")
+
+def _vc_sync_group(page):
+    try:
+        on = bool(page.gid) and get_voice().in_room("grp_" + page.gid)
+        page._vc_btn.setText("Leave voice" if on else "Join voice")
+        page._vc_btn.setStyleSheet("QPushButton { background: #ef4444; color: white; border-radius: 8px; padding: 6px 14px; font-weight: bold; }"
+                                   if on else "")
+    except RuntimeError:    # expected: the page was deleted
+        pass
+
+def _vc_group_poll(page):
+    try:
+        gid = page.gid
+        if not gid or not page.isVisible() or not cloud_configured():
+            page._vc_who.hide()
+            return
+        def work():
+            names = []
+            try:
+                token, _u = get_id_token()
+                mem = _http_json(_fdb(f"vc/rooms/grp_{gid}/members", token))
+                if isinstance(mem, dict):
+                    names = [str(m.get("name") or "?")[:24] for m in mem.values() if _vc_fresh(m)]
+            except Exception:    # expected: offline / no rules yet
+                pass
+            def show():
+                try:
+                    if page.gid != gid:
+                        return
+                    page._vc_who.setText("In voice: " + ", ".join(names) if names else "")
+                    page._vc_who.setVisible(bool(names))
+                except RuntimeError:    # expected: the page was deleted
+                    pass
+            get_voice()._job.emit(show)
+        threading.Thread(target=work, daemon=True).start()
+    except RuntimeError:    # expected: the page was deleted
+        pass
+
+GroupChatPage.__init__ = _vc_group_init
+
+
+# ── unreleased Steam games ──
+# Store: an "Unreleased" filter button (Steam's upcoming games) and a small orange "Unreleased" under every card
+# for a game that isn't out yet. Library: the Install button is greyed out and the same orange text sits under the
+# title. Whether a game is out is read from the release date in Steam's search results (and from Steam's
+# appdetails for games in the library), remembered in store_cache/unreleased.json, and re-checked every few hours
+# so a game unlocks by itself once it releases.
+import datetime as _unr_dt
+
+_unr_lock = threading.RLock()
+_unr_state = {}             # appid -> when we last saw it as unreleased (saved to disk)
+_unr_released = set()       # appids confirmed released during this session
+_unr_loaded = [False]
+_unr_bus_obj = [None]
+_UNR_RECHECK_SECONDS = 6 * 3600
+_UNR_BTN_STYLE = ("QPushButton { background: rgba(128,128,128,0.22); color: rgba(150,150,150,0.95); "
+                  "border: 1px solid rgba(128,128,128,0.30); }")
+
+def _unr_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "unreleased.json")
+
+def _unr_load():
+    if _unr_loaded[0]:
+        return
+    _unr_loaded[0] = True
+    try:
+        with open(_unr_path(), encoding="utf-8") as f:
+            raw = json.load(f)
+        for k, v in (raw or {}).items():
+            _unr_state[int(k)] = float(v)
+    except Exception:    # expected: first run, nothing saved yet
+        pass
+
+def _unr_save():
+    try:
+        path = _unr_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in _unr_state.items()}, f)
+        os.replace(tmp, path)
+    except Exception:
+        _log_exc("_unr_save")
+
+class _UnrBus(QObject):
+    changed = pyqtSignal(int)       # appid whose released / unreleased state just changed
+
+def _unr_bus():
+    if _unr_bus_obj[0] is None:     # first called from the GUI thread, so signals reach widgets safely
+        _unr_bus_obj[0] = _UnrBus()
+    return _unr_bus_obj[0]
+
+def is_unreleased(appid):
+    """True / False when we know whether this Steam game is out yet, None when we haven't seen it."""
+    try:
+        appid = int(appid)
+    except (TypeError, ValueError):
+        return None
+    with _unr_lock:
+        _unr_load()
+        if appid in _unr_state:
+            return True
+        if appid in _unr_released:
+            return False
+    return None
+
+def _unr_set(appid, flag):
+    appid = int(appid)
+    with _unr_lock:
+        _unr_load()
+        was = appid in _unr_state
+        if flag:
+            _unr_state[appid] = time.time()
+            _unr_released.discard(appid)
+            changed = not was
+        else:
+            _unr_state.pop(appid, None)
+            _unr_released.add(appid)
+            changed = was
+        if changed:
+            _unr_save()
+    if changed and _unr_bus_obj[0] is not None:
+        try:
+            _unr_bus_obj[0].changed.emit(appid)
+        except RuntimeError:    # expected: the bus is already gone
+            pass
+    return changed
+
+def _unr_text_unreleased(text):
+    """Steam's release-date text -> True (not out), False (out), None (no date shown)."""
+    t = html_lib.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+    if not t:
+        return None
+    today = _unr_dt.date.today()
+    for fmt in ("%b %d, %Y", "%d %b, %Y", "%d %b %Y", "%B %d, %Y", "%d %B, %Y", "%d %B %Y"):
+        try:
+            return _unr_dt.datetime.strptime(t, fmt).date() > today
+        except ValueError:
+            pass
+    for fmt in ("%b %Y", "%B %Y", "%b, %Y"):        # month only: Steam shows that for games still to come
+        try:
+            d = _unr_dt.datetime.strptime(t, fmt).date()
+            return (d.year, d.month) >= (today.year, today.month)
+        except ValueError:
+            pass
+    if re.fullmatch(r"\d{4}", t):
+        return int(t) >= today.year
+    return True                                     # "Coming soon", "To be announced", "Q4 2026" ...
+
+# Every Steam search page goes through parse_steam_results, so noting the release date there covers the Store,
+# the picker dialogs and everything else that lists Steam games.
+_UNR_REL_RE = re.compile(r'<div[^>]*\bsearch_released\b[^>]*>(.*?)</div>', re.S)
+_unr_prev_parse = parse_steam_results
+
+def parse_steam_results(results_html):
+    games = _unr_prev_parse(results_html)
+    try:
+        wanted = {g[0] for g in games}
+        for appid, body in _ROW_RE.findall(results_html or ""):
+            appid = int(appid)
+            if appid not in wanted:
+                continue
+            m = _UNR_REL_RE.search(body)
+            if m:
+                verdict = _unr_text_unreleased(m.group(1))
+                if verdict is not None:
+                    _unr_set(appid, verdict)
+    except Exception:
+        _log_exc("parse_steam_results unreleased")
+    return games
+
+# ── Store: unreleased games mixed into the normal list ──
+# Every default page (no search word) gets a few of Steam's most wishlisted upcoming games slipped in, so they
+# sit among the other games with nothing but the orange "Unreleased" text under them.
+_UNR_MIX = 10
+_unr_prev_fetch = fetch_steam_games
+
+def fetch_steam_games(term, start, count=STORE_PAGE_SIZE, tags=None, sort_by="_ASC"):
+    games, total = _unr_prev_fetch(term, start, count, tags, sort_by)
+    if term or sort_by != "_ASC" or count != STORE_PAGE_SIZE:
+        return games, total
+    try:
+        params = {"query": "", "term": "", "start": (start // STORE_PAGE_SIZE) * _UNR_MIX, "count": _UNR_MIX,
+                  "dynamic_data": "", "category1": 998, "l": "english", "infinite": 1, "filter": "popularcomingsoon"}
+        if tags:
+            params["tags"] = ",".join(str(int(t)) for t in tags)
+        data = json.loads(_http_get(STEAM_SEARCH_URL + "?" + urllib.parse.urlencode(params), timeout=15).decode("utf-8", errors="replace"))
+        have = {g[0] for g in games}
+        extra = [g for g in parse_steam_results(data.get("results_html", "")) if g[0] not in have]
+        for g in extra:
+            _unr_set(g[0], True)
+        out, step = list(games), max(2, len(games) // (len(extra) + 1))
+        for i, g in enumerate(extra):
+            out.insert(min(len(out), (i + 1) * step + i), g)
+        return out, total
+    except Exception:    # expected: offline or Steam is limiting requests; the normal list still shows
+        return games, total
+
+# ── Store: orange "Unreleased" under the card ──
+def _unr_render_card(card):
+    try:
+        card.flag_label.hide()
+        card.price_label.setText(f'<b style="color:{ORANGE}">Unreleased</b>')
+    except RuntimeError:    # expected: the widget or object may already be deleted
+        pass
+
+_unr_prev_card_set_price = StoreCardH.set_price
+
+def _unr_card_set_price(self, text, discount=0, original="", flag=""):
+    if text == "Coming soon":           # the price lookup found it isn't out yet
+        _unr_set(self.appid, True)
+    if is_unreleased(self.appid):
+        _unr_render_card(self)
+    else:
+        _unr_prev_card_set_price(self, text, discount, original, flag)
+
+StoreCardH.set_price = _unr_card_set_price
+
+_unr_prev_store_on_page = StorePage._on_page
+
+def _unr_store_on_page(self, result):
+    _unr_prev_store_on_page(self, result)
+    if type(self) is StorePage:
+        try:
+            for card in list(self._cards):
+                if isinstance(card, StoreCardH) and is_unreleased(card.appid):
+                    _unr_render_card(card)
+        except Exception:
+            _log_exc("unreleased store labels")
+
+def _unr_store_changed(self, appid):
+    try:
+        card = self._card_by_id.get(appid)
+        if not isinstance(card, StoreCardH):
+            return
+        if is_unreleased(appid):
+            _unr_render_card(card)
+        else:
+            card.set_price(*self._st_meta.price_cache.get(appid, ("", 0, "", "")))
+    except (RuntimeError, AttributeError):    # expected: the card is gone or the page isn't fully built yet
+        pass
+
+_unr_prev_store_init = StorePage.__init__
+
+def _unr_store_init(self, *a, **k):
+    _unr_prev_store_init(self, *a, **k)
+    if type(self) is StorePage:
+        try:
+            _unr_bus().changed.connect(self._unr_on_changed)
+        except Exception:
+            _log_exc("unreleased store hook")
+
+StorePage._on_page = _unr_store_on_page
+StorePage._unr_on_changed = _unr_store_changed
+StorePage.__init__ = _unr_store_init
+
+# ── Library: greyed-out Install button + orange "Unreleased" ──
+def _unr_apply_card(win, appid):
+    card = win.steam_cards.get(appid)
+    if card is None:
+        return
+    btn = card.findChild(QPushButton, "Primary")
+    status = card.findChild(QLabel, "CardStatus")
+    if btn is None:
+        return
+    if is_unreleased(appid):
+        if btn.text() != "Install":         # already installed / located by the user: leave it alone
+            return
+        btn.setEnabled(False)
+        btn.setCursor(Qt.CursorShape.ArrowCursor)
+        btn.setStyleSheet(_UNR_BTN_STYLE)
+        btn.setToolTip("This game hasn't been released yet")
+        if status is not None:
+            status.setText("Unreleased")
+            status.setStyleSheet(f"color: {ORANGE};")
+        card._unr_on = True
+    elif getattr(card, "_unr_on", False):    # it came out: unlock it again
+        card._unr_on = False
+        btn.setEnabled(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet("")
+        btn.setToolTip("Install through Steam (Steam must be installed)")
+        if status is not None and status.text() == "Unreleased":
+            status.setText("Steam game")
+            status.setStyleSheet("")
+
+def _unr_refresh_job(ids):
+    """Asks Steam whether these library games are out yet (one small call each, spaced out)."""
+    for appid in ids:
+        if time.time() < _steam_busy["until"]:
+            return
+        try:
+            time.sleep(0.4)
+            raw = json.loads(_http_get(
+                f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us&filters=basic",
+                timeout=15).decode("utf-8", errors="replace"))
+            info = (raw.get(str(appid)) or {}).get("data")
+            if isinstance(info, dict):
+                _unr_set(appid, bool((info.get("release_date") or {}).get("coming_soon")))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 403):
+                _steam_busy["until"] = time.time() + 120
+                return
+        except Exception:    # expected: offline or the server did not answer
+            continue
+
+_unr_prev_create_card = AdaptiveApp.create_steam_card
+
+def _unr_create_steam_card(self, appid, title_text, cover_path):
+    _unr_prev_create_card(self, appid, title_text, cover_path)
+    try:
+        if not getattr(self, "_unr_hooked", False):
+            self._unr_hooked = True
+            _unr_bus().changed.connect(self._unr_on_changed)
+            self._unr_timer = QTimer(self)
+            self._unr_timer.setInterval(_UNR_RECHECK_SECONDS * 1000)
+            self._unr_timer.timeout.connect(self._unr_recheck)
+            self._unr_timer.start()
+            QTimer.singleShot(5000, self._unr_recheck)       # soon after start: has anything come out?
+        if is_unreleased(appid):
+            _unr_apply_card(self, appid)
+    except Exception:
+        _log_exc("unreleased library card")
+
+def _unr_win_changed(self, appid):
+    try:
+        _unr_apply_card(self, appid)
+    except RuntimeError:    # expected: the card is gone
+        pass
+
+def _unr_win_recheck(self):
+    try:
+        ids = [a for a in list(self.steam_cards) if is_unreleased(a)]
+    except RuntimeError:
+        return
+    if ids:
+        threading.Thread(target=_unr_refresh_job, args=(ids,), daemon=True).start()
+
+_unr_prev_add_game = AdaptiveApp.add_steam_game
+
+def _unr_add_steam_game(self, appid, title, cover_path):
+    _unr_prev_add_game(self, appid, title, cover_path)
+    if is_unreleased(appid) is None:         # added without Steam's date seen: ask once
+        threading.Thread(target=_unr_refresh_job, args=([appid],), daemon=True).start()
+
+AdaptiveApp.create_steam_card = _unr_create_steam_card
+AdaptiveApp._unr_on_changed = _unr_win_changed
+AdaptiveApp._unr_recheck = _unr_win_recheck
+AdaptiveApp.add_steam_game = _unr_add_steam_game
+
+
+# ── NCZ Chess opened from Steam: put the launcher on top ──
+def _ncz_raise_window(w):
+    try:
+        w.setWindowState(w.windowState() & ~Qt.WindowState.WindowMinimized)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+        _force_foreground(int(w.winId()))          # the window manager / Windows ignore a plain activateWindow()
+    except Exception:
+        _log_exc("_ncz_raise_window")
+
+_chs_prev_launch = _ncz_launch_requested
+
+def _ncz_launch_requested(app, title, tries=0):
+    _chs_prev_launch(app, title, tries)
+    try:
+        if _norm_title(title) == _norm_title("NCZ Chess"):
+            w = getattr(app, "_ncz_main_window", None)
+            page = w.__dict__.get("chess_page") if w is not None else None
+            if page is not None and w.pages.currentWidget() is page:       # chess is open now: bring the launcher forward
+                _ncz_raise_window(w)
+                QTimer.singleShot(400, lambda: _ncz_raise_window(w))       # once more after the window has settled
+    except Exception:
+        _log_exc("_ncz_launch_requested chess")
+
+# ── a finished game download makes its desktop shortcut by itself ──
+def _ncz_dl_exe(title):
+    """The installed exe of a game that just finished downloading, '' if it can't be found."""
+    for finder in (lambda: _sc_downloaded_exe(title)[1],
+                   lambda: find_best_game_exe(_safe_installed_game_dir(title), title),
+                   lambda: _fan_installed_exe(title),
+                   lambda: installed_exe_for(title)):
+        try:
+            exe = finder()
+        except Exception:    # expected: this lookup doesn't apply to this kind of game
+            exe = ""
+        if exe and os.path.exists(exe):
+            return exe
+    return ""
+
+def _ncz_auto_shortcut(title, cover=""):
+    try:
+        from PyQt6.QtCore import QStandardPaths    # lazy: saves memory/startup until used
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation) or os.path.expanduser("~/Desktop")
+        target = os.path.join(desktop, (sanitize_folder_name(title) or "Game") + (".lnk" if sys.platform.startswith("win") else ".desktop"))
+        if os.path.exists(target):                 # already has one (an update, or made by hand): leave it
+            return
+        exe = _ncz_dl_exe(title)
+        if not exe:
+            return
+        global QMessageBox
+        real = QMessageBox
+        class _Quiet:                              # create_game_shortcut talks through message boxes: stay silent here
+            def __getattr__(self, name):
+                return getattr(real, name)
+            @staticmethod
+            def information(*a, **k):
+                return real.StandardButton.Ok
+            @staticmethod
+            def warning(*a, **k):
+                return real.StandardButton.Ok
+        QMessageBox = _Quiet()
+        try:
+            create_game_shortcut(getattr(QApplication.instance(), "_ncz_main_window", None), title, exe, "", cover or "")
+        finally:
+            QMessageBox = real
+    except Exception:
+        _log_exc("_ncz_auto_shortcut")
+
+_dsc_prev_card_init = DownloadCard.__init__
+
+def _dsc_card_init(self, *a, **k):
+    _dsc_prev_card_init(self, *a, **k)
+    try:
+        if not isinstance(self, _DgUpdateCard):    # that one makes update files, not a game
+            self._dsc_cover = a[3] if len(a) > 3 else k.get("cover_path", "")
+            self.worker.finished.connect(self._dsc_done)
+    except Exception:
+        _log_exc("download shortcut hook")
+
+def _dsc_done(self, _path=""):
+    title, cover = self.title, getattr(self, "_dsc_cover", "")
+    QTimer.singleShot(2500, lambda: _ncz_auto_shortcut(title, cover))   # after the install bookkeeping is written
+
+DownloadCard.__init__ = _dsc_card_init
+DownloadCard._dsc_done = _dsc_done
 
 
 if __name__ == "__main__":
