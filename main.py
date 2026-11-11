@@ -396,7 +396,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QTextEdit, QSizePolicy, QLayout, QListWidget, QListWidgetItem,
     QAbstractItemView, QTabWidget
 )
-from PyQt6.QtCore import QDate, QDateTime, QTime, QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import QEvent, QDate, QDateTime, QTime, QMimeData, QSize, Qt, QRectF, QRect, QThread, QUrl, QBuffer, QIODevice, QObject, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QTextImageFormat, QTextCharFormat, QTextDocument, QPixmap, QPainter, QPainterPath, QPalette, QColor, QIcon, QFont, QFontDatabase, QDesktopServices, QImage, QPen, QMovie, QKeySequence
 try:        # in-launcher browser (pip install PyQt6-WebEngine); without it NCZFront falls back to the default browser
     import importlib.util       # only checks it's installed: Chromium is imported the first time NCZFront opens (_ncz_web_classes)
@@ -7594,6 +7594,97 @@ GREEN = "#22c55e"
 ORANGE = "#f59e0b"
 RED = "#f44336"
 
+# ── Mouse side buttons (Back / Forward) navigate between launcher pages like a browser ──
+class _MouseNavFilter(QObject):
+    """App-wide filter: the mouse's side buttons go back / forward through the pages the user visited in the main window."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.history = [app.pages.currentWidget()]
+        self.pos = 0
+        self._moving = False
+        app.pages.currentChanged.connect(self._changed)
+        QApplication.instance().installEventFilter(self)
+
+    def _changed(self, _i):
+        if self._moving:
+            return
+        w = self.app.pages.currentWidget()
+        if w is None or (0 <= self.pos < len(self.history) and self.history[self.pos] is w):
+            return
+        del self.history[self.pos + 1:]          # a new visit drops the "forward" branch, like a browser
+        self.history.append(w)
+        self.pos = len(self.history) - 1
+        if len(self.history) > 50:
+            del self.history[0]
+            self.pos -= 1
+
+    def _resolve(self, w):
+        """A lazy-page placeholder may have been replaced by the real page since it was recorded."""
+        stack = self.app.pages
+        try:
+            if stack.indexOf(w) >= 0:
+                return w
+        except RuntimeError:                      # the placeholder was deleted
+            pass
+        for name, ent in self.app.__dict__.get("_lazy_pages", {}).items():
+            if ent["ph"] is w:
+                page = self.app.__dict__.get(name)
+                if page is not None and stack.indexOf(page) >= 0:
+                    return page
+        return None
+
+    def _go(self, step):
+        target = self.pos + step
+        while 0 <= target < len(self.history):
+            w = self._resolve(self.history[target])
+            if w is not None:
+                self.history[target] = w
+                self.pos = target
+                self._moving = True
+                try:
+                    self.app.pages.setCurrentWidget(w)
+                finally:
+                    self._moving = False
+                self._sync_nav(w)
+                return True
+            del self.history[target]              # page no longer exists
+            if step < 0:
+                self.pos -= 1
+                target -= 1
+        return False
+
+    def _sync_nav(self, w):
+        app = self.app
+        try:
+            idx = app.pages.indexOf(w)
+            if w is app.__dict__.get("store_detail_page"):
+                idx = 4                           # the game page belongs to the Store tab
+            btn = app.nav_group.button(idx)
+            if btn is None:
+                for tab in app.__dict__.get("_profile_tabs", {}).values():
+                    if tab.get("page") is w:
+                        btn = tab.get("btn")
+            if btn is not None:
+                btn.setChecked(True)
+        except RuntimeError:
+            pass
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.MouseButtonPress:
+            return False
+        b = ev.button()
+        if b not in (Qt.MouseButton.BackButton, Qt.MouseButton.ForwardButton):
+            return False
+        try:
+            if not isinstance(obj, QWidget) or obj.window() is not self.app or not self.app.isActiveWindow():
+                return False                      # dialogs, overlays and Big Picture keep their own handling
+            if QApplication.activePopupWidget() is not None:
+                return False
+            return self._go(-1 if b == Qt.MouseButton.BackButton else 1)
+        except RuntimeError:
+            return False
+
 class AdaptiveApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -7698,6 +7789,7 @@ class AdaptiveApp(QMainWindow):
         self._init_lb()
         self._init_ext()
         self._init_ncz_su()
+        self._init_mouse_nav()
 
     # ── sidebar ──
     def make_nav_button(self, text, checkable=False):
@@ -10319,6 +10411,12 @@ class AdaptiveApp(QMainWindow):
             _log_exc("_init_ext")
 
     # ── Settings: startup animation panel ──
+
+    def _init_mouse_nav(self):
+        try:
+            self._mouse_nav = _MouseNavFilter(self)
+        except Exception:
+            _log_exc("_init_mouse_nav")
 
     def _init_ncz_su(self):
         try:
@@ -59266,20 +59364,26 @@ def _vc_audio_json():
 # your own, put join.wav / leave.wav in assets/voice/sounds/ and they replace these.
 _vc_snd = {"fx": {}, "broken": False, "last": {}}
 _VC_SND_NOTES = {"join": ((659.25, 0.00, 0.12), (987.77, 0.08, 0.20)),       # (frequency Hz, start s, length s)
-                 "leave": ((783.99, 0.00, 0.12), (523.25, 0.08, 0.20))}
+                 "leave": ((783.99, 0.00, 0.12), (523.25, 0.08, 0.20)),
+                 # ringtones (frequency, start, length, decay): incoming = a four-note bell phrase, outgoing = the soft two-tone "ringback"
+                 "ring_in": ((880.00, 0.00, 0.55, 5.0), (659.25, 0.22, 0.55, 5.0), (880.00, 0.44, 0.55, 5.0), (659.25, 0.66, 0.70, 4.0)),
+                 "ring_out": ((440.0, 0.00, 1.00, 2.5), (480.0, 0.00, 1.00, 2.5))}
+_VC_SND_LEN = {"ring_in": 2.0, "ring_out": 3.0}           # total length: the silence after the notes is part of the ring pattern
 
 def _vc_synth(kind):
     rate = 44100
     notes = _VC_SND_NOTES[kind]
-    n = int(rate * (max(st + ln for _f, st, ln in notes) + 0.04))
+    n = int(rate * max(max(nt[1] + nt[2] for nt in notes) + 0.04, _VC_SND_LEN.get(kind, 0.0)))
     buf = [0.0] * n
-    for freq, st, ln in notes:
+    for nt in notes:
+        freq, st, ln = nt[0], nt[1], nt[2]
+        decay = nt[3] if len(nt) > 3 else 15.0
         s0 = int(st * rate)
         for i in range(int(ln * rate)):
             if s0 + i >= n:
                 break
             t = i / rate
-            env = min(1.0, t / 0.005) * _math.exp(-t * 15.0)               # soft attack (no click), round decay
+            env = min(1.0, t / 0.005) * _math.exp(-t * decay)               # soft attack (no click), round decay
             ph = 2 * _math.pi * freq * t
             buf[s0 + i] += (_math.sin(ph) + 0.30 * _math.sin(2 * ph) + 0.07 * _math.sin(3 * ph)) * env
     peak = max(1e-9, max(abs(v) for v in buf))
@@ -59302,10 +59406,21 @@ def _vc_sound_path(kind):
             w.writeframes(data)
     return path
 
-def _vc_play(kind):
-    """kind = 'join' or 'leave'. Silent when turned off in Settings > Voice; the same sound twice within 0.4 s plays once."""
+def _vc_stop(kind):
+    """Cuts a ringtone short (answered / declined / hung up)."""
     try:
-        if kind not in _VC_SND_NOTES or _vc_snd["broken"] or not _vc_get("voice_sounds"):
+        fx = _vc_snd["fx"].get(kind)
+        if fx is not None:
+            fx.stop()
+    except Exception:
+        pass
+
+def _vc_play(kind, force=False):
+    """kind = 'join', 'leave', 'ring_in' or 'ring_out'. Join / leave are silent when turned off in Settings > Voice; ringtones
+    (force=True) always play. The same sound twice within 0.4 s plays once. Put ring_in.wav / ring_out.wav in
+    assets/voice/sounds/ to use your own ringtone."""
+    try:
+        if kind not in _VC_SND_NOTES or _vc_snd["broken"] or (not force and not _vc_get("voice_sounds")):
             return
         now = time.time()
         if now - _vc_snd["last"].get(kind, 0.0) < 0.4:
@@ -59797,18 +59912,37 @@ class VoiceManager(QObject):
         s = {"room": room, "kind": kind, "label": label, "me": me, "name": myname, "ring_to": ring_to,
              "stop": threading.Event(), "t": None, "peers": {}, "ready": False, "muted": False, "deaf": False,
              "pre_muted": False, "retries": {}, "answered": ring_to is None, "t0": time.time(), "offerer": set(),
-             "speak": {}, "expanded": kind == "dm", "pings": {}, "seeded": False, "snd_joined": False,
+             "speak": {}, "expanded": True, "pings": {}, "seeded": False, "snd_joined": False,
              "roles": {}, "smod": {}, "srv_m": False, "srv_d": False, "smod_hold": 0.0, "roles_at": 0.0}
         self.active, self.notice, self.ping = s, "", None
         self.engine.call("init", json.dumps(_vc_ice_servers()), _vc_audio_json())
         threading.Thread(target=self._run, args=(s,), daemon=True).start()
+        if ring_to:                                      # the caller hears the ringback until they pick up / it is declined
+            if getattr(self, "_rb", None) is None:
+                self._rb = QTimer(self)
+                self._rb.setInterval(3000)
+                self._rb.timeout.connect(self._ringback)
+            self._rb.start()
+            self._ringback()
         self.changed.emit()
+
+    def _ringback(self):
+        s = self.active
+        if s and s["ring_to"] and not s["answered"]:
+            _vc_play("ring_out", force=True)
+        else:
+            if getattr(self, "_rb", None) is not None:
+                self._rb.stop()
+            _vc_stop("ring_out")
 
     def leave(self, notice=""):
         s = self.active
         if not s:
             return
         self.active = None
+        if getattr(self, "_rb", None) is not None:
+            self._rb.stop()
+        _vc_stop("ring_out")
         if s.get("snd_joined"):
             _vc_play("leave")
         s["stop"].set()
@@ -60024,8 +60158,11 @@ class VoiceManager(QObject):
                 sigs = _http_json(_fdb(f"vc/rooms/{room}/signals/{me}", token))
                 ringing = True
                 if s["ring_to"] and not s["answered"]:
-                    r = _http_json(_fdb(f"vc/ring/{s['ring_to']}", token))
-                    ringing = isinstance(r, dict) and r.get("from") == me
+                    try:
+                        r = _http_json(_fdb(f"vc/ring/{s['ring_to']}", token))
+                        ringing = isinstance(r, dict) and r.get("from") == me
+                    except Exception:    # the database rules may not let the caller read the callee's ring node: keep ringing until the timeout
+                        ringing = True
                 members = members if isinstance(members, dict) else {}
                 sigs = sigs if isinstance(sigs, dict) else {}
                 if sigs and not s["stop"].is_set():
@@ -60254,7 +60391,7 @@ from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QFontMetricsF
 
 _DC = {"bg": "#1e1f22", "panel": "#232428", "card": "#2b2d31", "hover": "#35373c", "line": "#3f4147",
-       "text": "#f2f3f5", "sub": "#b5bac1", "green": "#23a55a", "red": "#f23f43", "orange": "#f0b232"}
+       "text": "#f2f3f5", "sub": "#b5bac1", "green": "#23a559", "red": "#ed4245", "orange": "#f0b232"}
 _DC_AVATAR_COLORS = ["#5865f2", "#3ba55c", "#faa61a", "#eb459e", "#ed4245", "#1abc9c", "#9b59b6", "#e67e22"]
 
 
@@ -60574,7 +60711,50 @@ def _vc_ns_menu(parent, anchor):
 
 
 # ── the "Voice Connected" panel ──
+class _VcDot(QWidget):
+    """The green pulsing dot of the minimised call bar (same 1.6 s pulse as the web)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(10, 10)
+        self.phase = 0.0
+        self._t = QTimer(self)
+        self._t.setInterval(50)
+        self._t.timeout.connect(self._tick)
+        self._t.start()
+
+    def _tick(self):
+        if self.isVisible():
+            self.phase = (self.phase + 0.05 / 1.6) % 1.0
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QColor(_DC["green"])
+        c.setAlphaF(1.0 - 0.65 * (1.0 - abs(2.0 * self.phase - 1.0)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QRectF(0, 0, 10, 10))
+
+
+def _vc_web_state(s):
+    """(text, timer) exactly like the web call screen: Ringing... / Connecting... / Waiting for them... /
+    You're the only one here / Voice connected."""
+    t = int(max(0, time.time() - s["t0"]))
+    tm = f"{t // 60}:{t % 60:02d}"
+    peers = s["peers"]
+    if s["ring_to"] and not s["answered"] and not peers:
+        return "Ringing\u2026", ""
+    if not peers:
+        return ("Waiting for them\u2026", "") if s["kind"] == "dm" else ("You're the only one here", tm)
+    if not s["ready"] or not any(p["state"] == "connected" for p in peers.values()):
+        return "Connecting\u2026", ""
+    return "Voice connected", tm
+
+
 class _VcPanel(QFrame):
+    """The minimised call bar (same look as the web's): pulsing green dot, status + who, mute and hang up."""
     W = 304
 
     def __init__(self, mgr, win):
@@ -60582,71 +60762,39 @@ class _VcPanel(QFrame):
         self._mgr, self._win = mgr, win
         self.setObjectName("VcPanel")
         self.setFixedWidth(self.W)
-        self.setStyleSheet(f"QFrame#VcPanel {{ background: {_DC['panel']}; border: 1px solid #1a1b1e; border-radius: 8px; }}"
+        self.setStyleSheet(f"QFrame#VcPanel {{ background: {_DC['panel']}; border: 1px solid {_DC['line']}; border-radius: 12px; }}"
                            "QLabel { background: transparent; }")
-        v = QVBoxLayout(self)
-        v.setContentsMargins(10, 8, 10, 8)
-        v.setSpacing(6)
-        top = QHBoxLayout()
-        top.setSpacing(4)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 8, 10, 8)
+        row.setSpacing(8)
         self.head_w = _VcClickable()
         hl = QHBoxLayout(self.head_w)
         hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(8)
-        self.bars = _VcIcon("bars", 20, _DC["green"])
+        hl.setSpacing(10)
+        self.dot = _VcDot()
         col = QVBoxLayout()
         col.setSpacing(0)
         self.state = QLabel("")
-        self.state.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.state.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {_DC['text']};")
         self.sub = QLabel("")
         self.sub.setStyleSheet(f"font-size: 12px; color: {_DC['sub']};")
         col.addWidget(self.state)
         col.addWidget(self.sub)
-        hl.addWidget(self.bars)
+        hl.addWidget(self.dot)
         hl.addLayout(col, 1)
         self.head_w.clicked.connect(self._toggle_stage)
-        self.ns_b = _VcRound("wave", 32, flat=True)
-        self.ns_b.setToolTip("Noise Suppression")
-        self.ns_b.clicked.connect(lambda: _vc_ns_menu(self, self.ns_b))
-        self.leave_b = _VcRound("hangup", 32, flat=True)
-        self.leave_b.setToolTip("Disconnect")
-        self.leave_b.clicked.connect(lambda: mgr.leave())
-        top.addWidget(self.head_w, 1)
-        top.addWidget(self.ns_b)
-        top.addWidget(self.leave_b)
-        v.addLayout(top)
-
-        self.sep = QFrame()
-        self.sep.setFixedHeight(1)
-        self.sep.setStyleSheet(f"background: {_DC['line']};")
-        v.addWidget(self.sep)
-
-        self.user_w = QWidget()
-        ul = QHBoxLayout(self.user_w)
-        ul.setContentsMargins(0, 0, 0, 0)
-        ul.setSpacing(6)
-        self.me_av = _VcAvatarWidget(32)
-        ucol = QVBoxLayout()
-        ucol.setSpacing(0)
-        self.me_name = QLabel("")
-        self.me_name.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {_DC['text']};")
-        self.me_sub = QLabel("")
-        self.me_sub.setStyleSheet(f"font-size: 11px; color: {_DC['sub']};")
-        ucol.addWidget(self.me_name)
-        ucol.addWidget(self.me_sub)
-        self.mic_b = _VcRound("mic", 32, flat=True)
-        self.deaf_b = _VcRound("headset", 32, flat=True)
-        self.gear_b = _VcRound("gear", 32, flat=True)
+        self.mic_b = _VcRound("mic", 40)
+        self.leave_b = _VcRound("hangup", 40, bg=_DC["red"])
         self.mic_b.clicked.connect(mgr.toggle_mute)
-        self.deaf_b.clicked.connect(mgr.toggle_deafen)
-        self.gear_b.setToolTip("Voice Settings")
-        self.gear_b.clicked.connect(lambda: _vc_open_settings(win))
-        ul.addWidget(self.me_av)
-        ul.addLayout(ucol, 1)
-        for b in (self.mic_b, self.deaf_b, self.gear_b):
-            ul.addWidget(b)
-        v.addWidget(self.user_w)
-
+        self.leave_b.setToolTip("Leave call")
+        self.leave_b.clicked.connect(lambda: mgr.leave())
+        row.addWidget(self.head_w, 1)
+        row.addWidget(self.mic_b)
+        row.addWidget(self.leave_b)
+        self._tm = QTimer(self)
+        self._tm.setInterval(1000)
+        self._tm.timeout.connect(lambda: self.isVisible() and self.refresh())
+        self._tm.start()
         win.installEventFilter(self)
         mgr.changed.connect(self.refresh)
         self.hide()
@@ -60674,46 +60822,41 @@ class _VcPanel(QFrame):
             return
         if not s:                                        # a short notice after the call ended ("X left the call.")
             self.state.setWordWrap(True)
-            self.state.setStyleSheet(f"font-size: 13px; color: {_DC['text']};")
             self.state.setText(m.notice)
             self.sub.hide()
-            self.bars.hide()
-            for w in (self.ns_b, self.leave_b, self.sep, self.user_w):
-                w.hide()
+            self.dot.hide()
+            self.mic_b.hide()
+            self.leave_b.hide()
             self.head_w.setCursor(Qt.CursorShape.ArrowCursor)
             self.show()
             self._place()
             return
+        if s.get("expanded"):                            # the full call screen is open: the bar only shows when it is minimised
+            self.hide()
+            return
         self.state.setWordWrap(False)
         self.sub.show()
-        self.bars.show()
-        for w in (self.ns_b, self.leave_b, self.sep, self.user_w):
-            w.show()
+        self.dot.show()
+        self.mic_b.show()
+        self.leave_b.show()
         self.head_w.setCursor(Qt.CursorShape.PointingHandCursor)
-        text, color = _vc_state_text(s)
-        self.state.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color};")
+        text, _tm = _vc_web_state(s)
         self.state.setText(text)
-        self.bars.set_color(color if color != _DC["text"] else _DC["sub"])
-        _vc_elide(self.sub, s["label"], 170)
-        self.bars.setToolTip(f"Average ping: {m.ping} ms" if m.ping is not None else "Connecting...")
+        _vc_elide(self.sub, s["label"], 150)
         me = next((p for p in m.participants() if p["me"]), None)
         if me:
-            self.me_av.set_data(me["avatar"], me["name"], me["speak"])
-            _vc_elide(self.me_name, me["name"], 120)
-            srv = bool(me.get("smuted") or me.get("sdeaf"))
-            self.me_sub.setText("Server deafened" if me.get("sdeaf") else "Server muted" if me.get("smuted") else
-                                "Deafened" if me["deaf"] else "Muted" if me["muted"] else "Online")
-            self.me_sub.setStyleSheet(f"font-size: 11px; color: {_DC['red'] if srv else _DC['sub']};")
-            self.mic_b.set_off(me["muted"])
-            self.deaf_b.set_off(me["deaf"])
-            self.mic_b.setToolTip("An admin muted you" if srv else ("Unmute" if me["muted"] else "Mute"))
-            self.deaf_b.setToolTip("An admin deafened you" if me.get("sdeaf") else ("Undeafen" if me["deaf"] else "Deafen"))
+            off = bool(me["muted"] or me["deaf"])
+            self.mic_b.kind = "mic"
+            self.mic_b.set_off(off)
+            self.mic_b.setToolTip("Unmute" if off else "Mute")
         self.show()
         self._place()
 
 
 # ── the call view ──
 class _VcTile(QWidget):
+    """One person on the call screen, drawn like the web's tile: flat card, green outline while speaking,
+    name pill bottom left, mute / deafen badges bottom right."""
     menu_requested = pyqtSignal(object, QPoint)      # tile data, where to open the admin menu
 
     def __init__(self):
@@ -60721,8 +60864,9 @@ class _VcTile(QWidget):
         self.d = {}
         self._hover = False
         self.setMouseTracking(True)
-        self.setMinimumSize(190, 120)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(190)
+        self.setFixedHeight(170)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _badge(self):
         return QRectF(self.width() - 40, 10, 30, 30)
@@ -60756,48 +60900,59 @@ class _VcTile(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         w, h = self.width(), self.height()
+        if d.get("ringing"):
+            p.setOpacity(0.7)
         r = QRectF(1, 1, w - 2, h - 2)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_vc_color_for(d["name"]).darker(280))
-        p.drawRoundedRect(r, 10, 10)
-        speak = bool(d.get("speak"))
-        if speak:
-            p.setPen(QPen(QColor(_DC["green"]), 3))
+        p.setBrush(QColor(_DC["card"]))
+        p.drawRoundedRect(r, 14, 14)
+        if d.get("speak"):
+            p.setPen(QPen(QColor(_DC["green"]), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r.adjusted(1.5, 1.5, -1.5, -1.5), 9, 9)
-        size = max(56, min(112, int(min(w, h) * 0.5)))
-        cy = h / 2.0 - (8 if d.get("ringing") else 0)
-        _vc_paint_avatar(p, w / 2.0, cy, size, d.get("avatar"), d["name"], speak=speak, dim=bool(d.get("ringing")))
+            p.drawRoundedRect(r, 14, 14)
+        size = int(d.get("size") or 96)
+        flag = d.get("flag") or ""
+        cy = h / 2.0 - (8 if flag else 0)
+        _vc_paint_avatar(p, w / 2.0, cy, size, d.get("avatar"), d["name"])
         f = p.font()
-        if d.get("ringing"):
-            f.setPixelSize(13)
+        if flag:
+            f.setPixelSize(12)
             f.setBold(False)
             p.setFont(f)
             p.setPen(QColor(_DC["sub"]))
-            p.drawText(QRectF(0, cy + size / 2 + 10, w, 20), Qt.AlignmentFlag.AlignCenter, "Ringing...")
+            p.drawText(QRectF(0, cy + size / 2 + 6, w, 18), Qt.AlignmentFlag.AlignCenter, flag)
+        # mute / deafen / admin badges, bottom right: 24 px dark circles with a red crossed icon
+        kinds = []
+        if d.get("muted"):
+            kinds.append("mic")
+        if d.get("deaf"):
+            kinds.append("headset")
+        if d.get("smuted") or d.get("sdeaf"):
+            kinds.append("shield")
+        bx = w - 8 - len(kinds) * 24 - max(0, len(kinds) - 1) * 4
+        for k in kinds:
+            c = QRectF(bx, h - 8 - 24, 24, 24)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 166))
+            p.drawEllipse(c)
+            if k == "shield":
+                _vc_draw_icon(p, "shield", c.center().x(), c.center().y(), 13, QColor(_DC["orange"]))
+            else:
+                _vc_draw_icon(p, k, c.center().x(), c.center().y(), 14, QColor(_DC["red"]), slash=True, gap=QColor(0, 0, 0))
+            bx += 28
+        # name pill, bottom left
         f.setPixelSize(13)
         f.setBold(True)
         p.setFont(f)
         fm = QFontMetricsF(f)
-        icons = [k for k, on in (("mic", d.get("muted") and not d.get("deaf")), ("headset", d.get("deaf"))) if on]
-        srv = bool(d.get("smuted") or d.get("sdeaf"))          # an admin did it: a shield marks it
-        n_ic = len(icons) + (1 if srv and icons else 0)
         text = d["name"]
-        tw = min(fm.horizontalAdvance(text), w - 40 - 18 * n_ic)
-        pill_w = tw + 16 + 18 * n_ic
-        pill = QRectF(10, h - 38, pill_w, 26)
+        tw = min(fm.horizontalAdvance(text), w - 64 - 16)
+        pill = QRectF(8, h - 8 - 24, tw + 16, 24)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 150))
+        p.setBrush(QColor(0, 0, 0, 153))
         p.drawRoundedRect(pill, 6, 6)
-        x = pill.left() + 8
-        for k in icons:
-            _vc_draw_icon(p, k, x + 7, pill.center().y(), 14, QColor(_DC["red"]), slash=True, gap=QColor(0, 0, 0))
-            x += 18
-        if srv and icons:
-            _vc_draw_icon(p, "shield", x + 6, pill.center().y(), 13, QColor(_DC["orange"]))
-            x += 18
         p.setPen(QColor("#ffffff"))
-        p.drawText(QRectF(x, pill.top(), tw + 4, pill.height()),
+        p.drawText(QRectF(pill.left() + 8, pill.top(), tw + 4, pill.height()),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    fm.elidedText(text, Qt.TextElideMode.ElideRight, tw))
         if d.get("can_mod") and self._hover:                    # admin menu button (right-click works too)
@@ -60809,58 +60964,76 @@ class _VcTile(QWidget):
 
 
 class _VcStage(QFrame):
+    """The call screen, laid out like the web's: full window, dark, minimise + title on top, tiles in the middle,
+    status line, and a dark rounded bar with mic / deafen / voice settings / leave at the bottom."""
+
     def __init__(self, mgr, win):
         super().__init__(win)
         self._mgr, self._win = mgr, win
-        self._ids, self._tiles = [], []
+        self._ids, self._tiles, self._cols = [], [], 0
         self.setObjectName("VcStage")
-        self.setStyleSheet(f"QFrame#VcStage {{ background: {_DC['bg']}; border: 1px solid #111214; border-radius: 12px; }}"
+        self.setStyleSheet(f"QFrame#VcStage {{ background: {_DC['bg']}; border: none; }}"
                            "QLabel { background: transparent; }")
         v = QVBoxLayout(self)
-        v.setContentsMargins(16, 12, 16, 18)
-        v.setSpacing(12)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
         top = QHBoxLayout()
+        top.setContentsMargins(10, 8, 10, 4)
         top.setSpacing(8)
-        self.icon = _VcIcon("speaker", 20, _DC["sub"])
-        tcol = QVBoxLayout()
-        tcol.setSpacing(0)
-        self.title = QLabel("")
-        self.title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {_DC['text']};")
-        self.stat = QLabel("")
-        self.stat.setStyleSheet("font-size: 12px;")
-        tcol.addWidget(self.title)
-        tcol.addWidget(self.stat)
-        self.ping_icon = _VcIcon("bars", 16, _DC["green"])
-        self.ping_l = QLabel("")
-        self.ping_l.setStyleSheet(f"font-size: 12px; color: {_DC['sub']};")
         self.min_b = _VcRound("chevron", 30, flat=True)
-        self.min_b.setToolTip("Minimize call view")
+        self.min_b.setToolTip("Minimise")
         self.min_b.clicked.connect(lambda: mgr.set_expanded(False))
-        top.addWidget(self.icon)
-        top.addLayout(tcol, 1)
-        top.addWidget(self.ping_icon)
-        top.addWidget(self.ping_l)
+        self.title = QLabel("")
+        self.title.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
         top.addWidget(self.min_b)
+        top.addWidget(self.title, 1)
         v.addLayout(top)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(12, 12, 12, 12)
+        il.addStretch(1)
         self.holder = QWidget()
         self.grid = QGridLayout(self.holder)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(10)
-        v.addWidget(self.holder, 1)
-        ctl = QHBoxLayout()
-        ctl.setSpacing(14)
+        il.addWidget(self.holder)
+        il.addStretch(1)
+        self.scroll.setWidget(inner)
+        v.addWidget(self.scroll, 1)
+        self.out = QLabel("")
+        self.out.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.out.setStyleSheet(f"font-size: 13px; color: {_DC['sub']}; padding-bottom: 10px;")
+        v.addWidget(self.out)
+        bar = QFrame()
+        bar.setObjectName("VcCtl")
+        bar.setStyleSheet("QFrame#VcCtl { background: #111214; border-top-left-radius: 22px; border-top-right-radius: 22px; }")
+        ctl = QHBoxLayout(bar)
+        ctl.setContentsMargins(10, 14, 10, 14)
+        ctl.setSpacing(16)
         self.mic_b = _VcRound("mic", 52)
         self.deaf_b = _VcRound("headset", 52)
+        self.set_b = _VcRound("gear", 52)
+        self.set_b.setToolTip("Voice settings")
         self.leave_b = _VcRound("hangup", 52, bg=_DC["red"])
-        self.leave_b.setToolTip("Disconnect")
+        self.leave_b.setToolTip("Leave call")
         self.mic_b.clicked.connect(mgr.toggle_mute)
         self.deaf_b.clicked.connect(mgr.toggle_deafen)
+        self.set_b.clicked.connect(lambda: _vc_open_settings(win))
         self.leave_b.clicked.connect(lambda: mgr.leave())
         ctl.addStretch(1)
-        for b in (self.mic_b, self.deaf_b, self.leave_b):
+        for b in (self.mic_b, self.deaf_b, self.set_b, self.leave_b):
             ctl.addWidget(b)
         ctl.addStretch(1)
-        v.addLayout(ctl)
+        v.addWidget(bar)
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._upd_out)
+        self._tick.start()
         win.installEventFilter(self)
         mgr.changed.connect(self.refresh)
         self.hide()
@@ -60871,15 +61044,27 @@ class _VcStage(QFrame):
         return False
 
     def _place(self):
-        n = len(self._tiles)
-        w = min(self._win.width() - 60, 940 if n > 2 else 760)
-        h = min(self._win.height() - 110, 540 if n > 2 else 430)
-        w, h = max(w, 420), max(h, 320)
-        self.setGeometry(max(0, (self._win.width() - w) // 2), max(0, (self._win.height() - h) // 2), w, h)
+        self.setGeometry(0, 0, self._win.width(), self._win.height())
         self.raise_()
-        bar = _voice.get("bar")
-        if bar is not None and bar.isVisible():
-            bar.raise_()
+        if self._cols_now() != self._cols:
+            self._regrid()
+
+    def _cols_now(self):
+        n = len(self._tiles)
+        avail = max(0, self.width() - 24)
+        return max(1, min(max(n, 1), (avail + 10) // 240))      # same as the web's auto-fit columns of 230 px + 10 px gap
+
+    def _regrid(self):
+        for t in self._tiles:
+            self.grid.removeWidget(t)
+        for i in range(12):
+            self.grid.setColumnStretch(i, 0)
+        cols = self._cols_now()
+        self._cols = cols
+        for i, t in enumerate(self._tiles):
+            self.grid.addWidget(t, i // cols, i % cols)
+        for c in range(cols):
+            self.grid.setColumnStretch(c, 1)
 
     def _tile_menu(self, d, gpos):
         """Admin / owner menu for one person in the call: server mute, server deafen, disconnect."""
@@ -60917,21 +61102,18 @@ class _VcStage(QFrame):
             t.setParent(None)
             t.deleteLater()
         self._tiles = []
-        for i in range(6):
-            self.grid.setRowStretch(i, 0)
-        for i in range(4):
-            self.grid.setColumnStretch(i, 0)
-        n = len(parts)
-        cols = 1 if n <= 1 else (2 if n <= 4 else 3)
-        for i in range(n):
+        for _ in parts:
             t = _VcTile()
             t.menu_requested.connect(self._tile_menu)
             self._tiles.append(t)
-            self.grid.addWidget(t, i // cols, i % cols)
-        for c in range(cols):
-            self.grid.setColumnStretch(c, 1)
-        for r_ in range((n + cols - 1) // cols):
-            self.grid.setRowStretch(r_, 1)
+        self._regrid()
+
+    def _upd_out(self):
+        s = self._mgr.active
+        if not s or not self.isVisible():
+            return
+        text, tm = _vc_web_state(s)
+        self.out.setText(text + (f" \u00b7 {tm}" if tm else ""))
 
     def refresh(self):
         m = self._mgr
@@ -60945,15 +61127,14 @@ class _VcStage(QFrame):
         if rebuilt:
             self._ids = ids
             self._rebuild(parts)
+        size = 96 if len(parts) <= 2 else 64
+        calling = bool(s["ring_to"] and not s["answered"])
         for t, p in zip(self._tiles, parts):
-            t.set_data(p)
-        text, color = _vc_state_text(s)
+            d = dict(p)
+            d["size"] = size
+            d["flag"] = ("Ringing\u2026" if calling else "Not in the call") if p.get("ringing") else ""
+            t.set_data(d)
         self.title.setText(s["label"])
-        self.stat.setText(text)
-        self.stat.setStyleSheet(f"font-size: 12px; color: {color};")
-        self.icon.set_color(_DC["sub"])
-        self.ping_icon.setVisible(m.ping is not None)
-        self.ping_l.setText(f"{m.ping} ms" if m.ping is not None else "")
         me = next((p for p in parts if p["me"]), None)
         if me:
             srv = bool(me.get("smuted") or me.get("sdeaf"))
@@ -60964,6 +61145,7 @@ class _VcStage(QFrame):
         if rebuilt or not self.isVisible():
             self.show()
             self._place()
+        self._upd_out()
 
 
 # ── the incoming call pop-up ──
@@ -60971,10 +61153,10 @@ class _VcRinger(QWidget):
     def __init__(self, name):
         super().__init__()
         self.name, self.path, self.phase = name, None, 0.0
-        self.setFixedSize(230, 170)
+        self.setFixedSize(190, 150)
 
     def tick(self):
-        self.phase = (self.phase + 0.018) % 1.0
+        self.phase = (self.phase + 0.0236) % 1.0
         self.update()
 
     def paintEvent(self, ev):
@@ -60982,14 +61164,13 @@ class _VcRinger(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         cx, cy, size = self.width() / 2.0, self.height() / 2.0, 96
-        for off in (0.0, 0.5):
-            t = (self.phase + off) % 1.0
-            c = QColor(_DC["green"])
-            c.setAlphaF(0.38 * (1.0 - t))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(c)
-            rr = size / 2.0 + 4 + 30 * t
-            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        t = self.phase                                   # one expanding green ring, like the web's pulse
+        c = QColor(_DC["green"])
+        c.setAlphaF(0.6 * (1.0 - t))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        rr = size / 2.0 + 22 * t
+        p.drawEllipse(QPointF(cx, cy), rr, rr)
         _vc_paint_avatar(p, cx, cy, size, self.path, self.name)
 
 
@@ -61006,37 +61187,31 @@ class _VcIncomingDialog(QDialog):
         card = QFrame()
         card.setObjectName("VcIn")
         card.setFixedWidth(340)
-        card.setStyleSheet(f"QFrame#VcIn {{ background: {_DC['bg']}; border: 1px solid #111214; border-radius: 14px; }}"
+        card.setStyleSheet(f"QFrame#VcIn {{ background: {_DC['panel']}; border: 1px solid {_DC['line']}; border-radius: 18px; }}"
                            "QLabel { background: transparent; }")
         outer.addWidget(card)
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(24, 18, 24, 22)
-        lay.setSpacing(4)
+        lay.setContentsMargins(20, 26, 20, 26)
+        lay.setSpacing(10)
         self.ringer = _VcRinger(name)
         lay.addWidget(self.ringer, 0, Qt.AlignmentFlag.AlignHCenter)
         title = QLabel(_vc_html.escape(name))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {_DC['text']};")
-        sub = QLabel("Incoming Voice Call...")
+        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {_DC['text']};")
+        sub = QLabel("Incoming voice call\u2026")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"font-size: 13px; color: {_DC['sub']};")
         lay.addWidget(title)
         lay.addWidget(sub)
         lay.addSpacing(14)
         row = QHBoxLayout()
-        row.setSpacing(34)
+        row.setSpacing(44)
         row.addStretch(1)
-        for kind, bg, text, fn in (("hangup", _DC["red"], "Decline", self._decline), ("answer", _DC["green"], "Accept", self._accept)):
-            col = QVBoxLayout()
-            col.setSpacing(6)
-            b = _VcRound(kind, 56, bg=bg)
+        for kind, bg, fn in (("hangup", _DC["red"], self._decline), ("answer", _DC["green"], self._accept)):
+            b = _VcRound(kind, 64, bg=bg)
+            b.setToolTip("Decline" if kind == "hangup" else "Accept")
             b.clicked.connect(fn)
-            cap = QLabel(text)
-            cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cap.setStyleSheet(f"font-size: 12px; color: {_DC['sub']};")
-            col.addWidget(b, 0, Qt.AlignmentFlag.AlignHCenter)
-            col.addWidget(cap)
-            row.addLayout(col)
+            row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
         self._anim = QTimer(self)
@@ -61044,10 +61219,10 @@ class _VcIncomingDialog(QDialog):
         self._anim.timeout.connect(self.ringer.tick)
         self._anim.start()
         self._beep = QTimer(self)
-        self._beep.setInterval(1800)
-        self._beep.timeout.connect(QApplication.beep)
+        self._beep.setInterval(2000)
+        self._beep.timeout.connect(lambda: _vc_play("ring_in", force=True))
         self._beep.start()
-        QApplication.beep()
+        _vc_play("ring_in", force=True)
         mgr.changed.connect(self._upd)
         self._upd()
         self.adjustSize()
@@ -61072,6 +61247,7 @@ class _VcIncomingDialog(QDialog):
 
     def _finish(self):
         self._beep.stop()
+        _vc_stop("ring_in")
         self._anim.stop()
         try:
             self._mgr.changed.disconnect(self._upd)
