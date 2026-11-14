@@ -108,6 +108,7 @@ from string import Template
 #   Add Existing Fan Game
 #   drag to reorder the library
 #   Auto-Add Desktop Games
+#   Non-Dev NCZ Games (Library tab with a NEW badge: NCZ Tetris)
 #   Qt part
 #   frameless window: exit button + draggable top bar
 #   in-game overlay (toast + settings)
@@ -62212,6 +62213,529 @@ def _dsc_done(self, _path=""):
 
 DownloadCard.__init__ = _dsc_card_init
 DownloadCard._dsc_done = _dsc_done
+
+
+# ── Non-Dev NCZ Games (Library tab with a NEW badge, first button in the tab row) ──
+# Games made by the NCZ community that are plain downloads (no version file, no Linux conversion script):
+# one direct MediaFire link per platform. They install into the Game Library like every other game
+# (<install folder>/<folder>/<file>) and get Install / Launch, Open Game Location, Uninstall and the shortcut entries.
+NONDEV_GAMES = [
+    dict(id="ncz-tetris", title="NCZ Tetris", cover="ncz-tetris.png", folder="NCZ Tetris",
+         creator_uid="UVB56Q0TMHQ4z8PDXvypPnnz3ot2",       # account whose profile picture + username show as "Made by"
+         win_url="https://www.mediafire.com/file/bff9yxbazw9tbo1/NCZ-Tetris.exe/file",
+         win_file="NCZ-Tetris.exe",
+         linux_url="https://www.mediafire.com/file/kaj9vmsbsqxiw7i/NCZ-Tetris-1.0.0-x86_64.AppImage/file",
+         linux_file="NCZ-Tetris-1.0.0-x86_64.AppImage"),
+]
+
+def _nd_platform(g):
+    """(download page, file name) for this OS, or (None, None) when the game has no build for it."""
+    if sys.platform.startswith("win"):
+        return g["win_url"], g["win_file"]
+    if sys.platform.startswith("linux"):
+        return g["linux_url"], g["linux_file"]
+    return None, None
+
+def _nd_resolve_mediafire(page_url):
+    """MediaFire page -> direct download link."""
+    req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
+        html_text = resp.read().decode("utf-8", errors="replace")
+    m = re.search(r'href="(https?://download[^"]+)"', html_text)
+    if m:
+        return m.group(1).replace("&amp;", "&")
+    m = re.search(r'data-scrambled-url="([^"]+)"', html_text)      # newer pages hide the link in base64
+    if m:
+        import base64
+        try:
+            link = base64.b64decode(m.group(1)).decode("utf-8", errors="replace")
+            if link.startswith("http"):
+                return link
+        except Exception:
+            _log_exc("_nd_resolve_mediafire")
+    raise RuntimeError("Couldn't find the download link on the MediaFire page.")
+
+def _nd_exe(g):
+    """Installed game file of this OS, '' if it isn't installed."""
+    _url, fname = _nd_platform(g)
+    if not fname:
+        return ""
+    path = os.path.join(installed_game_dir(g["folder"]), fname)
+    return path if os.path.isfile(path) else ""
+
+class NondevDownloadWorker(QThread):
+    progress = pyqtSignal(object, object, float)
+    status_update = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, game):
+        super().__init__()
+        self.game = game
+        self._response = None
+        self.__dict__["_cancel_flag"] = False
+        self.__dict__["_paused"] = False
+
+    # a paused worker just waits inside the _is_cancelled check, like the other download workers
+    @property
+    def _is_cancelled(self):
+        while self.__dict__.get("_paused") and not self.__dict__.get("_cancel_flag"):
+            time.sleep(0.2)
+        return self.__dict__.get("_cancel_flag", False)
+
+    @_is_cancelled.setter
+    def _is_cancelled(self, v):
+        self.__dict__["_cancel_flag"] = v
+
+    @property
+    def _paused(self):
+        return self.__dict__.get("_paused", False)
+
+    def pause(self):
+        self.__dict__["_paused"] = True
+
+    def resume(self):
+        self.__dict__["_paused"] = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if self._response:
+            try:
+                self._response.close()
+            except Exception:    # expected: cleanup that may already be done
+                pass
+
+    def run(self):
+        g = self.game
+        part = ""
+        try:
+            page, fname = _nd_platform(g)
+            if not page:
+                raise RuntimeError(f"{g['title']} has no build for this operating system.")
+            self.status_update.emit("Resolving MediaFire link...")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            first = (_nd_resolve_mediafire(page), headers)
+            part = resumable_download(self, lambda: (_nd_resolve_mediafire(page), headers),
+                                      lambda _r, _u: ".nondev-" + fname, first=first)
+            if self._is_cancelled:
+                raise RuntimeError("CANCELLED")
+            folder = os.path.join(GAMES_DIR, g["folder"])
+            os.makedirs(folder, exist_ok=True)
+            final = os.path.join(folder, fname)
+            if os.path.exists(final):
+                os.remove(final)
+            shutil.move(part, final)
+            part = ""
+            if not sys.platform.startswith("win"):
+                os.chmod(final, 0o755)
+            self.finished.emit(final)
+        except Exception as e:
+            if part and os.path.exists(part):
+                try:
+                    os.remove(part)
+                except Exception:    # expected: cleanup that may already be done
+                    pass
+            self.failed.emit("CANCELLED" if str(e) == "CANCELLED" else str(e))
+
+def _nd_refresh_card(app, g):
+    w = app.nondev_widgets.get(g["id"])
+    if not w:
+        return
+    page, _f = _nd_platform(g)
+    installed = bool(_nd_exe(g))
+    if w["btn"].text() != "Stop":                  # the Stop sync owns the text while the game runs
+        w["btn"].setText("Launch" if installed else "Install")
+        w["btn"].setProperty("ncz_orig_text", "Launch" if installed else "Install")
+    w["btn"].setEnabled(bool(page))
+    w["uninstall"].setEnabled(installed)
+    w["open"].setEnabled(installed)
+    if not page:
+        w["status"].setText("Not available on this OS")
+        w["status"].setStyleSheet(f"color: {ORANGE};")
+    elif installed:
+        w["status"].setText("\u25CF Installed")
+        w["status"].setStyleSheet(f"color: {GREEN};")
+    else:
+        w["status"].setText("Not installed")
+        w["status"].setStyleSheet("")
+
+def _nd_install(app, g):
+    if getattr(app, "_nd_installing", {}).get(g["id"]):
+        app.nav_group.button(6).setChecked(True)
+        app.pages.setCurrentWidget(app.downloads_page)
+        return
+    worker = NondevDownloadWorker(g)
+    card = DownloadCard(g["title"], "", 0, asset_path(g["cover"]), app, worker=worker)
+    app.__dict__.setdefault("_nd_installing", {})[g["id"]] = True
+    def done(*_a):
+        app._nd_installing[g["id"]] = False
+        _nd_refresh_card(app, g)
+    worker.finished.connect(done)
+    worker.failed.connect(done)
+    app.downloads_page.add_download_card(card)
+    app.nav_group.button(6).setChecked(True)
+    app.pages.setCurrentWidget(app.downloads_page)
+
+def _nd_launch(app, g):
+    exe = _nd_exe(g)
+    if not exe:
+        QMessageBox.warning(app, "Launch Error", f"{g['title']} isn't installed.")
+        return
+    try:
+        args = launch_args_for(f"nondev-{g['id']}") or []
+        if not sys.platform.startswith("win"):
+            os.chmod(exe, 0o755)
+            subprocess.Popen([exe] + list(args), cwd=os.path.dirname(exe), env=system_env())
+        else:
+            subprocess.Popen([exe] + list(args), cwd=os.path.dirname(exe))
+    except Exception as e:
+        QMessageBox.warning(app, "Launch Game", f"Couldn't launch {g['title']}: {e}")
+
+def _nd_uninstall(app, g):
+    folder = installed_game_dir(g["folder"])
+    if not os.path.isdir(folder):
+        _nd_refresh_card(app, g)
+        return
+    if QMessageBox.question(app, "Uninstall", f"Uninstall {g['title']}?\n\n{folder}") != QMessageBox.StandardButton.Yes:
+        return
+    try:
+        shutil.rmtree(folder)
+    except Exception as e:
+        QMessageBox.warning(app, "Uninstall", f"Couldn't remove the game folder:\n{e}")
+    _nd_refresh_card(app, g)
+
+# ── "Made by: (picture) username" under the title: read from the creator's public profile, cached for offline ──
+def _nd_creators_cache_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "nondev_creators.json")
+
+def _nd_load_creators_cache():
+    try:
+        with open(_nd_creators_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _nd_apply_creator(app, g, info):
+    w = app.nondev_widgets.get(g["id"])
+    if not w or not isinstance(info, dict) or not info.get("name"):
+        return
+    try:
+        w["by_name"].setText(info["name"])
+        path = info.get("avatar") or ""
+        pm = CreditsPage.circular_pixmap(path, 20) if path and os.path.exists(path) else None
+        if pm:
+            w["by_pfp"].setPixmap(pm)
+            w["by_pfp"].show()
+        else:
+            w["by_pfp"].hide()
+        w["by_row"].show()
+    except RuntimeError:
+        pass          # the card was deleted
+
+def _nd_fetch_creators():
+    """Worker thread: {game id: {'name', 'avatar'}} from public/<creator uid>."""
+    token, _me = get_id_token()
+    out = {}
+    for g in NONDEV_GAMES:
+        uid = g.get("creator_uid")
+        if not uid:
+            continue
+        d = _http_json(_fdb(f"public/{uid}", token))
+        if not isinstance(d, dict) or not isinstance(d.get("username"), str) or not d["username"]:
+            continue
+        photo = d.get("photo")
+        out[g["id"]] = {"name": d["username"], "avatar": (_friend_avatar_file(uid, photo) if photo else None) or ""}
+    return out
+
+def _nd_start_creators(app):
+    cache = _nd_load_creators_cache()
+    for g in NONDEV_GAMES:
+        _nd_apply_creator(app, g, cache.get(g["id"]))
+    state = {"done": False, "busy": False}
+    def fetch():
+        if state["done"] or state["busy"]:
+            return
+        state["busy"] = True
+        worker = TaskWorker(_nd_fetch_creators)
+        def ok(res):
+            state["busy"] = False
+            if not isinstance(res, dict) or not res:
+                return
+            state["done"] = True
+            for g in NONDEV_GAMES:
+                _nd_apply_creator(app, g, res.get(g["id"]))
+            try:
+                with open(_nd_creators_cache_path(), "w", encoding="utf-8") as f:
+                    json.dump(res, f)
+            except OSError:
+                _log_exc("nondev creators cache")
+        def bad(_msg):
+            state["busy"] = False          # not signed in / offline: tried again below
+        worker.done.connect(ok)
+        worker.failed.connect(bad)
+        app._nd_creator_worker = worker
+        worker.start()
+    fetch()
+    app._nd_creator_timer = QTimer(app)
+    app._nd_creator_timer.setInterval(30000)
+    app._nd_creator_timer.timeout.connect(lambda: (fetch(), state["done"] and app._nd_creator_timer.stop()))
+    app._nd_creator_timer.start()
+
+def _nd_build_card(app, g):
+    cover_file = asset_path(g["cover"])
+    card = QFrame(app.nondev_section)
+    card.setObjectName("GameCard")
+    card.setFixedWidth(COVER_W + 18)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(8, 8, 8, 10)
+    layout.setSpacing(0)
+
+    cover = QLabel()
+    cover.setFixedSize(COVER_W, COVER_H)
+    cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    pix = app.get_rounded_pixmap(cover_file, COVER_W, COVER_H, 8) if os.path.exists(cover_file) else None
+    if pix:
+        cover.setPixmap(pix)
+    else:
+        cover.setObjectName("CoverPlaceholder")
+        cover.setText("Missing\nCover")
+    layout.addWidget(cover)
+    layout.addSpacing(10)
+
+    title = QLabel(g["title"])
+    title.setObjectName("CardTitle")
+    title.setWordWrap(True)
+    title.setFixedHeight(38)
+    title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    layout.addWidget(title)
+
+    by_row = QWidget()
+    bl = QHBoxLayout(by_row)
+    bl.setContentsMargins(0, 0, 0, 6)
+    bl.setSpacing(6)
+    by_label = QLabel("Made by:")
+    by_label.setObjectName("CardStatus")
+    by_pfp = QLabel()
+    by_pfp.setFixedSize(20, 20)
+    by_name = QLabel()
+    by_name.setStyleSheet("font-weight: 600;")
+    bl.addWidget(by_label)
+    bl.addWidget(by_pfp)
+    bl.addWidget(by_name)
+    bl.addStretch()
+    by_row.hide()                                # shown once the creator's profile is known
+    layout.addWidget(by_row)
+
+    status = QLabel()
+    status.setObjectName("CardStatus")
+    layout.addWidget(status)
+    layout.addSpacing(12)
+
+    actions = QHBoxLayout()
+    actions.setSpacing(6)
+    btn = QPushButton("Install")
+    btn.setObjectName("Primary")
+    btn.setFixedHeight(38)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.clicked.connect(lambda _c=False: _nd_launch(app, g) if _nd_exe(g) else _nd_install(app, g))
+    more = QPushButton("\u2022\u2022\u2022")
+    more.setObjectName("MoreButton")
+    more.setFixedSize(42, 38)
+    more.setCursor(Qt.CursorShape.PointingHandCursor)
+    menu = QMenu(more)
+    menu.setToolTipsVisible(True)
+    more.setMenu(menu)
+    act_open = menu.addAction("Open Game Location")
+    act_open.triggered.connect(lambda _c=False: app.open_game_location(g["folder"]))
+    act_un = menu.addAction("Uninstall")
+    act_un.triggered.connect(lambda _c=False: _nd_uninstall(app, g))
+    actions.addWidget(btn, 1)
+    actions.addWidget(more)
+    layout.addLayout(actions)
+
+    app.nondev_widgets[g["id"]] = dict(btn=btn, status=status, uninstall=act_un, open=act_open,
+                                         by_row=by_row, by_pfp=by_pfp, by_name=by_name)
+    app.nondev_cards.append((card, g["title"]))
+    _nd_refresh_card(app, g)
+    try:
+        _add_shortcut_action(app, card, g["title"], lambda: _nd_exe(g), cover=cover_file, key=f"nondev-{g['id']}")
+    except Exception:
+        _log_exc("nondev shortcut action")
+
+def _nd_cover_paths(g):
+    path = asset_path(g["cover"])
+    return path if os.path.exists(path) else ""
+
+_nd_prev_library_cover_paths = library_cover_paths
+
+def _nd_library_cover_paths():
+    out = _nd_prev_library_cover_paths()
+    for g in NONDEV_GAMES:
+        path = _nd_cover_paths(g)
+        if path:
+            out[pretty_game_name(g["title"])] = path      # friends see the cover of what you play / own
+    return out
+
+library_cover_paths = _nd_library_cover_paths
+
+def _nd_install_status_hooks(app):
+    """Makes Non-Dev games count like every other library game: Launch -> Stop while running,
+    and they are part of the library list that friends / NCZFront / Discord see."""
+    def sync():
+        running = {n.lower(): n for n in list(_running)}
+        for card, title in list(app.nondev_cards):
+            try:
+                btn = card.findChild(QPushButton, "Primary")
+                if btn is None:
+                    continue
+                name = running.get(pretty_game_name(title).lower()) or running.get(str(title).lower())
+                if name:
+                    if not btn.property("ncz_filter_on"):
+                        btn.installEventFilter(app._stop_filter)
+                        btn.setProperty("ncz_filter_on", True)
+                    if btn.property("ncz_running_name") != name:
+                        btn.setProperty("ncz_orig_text", btn.text() if btn.text() != "Stop" else "Launch")
+                        btn.setProperty("ncz_running_name", name)
+                    if btn.text() != "Stop":
+                        btn.setText("Stop")
+                    btn.setEnabled(True)
+                elif btn.property("ncz_running_name"):
+                    btn.setProperty("ncz_running_name", "")
+                    if btn.text() == "Stop":
+                        btn.setText(btn.property("ncz_orig_text") or "Launch")
+            except RuntimeError:
+                continue          # card was deleted
+    app._nd_stop_timer = QTimer(app)
+    app._nd_stop_timer.setInterval(700)
+    app._nd_stop_timer.timeout.connect(sync)
+    app._nd_stop_timer.start()
+
+    # same snapshot as _init_lib, plus the Non-Dev cards
+    old = getattr(app, "_lib_timer", None)
+    if old is not None:
+        old.stop()
+    def snap():
+        titles = []
+        lists = [list(app.cards), list(getattr(app, "fan_lib_list", [])), list(app.nondev_cards)]
+        for lst in lists:
+            for card, title in lst:
+                try:
+                    card.objectName()          # raises if the card was deleted
+                except RuntimeError:
+                    continue
+                t = pretty_game_name(title)
+                if t and t not in titles:
+                    titles.append(t)
+        covers = library_cover_paths()
+        if titles and (titles != _library_snapshot or covers != _library_covers):
+            first = not _library_snapshot
+            _library_snapshot[:] = titles
+            _library_covers.clear()
+            _library_covers.update(covers)
+            if not first:
+                for cb in _playing_listeners:
+                    cb()
+    app._lib_timer = QTimer(app)
+    app._lib_timer.setInterval(3000)
+    app._lib_timer.timeout.connect(snap)
+    app._lib_timer.start()
+    snap()
+
+_nd_prev_init_fan = AdaptiveApp._init_fan
+
+def _nd_init_fan(self):
+    _nd_prev_init_fan(self)
+    self.nondev_cards = []
+    self.nondev_widgets = {}
+    self.nondev_section = QWidget(self.grid_container)
+    sec = QGridLayout(self.nondev_section)
+    sec.setContentsMargins(0, 0, 0, 0)
+    sec.setHorizontalSpacing(24)
+    sec.setVerticalSpacing(24)
+    sec.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    self.nondev_grid = sec
+    self.nondev_section.hide()
+    for g in NONDEV_GAMES:
+        _nd_build_card(self, g)
+    # third button of the Games / Fan Games switch, with a NEW badge next to it
+    tabs = self.library_tabs
+    holder = QWidget(tabs)
+    hl = QHBoxLayout(holder)
+    hl.setContentsMargins(0, 0, 10, 0)
+    hl.setSpacing(6)
+    b = QPushButton("Non-Dev NCZ Games")
+    b.setCheckable(True)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    group = tabs.findChild(QButtonGroup)
+    if group is not None:
+        group.addButton(b)
+    b.clicked.connect(lambda _c=False: (setattr(self, "_lib_tab", "nondev"),
+                                        self.apply_filter(self.search_edit.text())))
+    badge = QLabel("NEW")
+    badge.setStyleSheet(f"background: palette(highlight); color: {_on_accent()}; border-radius: 7px; padding: 1px 7px; "
+                        "font-size: 10px; font-weight: bold;")
+    hl.addWidget(b)
+    hl.addWidget(badge)
+    tl = tabs.layout()
+    tl.insertWidget(max(0, tl.count() - 1), holder)      # after Games and Fan Games, before the trailing stretch
+    _nd_install_status_hooks(self)
+    _nd_start_creators(self)
+    self.apply_filter()
+
+AdaptiveApp._init_fan = _nd_init_fan
+
+_nd_prev_apply_filter = AdaptiveApp.apply_filter
+
+def _nd_apply_filter(self, text=""):
+    if not hasattr(self, "nondev_section"):
+        return _nd_prev_apply_filter(self, text)
+    if getattr(self, "_lib_tab", "games") != "nondev":
+        for card, _t in self.nondev_cards:
+            card.hide()
+        self.nondev_section.hide()
+        return _nd_prev_apply_filter(self, text)
+    # Non-Dev tab: lay out the normal pass with no cards at all, then fill in this tab's cards
+    query = (text if isinstance(text, str) else self.search_edit.text()).strip().lower()
+    cols = max(1, self.grid_columns())
+    fan = getattr(self, "fan_lib_list", None)
+    saved_main = list(self.cards)
+    saved_fan = list(fan) if fan is not None else None
+    for card, _t in saved_main + (saved_fan or []):
+        card.hide()
+    try:
+        self.cards[:] = []
+        if fan is not None:
+            fan[:] = []
+        _nd_prev_apply_filter(self, text)
+    finally:
+        self.cards[:] = saved_main
+        if fan is not None:
+            fan[:] = saved_fan
+    while self.nondev_grid.count():
+        self.nondev_grid.takeAt(0)
+    shown = 0
+    for card, title in self.nondev_cards:
+        try:
+            _lb_decorate(self, card, title)         # star badge + favorite / hide / screenshots in the ••• menu
+            keep = _lb_keep(title)
+        except Exception:
+            _log_exc("nondev decorate")
+            keep = True
+        if keep and query in title.lower():
+            self.nondev_grid.addWidget(card, shown // cols, shown % cols)
+            card.show()
+            shown += 1
+        else:
+            card.hide()
+    self.nondev_section.setVisible(shown > 0)
+    if shown:
+        self.grid.addWidget(self.nondev_section, 0, 0, 1, cols)
+    self.count_label.setText(f"{shown} game{'s' if shown != 1 else ''}")
+    self.empty_label.setText("No games match your search.")
+    self.empty_label.setVisible(shown == 0)
+
+AdaptiveApp.apply_filter = _nd_apply_filter    # kept as patch chain: wraps the other apply_filter wrappers
 
 
 if __name__ == "__main__":
