@@ -108,7 +108,7 @@ from string import Template
 #   Add Existing Fan Game
 #   drag to reorder the library
 #   Auto-Add Desktop Games
-#   Non-Dev NCZ Games (Library tab with a NEW badge: NCZ Tetris)
+#   Other NCZ Games (Library tab with a NEW badge: NCZ Tetris, NCZ Chess)
 #   Qt part
 #   frameless window: exit button + draggable top bar
 #   in-game overlay (toast + settings)
@@ -7950,6 +7950,9 @@ class AdaptiveApp(QMainWindow):
         self.create_game_card("Five Nights at NCZ 2", asset_path("fnancz2cover.png"), "ncz2")
         self.create_game_card("Five Nights at NCZ: The Return", asset_path("fnancz-tr.png"), "nczreturn")
         self.create_game_card("NCZ Chess", asset_path("nczchess.png"), "chess")
+        # NCZ Chess lives in the "Other NCZ Games" tab: take its card out of the Games list (the tab adopts it, see _nd_init_fan)
+        self.chess_card_entry = self.cards.pop()
+        self.chess_card_entry[0].hide()
         self.create_game_card("NCZFront", asset_path("nczfront-cover.png"), "nczfront")
         self.steam_cards = {}
         for game in load_steam_library():
@@ -10029,10 +10032,10 @@ class AdaptiveApp(QMainWindow):
     # ── drag to reorder the library ──
 
     def _init_reorder(self):
-        # the five NCZ games (AE, 2, The Return, Chess, NCZFront) are always the first five cards
-        self._fixed_cards = {id(c) for c, _t in self.cards[:5]}
+        # the four NCZ games in this list (AE, 2, The Return, NCZFront) are always the first four cards
+        self._fixed_cards = {id(c) for c, _t in self.cards[:4]}
         saved = _load_library_order()
-        _apply_saved_order(self.cards, saved.get("main", []), keep_first=5)
+        _apply_saved_order(self.cards, saved.get("main", []), keep_first=4)
         _apply_saved_order(getattr(self, "fan_lib_list", []), saved.get("fan", []))
         self._card_reorder = _CardReorder(self)
         self.apply_filter()
@@ -26102,7 +26105,7 @@ class DesktopGamesDialog(QDialog):
 
 def _desk_known(self):
     """What the library already has, so nothing gets added twice."""
-    titles = {_norm_title(t) for _c, t in self.cards}
+    titles = {_norm_title(t) for _c, t in list(self.cards) + list(getattr(self, "nondev_cards", []))}
     exes, urls, appids = set(), set(), set()
     for g in load_custom_games():
         titles.add(_norm_title(g.get("title")))
@@ -28134,7 +28137,7 @@ def _sort_apply_filter(self, text=""):
     orig_main = list(self.cards)
     orig_fan = list(fan) if fan is not None else None
     try:
-        self.cards[5:] = sorted(self.cards[5:], key=lambda it: it[1].casefold())
+        self.cards[4:] = sorted(self.cards[4:], key=lambda it: it[1].casefold())
         if fan is not None:
             fan.sort(key=lambda it: it[1].casefold())
         return _sort_prev_apply_filter(self, text)
@@ -62215,10 +62218,17 @@ DownloadCard.__init__ = _dsc_card_init
 DownloadCard._dsc_done = _dsc_done
 
 
-# ── Non-Dev NCZ Games (Library tab with a NEW badge, first button in the tab row) ──
+# ── Other NCZ Games (Library tab with a NEW badge, first button in the tab row) ──
 # Games made by the NCZ community that are plain downloads (no version file, no Linux conversion script):
 # one direct MediaFire link per platform. They install into the Game Library like every other game
 # (<install folder>/<folder>/<file>) and get Install / Launch, Open Game Location, Uninstall and the shortcut entries.
+# NCZ Chess is built into the launcher (no download) but is listed in this tab too; these are the accounts credited as "Made by".
+BUILTIN_CREATORS = {"chess": "XcqSn5Zvhsf1npoNl3FNG1bKpU63"}
+
+def _nd_creator_games():
+    """Every game with a "Made by" line: the downloads above plus the built-in ones."""
+    return list(NONDEV_GAMES) + [dict(id=gid, creator_uid=uid) for gid, uid in BUILTIN_CREATORS.items()]
+
 NONDEV_GAMES = [
     dict(id="ncz-tetris", title="NCZ Tetris", cover="ncz-tetris.png", folder="NCZ Tetris",
          creator_uid="UVB56Q0TMHQ4z8PDXvypPnnz3ot2",       # account whose profile picture + username show as "Made by"
@@ -62437,7 +62447,7 @@ def _nd_fetch_creators():
     """Worker thread: {game id: {'name', 'avatar'}} from public/<creator uid>."""
     token, _me = get_id_token()
     out = {}
-    for g in NONDEV_GAMES:
+    for g in _nd_creator_games():
         uid = g.get("creator_uid")
         if not uid:
             continue
@@ -62450,7 +62460,7 @@ def _nd_fetch_creators():
 
 def _nd_start_creators(app):
     cache = _nd_load_creators_cache()
-    for g in NONDEV_GAMES:
+    for g in _nd_creator_games():
         _nd_apply_creator(app, g, cache.get(g["id"]))
     state = {"done": False, "busy": False}
     def fetch():
@@ -62463,7 +62473,7 @@ def _nd_start_creators(app):
             if not isinstance(res, dict) or not res:
                 return
             state["done"] = True
-            for g in NONDEV_GAMES:
+            for g in _nd_creator_games():
                 _nd_apply_creator(app, g, res.get(g["id"]))
             try:
                 with open(_nd_creators_cache_path(), "w", encoding="utf-8") as f:
@@ -62481,6 +62491,35 @@ def _nd_start_creators(app):
     app._nd_creator_timer.setInterval(30000)
     app._nd_creator_timer.timeout.connect(lambda: (fetch(), state["done"] and app._nd_creator_timer.stop()))
     app._nd_creator_timer.start()
+
+def _nd_make_by_row():
+    """The "Made by: (picture) username" row (hidden until the creator's profile is known) -> (row, picture label, name label)."""
+    by_row = QWidget()
+    bl = QHBoxLayout(by_row)
+    bl.setContentsMargins(0, 0, 0, 6)
+    bl.setSpacing(6)
+    by_label = QLabel("Made by:")
+    by_label.setObjectName("CardStatus")
+    by_pfp = QLabel()
+    by_pfp.setFixedSize(20, 20)
+    by_name = QLabel()
+    by_name.setStyleSheet("font-weight: 600;")
+    bl.addWidget(by_label)
+    bl.addWidget(by_pfp)
+    bl.addWidget(by_name)
+    bl.addStretch()
+    by_row.hide()
+    return by_row, by_pfp, by_name
+
+def _nd_adopt_builtin(app, game_id, entry):
+    """Moves a built-in game's card (NCZ Chess) into this tab and gives it the "Made by" row under its title."""
+    card, title = entry
+    by_row, by_pfp, by_name = _nd_make_by_row()
+    layout = card.layout()
+    title_lbl = card.findChild(QLabel, "CardTitle")
+    layout.insertWidget(layout.indexOf(title_lbl) + 1 if title_lbl is not None else 3, by_row)
+    app.nondev_widgets[game_id] = dict(by_row=by_row, by_pfp=by_pfp, by_name=by_name)
+    app.nondev_cards.append((card, title))
 
 def _nd_build_card(app, g):
     cover_file = asset_path(g["cover"])
@@ -62510,21 +62549,7 @@ def _nd_build_card(app, g):
     title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
     layout.addWidget(title)
 
-    by_row = QWidget()
-    bl = QHBoxLayout(by_row)
-    bl.setContentsMargins(0, 0, 0, 6)
-    bl.setSpacing(6)
-    by_label = QLabel("Made by:")
-    by_label.setObjectName("CardStatus")
-    by_pfp = QLabel()
-    by_pfp.setFixedSize(20, 20)
-    by_name = QLabel()
-    by_name.setStyleSheet("font-weight: 600;")
-    bl.addWidget(by_label)
-    bl.addWidget(by_pfp)
-    bl.addWidget(by_name)
-    bl.addStretch()
-    by_row.hide()                                # shown once the creator's profile is known
+    by_row, by_pfp, by_name = _nd_make_by_row()  # shown once the creator's profile is known
     layout.addWidget(by_row)
 
     status = QLabel()
@@ -62580,7 +62605,7 @@ def _nd_library_cover_paths():
 library_cover_paths = _nd_library_cover_paths
 
 def _nd_install_status_hooks(app):
-    """Makes Non-Dev games count like every other library game: Launch -> Stop while running,
+    """Makes Other NCZ Games count like every other library game: Launch -> Stop while running,
     and they are part of the library list that friends / NCZFront / Discord see."""
     def sync():
         running = {n.lower(): n for n in list(_running)}
@@ -62611,7 +62636,7 @@ def _nd_install_status_hooks(app):
     app._nd_stop_timer.timeout.connect(sync)
     app._nd_stop_timer.start()
 
-    # same snapshot as _init_lib, plus the Non-Dev cards
+    # same snapshot as _init_lib, plus the Other NCZ Games cards
     old = getattr(app, "_lib_timer", None)
     if old is not None:
         old.stop()
@@ -62658,13 +62683,16 @@ def _nd_init_fan(self):
     self.nondev_section.hide()
     for g in NONDEV_GAMES:
         _nd_build_card(self, g)
+    chess_entry = getattr(self, "chess_card_entry", None)       # NCZ Chess: built in, listed after the downloads
+    if chess_entry is not None:
+        _nd_adopt_builtin(self, "chess", chess_entry)
     # third button of the Games / Fan Games switch, with a NEW badge next to it
     tabs = self.library_tabs
     holder = QWidget(tabs)
     hl = QHBoxLayout(holder)
     hl.setContentsMargins(0, 0, 10, 0)
     hl.setSpacing(6)
-    b = QPushButton("Non-Dev NCZ Games")
+    b = QPushButton("Other NCZ Games")
     b.setCheckable(True)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     group = tabs.findChild(QButtonGroup)
@@ -62695,7 +62723,7 @@ def _nd_apply_filter(self, text=""):
             card.hide()
         self.nondev_section.hide()
         return _nd_prev_apply_filter(self, text)
-    # Non-Dev tab: lay out the normal pass with no cards at all, then fill in this tab's cards
+    # Other NCZ Games tab: lay out the normal pass with no cards at all, then fill in this tab's cards
     query = (text if isinstance(text, str) else self.search_edit.text()).strip().lower()
     cols = max(1, self.grid_columns())
     fan = getattr(self, "fan_lib_list", None)
