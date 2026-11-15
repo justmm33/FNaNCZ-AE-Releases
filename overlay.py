@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtCore import (Qt, QTimer, QVariantAnimation, QSequentialAnimationGroup, QEasingCurve,
                           QRectF, QPointF, QUrl, QObject, pyqtSignal, pyqtSlot)
 from PyQt6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPixmap, QPen, QPainterPath, QGuiApplication,
-                         QFontDatabase, QMovie, QDesktopServices)
+                         QFontDatabase, QMovie, QDesktopServices, QLinearGradient, QBrush)
 
 _LOG_EXC_LAST = {}      # where -> time of its last log line
 
@@ -425,55 +425,6 @@ def _draw_icon(p, cy):
     p.restore()
 
 
-CLIENT_ICON = 20                  # size of the mobile / web symbol next to a username (unscaled toast units)
-CLIENT_KINDS = ("mobile", "web")
-
-
-def draw_client_icon(p, kind, cx, cy, s, color):
-    """Little line symbol centred on (cx, cy), `s` tall: a phone for 'mobile', a globe for 'web'.
-    Anything else draws nothing. Also used by main.py (friends tab / profiles) through client_icon_pixmap()."""
-    if kind not in CLIENT_KINDS:
-        return
-    p.save()
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color), max(1.3, s * 0.105))
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    half = pen.widthF() / 2
-    if kind == "mobile":
-        w, h = s * 0.58, s - pen.widthF()
-        w -= pen.widthF()
-        rect = QRectF(cx - w / 2, cy - h / 2, w, h)
-        p.drawRoundedRect(rect, w * 0.24, w * 0.24)
-        y = rect.bottom() - h * 0.21                 # home bar
-        p.drawLine(QPointF(cx - w * 0.17, y), QPointF(cx + w * 0.17, y))
-    else:
-        r = s / 2 - half
-        c = QPointF(cx, cy)
-        p.drawEllipse(c, r, r)                       # globe outline
-        p.drawEllipse(c, r * 0.42, r)                # meridian
-        p.drawLine(QPointF(cx - r, cy), QPointF(cx + r, cy))                      # equator
-        dy, dx = r * 0.5, r * 0.866
-        p.drawLine(QPointF(cx - dx, cy - dy), QPointF(cx + dx, cy - dy))          # latitudes
-        p.drawLine(QPointF(cx - dx, cy + dy), QPointF(cx + dx, cy + dy))
-    p.restore()
-
-
-def client_icon_pixmap(kind, size=16, color="#ffffff", dpr=2.0):
-    """The same symbol as a transparent QPixmap (size x size logical px, drawn crisp at `dpr`) for labels in main.py."""
-    pm = QPixmap(int(round(size * dpr)), int(round(size * dpr)))
-    pm.setDevicePixelRatio(dpr)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    try:
-        draw_client_icon(p, kind, size / 2, size / 2, size, color)
-    finally:
-        p.end()
-    return pm
-
-
 def _fit_font(text, px, max_w, bold=True):
     """Largest font (up to px) that fits max_w."""
     while px > 9:
@@ -484,12 +435,65 @@ def _fit_font(text, px, max_w, bold=True):
     return _make_font(9, bold)
 
 
+def _is_light():
+    return _light and not _sunset
+
+
+def _glass_body(p, h, radius=26):
+    """The toast's liquid-glass body in toast units (0,0 .. W,h): smoked glass (frosted white in light mode), a soft highlight
+    along the top, and the accent bleeding in from the left edge. No outline."""
+    light = _is_light()
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, W, h), radius, radius)
+    fill = QLinearGradient(0, 0, 0, h)
+    if light:
+        fill.setColorAt(0.0, QColor(255, 255, 255, 226))
+        fill.setColorAt(1.0, QColor(232, 234, 240, 206))
+    else:
+        fill.setColorAt(0.0, QColor(52, 52, 62, 214))
+        fill.setColorAt(1.0, QColor(14, 14, 19, 230))
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.fillPath(path, QBrush(fill))
+    p.setClipPath(path)
+    hh = min(h * 0.6, 64.0)
+    hi = QLinearGradient(0, 0, 0, hh)
+    hi.setColorAt(0.0, QColor(255, 255, 255, 150 if light else 48))
+    hi.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(0, 0, W, hh), QBrush(hi))
+    gw = BAR_W * 3.4
+    glow = QLinearGradient(0, 0, gw, 0)
+    for pos, a in ((0.0, 235), (0.12, 200), (0.35, 80), (1.0, 0)):
+        c = QColor(ACCENT)
+        c.setAlpha(a if not light else int(a * 0.8))
+        glow.setColorAt(pos, c)
+    p.fillRect(QRectF(0, 0, gw, h), QBrush(glow))
+    p.restore()
+
+
+def _glass_pill(p, rect, top, bottom):
+    path = QPainterPath()
+    path.addRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+    g = QLinearGradient(0, rect.top(), 0, rect.bottom())
+    g.setColorAt(0.0, top)
+    g.setColorAt(1.0, bottom)
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.fillPath(path, QBrush(g))
+    p.setClipPath(path)
+    hh = rect.height() * 0.55
+    hi = QLinearGradient(0, rect.top(), 0, rect.top() + hh)
+    hi.setColorAt(0.0, QColor(255, 255, 255, 70))
+    hi.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(rect.left(), rect.top(), rect.width(), hh), QBrush(hi))
+    p.restore()
+
+
 class PlayingToast(QWidget):
     def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None,
-                 badge_path=None, plain=False, client=None):
+                 badge_path=None, plain=False):
         super().__init__()
         self.plain = plain          # text only: no avatar circle (used for "Screenshot taken")
-        self.client = client if client in CLIENT_KINDS else None    # "mobile" / "web": symbol after the username
         self.user, self.game, self.prefix = user, game, prefix
         self.avatar = QPixmap(avatar_path) if avatar_path else None
         self.badge = QPixmap(badge_path) if badge_path else None   # small round picture on the avatar (group chats: who wrote)
@@ -647,15 +651,7 @@ class PlayingToast(QWidget):
         p.translate(self._off, 0)
         p.scale(SCALE, SCALE)
         p.setClipRect(QRectF(0, 0, W, h))
-        p.fillRect(0, 0, W, h, BG)
-
-        # diagonal stripes
-        p.setPen(QPen(STRIPE, 16))
-        for x in range(-h, W + h, 64):
-            p.drawLine(x, h, x + h, 0)
-
-        # accent bar
-        p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _glass_body(p, h)
         _draw_icon(p, H / 2)
 
         if self.plain:
@@ -687,7 +683,7 @@ class PlayingToast(QWidget):
             br = QRectF(r.right() - 10 - bd / 2, r.bottom() - 10 - bd / 2, bd, bd)
             p.save()
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(BG)
+            p.setBrush(QColor(240, 240, 244) if _is_light() else QColor(24, 24, 30))
             p.drawEllipse(br.adjusted(-3, -3, 3, 3))          # ring that separates it from the group icon
             bp = QPainterPath()
             bp.addEllipse(br)
@@ -700,14 +696,9 @@ class PlayingToast(QWidget):
         # text: username (purple), "is playing" (white), game (purple)
         tx = int(r.right()) + 10
         max_w = W - tx - 12 - ICON_RESERVE
-        name_w = max_w - (CLIENT_ICON + 8 if self.client else 0)
         p.setPen(NAME_COLOR)
-        nf = _fit_font(self.user, 25, name_w)
-        p.setFont(nf)
-        _draw_text(p, QRectF(tx, 18, name_w, 36), self.user)
-        if self.client:
-            draw_client_icon(p, self.client, tx + _text_w(nf, self.user) + 8 + CLIENT_ICON / 2, 36,
-                             CLIENT_ICON, NAME_COLOR)
+        p.setFont(_fit_font(self.user, 25, max_w))
+        _draw_text(p, QRectF(tx, 18, max_w, 36), self.user)
 
         prefix = self.prefix
         f2 = _fit_font(prefix + self.game, 20, max_w)
@@ -757,8 +748,8 @@ class InviteToast(PlayingToast):
     Accept opens the Steam join link, exactly like accepting an invite in Steam. Unlike the other toasts this one takes
     mouse clicks (it still never takes keyboard focus away from the game)."""
 
-    def __init__(self, user, game, link, avatar_path=None, cover_path=None, duration_ms=20000, client=None):
-        super().__init__(user, game, avatar_path, duration_ms=duration_ms, prefix="invited you to play ", client=client)
+    def __init__(self, user, game, link, avatar_path=None, cover_path=None, duration_ms=20000):
+        super().__init__(user, game, avatar_path, duration_ms=duration_ms, prefix="invited you to play ")
         self.link = link if str(link).startswith("steam://") else ""
         self.cover = QPixmap(cover_path) if cover_path else None
         self.h = INV_H
@@ -811,11 +802,7 @@ class InviteToast(PlayingToast):
         p.translate(self._off, 0)
         p.scale(SCALE, SCALE)
         p.setClipRect(QRectF(0, 0, W, h))
-        p.fillRect(0, 0, W, h, BG)
-        p.setPen(QPen(STRIPE, 16))
-        for x in range(-h, W + h, 64):
-            p.drawLine(x, h, x + h, 0)
-        p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _glass_body(p, h)
         _draw_icon(p, 12 + ICON_D / 2)
 
         # cover
@@ -854,14 +841,9 @@ class InviteToast(PlayingToast):
         else:
             p.fillPath(apath, AVATAR_COLOR)
         nx = tx + d + 8
-        ci = int(CLIENT_ICON * 0.8)
-        name_w = W - nx - 12 - ICON_RESERVE - (ci + 8 if self.client else 0)
         p.setPen(NAME_COLOR)
-        nf = _fit_font(self.user, 20, name_w)
-        p.setFont(nf)
-        _draw_text(p, QRectF(nx, 10, name_w, 30), self.user)
-        if self.client:
-            draw_client_icon(p, self.client, nx + _text_w(nf, self.user) + 8 + ci / 2, 25, ci, NAME_COLOR)
+        p.setFont(_fit_font(self.user, 20, W - nx - 12 - ICON_RESERVE))
+        _draw_text(p, QRectF(nx, 10, W - nx - 12 - ICON_RESERVE, 30), self.user)
         p.setPen(TEXT_COLOR)
         p.setFont(_make_font(15, False))
         p.drawText(QRectF(tx, 44, max_w, 22), Qt.AlignmentFlag.AlignVCenter, "invited you to play")
@@ -873,14 +855,16 @@ class InviteToast(PlayingToast):
         for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
                                          (self._dismiss_r, "Dismiss", False, "dismiss")):
             hot = self._hover == key
-            bp = QPainterPath()
-            bp.addRoundedRect(rect, 8, 8)
             if primary:
                 col = QColor(ACCENT).lighter(115) if hot else QColor(ACCENT)
-                p.fillPath(bp, col)
+                _glass_pill(p, rect, col.lighter(112), col.darker(112))
                 txt = QColor("white") if col.lightnessF() < 0.6 else QColor("#111111")
             else:
-                p.fillPath(bp, QColor(128, 128, 128, 80 if hot else 40))
+                if _is_light():
+                    top, bot = QColor(0, 0, 0, 40 if hot else 24), QColor(0, 0, 0, 26 if hot else 14)
+                else:
+                    top, bot = QColor(255, 255, 255, 58 if hot else 38), QColor(255, 255, 255, 30 if hot else 16)
+                _glass_pill(p, rect, top, bot)
                 txt = TEXT_COLOR
             p.setPen(txt)
             p.setFont(_make_font(16, True))
@@ -976,11 +960,10 @@ class OverlayManager:
             return                             # alive: it is drawing the toasts
         self._proc = None
         self._helper_failed = True
-        for user, game, avatar, prefix, image, link, badge, plain, client in pending:
-            self._show_local(user, game, avatar, prefix, image, link, badge, plain, client)
+        for user, game, avatar, prefix, image, link, badge, plain in pending:
+            self._show_local(user, game, avatar, prefix, image, link, badge, plain)
 
-    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False,
-                        client=None):
+    def _send_to_helper(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         try:
             proc = self._proc
             if proc is not None and proc.poll() is not None:     # the helper died after running for a while
@@ -994,29 +977,27 @@ class OverlayManager:
                 proc = self._proc
             proc.stdin.write(json.dumps({"user": user, "game": game, "avatar": avatar_path or "",
                                          "prefix": prefix, "image": image or "", "link": link or "",
-                                         "badge": badge or "", "plain": bool(plain), "client": client or "",
+                                         "badge": badge or "", "plain": bool(plain),
                                          "accent": _accent_hex, "light": _light, "sunset": _sunset, "icon": current_icon_path(),
                                          "emoji_dir": emoji_dir}) + "\n")
             proc.stdin.flush()
             if self._pending is not None:
-                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain, client))
+                self._pending.append((user, game, avatar_path, prefix, image, link, badge, plain))
             return True
         except (OSError, ValueError):
             self._proc = None
             self._helper_failed = True
             return False
 
-    def notify_playing(self, user, game, avatar_path=None, prefix="is playing ", image=None, badge=None, client=None):
+    def notify_playing(self, user, game, avatar_path=None, prefix="is playing ", image=None, badge=None):
         """Shows '<user> <prefix><game>' (game part is highlighted purple). image: path of a picture (png / jpg /
         gif ...) to show under the text. badge: path of a small round picture drawn on the avatar's corner (used
-        for group chats: avatar = group icon, badge = the person who wrote). client: "mobile" or "web" draws a
-        little phone / globe symbol after the username (None = on the desktop launcher, nothing is drawn)."""
+        for group chats: avatar = group icon, badge = the person who wrote)."""
         if self.mode == "off":
             return
-        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, None, badge,
-                                                         client=client):
+        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, None, badge):
             return
-        self._show_local(user, game, avatar_path, prefix, image, None, badge, client=client)
+        self._show_local(user, game, avatar_path, prefix, image, None, badge)
 
     def notify_text(self, text):
         """A toast with just the text (no avatar circle), e.g. 'Screenshot taken'."""
@@ -1026,18 +1007,17 @@ class OverlayManager:
             return
         self._show_local(text, "", None, "", None, None, None, True)
 
-    def notify_invite(self, user, game, link, avatar_path=None, image=None, client=None):
+    def notify_invite(self, user, game, link, avatar_path=None, image=None):
         """'<user> invited you to play <game>' with an Accept button that opens the Steam join link.
         image: path of the game's cover."""
         if self.mode == "off":
             return
         prefix = "invited you to play "
-        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, link, client=client):
+        if self._wants_helper() and self._send_to_helper(user, game, avatar_path, prefix, image, link):
             return
-        self._show_local(user, game, avatar_path, prefix, image, link, client=client)
+        self._show_local(user, game, avatar_path, prefix, image, link)
 
-    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False,
-                    client=None):
+    def _show_local(self, user, game, avatar_path, prefix, image=None, link=None, badge=None, plain=False):
         # A native Wayland window can't be placed in the corner or kept above games, so use a normal desktop
         # notification there instead of a misplaced window.
         if sys.platform.startswith("linux") and QGuiApplication.platformName().startswith("wayland"):
@@ -1048,10 +1028,9 @@ class OverlayManager:
         while len(live) >= MAX_STACK:          # keep the stack on screen: drop the oldest
             live.pop(0).dismiss()
         if link:
-            t = InviteToast(user, game, link, avatar_path, image, client=client)
+            t = InviteToast(user, game, link, avatar_path, image)
         else:
-            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge, plain=plain,
-                             client=client)
+            t = PlayingToast(user, game, avatar_path, prefix=prefix, image_path=image, badge_path=badge, plain=plain)
         avail = QApplication.primaryScreen().availableGeometry().height() - 2 * MARGIN
         while live and sum(x.th + GAP for x in live) + t.th > avail:    # tall picture toasts: keep the stack on screen
             live.pop(0).dismiss()
@@ -1366,14 +1345,14 @@ class _ServerBridge(QObject):
             set_light(bool(d["light"]))
         if d.get("link"):
             overlay.notify_invite(str(d.get("user", "")), str(d.get("game", "")), str(d["link"]),
-                                  d.get("avatar") or None, d.get("image") or None, client=d.get("client") or None)
+                                  d.get("avatar") or None, d.get("image") or None)
             return
         if d.get("plain"):
             overlay.notify_text(str(d.get("user", "")))
             return
         overlay.notify_playing(str(d.get("user", "")), str(d.get("game", "")), d.get("avatar") or None,
                                str(d.get("prefix", "is playing ")), d.get("image") or None,
-                               badge=d.get("badge") or None, client=d.get("client") or None)
+                               badge=d.get("badge") or None)
 
 
 def run_server():
