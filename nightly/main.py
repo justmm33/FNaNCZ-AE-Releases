@@ -2327,6 +2327,10 @@ def load_app_font():
         if len(weights) < 4:      # Qt kept the variable file as a single weight: register real static weights instead
             for path in _cut_static_weights(variable):
                 QFontDatabase.addApplicationFont(path)
+    try:
+        _i18n_register_arabic_font(family)       # SF Arabic (assets/SF-Arabic.ttf) draws any Arabic text
+    except Exception:
+        _log_exc("_i18n_register_arabic_font")
     return family
 
 def build_app_font():
@@ -10350,11 +10354,19 @@ class AdaptiveApp(QMainWindow):
     def _init_ui(self):
         import traceback    # lazy: saves memory/startup until used
         try:
+            _i18n_install()
+        except Exception:
+            traceback.print_exc()
+        try:
             _ui_add_setting(self)
         except Exception:
             traceback.print_exc()
         try:
             _ui_add_appearance_setting(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            _ui_add_language_setting(self)
         except Exception:
             traceback.print_exc()
         try:
@@ -24817,13 +24829,18 @@ def _gj_find_link(self, game_url, gid=None):
                 except Exception:
                     builds = []
                 named = [b for b in builds if b.get("pkg") or b.get("filename")]   # only builds that have a real name
+                self._gj_names = {b["id"]: (b.get("pkg") or b.get("filename") or f"Build {b['id']}") for b in (named or builds)}
                 ask = getattr(self, "ask_build", None)
                 chosen = getattr(self, "_gj_build_id", None)     # kept, so a re-link (expired url) doesn't ask again
                 if len(named) > 1 and ask and chosen is None:
                     self.status_update.emit("Waiting for you to pick a build...")
-                    chosen = ask(named)
-                    if chosen is None:
+                    ids = ask(named)
+                    if not ids:
                         raise RuntimeError("CANCELLED")
+                    if not isinstance(ids, (list, tuple)):
+                        ids = [ids]
+                    self._gj_build_queue = list(ids)                 # every build the user ticked, downloaded one after another
+                    chosen = ids[0]
                     self._gj_build_id = chosen
                     self.status_update.emit("Getting the download link...")
                 if chosen is not None:
@@ -24972,14 +24989,16 @@ class GameJoltBuildDialog(QDialog):
     def __init__(self, parent, title, builds):
         super().__init__(parent)
         self.setWindowTitle("Choose a build")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(440)
         self._builds = builds
         lay = QVBoxLayout(self)
-        head = QLabel(f"<b>{html_lib.escape(title)}</b> has {len(builds)} Windows builds.<br>Pick the one you want to download:")
+        head = QLabel(f"<b>{html_lib.escape(title)}</b> has {len(builds)} Windows builds.<br>Pick the one(s) you want to download (click to select several):")
         head.setWordWrap(True)
         lay.addWidget(head)
         self.list = QListWidget()
-        self.list.setMinimumHeight(260)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)   # a click toggles, so several builds can be picked
+        self.list.setMinimumHeight(150)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         dim = self.palette().placeholderText().color().name()
         for i, b in enumerate(builds):
             name = b.get("pkg") or b.get("filename") or f"Build {b['id']}"
@@ -25006,16 +25025,17 @@ class GameJoltBuildDialog(QDialog):
             lab = QLabel("<br>".join(lines))
             lab.setWordWrap(True)
             lab.setTextFormat(Qt.TextFormat.RichText)
-            lab.setFixedWidth(450)
+            lab.setFixedWidth(380)
             lab.setContentsMargins(8, 6, 8, 6)
             lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             it = QListWidgetItem()
             it.setData(Qt.ItemDataRole.UserRole, b["id"])
-            it.setSizeHint(QSize(460, lab.heightForWidth(450) + 4))
+            it.setSizeHint(QSize(390, lab.heightForWidth(380) + 4))
             self.list.addItem(it)
             self.list.setItemWidget(it, lab)
         self.list.setCurrentRow(0)
-        self.list.itemDoubleClicked.connect(lambda _i: self.accept())
+        if self.list.count():
+            self.list.item(0).setSelected(True)
         lay.addWidget(self.list)
         row = QHBoxLayout()
         row.addStretch()
@@ -25030,13 +25050,22 @@ class GameJoltBuildDialog(QDialog):
         lay.addLayout(row)
 
     def chosen_id(self):
-        it = self.list.currentItem()
-        return it.data(Qt.ItemDataRole.UserRole) if it else None
+        ids = self.chosen_ids()
+        return ids[0] if ids else None
+
+    def chosen_ids(self):
+        """Every selected build, in list order."""
+        ids = [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count()) if self.list.item(i).isSelected()]
+        if not ids:
+            it = self.list.currentItem()
+            ids = [it.data(Qt.ItemDataRole.UserRole)] if it else []
+        return ids
 
 def _gj_show_build_dialog(parent, worker, builds):
     dlg = GameJoltBuildDialog(parent, worker.title, builds)
     ok = dlg.exec() == QDialog.DialogCode.Accepted
-    worker.answer_build(dlg.chosen_id() if ok else None)
+    ids = dlg.chosen_ids() if ok else []
+    worker.answer_build(ids or None)
 
 class GameJoltDownloadWorker(FirebaseDownloadWorker):
     pick_build = pyqtSignal(object)      # list of build dicts -> the GUI thread shows the chooser
@@ -25066,20 +25095,43 @@ class GameJoltDownloadWorker(FirebaseDownloadWorker):
     def run(self):
         dest_path, fresh = None, False
         try:
+            base = installed_game_dir(sanitize_folder_name(self.title))
             if self.existing_zip_path and os.path.exists(self.existing_zip_path):
                 dest_path = self.existing_zip_path   # user chose to reuse the file that's already downloaded
-            else:
-                url, headers = _gj_find_link(self, self.game_url, self.gid)
+                self.status_update.emit("Installing...")
+                _gj_install_file(dest_path, base)
+                self.finished.emit(dest_path)
+                return
+            url, headers = _gj_find_link(self, self.game_url, self.gid)
+            queue = list(getattr(self, "_gj_build_queue", None) or [])
+            multi = len(queue) > 1 or bool(getattr(self, "force_sub", False))   # several builds: each gets its own folder
+            ids = queue or [None]
+            first_exe = None
+            for n, bid in enumerate(ids):
+                if bid is not None:
+                    self._gj_build_id = bid
+                if n > 0:
+                    self.status_update.emit(f"Getting build {n + 1} of {len(ids)}...")
+                    url, headers = _gj_find_link(self, self.game_url, self.gid)
                 self.download_url = url
                 dest_path = _gj_stream(self, url, headers, lambda: _gj_find_link(self, self.game_url, self.gid))
                 fresh = True
-            if self._is_cancelled:
-                if fresh and os.path.exists(dest_path):   # never delete a file the user chose to keep
-                    os.remove(dest_path)
-                self.failed.emit("CANCELLED")
-                return
-            self.status_update.emit("Installing...")
-            _gj_install_file(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+                if self._is_cancelled:
+                    if fresh and os.path.exists(dest_path):   # never delete a file the user chose to keep
+                        os.remove(dest_path)
+                    self.failed.emit("CANCELLED")
+                    return
+                self.status_update.emit("Installing..." if len(ids) == 1 else f"Installing build {n + 1} of {len(ids)}...")
+                target = base
+                if multi:
+                    label = str((getattr(self, "_gj_names", {}) or {}).get(bid) or os.path.splitext(os.path.basename(dest_path))[0])
+                    label = os.path.splitext(label)[0] if label.lower().endswith((".zip", ".rar", ".7z", ".exe")) else label
+                    target = os.path.join(base, sanitize_folder_name(label) or f"Build {n + 1}")
+                _gj_install_file(dest_path, target)
+                if first_exe is None:
+                    first_exe = _find_game_exe(target)
+            if multi and first_exe and not _fan_launch_choice(self.title):
+                _fan_set_launch_choice(self.title, first_exe)      # the first one you picked starts by default
             self.finished.emit(dest_path)
         except Exception as e:
             if self._is_cancelled or str(e) == "CANCELLED":
@@ -25177,8 +25229,58 @@ def _fan_linked_exe(title):
             return g["exe_path"]
     return None
 
+def _fan_builds_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_builds.json")
+
+def _fan_launch_choice(title):
+    """The build you picked to start in game settings -> Builds (None when nothing was picked or it's gone)."""
+    try:
+        with open(_fan_builds_path(), encoding="utf-8") as f:
+            p = json.load(f).get(title)
+        return p if p and os.path.exists(p) else None
+    except Exception:
+        return None
+
+def _fan_set_launch_choice(title, path):
+    try:
+        try:
+            with open(_fan_builds_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        d[title] = path
+        with open(_fan_builds_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        _log_exc("_fan_set_launch_choice")
+
+def _fan_build_exes(title):
+    """Every game exe under the game's folder (one per build when several were downloaded)."""
+    root = installed_game_dir(sanitize_folder_name(title))
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for r, _d, files in os.walk(root):
+        if (os.path.relpath(r, root).count(os.sep) if r != root else 0) > 4:
+            continue
+        for f in files:
+            if f.lower().endswith(".exe") and not any(w in f.lower() for w in _BAD_EXE_WORDS):
+                out.append(os.path.join(r, f))
+    return sorted(out)
+
 def _fan_installed_exe(title):
-    return _fan_linked_exe(title) or _find_game_exe(installed_game_dir(sanitize_folder_name(title)))
+    return _fan_launch_choice(title) or _fan_linked_exe(title) or _find_game_exe(installed_game_dir(sanitize_folder_name(title)))
+
+def _fan_more_builds(app, gid, title, cover, link):
+    """Game settings -> Builds -> Download more: runs the Game Jolt build picker again; new builds go in their own folders."""
+    worker = GameJoltDownloadWorker(title, link, gid, None)
+    worker.force_sub = True
+    worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(app, w, builds))
+    worker.finished.connect(lambda _p, g=gid: app._fan_refresh(g))
+    card = DownloadCard(title, link, 0, cover or "", app, worker=worker)
+    app.downloads_page.add_download_card(card)
+    app.nav_group.button(6).setChecked(True)
+    app.pages.setCurrentWidget(app.downloads_page)
 
 def _fan_update_btn(btn, title):
     btn.setText("Launch" if _fan_installed_exe(title) else "Install")
@@ -33865,6 +33967,1384 @@ def _ui_add_setting(self):
                                "Locked to this theme's color."
                                if _active_theme_key() else
                                "Locked to the New theme's color.")
+
+# ── Language (English / Arabic) ──
+# English is the default. Text is translated on the fly: widgets are translated when they are shown (and when code sets
+# their text), and the original English is remembered on the widget, so `.text()` still returns English for the launcher's
+# own logic (e.g. nav tabs are found by their English names) while the screen shows Arabic. Anything without a translation
+# simply stays in English. The choice is saved as "ui_language" and applies immediately (no restart).
+_I18N_LANGS = (("en", "English", "gb"), ("ar", "العربية", "qa"))
+_i18n_lang = "en"
+_i18n_filter = None
+_i18n_qt_tr = None
+_I18N_ORIG = {}
+
+_I18N_AR_SRC = r"""
+Library => المكتبة
+Store => المتجر
+Fangames => ألعاب المعجبين
+Friends => الأصدقاء
+Steam Workshop => ورشة ستيم
+GMod Addons => إضافات GMod
+Garry's Mod Addon Manager => مدير إضافات Garry's Mod
+Settings => الإعدادات
+Credits => الشكر والتقدير
+Downloads => التنزيلات
+Language => اللغة
+Choose the launcher's language. English is the default. => اختر لغة المشغّل. الإنجليزية هي الافتراضية.
+Theme => السمة
+Interface Style => نمط الواجهة
+Dark Mode => الوضع الداكن
+System => النظام
+Accent Color => لون التمييز
+Reset => إعادة ضبط
+Choose... => اختيار...
+Search => بحث
+Search settings => البحث في الإعدادات
+No settings match your search. => لا توجد إعدادات مطابقة لبحثك.
+Trending => الرائج
+Most Popular => الأكثر شعبية
+Works on your PC => يعمل على جهازك
+Discover games => اكتشف الألعاب
+Trending now => الرائج الآن
+Most popular => الأكثر شعبية
+Games that run on your PC => ألعاب تعمل على جهازك
+Browse Steam games and add them to your library => تصفّح ألعاب ستيم وأضفها إلى مكتبتك
+Search Steam games => ابحث في ألعاب ستيم
+Search Steam store... => ابحث في متجر ستيم...
+Search fan games => ابحث في ألعاب المعجبين
+Search library => ابحث في المكتبة
+Recommended for you => مقترح لك
+Based on the games you play => بناءً على الألعاب التي تلعبها
+Free to Play => مجاني
+Tags => الوسوم
+Filter games by Steam tags => تصفية الألعاب حسب وسوم ستيم
+Search tags => ابحث في الوسوم
+Loading tags... => جارٍ تحميل الوسوم...
+Apply => تطبيق
+Retry => إعادة المحاولة
+Load more => تحميل المزيد
+Loading... => جارٍ التحميل...
+Refresh => تحديث
+Refresh Game Assets => تحديث موارد الألعاب
+Refresh Assets => تحديث الموارد
+Clear Assets => مسح الموارد
+Launch => تشغيل
+Play => تشغيل
+Stop => إيقاف
+Pause => إيقاف مؤقت
+Resume => استئناف
+Install => تثبيت
+Uninstall => إلغاء التثبيت
+Update => تحديث
+Download => تنزيل
+Installed => مثبّتة
+Status => الحالة
+Last played => آخر لعب
+Play time => وقت اللعب
+Edit Save => تعديل الحفظ
+Edit Settings => تعديل الإعدادات
+Launch Options => خيارات التشغيل
+Open Game Location => فتح موقع اللعبة
+Open Folder => فتح المجلد
+Open folder => فتح المجلد
+Add to Library => إضافة إلى المكتبة
+Remove from Library => إزالة من المكتبة
+In Library => في المكتبة
+View in Store => عرض في المتجر
+View Details => عرض التفاصيل
+Open on Steam => فتح على ستيم
+NCZ Games => ألعاب NCZ
+Steam Games => ألعاب ستيم
+Steam game => لعبة ستيم
+Fan game => لعبة معجبين
+Custom game => لعبة مخصصة
+Add Game => إضافة لعبة
+Add game => إضافة لعبة
+Add Custom Game => إضافة لعبة مخصصة
+Add Existing Game => إضافة لعبة موجودة
+Game Library => مكتبة الألعاب
+Library Layout => تخطيط المكتبة
+Classic grid => شبكة كلاسيكية
+Steam-style => على طراز ستيم
+Custom order => ترتيب مخصص
+A to Z => من A إلى Z
+Cancel => إلغاء
+Close => إغلاق
+Save => حفظ
+Clear => مسح
+Remove => إزالة
+Delete => حذف
+Done => تم
+OK => موافق
+Confirm => تأكيد
+Browse... => استعراض...
+Browse => استعراض
+Copy => نسخ
+Send => إرسال
+Accept => قبول
+Decline => رفض
+Reply => رد
+On => تشغيل
+Off => إيقاف
+Enabled => مفعّل
+Default => الافتراضي
+Account => الحساب
+Log In => تسجيل الدخول
+Log Out => تسجيل الخروج
+Sign in => تسجيل الدخول
+Create Account => إنشاء حساب
+Username => اسم المستخدم
+Email => البريد الإلكتروني
+Password => كلمة المرور
+Forgot password? => هل نسيت كلمة المرور؟
+Edit Username => تعديل اسم المستخدم
+Change Picture => تغيير الصورة
+Remove Picture => إزالة الصورة
+Set Country => تحديد الدولة
+Change Country => تغيير الدولة
+Cloud Sync => المزامنة السحابية
+Sync with friend => مزامنة مع صديق
+Your friend code => رمز صداقتك
+Friend code => رمز الصداقة
+Enter a friend's code => أدخل رمز صديق
+Add friend => إضافة صديق
+Add Friend => إضافة صديق
+ADD FRIENDS => إضافة أصدقاء
+Add Friends => إضافة أصدقاء
+Friend added! => تمت إضافة الصديق!
+Adding... => جارٍ الإضافة...
+Search friends => ابحث في الأصدقاء
+No friends match your search. => لا يوجد أصدقاء مطابقون لبحثك.
+Loading friends... => جارٍ تحميل الأصدقاء...
+View Profile => عرض الملف الشخصي
+View profile => عرض الملف الشخصي
+Invite to Game => دعوة إلى لعبة
+Join Game => انضمام إلى اللعبة
+Join game => انضمام إلى اللعبة
+Online => متصل
+Offline => غير متصل
+Idle => خامل
+Group chats => المحادثات الجماعية
+New group => مجموعة جديدة
+Group name => اسم المجموعة
+Members => الأعضاء
+Add members => إضافة أعضاء
+Group settings => إعدادات المجموعة
+Leave group => مغادرة المجموعة
+Delete group => حذف المجموعة
+Activity => النشاط
+Message... => رسالة...
+Write a message... => اكتب رسالة...
+No messages yet. Say hi! => لا توجد رسائل بعد. قل مرحباً!
+Let my phone start games on this PC => السماح لهاتفي بتشغيل الألعاب على هذا الجهاز
+Let my phone manage downloads on this PC => السماح لهاتفي بإدارة التنزيلات على هذا الجهاز
+Let my phone sync cloud saves for this PC => السماح لهاتفي بمزامنة الحفظ السحابي لهذا الجهاز
+Turn this on to start games from the Friends app on your phone (My PC tab). Only games that are already installed in your library can be started, and only from your own account. The launcher has to be running. => فعّل هذا لتشغيل الألعاب من تطبيق الأصدقاء على هاتفك (تبويب جهازي). يمكن تشغيل الألعاب المثبّتة في مكتبتك فقط، ومن حسابك فقط. يجب أن يكون المشغّل قيد التشغيل.
+Search Workshop => ابحث في الورشة
+Search the Workshop => ابحث في الورشة
+Search addons => ابحث في الإضافات
+Mods => التعديلات
+Author => المؤلف
+Import List => استيراد قائمة
+Export list => تصدير القائمة
+Select all shown => تحديد كل المعروض
+Clear selection => مسح التحديد
+Downloaded => تم التنزيل
+Install to Garry's Mod => تثبيت في Garry's Mod
+Desktop Shortcut => اختصار سطح المكتب
+Create Shortcut => إنشاء اختصار
+Create Desktop Shortcut => إنشاء اختصار على سطح المكتب
+Start with System => التشغيل مع النظام
+Automatic Updates => التحديثات التلقائية
+Launcher updates => تحديثات المشغّل
+Check for updates => التحقق من التحديثات
+Restart launcher => إعادة تشغيل المشغّل
+Currency => العملة
+Download server => خادم التنزيل
+Ask every time => اسأل في كل مرة
+Direct3D Renderer => معالج Direct3D
+Compatibility Tool => أداة التوافق
+Switch Compatibility Tool => تبديل أداة التوافق
+Controller Remap => إعادة تعيين وحدة التحكم
+Controller Translator => مترجم وحدة التحكم
+Game Overlay => واجهة اللعبة
+Discord Rich Presence => حالة ديسكورد
+Screenshots => لقطات الشاشة
+System Requirements => متطلبات النظام
+About this game => عن هذه اللعبة
+Show more => عرض المزيد
+Show less => عرض أقل
+Details => التفاصيل
+Coming soon => قريباً
+Unsaved changes. => توجد تغييرات غير محفوظة.
+Saved. Restart the launcher to see the change. => تم الحفظ. أعد تشغيل المشغّل لرؤية التغيير.
+Restart the launcher to apply the new theme. => أعد تشغيل المشغّل لتطبيق السمة الجديدة.
+Terms and Conditions => الشروط والأحكام
+I have read and accept => لقد قرأت الشروط وأوافق عليها
+Decline and exit => رفض والخروج
+Please wait... => يرجى الانتظار...
+Loading details... => جارٍ تحميل التفاصيل...
+Downloading... => جارٍ التنزيل...
+Installing... => جارٍ التثبيت...
+Starting... => جارٍ البدء...
+Cancelling... => جارٍ الإلغاء...
+Connecting... => جارٍ الاتصال...
+Searching... => جارٍ البحث...
+Working... => جارٍ العمل...
+Download failed! => فشل التنزيل!
+No games match your search. => لا توجد ألعاب مطابقة لبحثك.
+No games yet. => لا توجد ألعاب بعد.
+No active or recent downloads. => لا توجد تنزيلات نشطة أو حديثة.
+Couldn't load => تعذّر التحميل
+Game not found => اللعبة غير موجودة
+Game Title => عنوان اللعبة
+Cover Image => صورة الغلاف
+Change Cover => تغيير الغلاف
+Pick Cover => اختيار غلاف
+Locate Game => تحديد موقع اللعبة
+Copy Game ID => نسخ معرّف اللعبة
+Big Picture => الشاشة الكبيرة
+Admin panel => لوحة الإدارة
+Minimize => تصغير
+Sync Data => مزامنة البيانات
+Save Data => حفظ البيانات
+Add to Steam => إضافة إلى ستيم
+Add a Game => إضافة لعبة
+Edit Current Save => تعديل الحفظ الحالي
+Edit Current Settings => تعديل الإعدادات الحالية
+Upload this device's save and settings to your account => رفع حفظ هذا الجهاز وإعداداته إلى حسابك
+Download your account's save and settings to this device => تنزيل حفظ حسابك وإعداداته إلى هذا الجهاز
+Custom Games => ألعاب مخصصة
+Fan Games => ألعاب المعجبين
+Favorites => المفضلة
+Remove from favorites => إزالة من المفضلة
+Add to favorites => إضافة إلى المفضلة
+Select a game => اختر لعبة
+Not installed => غير مثبّتة
+Update available => تحديث متاح
+Running => قيد التشغيل
+Never => أبداً
+Credits => الشكر والتقدير
+# ── more Arabic strings (added) ──
+Reveal NSFW cover => إظهار الغلاف (+18)
+Are you sure you would like to reveal this NSFW cover? You are fully responsible for it. => هل أنت متأكد أنك تريد إظهار هذا الغلاف (+18)؟ أنت المسؤول عنه بالكامل.
+GAME INVITE => دعوة للعب
+Apply Fix => تطبيق الإصلاح
+Pick a friend => اختر صديقًا
+Shows "FRIEND is playing GAME" when a friend starts a game. Overlay window works over borderless/windowed games; injection (D3D11, 64-bit games) also works in exclusive fullscreen; on Linux it is loaded into Wine/Proton games through AppInit_DLLs. If it fails it falls back to the window. Don't use it with anti-cheat games. => يعرض إشعار «الصديق يلعب اللعبة» عندما يبدأ صديق لعبة. تعمل نافذة الطبقة العلوية مع الألعاب بوضع النافذة أو بلا حواف؛ كما يعمل الحقن (D3D11 وألعاب 64 بت) في وضع ملء الشاشة الحصري، وعلى لينكس يُحمَّل داخل ألعاب Wine/Proton عبر AppInit_DLLs. إذا فشل يعود إلى النافذة. لا تستخدمه مع الألعاب التي تحتوي على نظام مكافحة الغش.
+Turns an Xbox-style controller into keyboard + mouse while a game is running (left stick = WASD, right stick = mouse, triggers = clicks, A = Space...). Turn it off for games that already support controllers, or they'll get both. => يحوّل يد التحكم بنمط Xbox إلى لوحة مفاتيح وفأرة أثناء تشغيل اللعبة (العصا اليسرى = WASD، العصا اليمنى = الفأرة، الزنادان = نقرات، A = مسافة...). أوقفه للألعاب التي تدعم يد التحكم أصلًا، وإلا ستستقبل الإدخالين معًا.
+On (keyboard + mouse) => تشغيل (لوحة مفاتيح + فأرة)
+Remap buttons => إعادة تعيين الأزرار
+Shows the game you're playing from the launcher on your Discord profile. Needs Discord running, and the pypresence package installed. => يعرض اللعبة التي تلعبها من المشغّل على ملفك في Discord. يتطلب تشغيل Discord وتثبيت حزمة pypresence.
+Add reaction... => إضافة تفاعل...
+Custom Themes => سمات مخصصة
+Make your own theme: pick the Classic or Modern layout and your own colours, then save it. Saved themes show up in the Theme list above. Needs a restart. => أنشئ سمتك الخاصة: اختر التخطيط الكلاسيكي أو العصري وألوانك، ثم احفظها. تظهر السمات المحفوظة في قائمة السمات أعلاه. يتطلب إعادة التشغيل.
+Customize... => تخصيص...
+New, Sunset, Classic (pick your own accent colour) or Legacy. Needs a restart. => جديد، غروب الشمس، كلاسيكي (اختر لون التمييز) أو قديم. يتطلب إعادة التشغيل.
+Classic is the lightest, best for older PCs. Liquid Glass adds frosted glass and smooth animations. Needs a restart. => الكلاسيكي هو الأخف وهو الأنسب للأجهزة القديمة. يضيف Liquid Glass زجاجًا شفافًا ورسومًا متحركة سلسة. يتطلب إعادة التشغيل.
+NSFW Covers => أغلفة +18
+Hide again => إخفاء مجددًا
+Input Bridge => جسر الإدخال
+YOUR FRIENDS => أصدقاؤك
+WORKSHOP => الورشة
+Never for this game => أبدًا لهذه اللعبة
+Not now => ليس الآن
+Sync selected => مزامنة المحدد
+Nothing listed? Just play the game once: when you close it, the launcher finds the folders that changed and asks which ones to keep in the cloud. => لا يظهر شيء؟ العب اللعبة مرة واحدة فقط: عند إغلاقها يكتشف المشغّل المجلدات التي تغيّرت ويسألك أيها تريد حفظه في السحابة.
+Sync profile picture with Discord => مزامنة صورة الملف الشخصي مع Discord
+Uses your Discord profile picture as your launcher picture. Needs the Discord desktop app open. It only copies when your Discord picture changes, so a picture you set by hand stays until then. => يستخدم صورة ملفك في Discord كصورة لك في المشغّل. يتطلب فتح تطبيق Discord لسطح المكتب. ينسخ الصورة فقط عندما تتغيّر صورتك في Discord، فتبقى الصورة التي اخترتها يدويًا حتى ذلك الحين.
+D-pad / arrows  Move      A / Enter  Select      B / Esc  Back => الأسهم  تنقّل      A / Enter  اختيار      B / Esc  رجوع
+What do you want to do with the NCZ Command Line Tool? => ماذا تريد أن تفعل بأداة سطر أوامر NCZ؟
+Install adds the  ncz-gm  command and opens a terminal running it. Uninstall removes the command. => يضيف التثبيت الأمر  ncz-gm  ويفتح طرفية تشغّله. تُزيل الإزالة الأمر.
+Manage NCZ Command Line Tool => إدارة أداة سطر أوامر NCZ
+Install or uninstall the ncz-gm command (installing also opens a terminal running it) => تثبيت أو إزالة الأمر ncz-gm (يفتح التثبيت أيضًا طرفية تشغّله)
+Manage... => إدارة...
+Posting... => جارٍ النشر...
+Limits... => الحدود...
+Add custom animation... => إضافة رسوم متحركة مخصصة...
+Remove selected => إزالة المحدد
+‹  Back to Store => ‹  العودة إلى المتجر
+Game shortcuts open the launcher => اختصارات الألعاب تفتح المشغّل
+Rewrite => إعادة الكتابة
+Who has the update? => من لديه التحديث؟
+Pick who has the update => اختر من لديه التحديث
+Get different files => الحصول على ملفات مختلفة
+Apply update zip => تطبيق ملف التحديث المضغوط
+Made by: => من صنع:
+Other NCZ Games => ألعاب NCZ الأخرى
+Save and Exit => حفظ وخروج
+Use Existing => استخدام الموجود
+Overwrite => استبدال
+Installing redistributables => جارٍ تثبيت الحزم المطلوبة
+System: Follows your device's theme => النظام: يتبع سمة جهازك
+Pick the highlight color used across the launcher => اختر لون التمييز المستخدم في المشغّل
+Add NCZ Games Launcher to your desktop => إضافة مشغّل ألعاب NCZ إلى سطح المكتب
+Start the launcher in the background when you log in => تشغيل المشغّل في الخلفية عند تسجيل الدخول إلى الجهاز
+Download new launcher versions automatically when it starts. When disabled, the launcher stays on the version you have now. => تنزيل إصدارات المشغّل الجديدة تلقائيًا عند بدء تشغيله. عند التعطيل يبقى المشغّل على الإصدار الحالي.
+SteamGridDB API Key => مفتاح SteamGridDB API
+Used to load covers in the Store => يُستخدم لتحميل الأغلفة في المتجر
+Paste your API key => الصق مفتاح API
+Get a free API key => احصل على مفتاح API مجاني
+Store prices are converted from USD, so they're approximate => أسعار المتجر محوّلة من الدولار الأمريكي، لذا فهي تقريبية
+SteamRIP downloads directly. FitGirl downloads it as a repacked torrent. AnkerGames downloads directly after you solve a captcha. "Ask every time" shows a popup for each download where you pick the server (servers that don't have the game are greyed out). => يُنزّل SteamRIP مباشرة. يُنزّل FitGirl اللعبة كتورنت معاد تجميعه. يُنزّل AnkerGames مباشرة بعد حل اختبار CAPTCHA. يعرض خيار «اسأل في كل مرة» نافذة لكل تنزيل تختار منها الخادم (تظهر الخوادم التي لا تملك اللعبة باهتة).
+Check for a newer version of the launcher right now. => ابحث عن إصدار أحدث من المشغّل الآن.
+Add existing library folder... => إضافة مجلد مكتبة موجود...
+Rescan partitions => إعادة فحص الأقسام
+Steam-style (game list on the left, big game page on the right) or the classic grid of cards. Restart the launcher to apply a change. => بنمط ستيم (قائمة الألعاب على اليسار وصفحة اللعبة الكبيرة على اليمين) أو الشبكة الكلاسيكية من البطاقات. أعد تشغيل المشغّل لتطبيق التغيير.
+7-Zip / WinRAR location => موقع 7-Zip / WinRAR
+Choose another folder... => اختيار مجلد آخر...
+Checking key... => جارٍ التحقق من المفتاح...
+Key saved, but it couldn't be checked right now (no connection?). => تم حفظ المفتاح لكن تعذّر التحقق منه الآن (لا يوجد اتصال؟).
+Restart the launcher for this to take effect. => أعد تشغيل المشغّل لتطبيق ذلك.
+Checking... => جارٍ التحقق...
+3-20 letters, numbers, _ . - => من 3 إلى 20 حرفًا أو رقمًا أو _ . -
+Speed: 0 KB/s | Downloaded: 0 MB => السرعة: 0 ك.ب/ث | تم التنزيل: 0 م.ب
+Error details copied to clipboard. => تم نسخ تفاصيل الخطأ إلى الحافظة.
+Search SteamGridDB for a game => ابحث في SteamGridDB عن لعبة
+Use This Cover => استخدام هذا الغلاف
+Loading covers... => جارٍ تحميل الأغلفة...
+Store prices are converted from USD, so they're approximate. => أسعار المتجر محوّلة من الدولار الأمريكي، لذا فهي تقريبية.
+Search currencies (name or code) => ابحث عن عملة (الاسم أو الرمز)
+Select => اختيار
+Reveal => إظهار
+Pick one or more tags. Games have to match all of them. => اختر وسمًا واحدًا أو أكثر. يجب أن تطابق الألعاب جميعها.
+< Back to Store => < العودة إلى المتجر
+Click a tag to find more games with it => انقر على وسم للعثور على ألعاب أكثر بهذا الوسم
+More like this => المزيد المشابه
+Compatibility settings updated for this game. => تم تحديث إعدادات التوافق لهذه اللعبة.
+Install through Steam (Steam must be installed) => التثبيت عبر ستيم (يجب أن يكون ستيم مثبّتًا)
+Auto-Add Desktop Games => إضافة ألعاب سطح المكتب تلقائيًا
+Share this so friends can add you in the Friends tab => شارك هذا حتى يتمكن أصدقاؤك من إضافتك في تبويب الأصدقاء
+The terms have been updated. Please read and accept them to keep using the launcher. => تم تحديث الشروط. يرجى قراءتها وقبولها لمتابعة استخدام المشغّل.
+Open launcher => فتح المشغّل
+Quit => خروج
+Which appearance would you like to use? => أي مظهر تريد استخدامه؟
+Classic is the lightest on your PC. Liquid Glass looks smoother but needs a bit more power. => الكلاسيكي هو الأخف على جهازك. يبدو Liquid Glass أكثر سلاسة لكنه يحتاج قدرة أكبر قليلًا.
+Remove finished and failed downloads (running and paused ones stay) => حذف التنزيلات المنتهية والفاشلة (تبقى الجارية والمتوقفة مؤقتًا)
+Speed: 0 KB/s | 0 MB / 0 MB => السرعة: 0 ك.ب/ث | 0 م.ب / 0 م.ب
+Remove this card from the list => إزالة هذه البطاقة من القائمة
+Copy Error => نسخ الخطأ
+Default (System Wine / Auto) => الافتراضي (Wine النظام / تلقائي)
+Launcher setting => إعداد المشغّل
+Run setup => تشغيل الإعداد
+Setup closed => تم إغلاق الإعداد
+Delete setup files? => حذف ملفات الإعداد؟
+Search emoji... => ابحث عن إيموجي...
+Add reaction => إضافة تفاعل
+Jump to the original message => الانتقال إلى الرسالة الأصلية
+Opens Steam and joins, the same as accepting an invite in Steam => يفتح ستيم وينضم، كما لو قبلت دعوة في ستيم
+Open in your video player => فتح في مشغّل الفيديو لديك
+<   Friends => <   الأصدقاء
+Cancel reply (Esc) => إلغاء الرد (Esc)
+Attach images or videos (you can also paste or drop them) => إرفاق صور أو فيديوهات (يمكنك أيضًا لصقها أو إسقاطها)
+Emoji => إيموجي
+Invite to a Steam game => دعوة إلى لعبة ستيم
+Steam Web API key => مفتاح Steam Web API
+Get a Steam Web API key => احصل على مفتاح Steam Web API
+Game name => اسم اللعبة
+optional: free key from steamcommunity.com/dev/apikey => اختياري: مفتاح مجاني من steamcommunity.com/dev/apikey
+Paste the game's steam join link. With a Steam API key saved (and your Steam profile's Game details set to public) the launcher finds the link by itself next time. => الصق رابط الانضمام إلى اللعبة في ستيم. عند حفظ مفتاح Steam API (وضبط «تفاصيل اللعبة» في ملفك على عام) يجد المشغّل الرابط تلقائيًا في المرة القادمة.
+Send invite => إرسال الدعوة
+Workshop addons folder => مجلد إضافات الورشة
+Folder with your downloaded .gma and legacy .bin addons. Each one is extracted into garrysmod/addons under its title. => مجلد يحتوي على إضافات .gma و.bin القديمة التي نزّلتها. تُستخرج كل واحدة إلى garrysmod/addons باسم عنوانها.
+Choose your Workshop addons folder => اختر مجلد إضافات الورشة
+Extract && Install addons => استخراج وتثبيت الإضافات
+Clear path cache => مسح ذاكرة المسارات
+Extraction log will appear here => سيظهر سجل الاستخراج هنا
+Extracting... => جارٍ الاستخراج...
+Delete this addon from disk => حذف هذه الإضافة من القرص
+< Choose another game => < اختيار لعبة أخرى
+Import a .nczlist file: its mods are added to the queue and downloaded => استيراد ملف .nczlist: تُضاف مودّاته إلى قائمة الانتظار وتُنزَّل
+Download by Link => التنزيل عبر رابط
+Paste a Steam Workshop link (or item ID) to download that mod => الصق رابط ورشة ستيم (أو معرّف العنصر) لتنزيل ذلك المود
+Ask a friend to share their mods for this game: they get a yes/no popup, and if they accept, the mods you're missing are checked and downloaded => اطلب من صديق مشاركة مودّاته لهذه اللعبة: تظهر له نافذة نعم/لا، وإن وافق يتم فحص المودّات التي تنقصك وتنزيلها
+Choose a game you've downloaded to browse its Steam Workshop. => اختر لعبة نزّلتها لتصفح ورشة ستيم الخاصة بها.
+List mode => وضع القائمة
+Select mods to export as a .nczlist file => حدد المودّات لتصديرها كملف .nczlist
+Open in browser => فتح في المتصفح
+Open this game's Steam Workshop in a browser window. Every mod you subscribe to is added to the queue automatically, and the window stays open. => يفتح ورشة ستيم لهذه اللعبة في نافذة متصفح. كل مود تشترك فيه يُضاف إلى قائمة الانتظار تلقائيًا، وتبقى النافذة مفتوحة.
+Search by mod name, or by author (name or Steam profile link) => ابحث باسم المود أو باسم المؤلف (الاسم أو رابط ملف ستيم)
+Add by links => إضافة عبر الروابط
+Paste Steam Workshop links (or item IDs) to add many mods to this list at once => الصق روابط ورشة ستيم (أو معرّفات العناصر) لإضافة عدة مودّات إلى هذه القائمة دفعة واحدة
+Automatically disable other enabled mods => تعطيل المودّات المفعّلة الأخرى تلقائيًا
+When someone imports this list, their other enabled mods (Garry's Mod addons) are disabled first => عندما يستورد شخص ما هذه القائمة تُعطَّل مودّاته المفعّلة الأخرى (إضافات Garry's Mod) أولًا
+Steam login: anonymous => تسجيل دخول ستيم: مجهول
+Leave empty for anonymous downloads. To use an account, run steamcmd once from the steamcmd folder and log in so it remembers you. => اتركه فارغًا للتنزيل المجهول. لاستخدام حساب، شغّل steamcmd مرة واحدة من مجلد steamcmd وسجّل الدخول ليتذكّرك.
+Download required items => تنزيل العناصر المطلوبة
+When a mod needs other Workshop items (its 'Required items'), download the ones you don't have yet as well. => عندما يحتاج مود إلى عناصر ورشة أخرى («العناصر المطلوبة»)، نزّل التي لا تملكها بعد أيضًا.
+Clear finished => مسح المنتهية
+Install all to Garry's Mod => تثبيت الكل في Garry's Mod
+Extract every downloaded addon below into garrysmod/addons => استخراج كل إضافة منزّلة أدناه إلى garrysmod/addons
+Nothing downloaded for this game yet. => لم يتم تنزيل أي شيء لهذه اللعبة بعد.
+View => عرض
+Looking up... => جارٍ البحث...
+Checking Workshop... => جارٍ فحص الورشة...
+Install all => تثبيت الكل
+Browser open... => المتصفح مفتوح...
+GloriousEggroll's Proton builds. Installed versions appear in the launcher's compatibility tool picker, so you can run games with them. => إصدارات Proton من GloriousEggroll. تظهر الإصدارات المثبّتة في منتقي أدوات التوافق في المشغّل، فيمكنك تشغيل الألعاب بها.
+Loading versions... => جارٍ تحميل الإصدارات...
+Plain Wine builds. Installed builds appear in each game's Switch Compatibility Tool menu, so you can run any game, fan games included, with a specific Wine version. => إصدارات Wine العادية. تظهر الإصدارات المثبّتة في قائمة «تبديل أداة التوافق» لكل لعبة، فيمكنك تشغيل أي لعبة، بما فيها ألعاب المعجبين، بإصدار Wine محدد.
+Game Jolt, itch.io or GameBanana link => رابط Game Jolt أو itch.io أو GameBanana
+Custom category... => فئة مخصصة...
+New category name => اسم الفئة الجديدة
+Add => إضافة
+‹ Previous => ‹ السابق
+Next › => التالي ›
+Game Jolt page => صفحة Game Jolt
+Open this game on Game Jolt => افتح هذه اللعبة على Game Jolt
+Fan game  •  Game Jolt => لعبة معجبين  •  Game Jolt
+Scrape Games => جمع الألعاب
+This can affect PC performance. It also replaces your current fan games list. => قد يؤثر هذا على أداء الجهاز. كما أنه يستبدل قائمة ألعاب المعجبين الحالية.
+Scrape => جمع
+Scraping Game Jolt => جارٍ جمع بيانات Game Jolt
+Show details => إظهار التفاصيل
+Stopping... => جارٍ الإيقاف...
+Download the Game Jolt scraper and rebuild fan_games.csv => نزّل أداة جمع بيانات Game Jolt وأعد بناء fan_games.csv
++ Add Game => + إضافة لعبة
+Arguments passed to the game when it starts: => المعاملات الممرَّرة إلى اللعبة عند بدئها:
+Launch Error => خطأ في التشغيل
+Wine Required => Wine مطلوب
+Couldn't find the game's executable. Is it installed? => تعذّر العثور على الملف التنفيذي للعبة. هل هي مثبّتة؟
+winetricks needs zenity or kdialog installed to show its window. Install one of them and try again. => يحتاج winetricks إلى zenity أو kdialog لعرض نافذته. ثبّت أحدهما وحاول مجددًا.
+Command-line arguments passed to the game when it starts => معاملات سطر الأوامر الممرَّرة إلى اللعبة عند بدئها
+Open Winetricks => فتح Winetricks
+Install Windows components (DLLs, fonts, runtimes) into this game's Wine / Proton prefix => تثبيت مكوّنات ويندوز (DLL والخطوط وبيئات التشغيل) في بادئة Wine / Proton الخاصة بهذه اللعبة
+Select All => تحديد الكل
+Select None => إلغاء التحديد
+Add Selected => إضافة المحدد
+Invite to the game you're playing => دعوة إلى اللعبة التي تلعبها
+Loading picture... => جارٍ تحميل الصورة...
+Choose what each controller input sends to the game. The right stick always moves the mouse. => اختر ما ترسله كل أداة إدخال في يد التحكم إلى اللعبة. العصا اليمنى تحرّك الفأرة دائمًا.
+MOUSE => الفأرة
+Reset to defaults => إعادة الضبط إلى الافتراضي
+Copy text => نسخ النص
+Delete message => حذف الرسالة
+Unban => رفع الحظر
+< Friends => < الأصدقاء
+You're no longer in that group. => لم تعد في تلك المجموعة.
+No group chats yet. Press "New group" to start one with your friends. => لا توجد محادثات جماعية بعد. اضغط «مجموعة جديدة» لبدء واحدة مع أصدقائك.
+Sign in from the profile button (bottom left) first. => سجّل الدخول من زر الملف الشخصي (أسفل اليسار) أولًا.
+Add a friend first, then you can start a group with them. => أضف صديقًا أولًا، ثم يمكنك بدء مجموعة معه.
+CURRENTLY IN-GAME => داخل اللعبة حاليًا
+Loading profile... => جارٍ تحميل الملف الشخصي...
+Sending... => جارٍ الإرسال...
+Choose the country shown on your profile. => اختر الدولة المعروضة في ملفك الشخصي.
+Search countries => ابحث عن دولة
+Your themes => سماتك
+Duplicate => تكرار
+Theme name => اسم السمة
+Layout => التخطيط
+Modern => عصري
+Colours => الألوان
+Start from a preset... => ابدأ من إعداد مسبق...
+Background gradient => تدرّج الخلفية
+Icon => الأيقونة
+Choose image... => اختيار صورة...
+Use automatic icon => استخدام أيقونة تلقائية
+Save && Use => حفظ واستخدام
+Unsaved changes. Press Save to finish deleting. => تغييرات غير محفوظة. اضغط حفظ لإنهاء الحذف.
+Your custom theme. Other themes are locked for this account. => سمتك المخصصة. السمات الأخرى مقفلة لهذا الحساب.
+Locked to this theme's color. => مقفل على لون هذه السمة.
+Restart the launcher now to apply the new look? => هل تريد إعادة تشغيل المشغّل الآن لتطبيق المظهر الجديد؟
+Choose your theme => اختر سمتك
+You can change it any time in Settings (a restart applies it). => يمكنك تغييرها في أي وقت من الإعدادات (يُطبَّق التغيير بعد إعادة التشغيل).
+Continue => متابعة
+Cloud saves => الحفظ السحابي
+Add folder... => إضافة مجلد...
+Upload now => رفع الآن
+Download now => تنزيل الآن
+Please update your launcher to version 12.1.0 => يرجى تحديث المشغّل إلى الإصدار 12.1.0
+Pick the board and colours you like best. You can change it any time with the Theme button at the top of NCZ Chess. => اختر اللوحة والألوان التي تفضّلها. يمكنك تغييرها في أي وقت عبر زر السمة أعلى NCZ Chess.
+Play with this theme => اللعب بهذه السمة
+Game review => مراجعة المباراة
+Back to game => العودة إلى المباراة
+Review again => المراجعة مجددًا
+Copy PGN => نسخ PGN
+Open Chesskit => فتح Chesskit
+Copies the PGN, then opens Chesskit so you can paste it in yourself => ينسخ PGN ثم يفتح Chesskit لتلصقه بنفسك
+PGN copied. On Chesskit press Load game, set the origin to PGN, paste it, then Add. => تم نسخ PGN. في Chesskit اضغط Load game، واضبط المصدر على PGN، ثم الصق واضغط Add.
+Review copied from Chesskit - click a move to jump to it. => تم نسخ المراجعة من Chesskit - انقر على نقلة للانتقال إليها.
+Move sounds on / off => أصوات النقلات تشغيل / إيقاف
+Board => اللوحة
+Change the board colours => تغيير ألوان اللوحة
+Pieces => القطع
+Change the piece colours => تغيير ألوان القطع
+Choose a theme (board, pieces and colours) => اختر سمة (اللوحة والقطع والألوان)
+Flip the board after every move => قلب اللوحة بعد كل نقلة
+Start local game => بدء لعبة محلية
+Send challenge => إرسال تحدٍّ
+Play bot => اللعب ضد الكمبيوتر
+Nothing here yet. Send a friend a challenge to start an online game. => لا شيء هنا بعد. أرسل تحديًا إلى صديق لبدء لعبة عبر الإنترنت.
+Draw offered => عُرض التعادل
+Flip board => قلب اللوحة
+Take back => تراجع
+Offer draw => عرض التعادل
+Resign => استسلام
+Play again => العب مجددًا
+Lobby => الردهة
+Sends the finished game to Chesskit's Stockfish and copies the report back here => يرسل المباراة المنتهية إلى Stockfish في Chesskit وينسخ التقرير إلى هنا
+Fan game  •  itch.io => لعبة معجبين  •  itch.io
+This game has no itch.io link. => هذه اللعبة ليس لها رابط على itch.io.
+Fan game  •  GameBanana => لعبة معجبين  •  GameBanana
+This game has no GameBanana link. => هذه اللعبة ليس لها رابط على GameBanana.
+Refresh Cover => تحديث الغلاف
+NCZ Command Line Tool => أداة سطر أوامر NCZ
+Nothing yet. What your friends play and add shows up here while the launcher is open. => لا شيء بعد. ما يلعبه أصدقاؤك ويضيفونه يظهر هنا أثناء فتح المشغّل.
+Press F9 while a game is running to take a screenshot. Double-click one to open it. => اضغط F9 أثناء تشغيل لعبة لالتقاط لقطة شاشة. انقر نقرًا مزدوجًا على لقطة لفتحها.
+Reviews => المراجعات
+Write a short review (optional) => اكتب مراجعة قصيرة (اختياري)
+Post review => نشر المراجعة
+No reviews yet. Be the first. => لا توجد مراجعات بعد. كن الأول.
+Sign in to see and write reviews. => سجّل الدخول لرؤية المراجعات وكتابتها.
+Sign in to post a review. => سجّل الدخول لنشر مراجعة.
+Post => نشر
+Update game => تحديث اللعبة
+Dependencies => التبعيات
+Installs any Python packages the launcher needs that are missing (PyQt6, psutil, rarfile, playwright + Chromium, pypresence, libtorrent...). Needs internet. Restart the launcher afterwards so new packages get picked up. => يثبّت أي حزم Python يحتاجها المشغّل وهي مفقودة (PyQt6 وpsutil وrarfile وplaywright + Chromium وpypresence وlibtorrent...). يتطلب الإنترنت. أعد تشغيل المشغّل بعد ذلك ليلتقط الحزم الجديدة.
+Install missing dependencies => تثبيت التبعيات المفقودة
+Some packages (like python-rsync, used by "Get different files") only have ready-made builds up to Python 3.12. This downloads a private Python 3.12 (about 30 MB), installs the launcher's packages into it and runs the launcher on it from then on. Your own Python isn't changed. Needs internet. => بعض الحزم (مثل python-rsync المستخدمة في «الحصول على ملفات مختلفة») لا تتوفر لها إصدارات جاهزة إلا حتى Python 3.12. يُنزّل هذا نسخة Python 3.12 خاصة (حوالي 30 م.ب) ويثبّت حزم المشغّل فيها ثم يشغّل المشغّل عليها من الآن فصاعدًا. لا يتغيّر Python الخاص بك. يتطلب الإنترنت.
+Startup animation => رسوم بدء التشغيل
+Pick a GIF, WebP, APNG, PNG or JPG file. => اختر ملف GIF أو WebP أو APNG أو PNG أو JPG.
+Add a sound to play with it? (WAV, MP3, OGG, FLAC or M4A) => هل تريد إضافة صوت يُشغَّل معها؟ (WAV أو MP3 أو OGG أو FLAC أو M4A)
+Select one of your custom animations first. => اختر إحدى رسومك المتحركة المخصصة أولًا.
+Log in to your account first (Account page), then add a friend with their friend code. => سجّل الدخول إلى حسابك أولًا (صفحة الحساب)، ثم أضف صديقًا برمز الصداقة الخاص به.
+That zip wasn't made by 'Get different files'. => هذا الملف المضغوط لم يُنشأ بواسطة «الحصول على ملفات مختلفة».
+Get different files... => الحصول على ملفات مختلفة...
+Apply update zip... => تطبيق ملف التحديث المضغوط...
+Steam is running. Close it completely (right-click its tray icon > Exit), then click Retry. => ستيم يعمل. أغلقه تمامًا (انقر بزر الفأرة الأيمن على أيقونته في الشريط > خروج)، ثم اضغط إعادة المحاولة.
+Adds this game to your Steam library with its artwork (SteamGridDB if you set a key, else Steam's) => يضيف هذه اللعبة إلى مكتبة ستيم مع صورها (من SteamGridDB إن ضبطت مفتاحًا، وإلا من ستيم)
+Voice => الصوت
+Leave call => مغادرة المكالمة
+Minimise => تصغير
+Builds => الإصدارات
+Launch this => تشغيل هذا
+Selected => محدد
+Download more builds => تنزيل المزيد من الإصدارات
+Pick which downloaded build the Launch button starts. => اختر الإصدار الذي يشغّله زر التشغيل.
+Pick extra builds of this game to download next to the ones you have. => اختر إصدارات إضافية من هذه اللعبة لتنزيلها بجانب ما لديك.
+Download... => تنزيل...
+Voice settings => إعدادات الصوت
+Incoming voice call… => مكالمة صوتية واردة…
+Microphone, noise suppression and noise gate for voice calls and group voice channels. => الميكروفون وكتم الضوضاء وبوابة الضوضاء للمكالمات الصوتية وقنوات الصوت الجماعية.
+Your devices are listed after the first microphone test or voice call. => تظهر أجهزتك بعد أول اختبار للميكروفون أو أول مكالمة صوتية.
+Noise Suppression => كتم الضوضاء
+Let's Check => لنفحص
+Reset voice settings => إعادة ضبط إعدادات الصوت
+Join voice => الانضمام إلى الصوت
+This game hasn't been released yet => لم تصدر هذه اللعبة بعد
+Not available on this OS => غير متاح على هذا النظام
+SORT BY => ترتيب حسب
+Re-download every game's art from the top of the library to the bottom; art that already matches is skipped => إعادة تنزيل صور كل لعبة من أعلى المكتبة إلى أسفلها؛ تُتخطّى الصور المطابقة أصلًا
+No games match. => لا توجد ألعاب مطابقة.
++  Add a Game => +  إضافة لعبة
+Artwork: pick icon, background, logo => الصور: اختر الأيقونة والخلفية والشعار
+Game options => خيارات اللعبة
+Favorite => مفضلة
+No editable keys found in JSON file. => لم يتم العثور على مفاتيح قابلة للتعديل في ملف JSON.
+Use XWayland on Wayland => استخدام XWayland على Wayland
+Needed for the Shift+Q friends overlay and for overlay windows to show over games on a Wayland desktop. Turn it off if the launcher looks blurry on a scaled display. Restart the launcher to apply. => مطلوب لطبقة أصدقاء Shift+Q ولظهور نوافذ الطبقة فوق الألعاب على سطح مكتب Wayland. أوقفه إذا بدا المشغّل ضبابيًا على شاشة مكبّرة. أعد تشغيل المشغّل لتطبيق ذلك.
+Used for Windows games run with Wine or Proton. DXVK/VKD3D are installed into your Wine prefix on first launch (needs winetricks). => يُستخدم لألعاب ويندوز التي تعمل عبر Wine أو Proton. يُثبَّت DXVK/VKD3D في بادئة Wine لديك عند أول تشغيل (يتطلب winetricks).
+Detecting 7-Zip / WinRAR... => جارٍ اكتشاف 7-Zip / WinRAR...
+Key removed. The Store will use Steam's own art. => تمت إزالة المفتاح. سيستخدم المتجر صور ستيم نفسها.
+Key saved and working. => تم حفظ المفتاح وهو يعمل.
+SteamGridDB rejected this key. It was saved, but double-check it. => رفض SteamGridDB هذا المفتاح. تم حفظه، لكن تأكد منه مجددًا.
+Cloud sync isn't set up in this build of the launcher yet. => المزامنة السحابية غير مفعّلة بعد في هذا الإصدار من المشغّل.
+Password Reset => إعادة تعيين كلمة المرور
+If an account exists for that email, a reset link is on its way. => إذا كان هناك حساب لهذا البريد الإلكتروني، فرابط إعادة التعيين في طريقه إليك.
+Profile => الملف الشخصي
+No games found. Try a different name. => لم يتم العثور على ألعاب. جرّب اسمًا مختلفًا.
+Couldn't load the details. Check your connection. => تعذّر تحميل التفاصيل. تحقق من اتصالك.
+Click to remove this tag => انقر لإزالة هذا الوسم
+Wine wasn't found. Install it, or download a build in the Wine tab. => لم يتم العثور على Wine. ثبّته أو نزّل إصدارًا من تبويب Wine.
+The download didn't finish. Please try again. => لم يكتمل التنزيل. يرجى المحاولة مرة أخرى.
+Log in to your account first, then try again. => سجّل الدخول إلى حسابك أولًا ثم حاول مجددًا.
+Add your SteamGridDB API key in Settings first, then try again. => أضف مفتاح SteamGridDB API في الإعدادات أولًا ثم حاول مجددًا.
+This game has no Game Jolt link. => هذه اللعبة ليس لها رابط على Game Jolt.
+Add Existing Fan Game => إضافة لعبة معجبين موجودة
+Couldn't find your Desktop folder. => تعذّر العثور على مجلد سطح المكتب.
+Close tab => إغلاق التبويب
+Full-screen mode for controller / keyboard (Ctrl+Shift+B) => وضع ملء الشاشة لوحدة التحكم / لوحة المفاتيح (Ctrl+Shift+B)
+Smart collections (recently played, played this week, most played, never played), favorites or hidden games. Use a game's ••• menu to favorite or hide it. => مجموعات ذكية (لُعبت مؤخرًا، لُعبت هذا الأسبوع، الأكثر لعبًا، لم تُلعب أبدًا) أو المفضلة أو الألعاب المخفية. استخدم قائمة ••• الخاصة بلعبة لتفضيلها أو إخفائها.
+Use Classic => استخدام الكلاسيكي
+Copied => تم النسخ
+Paused => متوقف مؤقتًا
+Starting the Steam download... => جارٍ بدء تنزيل ستيم...
+Executable => الملف التنفيذي
+Default (System Wine / Native) => الافتراضي (Wine النظام / أصلي)
+Invalid Input => إدخال غير صالح
+Please provide a valid game title and existing executable path. => يرجى إدخال عنوان لعبة صالح ومسار ملف تنفيذي موجود.
+Select Proton / Wine Tool: => اختر أداة Proton / Wine:
+Direct3D renderer (Wine / Proton): => مُصيِّر Direct3D (Wine / Proton):
+Please provide a valid, existing executable path. => يرجى إدخال مسار ملف تنفيذي صالح وموجود.
+Sign in from the profile button (bottom left) to use friends. => سجّل الدخول من زر الملف الشخصي (أسفل اليسار) لاستخدام الأصدقاء.
+Sign in first. => سجّل الدخول أولًا.
+No friends yet. Share your code or enter someone else's to add them. => لا يوجد أصدقاء بعد. شارك رمزك أو أدخل رمز شخص آخر لإضافته.
+A Steam Web API key is 32 letters and numbers. => مفتاح Steam Web API مكوّن من 32 حرفًا ورقمًا.
+Enter the game's name. => أدخل اسم اللعبة.
+Workshop path => مسار الورشة
+Workshop path is invalid. => مسار الورشة غير صالح.
+Delete addon => حذف الإضافة
+Couldn't find the Garry's Mod folder (the one containing 'garrysmod'). => تعذّر العثور على مجلد Garry's Mod (الذي يحتوي على 'garrysmod').
+I couldn't find a Workshop link or item ID in that text. => لم أجد رابط ورشة أو معرّف عنصر في ذلك النص.
+The list is empty. => القائمة فارغة.
+Open a game first, then press Sync with friend so I know which game's mods to ask for. => افتح لعبة أولًا، ثم اضغط «مزامنة مع صديق» لأعرف مودّات أي لعبة أطلبها.
+You don't have any friends added yet. Add one with their friend code on the Friends page. => لم تضف أي أصدقاء بعد. أضف أحدهم برمز الصداقة الخاص به في صفحة الأصدقاء.
+Delete download => حذف التنزيل
+Garry's Mod isn't installed in the launcher. => Garry's Mod غير مثبّتة في المشغّل.
+No GE Proton releases found. => لم يتم العثور على إصدارات GE Proton.
+System Wine: not found. Install a build below and games will use it. => Wine النظام: غير موجود. ثبّت إصدارًا أدناه وستستخدمه الألعاب.
+No Wine builds found. => لم يتم العثور على إصدارات Wine.
+No description available. Open the game on Game Jolt for more. => لا يوجد وصف متاح. افتح اللعبة على Game Jolt للمزيد.
+How many games from each genre? => كم لعبة من كل نوع؟
+All done => اكتمل كل شيء
+Fan games list updated. => تم تحديث قائمة ألعاب المعجبين.
+Scrape did not finish => لم تكتمل عملية الجمع
+Add Fan Game => إضافة لعبة معجبين
+1. Choose the game => 1. اختر اللعبة
+2. Choose its executable => 2. اختر ملفها التنفيذي
+Launch Game => تشغيل اللعبة
+Restart => إعادة التشغيل
+No messages yet - say hi! => لا توجد رسائل بعد - قل مرحبًا!
+Picture unavailable => الصورة غير متاحة
+Couldn't load picture => تعذّر تحميل الصورة
+Right stick speed => سرعة العصا اليمنى
+Choose a group icon => اختر أيقونة المجموعة
+e.g. Friday night squad => مثال: شلّة ليلة الجمعة
+Choose icon... => اختيار أيقونة...
+Timeout => مهلة
+Group => المجموعة
+All your friends are already in this group (or are banned from it). => جميع أصدقائك موجودون بالفعل في هذه المجموعة (أو محظورون منها).
+That file couldn't be read as an image. => تعذّرت قراءة ذلك الملف كصورة.
+Delete theme => حذف السمة
+You have unsaved changes. Save them? => لديك تغييرات غير محفوظة. هل تريد حفظها؟
+Your theme is fixed for this account. => سمتك ثابتة لهذا الحساب.
+Your custom theme sets light or dark itself. => سمتك المخصصة تحدد الوضع الفاتح أو الداكن بنفسها.
+Off: phones can't send controller input to this PC. => متوقف: لا يمكن للهواتف إرسال إدخال وحدة التحكم إلى هذا الجهاز.
+Pick a folder inside AppData, Documents, Saved Games, your home folder or the game's own folder, so it can be found on your other devices. => اختر مجلدًا داخل AppData أو المستندات أو Saved Games أو مجلد المنزل أو مجلد اللعبة نفسها، ليمكن العثور عليه على أجهزتك الأخرى.
+There's nothing in the cloud for this game yet. => لا يوجد شيء في السحابة لهذه اللعبة بعد.
+Upload this device's saves to your account => رفع حفظات هذا الجهاز إلى حسابك
+Download your account's saves to this device => تنزيل حفظات حسابك إلى هذا الجهاز
+Cloud Saves... => الحفظ السحابي...
+Choose which folders are kept in the cloud, and turn syncing on or off => اختر المجلدات التي تُحفظ في السحابة، وشغّل المزامنة أو أوقفها
+Off: phones can't see or control this PC. => متوقف: لا يمكن للهواتف رؤية هذا الجهاز أو التحكم به.
+Couldn't load reviews. => تعذّر تحميل المراجعات.
+Everything is installed. => كل شيء مثبّت.
+Done. Close the launcher and start it the way you normally do: it will use your own Python again. => تم. أغلق المشغّل وابدأه بالطريقة المعتادة: سيستخدم Python الخاص بك مجددًا.
+Python 3.12 is ready. Restart the launcher now to run on it? => Python 3.12 جاهز. هل تريد إعادة تشغيل المشغّل الآن للعمل عليه؟
+Game shortcuts => اختصارات الألعاب
+Show zip => إظهار الملف المضغوط
+Compare game files => مقارنة ملفات اللعبة
+Voice call => مكالمة صوتية
+Sign in first to use voice calls. => سجّل الدخول أولًا لاستخدام المكالمات الصوتية.
+Sign in first to use voice chat. => سجّل الدخول أولًا لاستخدام الدردشة الصوتية.
+Unreleased => غير مصدرة
+● Installed => ● مثبّتة
+Collapse / expand => طيّ / توسيع
+Open this collection => فتح هذه المجموعة
+Store Page => صفحة المتجر
+Add your SteamGridDB API key in Settings first, or use "Choose a file". => أضف مفتاح SteamGridDB API في الإعدادات أولًا، أو استخدم «اختيار ملف».
+Artwork => العمل الفني
+That file isn't an image the launcher can read. => هذا الملف ليس صورة يستطيع المشغّل قراءتها.
+Game settings => إعدادات اللعبة
+Sync your saves => زامن حفظاتك
+Cloud sync unavailable => المزامنة السحابية غير متاحة
+Launch using wine => التشغيل عبر wine
+Unlink => إلغاء الربط
+Library order. A to Z keeps the NCZ games on top. => ترتيب المكتبة. من A إلى Z يُبقي ألعاب NCZ في الأعلى.
+(empty message) => (رسالة فارغة)
+Addon Manager => مدير الإضافات
+Platform => المنصة
+Launching Windows games is not supported on this platform. => تشغيل ألعاب ويندوز غير مدعوم على هذه المنصة.
+Checking which games have Workshop mods... => جارٍ فحص الألعاب التي لها مودّات في الورشة...
+No games with more than 2 Workshop mods found. => لم يتم العثور على ألعاب لها أكثر من مودّين في الورشة.
+That doesn't look like a valid .nczlist file. => لا يبدو هذا ملف .nczlist صالحًا.
+Browser => المتصفح
+Couldn't load this screenshot. => تعذّر تحميل لقطة الشاشة هذه.
+< Back to Fangames => < العودة إلى ألعاب المعجبين
+No cover => بلا غلاف
+Click to enlarge => انقر للتكبير
+Group icon => أيقونة المجموعة
+Add members... => إضافة أعضاء...
+Rename group... => إعادة تسمية المجموعة...
+Change group icon... => تغيير أيقونة المجموعة...
+Banned users... => المستخدمون المحظورون...
+No friends yet - add some in the Friends page => لا يوجد أصدقاء بعد - أضف بعضهم من صفحة الأصدقاء
+Open => فتح
+Remove from this list => إزالة من هذه القائمة
+Draw => تعادل
+Do both players agree to a draw? => هل يوافق اللاعبان على التعادل؟
+NCZ Command Line Tool uninstalled. => تمت إزالة أداة سطر أوامر NCZ.
+D-pad  Move      A  Pick up / put down      B  Drop the piece / Back      LB / RB  Browse moves      X  Flip board => الأسهم  تنقّل      A  رفع القطعة / وضعها      B  إسقاط القطعة / رجوع      LB / RB  تصفّح النقلات      X  قلب اللوحة
+Review posted. => تم نشر المراجعة.
+You're on the latest version. => أنت على أحدث إصدار.
+Create an account to sync your saves and settings across devices. => أنشئ حسابًا لمزامنة حفظاتك وإعداداتك عبر الأجهزة.
+Already have an account? Log in => هل لديك حساب؟ سجّل الدخول
+Log in to sync your saves and settings across devices. => سجّل الدخول لمزامنة حفظاتك وإعداداتك عبر الأجهزة.
+Need an account? Create one => تحتاج إلى حساب؟ أنشئ واحدًا
+Install Common Redist => تثبيت الحزم المشتركة
+Install Visual C++ / DirectX from the game's _CommonRedist folder (downloads them if missing) => تثبيت Visual C++ / DirectX من مجلد _CommonRedist الخاص باللعبة (ويُنزّلها إن كانت مفقودة)
+Download and install the latest version => تنزيل أحدث إصدار وتثبيته
+Open on Game Jolt => فتح على Game Jolt
+Share mods => مشاركة المودّات
+Loading details... Game Jolt can be slow, hang tight. => جارٍ تحميل التفاصيل... قد يكون Game Jolt بطيئًا، انتظر قليلًا.
+Kick from group => طرد من المجموعة
+Ban from group => حظر من المجموعة
+Remove group icon => إزالة أيقونة المجموعة
+Saved review - click a move to jump to it. => المراجعة محفوظة - انقر على نقلة للانتقال إليها.
+That isn't a supported audio file, so no sound was added. => هذا ليس ملف صوت مدعومًا، لذا لم يُضَف أي صوت.
+Reset artwork to automatic => إعادة الصور إلى التلقائي
+Saved. => تم الحفظ.
+This is a packaged build, so it can't update itself. Download the newest version from the releases page. => هذا إصدار مُحزَّم، لذا لا يمكنه تحديث نفسه. نزّل أحدث إصدار من صفحة الإصدارات.
+Extract the Windows build (no Linux conversion) and run it with wine => استخراج نسخة ويندوز (دون تحويل لينكس) وتشغيلها عبر wine
+Which Wine / Proton the Windows build runs with (used by "Launch using wine") => أي Wine / Proton تعمل به نسخة ويندوز (يُستخدم في «التشغيل عبر wine»)
+Uninstall wine version => إزالة إصدار wine
+Remove timeout => إزالة المهلة
+Installed. No terminal app was found: open one and run  ncz-gm => تم التثبيت. لم يُعثر على تطبيق طرفية: افتح واحدة وشغّل  ncz-gm
+Search SteamGridDB... => ابحث في SteamGridDB...
+Choose a file... => اختيار ملف...
+Refresh status => تحديث الحالة
+Classic => كلاسيكي
+New => جديد
+Sunset => غروب الشمس
+Legacy => قديم
+Minimise => تصغير
+# ── Settings page strings (added) ──
+Remote input needs xdotool on Linux. => يحتاج الإدخال عن بُعد إلى xdotool على لينكس.
+No filtering: your microphone is sent exactly as it is picked up. => بلا تصفية: يُرسل صوت الميكروفون كما يُلتقط تمامًا.
+Strongest filtering: also lowers everything that is not your voice between words. => أقوى تصفية: تخفض أيضًا كل ما ليس صوتك بين الكلمات.
+Wayland: remote input needs ydotool (install it and start its ydotoold daemon with access to /dev/uinput). xdotool can't type into Wayland apps. => Wayland: يحتاج الإدخال عن بُعد إلى ydotool (ثبّته وشغّل خدمة ydotoold مع صلاحية الوصول إلى /dev/uinput). لا يستطيع xdotool الكتابة في تطبيقات Wayland.
+Theme & Colors => السمة والألوان
+Launch & Tray => التشغيل والشريط
+Updates => التحديثات
+Storage & Tools => التخزين والأدوات
+Store & Covers => المتجر والأغلفة
+Controller => وحدة التحكم
+Graphics & Display => الرسوميات والعرض
+Friends & Account => الأصدقاء والحساب
+Dependencies & Python => التبعيات وPython
+NCZ default => افتراضي NCZ
+Choose a startup animation => اختر رسوم بدء التشغيل
+Big Picture startup animation => رسوم بدء تشغيل الشاشة الكبيرة
+Played full-screen when Big Picture opens. Press any key to skip it => تُعرض بملء الشاشة عند فتح الشاشة الكبيرة. اضغط أي مفتاح لتخطيها
+Startup animation sound => صوت رسوم بدء التشغيل
+Play the sound that goes with the startup animation => تشغيل الصوت المرافق لرسوم بدء التشغيل
+Add custom startup animation => إضافة رسوم بدء تشغيل مخصصة
+A GIF, WebP, APNG, PNG or JPG, optionally with a sound => ملف GIF أو WebP أو APNG أو PNG أو JPG، مع صوت اختياريًا
+Remove custom startup animation => إزالة رسوم بدء التشغيل المخصصة
+Deletes the custom animation that is currently selected => يحذف الرسوم المخصصة المحددة حاليًا
+Startup animations folder => مجلد رسوم بدء التشغيل
+Drop files here yourself. A sound with the same file name plays with the animation => ضع الملفات هنا بنفسك. الصوت الذي يحمل اسم الملف نفسه يُشغَّل مع الرسوم
+Used to extract .rar / .7z downloads. Leave empty to auto-detect. If you keep getting an extraction error, pick 7z.exe (7-Zip) or WinRAR.exe / UnRAR.exe (WinRAR) yourself. => يُستخدم لاستخراج تنزيلات .rar / .7z. اتركه فارغًا للاكتشاف التلقائي. إذا استمر ظهور خطأ في الاستخراج، فاختر 7z.exe (7-Zip) أو WinRAR.exe / UnRAR.exe (WinRAR) بنفسك.
+That game isn't valid. => هذه اللعبة غير صالحة.
+That game isn't in your PC's library. => هذه اللعبة ليست في مكتبة جهازك.
+Removed => تمت الإزالة
+Look the game up in the store first. => ابحث عن اللعبة في المتجر أولًا.
+Pick a download server first. => اختر خادم التنزيل أولًا.
+Other => أخرى
+About => حول
+Voice & Audio => الصوت والمكالمات
+Appearance => المظهر
+Error => خطأ
+Input Device => جهاز الإدخال
+Output Device => جهاز الإخراج
+Input Volume => مستوى الإدخال
+Output Volume => مستوى الإخراج
+Noise Gate (Input Sensitivity) => بوابة الضوضاء (حساسية الإدخال)
+Noise Gate => بوابة الضوضاء
+Silences your microphone when you are not talking. => يكتم ميكروفونك عندما لا تتحدث.
+Automatically determine input sensitivity => تحديد حساسية الإدخال تلقائيًا
+Join & Leave Sounds => أصوات الانضمام والمغادرة
+Play a sound when you or somebody else joins or leaves a voice call. => تشغيل صوت عندما تنضم أنت أو شخص آخر إلى مكالمة صوتية أو يغادرها.
+Echo Cancellation => إلغاء الصدى
+Stops your friends from hearing themselves through your speakers. => يمنع أصدقاءك من سماع أنفسهم عبر سماعاتك.
+Automatic Gain Control => التحكم التلقائي في الكسب
+Evens out how loud your voice is. => يوازن مستوى علو صوتك.
+Put every voice setting back to its default. => إعادة كل إعدادات الصوت إلى قيمها الافتراضية.
+Close button minimizes to tray => زر الإغلاق يصغّر إلى الشريط
+Closing the launcher keeps it running in the system tray (use Quit in the tray menu to exit). When disabled, closing exits the launcher. Needs a system tray. => إغلاق المشغّل يُبقيه يعمل في شريط النظام (استخدم «خروج» من قائمة الشريط للإنهاء). عند التعطيل يؤدي الإغلاق إلى إنهاء المشغّل. يتطلب شريط نظام.
+Start in the tray => البدء في الشريط
+When the launcher starts with your computer it stays hidden in the tray instead of opening its window. => عند بدء المشغّل مع جهازك يبقى مخفيًا في الشريط بدل فتح نافذته.
+Launcher folder (default) => مجلد المشغّل (الافتراضي)
+Choose where to install games => اختر مكان تثبيت الألعاب
+Choose a folder that contains installed games => اختر مجلدًا يحتوي على ألعاب مثبّتة
+Shortcut created: => تم إنشاء الاختصار:
+Disabled => معطّل
+Avatar => الصورة الرمزية
+Revealed: NSFW covers are shown everywhere. => تم الإظهار: أغلفة +18 ظاهرة في كل مكان.
+Hidden: NSFW covers are blurred until you press Reveal on one. => مخفية: تُطمس أغلفة +18 إلى أن تضغط «إظهار» على أحدها.
+Hidden => مخفي
+Steam doesn't know that game. => ستيم لا يعرف تلك اللعبة.
+Primary => أساسي
+Expand all => توسيع الكل
+Collapse all => طيّ الكل
+D-pad / arrows => الأسهم
+Press any key to skip => اضغط أي مفتاح للتخطي
+Choose a startup sound => اختر صوت بدء التشغيل
+Devices & Volume => الأجهزة والمستوى
+None => بلا
+Standard => قياسي
+Lets the phone app browse the store, add games to your library, download them here (you pick the download server on the phone) and download Steam Workshop mods to this PC. Only your own account can do this, and the launcher has to be running. => يتيح لك تطبيق الهاتف تصفح المتجر، وإضافة الألعاب إلى مكتبتك، وتنزيلها على هذا الجهاز (حيث يمكنك اختيار خادم التنزيل من خلال الهاتف)، بالإضافة إلى تنزيل تعديلات (Mods) من "Steam Workshop" إلى هذا الحاسوب. لا يمكن القيام بذلك إلا عبر حسابك الشخصي، ويجب أن يكون برنامج التشغيل (Launcher) قيد العمل.
+Lets the phone app save this PC's game saves to your account, or restore them here. Restoring needs the game closed, and your current files are backed up first. Only your own account can do this, and the launcher has to be running. => تتيح لك هذه الميزة حفظ ملفات ألعاب هذا الحاسوب الشخصي في حسابك، أو استعادتها عليه. تتطلب عملية الاستعادة إغلاق اللعبة، وسيتم إنشاء نسخة احتياطية من ملفاتك الحالية أولاً. لا يمكن إجراء ذلك إلا من خلال حسابك الخاص، ويجب أن يكون برنامج التشغيل قيد العمل.
+High => عالٍ
+Sounds & Processing => الأصوات والمعالجة
+Noise gate is off: everything your microphone hears is sent. => بوابة الضوضاء متوقفة: كل ما يلتقطه ميكروفونك يُرسل.
+Stop Testing => إيقاف الاختبار
+That file doesn't exist. Pick the .exe again. => ذلك الملف غير موجود. اختر ملف .exe مرة أخرى.
+New games install to: => تُثبَّت الألعاب الجديدة في:
+Locked to your custom theme. => مقفل على سمتك المخصصة.
+Ready => جاهز
+Using: => المستخدم:
+Also scanning: => يفحص أيضًا:
+Can't use that folder: => لا يمكن استخدام ذلك المجلد:
+If it's a partition that isn't yours to write to, mount it with your user's permissions. => إذا كان قسمًا لا تملك صلاحية الكتابة عليه، فاربطه (mount) بصلاحيات مستخدمك.
+Couldn't create the shortcut: => تعذّر إنشاء الاختصار:
+Couldn't change it: => تعذّر تغييره:
+Something went wrong: => حدث خطأ ما:
+Locked by an admin. => مقفل بواسطة المشرف.
+Locked to the New theme's color. => مقفل على لون السمة الجديدة.
+Couldn't open a terminal: => تعذّر فتح طرفية:
+No 7-Zip or WinRAR found automatically. Pick the .exe above. => لم يُعثر على 7-Zip أو WinRAR تلقائيًا. اختر ملف .exe أعلاه.
+Added => تمت الإضافة
+No terminal app was found. Open one and run: => لم يُعثر على تطبيق طرفية. افتح واحدًا وشغّل:
+Auto-detected: => اكتُشف تلقائيًا:
+Couldn't check for updates: => تعذّر التحقق من التحديثات:
+Filters steady background noise like fans, keyboard hum and air conditioning. => ينقّي الضوضاء الخلفية الثابتة مثل المراوح وطنين لوحة المفاتيح والمكيّف.
+Your microphone only sends sound while it is louder than the line. Press Let's Check, talk, and drag the handle until it sits just above your background noise. => لا يرسل ميكروفونك الصوت إلا حين يكون أعلى من الخط. اضغط «لنفحص» وتحدّث واسحب المقبض حتى يستقر فوق ضوضاء الخلفية مباشرة.
+The launcher follows your background noise level for you. => يتابع المشغّل مستوى ضوضاء الخلفية لديك تلقائيًا.
+Automatic: the line follows your background noise. => تلقائي: يتبع الخط مستوى ضوضاء الخلفية.
+Startup & Updates => البدء والتحديثات
+Library & Downloads => المكتبة والتنزيلات
+Big Picture & Controller => الشاشة الكبيرة ووحدة التحكم
+Compatibility => التوافق
+Online & Integrations => الإنترنت والتكامل
+Shortcuts => الاختصارات
+Command Line Tool => أداة سطر الأوامر
+Launch Big Picture on startup => تشغيل الشاشة الكبيرة عند بدء التشغيل
+Open Big Picture mode automatically whenever the launcher starts => فتح وضع الشاشة الكبيرة تلقائيًا كلما بدأ المشغّل
+Big Picture when a controller connects => الشاشة الكبيرة عند اتصال وحدة التحكم
+Switch to Big Picture as soon as a controller is plugged in or turned on => التبديل إلى الشاشة الكبيرة فور توصيل وحدة التحكم أو تشغيلها
+Overlay notification sound => صوت إشعارات الطبقة العلوية
+Play a short chime when a friend notification pops up => تشغيل نغمة قصيرة عند ظهور إشعار من صديق
+Sync mods with friend => مزامنة المودّات مع صديق
+Ask => اسأل
+Your friend needs the launcher open to answer. The request expires after 2 minutes. => يجب أن يكون المشغّل مفتوحًا لدى صديقك ليجيب. ينتهي الطلب بعد دقيقتين.
+Sync this game's saves => مزامنة حفظات هذه اللعبة
+Cloud saves are on for all games => الحفظ السحابي مفعّل لجميع الألعاب
+Not synced yet. => لم تتم المزامنة بعد.
+Log in to your account to use cloud saves. => سجّل الدخول إلى حسابك لاستخدام الحفظ السحابي.
+Choose the folder that holds the saves => اختر المجلد الذي يحتوي على الحفظات
+Uploading to the cloud... => جارٍ الرفع إلى السحابة...
+Saved => تم الحفظ
+Checking the cloud... => جارٍ فحص السحابة...
+Getting your saves... => جارٍ جلب حفظاتك...
+Restored => تمت الاستعادة
+Lets the phone app browse the store, add games to your library, download them here (you pick the download server on the phone) and download Steam Workshop mods to this PC. => يتيح لتطبيق الهاتف تصفح المتجر وإضافة ألعاب إلى مكتبتك وتنزيلها هنا (تختار خادم التنزيل من الهاتف) وتنزيل مودّات ورشة ستيم إلى هذا الجهاز.
+Lets the phone app save this PC's game saves to your account, or restore them here. Restoring needs the game closed, and your current files are backed up first. => يتيح لتطبيق الهاتف حفظ حفظات ألعاب هذا الجهاز في حسابك أو استعادتها هنا. تتطلب الاستعادة إغلاق اللعبة، ويُنسخ ملفاتك الحالية احتياطيًا أولًا.
+Only your own account can do this, and the launcher has to be running. => يمكن لحسابك أنت فقط فعل ذلك، ويجب أن يكون المشغّل يعمل.
+Mute this PC's sound while a phone is listening (the phone keeps the sound) => كتم صوت هذا الجهاز أثناء استماع هاتف (يحتفظ الهاتف بالصوت)
+Forget phones => نسيان الهواتف
+Always on: the desktop shortcuts of the games in your library open the launcher in the tray, which then starts the game. Shortcuts of games that aren't in your library go back to starting their .exe. Press Rewrite to rewrite your desktop shortcuts now. => مفعّل دائمًا: تفتح اختصارات سطح المكتب لألعاب مكتبتك المشغّل في شريط النظام، فيبدأ اللعبة بنفسه. أما اختصارات الألعاب غير الموجودة في مكتبتك فتعود لتشغيل ملف .exe مباشرة. اضغط «إعادة الكتابة» لإعادة كتابة اختصارات سطح المكتب الآن.
+Common Redistributables => الحزم المشتركة
+If Windows asks for permission, approve it so the installers can run. => إذا طلب ويندوز إذنًا فوافق عليه حتى تعمل المثبّتات.
+Installers run inside the game's Proton prefix and may take a minute. => تعمل المثبّتات داخل بادئة Proton الخاصة باللعبة وقد تستغرق دقيقة.
+Installers run through wine and may take a minute. => تعمل المثبّتات عبر wine وقد تستغرق دقيقة.
+(Proton prefix) => (بادئة Proton)
+Filter by tags => التصفية حسب الوسوم
+Open Friends tab once => فتح تبويب الأصدقاء مرة واحدة
+Choose download server => اختر خادم التنزيل
+Installed addons => الإضافات المثبّتة
+Install from Workshop => التثبيت من الورشة
+Enable all => تفعيل الكل
+Disable all => تعطيل الكل
+Queue => قائمة الانتظار
+Latest => الأحدث
+Found => تم العثور
+Matched on Steam => مطابق على ستيم
+Banned users => المستخدمون المحظورون
+Nobody is banned. => لا أحد محظور.
+Select someone to unban them. => اختر شخصًا لرفع الحظر عنه.
+Recent Activity => النشاط الأخير
+Game Collection => مجموعة الألعاب
+Stats => الإحصاءات
+Country => الدولة
+Not shown => غير معروض
+Disconnect from Voice => قطع الاتصال بالصوت
+Remove Server Mute => إزالة كتم الخادم
+Server Mute => كتم الخادم
+Remove Server Deafen => إزالة إصمام الخادم
+Server Deafen => إصمام الخادم
+Ringing… => جارٍ الرنين…
+Not in the call => ليس في المكالمة
+An admin muted you => كتمك أحد المشرفين
+An admin deafened you => أصمّك أحد المشرفين
+Unmute => إلغاء الكتم
+Mute => كتم
+Undeafen => إلغاء الإصمام
+Deafen => إصمام
+General => عام
+Hide from library => الاخفاء من المكتبة
+Arguments added everytime this game starts. => تتم إضافة وسائط في كل مرة تبدأ فيها هذه اللعبة
+SteamRIP => ستيم ريب
+FitGirl => فت جرل ريباكس
+FitGirl Repacks => فت جرل ريباكس
+Liquid Glass => زجاج سائل
+AnkerGames => انكر جامز
+"""
+_I18N_AR = {}
+for _ln in _I18N_AR_SRC.strip().splitlines():
+    if " => " in _ln:
+        _k, _v = _ln.split(" => ", 1)
+        _I18N_AR.setdefault(_k.strip().lower(), _v.strip())
+_I18N_REV = {}
+for _ln in _I18N_AR_SRC.strip().splitlines():
+    if " => " in _ln:
+        _k, _v = _ln.split(" => ", 1)
+        _I18N_REV.setdefault(_v.strip(), _k.strip())
+
+import re as _i18n_re
+_I18N_PATTERNS = [
+    (_i18n_re.compile(r"^([\d,\.]+) games$", _i18n_re.I), lambda m: f"{m.group(1)} لعبة"),
+    (_i18n_re.compile(r"^Playing (.+)$"), lambda m: f"يلعب {m.group(1)}"),
+    (_i18n_re.compile(r"^Because you played (.+)$"), lambda m: f"لأنك لعبت {m.group(1)}"),
+    (_i18n_re.compile(r"^your friends\s*-\s*(\d+)$", _i18n_re.I), lambda m: f"أصدقاؤك - {m.group(1)}"),
+    (_i18n_re.compile(r"^online\s*-\s*(\d+)$", _i18n_re.I), lambda m: f"متصل - {m.group(1)}"),
+    (_i18n_re.compile(r"^offline\s*-\s*(\d+)$", _i18n_re.I), lambda m: f"غير متصل - {m.group(1)}"),
+    (_i18n_re.compile(r"^(\d+) members?(?:\s*[•·]\s*(Owner|Admin|Member))?$"),
+     lambda m: f"{m.group(1)} عضو" + ({"Owner": " • المالك", "Admin": " • مشرف", "Member": " • عضو"}.get(m.group(2), "") if m.group(2) else "")),
+    (_i18n_re.compile(r"^(NCZ|STEAM|CUSTOM|FAN|EPIC|GOG)\s+GAMES\s*\((\d+)\)$", _i18n_re.I),
+     lambda m: {"ncz": "ألعاب NCZ", "steam": "ألعاب ستيم", "custom": "ألعاب مخصصة", "fan": "ألعاب المعجبين",
+                "epic": "ألعاب Epic", "gog": "ألعاب GOG"}[m.group(1).lower()] + f" ({m.group(2)})"),
+    (_i18n_re.compile(r"^Art:\s*(.+)$"), lambda m: f"الرسومات: {m.group(1)}"),
+    (_i18n_re.compile(r"^(\d+) min$"), lambda m: f"{m.group(1)} د"),
+    (_i18n_re.compile(r"^(\d+(?:\.\d+)?) h$"), lambda m: f"{m.group(1)} س"),
+    (_i18n_re.compile(r"^Tags \((\d+)\)$"), lambda m: f"الوسوم ({m.group(1)})"),
+    (_i18n_re.compile(r"^Results for \u201c(.*)\u201d$"), lambda m: f"نتائج \u201c{m.group(1)}\u201d"),
+]
+
+_i18n_arabic_font = {"done": False, "family": ""}
+
+def _i18n_cut_arabic_weights(var_path, fam):
+    """Static Regular / Medium / Semibold / Bold cuts of the variable SF Arabic (needs fontTools), cached next to the SF Pro ones."""
+    from fontTools.ttLib import TTFont
+    from fontTools.varLib import instancer
+    out_dir = os.path.join(os.path.expanduser("~"), ".cache", "ncz_games_launcher", "fonts")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = int(os.path.getmtime(var_path))
+    paths = []
+    for style, weight in _SF_STATIC_WEIGHTS:
+        if style in ("Light", "Heavy"):
+            continue
+        out = os.path.join(out_dir, f"SFArabic-{style}-{stamp}.ttf")
+        if not os.path.isfile(out):
+            font = TTFont(var_path)
+            axes = {a.axisTag: a.defaultValue for a in font["fvar"].axes}
+            axes["wght"] = float(weight)
+            inst = instancer.instantiateVariableFont(font, axes, inplace=False)
+            plain = style in ("Regular", "Bold")
+            for nid, val in ((1, fam if plain else f"{fam} {style}"), (2, style if plain else "Regular"),
+                             (4, f"{fam} {style}"), (6, f"SFArabic-{style}"), (16, fam), (17, style)):
+                for plat, enc, lang in ((3, 1, 0x409), (1, 0, 0)):
+                    inst["name"].setName(val, nid, plat, enc, lang)
+            inst["OS/2"].usWeightClass = weight
+            inst.save(out)
+        paths.append(out)
+    return paths
+
+def _i18n_register_arabic_font(primary_family=None):
+    """Loads assets/SF-Arabic.ttf and makes it the fallback for the launcher's fonts. Latin text keeps using SF Pro (or
+    whatever the app font is); Arabic letters, which SF Pro doesn't have, come from SF Arabic instead of Windows' default.
+    Does nothing if the file isn't there."""
+    st = _i18n_arabic_font
+    if st["done"]:
+        return st["family"]
+    st["done"] = True
+    cands = [asset_path("SF-Arabic.ttf"),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "SF-Arabic.ttf")]
+    try:
+        cands.append(os.path.join(_writable_dir(), "assets", "SF-Arabic.ttf"))
+    except Exception:
+        pass
+    for path in cands:
+        if not os.path.isfile(path):
+            continue
+        fid = QFontDatabase.addApplicationFont(path)
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+        if fams:
+            st["family"] = fams[0]
+            st["path"] = path
+            break
+    fam = st["family"]
+    if not fam:
+        return ""
+    try:                                   # one variable file = one weight to Qt: bold Arabic is then faked by smearing, which pulls the letters apart
+        if st.get("path") and _font_is_variable(st["path"]):
+            have = {int(QFontDatabase.weight(fam, x)) for x in QFontDatabase.styles(fam)}
+            if len(have) < 4:
+                for sp in _i18n_cut_arabic_weights(st["path"], fam):
+                    QFontDatabase.addApplicationFont(sp)
+    except Exception:
+        _log_exc("arabic static weights")
+    for base in {primary_family, "Segoe UI", "Noto Sans", "Helvetica Neue", "Arial", "Ubuntu"} - {None, ""}:
+        QFont.insertSubstitution(base, fam)
+    return fam
+
+_I18N_DEBUG = bool(os.environ.get("NCZ_I18N_DEBUG"))     # set NCZ_I18N_DEBUG=1, use the launcher in Arabic, then open i18n_missing.txt
+_I18N_SEEN = set()
+
+def _i18n_note_miss(core):
+    """Debug only: appends every English text that had no Arabic translation to i18n_missing.txt (next to main.py)."""
+    try:
+        if core in _I18N_SEEN or len(core) > 300 or not _i18n_re.search(r"[A-Za-z]{3}", core):
+            return
+        _I18N_SEEN.add(core)
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n_missing.txt"), "a", encoding="utf-8") as _f:
+            _f.write(core + " => \n")
+    except Exception:
+        pass
+
+def _i18n_tr(text):
+    """Arabic for `text` when Arabic is on and a translation exists; otherwise `text` unchanged."""
+    if _i18n_lang != "ar" or not isinstance(text, str) or not text.strip():
+        return text
+    m = _i18n_re.match(r"^(\s*)(.*?)(\s*)$", text, _i18n_re.S)
+    lead, core, trail = m.group(1), m.group(2), m.group(3)
+    hit = _I18N_AR.get(core.lower())
+    if hit is None and "&&" in core:                 # buttons escape a literal & as && (a single & is a shortcut mark)
+        h2 = _I18N_AR.get(core.replace("&&", "&").lower())
+        if h2 is not None:
+            hit = h2.replace("&", "&&")
+    if hit is None:
+        for rx, fn in _I18N_PATTERNS:
+            mm = rx.match(core)
+            if mm:
+                hit = fn(mm)
+                break
+    if hit is None and _I18N_DEBUG:
+        _i18n_note_miss(core)
+    return text if hit is None else lead + hit + trail
+
+def _i18n_tr_joined(text):
+    """Translate a custom-painted string; a ' · ' joined list (the collapsed section's row titles) is translated part by part."""
+    if _i18n_lang != "ar" or not isinstance(text, str):
+        return text
+    return " \u00b7 ".join(_i18n_tr(p) for p in text.split(" \u00b7 "))
+
+_I18N_CB_SRC, _I18N_CB_SHOWN = Qt.ItemDataRole.UserRole + 4711, Qt.ItemDataRole.UserRole + 4712
+
+def _i18n_combo_sync(cb):
+    """Dropdown items. Only combos whose items all carry their own data value are touched (settings dropdowns): those never read the
+    shown text back, while text-keyed combos (sort order, controller actions) must keep their English."""
+    try:
+        if cb.isEditable() or cb.count() == 0:
+            return
+        UR = Qt.ItemDataRole.UserRole
+        for i in range(cb.count()):
+            if cb.itemData(i, UR) is None and cb.itemData(i, _I18N_CB_SRC) is None:
+                return
+        o_text, o_set = _I18N_ORIG["cb_text"], _I18N_ORIG["cb_set"]
+        for i in range(cb.count()):
+            cur = o_text(cb, i)
+            src = cb.itemData(i, _I18N_CB_SRC)
+            base = src if (src is not None and cur == cb.itemData(i, _I18N_CB_SHOWN)) else cur
+            if _i18n_lang == "en" and base == cur:
+                base = _i18n_en(cur)
+            new = _i18n_tr(base)
+            if new != cur:
+                o_set(cb, i, new)
+            if new != base:
+                cb.setItemData(i, base, _I18N_CB_SRC)
+                cb.setItemData(i, new, _I18N_CB_SHOWN)
+            elif src is not None:
+                cb.setItemData(i, None, _I18N_CB_SRC)
+                cb.setItemData(i, None, _I18N_CB_SHOWN)
+    except Exception:
+        pass
+
+def _i18n_ss(sheet):
+    """Arabic letters join by touching: any letter-spacing pulls them apart, so Arabic runs without it."""
+    if _i18n_lang == "ar" and isinstance(sheet, str) and "letter-spacing" in sheet:
+        return _i18n_re.sub(r"letter-spacing\s*:\s*[^;}]*;?", "", sheet)
+    return sheet
+
+def _i18n_en(text):
+    """Back to English for a text that is currently the Arabic of a known string (menus etc.)."""
+    return _I18N_REV.get(text.strip(), text) if isinstance(text, str) else text
+
+def _i18n_sync(w, get, put, src_attr, shown_attr):
+    cur = get(w)
+    if not isinstance(cur, str):
+        return
+    src = getattr(w, src_attr, None)
+    base = src if (src is not None and cur == getattr(w, shown_attr, None)) else cur
+    if _i18n_lang == "en" and base == cur:
+        base = _i18n_en(cur)                       # a menu/leftover still showing Arabic: restore the English
+    new = _i18n_tr(base)
+    if new != cur:
+        put(w, new)
+    if new != base:
+        setattr(w, src_attr, base)
+        setattr(w, shown_attr, new)
+    else:
+        for a in (src_attr, shown_attr):
+            if a in getattr(w, "__dict__", {}):
+                try:
+                    delattr(w, a)
+                except Exception:
+                    pass
+
+def _i18n_fix_align(w):
+    """Qt decides a QLabel's left/right alignment from the TEXT direction, not the app's layout direction: a left-aligned label
+    showing Arabic is drawn on the right even though the layout is pinned left-to-right. AlignAbsolute turns that off, so the
+    translated labels (settings rows, descriptions...) stay on the left like the English ones. Only labels we translated are touched."""
+    try:
+        if getattr(w, "_i18n_src", None) is None:
+            return
+        A = Qt.AlignmentFlag
+        al = w.alignment()
+        if (al & A.AlignHorizontal_Mask) == A.AlignLeft:
+            w.setAlignment(al | A.AlignAbsolute)
+    except Exception:
+        pass
+
+def _i18n_apply(w):
+    try:
+        from PyQt6.QtWidgets import QAbstractButton, QLineEdit as _LE, QMenu as _MN, QWidget as _WG
+        if isinstance(w, QLabel):
+            _i18n_sync(w, _I18N_ORIG["ql_text"], _I18N_ORIG["ql_set"], "_i18n_src", "_i18n_shown")
+            _i18n_fix_align(w)
+        elif isinstance(w, QAbstractButton):
+            _i18n_sync(w, _I18N_ORIG["ab_text"], _I18N_ORIG["ab_set"], "_i18n_src", "_i18n_shown")
+        elif isinstance(w, QComboBox):
+            _i18n_combo_sync(w)
+        elif isinstance(w, _LE):
+            _i18n_sync(w, lambda x: x.placeholderText(), lambda x, t: x.setPlaceholderText(t), "_i18n_ph_src", "_i18n_ph_shown")
+        elif isinstance(w, _MN):
+            for a in w.actions():
+                t = a.text()
+                nt = _i18n_tr(_i18n_en(t) if _i18n_lang == "ar" else t) if _i18n_lang == "ar" else _i18n_en(t)
+                if nt != t:
+                    a.setText(nt)
+        if isinstance(w, _WG):
+            if _i18n_lang == "ar":                      # sheets set before the language was known: strip letter-spacing now
+                ss = w.styleSheet()
+                if "letter-spacing" in ss:
+                    w.setStyleSheet(ss)
+            _i18n_sync(w, lambda x: x.toolTip(), lambda x, t: x.setToolTip(t), "_i18n_tip_src", "_i18n_tip_shown")
+    except Exception:
+        pass
+
+def _i18n_retranslate_all():
+    try:
+        for w in list(QApplication.allWidgets()):
+            _i18n_apply(w)
+    except Exception:
+        _log_exc("_i18n_retranslate_all")
+
+class _I18nFilter(QObject):
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Type.Show and obj.isWidgetType():
+                _i18n_apply(obj)
+        except Exception:
+            pass
+        return False
+
+def _i18n_patch_classes():
+    """setText on labels/buttons goes through the translator; text() keeps returning the English the code set."""
+    from PyQt6.QtWidgets import QAbstractButton
+    if _I18N_ORIG:
+        return
+    _I18N_ORIG.update(ql_text=QLabel.text, ql_set=QLabel.setText, ab_text=QAbstractButton.text, ab_set=QAbstractButton.setText,
+                      cb_text=QComboBox.itemText, cb_set=QComboBox.setItemText)
+
+    def _cb_text(self, i):
+        src = self.itemData(i, _I18N_CB_SRC)
+        cur = _I18N_ORIG["cb_text"](self, i)
+        return src if (src is not None and cur == self.itemData(i, _I18N_CB_SHOWN)) else cur
+
+    def _cb_wrap(orig):
+        def f(self, *a, **k):
+            r = orig(self, *a, **k)
+            if _i18n_lang == "ar":
+                _i18n_combo_sync(self)          # items added after the box was shown
+            return r
+        return f
+
+    _ws_orig = QWidget.setStyleSheet
+    QWidget.setStyleSheet = lambda self, sh="": _ws_orig(self, _i18n_ss(sh))
+    QComboBox.itemText = _cb_text
+    _cur_orig = QComboBox.currentText
+    QComboBox.currentText = lambda self: (_cur_orig(self) if self.isEditable() or self.currentIndex() < 0
+                                          else self.itemText(self.currentIndex()))
+    for _n in ("addItem", "insertItem"):
+        setattr(QComboBox, _n, _cb_wrap(getattr(QComboBox, _n)))
+
+    def make_set(orig_set):
+        def setText(self, t=""):
+            tr = _i18n_tr(t) if isinstance(t, str) else t
+            orig_set(self, tr)
+            if isinstance(t, str) and tr != t:
+                self._i18n_src, self._i18n_shown = t, tr
+            elif "_i18n_src" in getattr(self, "__dict__", {}):
+                self._i18n_src = self._i18n_shown = None
+        return setText
+
+    def make_text(orig_text):
+        def text(self):
+            cur = orig_text(self)
+            src = getattr(self, "_i18n_src", None)
+            return src if (src is not None and cur == getattr(self, "_i18n_shown", None)) else cur
+        return text
+
+    QLabel.setText = make_set(_I18N_ORIG["ql_set"])
+    QLabel.text = make_text(_I18N_ORIG["ql_text"])
+    QAbstractButton.setText = make_set(_I18N_ORIG["ab_set"])
+    QAbstractButton.text = make_text(_I18N_ORIG["ab_text"])
+
+def _i18n_pin_ltr():
+    try:
+        QApplication.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        for ms in (0, 300, 1500):                 # and again after any queued language/locale events
+            QTimer.singleShot(ms, lambda: QApplication.setLayoutDirection(Qt.LayoutDirection.LeftToRight))
+    except Exception:
+        pass
+
+def _i18n_qt_translator(on):
+    """Qt's own strings (Yes/No/Cancel in dialogs, context menus), when the Arabic files are available."""
+    # Deliberately no Qt translator any more: qtbase_ar carries QT_LAYOUT_DIRECTION=RTL, which mirrored the whole launcher
+    # (rail on the right, window buttons on the left, art and bars flipped). The layout always stays left-to-right.
+    global _i18n_qt_tr
+    try:
+        app = QApplication.instance()
+        if _i18n_qt_tr is not None:
+            app.removeTranslator(_i18n_qt_tr)
+            _i18n_qt_tr = None
+        _i18n_pin_ltr()
+    except Exception:
+        pass
+
+def _i18n_install():
+    """Called once at start: reads the saved language and hooks the translator in."""
+    global _i18n_lang, _i18n_filter
+    if _i18n_filter is not None:
+        return
+    try:
+        saved = _raw_setting("ui_language")
+        _i18n_lang = saved if saved in ("en", "ar") else "en"
+        _i18n_patch_classes()
+        _i18n_filter = _I18nFilter()
+        QApplication.instance().installEventFilter(_i18n_filter)
+        _i18n_pin_ltr()
+        if _i18n_lang == "ar":                  # a sheet applied before the language was known may still carry letter-spacing
+            QTimer.singleShot(0, lambda: QApplication.instance().setStyleSheet(QApplication.instance().styleSheet()))
+        for ms in (0, 600, 2500):               # pages built lazily are caught by their Show event; this covers the rest
+            QTimer.singleShot(ms, _i18n_retranslate_all)
+    except Exception:
+        _log_exc("_i18n_install")
+
+def _i18n_set_language(code):
+    global _i18n_lang
+    if code not in ("en", "ar"):
+        return
+    _i18n_lang = code
+    try:
+        s = load_launcher_settings()
+        s["ui_language"] = code
+        save_launcher_settings(s)
+    except Exception:
+        _log_exc("_i18n_set_language")
+    _i18n_qt_translator(code == "ar")
+    _i18n_retranslate_all()
+
+def _i18n_flag_icon(kind, w=30, h=20):
+    """Flags drawn in code (emoji flags show as 'GB' / 'QA' letters on Windows)."""
+    from PyQt6.QtGui import QPolygonF
+    from PyQt6.QtCore import QPointF
+    ratio = 2
+    pm = QPixmap(w * ratio, h * ratio)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    W, H = float(w * ratio), float(h * ratio)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, W, H), 4 * ratio, 4 * ratio)
+    p.setClipPath(clip)
+    if kind == "gb":
+        p.fillRect(QRectF(0, 0, W, H), QColor("#012169"))
+        for width, col in ((H * 0.20, "#ffffff"), (H * 0.08, "#c8102e")):
+            pen = QPen(QColor(col), width)
+            p.setPen(pen)
+            p.drawLine(QPointF(0, 0), QPointF(W, H))
+            p.drawLine(QPointF(0, H), QPointF(W, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRect(QRectF(0, H * 0.5 - H * 0.17, W, H * 0.34))
+        p.drawRect(QRectF(W * 0.5 - H * 0.17, 0, H * 0.34, H))
+        p.setBrush(QColor("#c8102e"))
+        p.drawRect(QRectF(0, H * 0.5 - H * 0.10, W, H * 0.20))
+        p.drawRect(QRectF(W * 0.5 - H * 0.10, 0, H * 0.20, H))
+    else:                                          # Qatar: maroon with a white, nine-point serrated hoist
+        p.fillRect(QRectF(0, 0, W, H), QColor("#8a1538"))
+        edge, tip = W * 0.28, W * 0.42
+        pts = [QPointF(0, 0)]
+        for i in range(9):
+            y0, y1 = H * i / 9.0, H * (i + 1) / 9.0
+            pts += [QPointF(edge, y0), QPointF(tip, (y0 + y1) / 2.0)]
+        pts += [QPointF(edge, H), QPointF(0, H)]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawPolygon(QPolygonF(pts))
+    p.setClipping(False)
+    p.setPen(QPen(QColor(255, 255, 255, 60), 1.5))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(0.75, 0.75, W - 1.5, H - 1.5), 4 * ratio, 4 * ratio)
+    p.end()
+    pm.setDevicePixelRatio(ratio)
+    return QIcon(pm)
+
+def _ui_add_language_setting(self):
+    """Settings > Language: English (UK flag, default) or Arabic (Qatar flag). Applies immediately."""
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("Language")
+    title.setObjectName("RowTitle")
+    desc = QLabel("Choose the launcher's language. English is the default.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    combo = QComboBox()
+    combo.setFixedWidth(170)
+    combo.setIconSize(QSize(24, 16))
+    for code, name, flag in _I18N_LANGS:
+        combo.addItem(_i18n_flag_icon(flag), name, code)
+    combo.setCurrentIndex(max(0, combo.findData(_i18n_lang)))
+    combo.currentIndexChanged.connect(lambda _i: _i18n_set_language(combo.currentData()))
+    row.addLayout(col, 1)
+    row.addWidget(combo)
+    at = -1
+    for anchor in (getattr(sp, "appearance_combo", None), getattr(sp, "ui_style_combo", None)):
+        if anchor is None:
+            continue
+        for i in range(lay.count()):
+            item = lay.itemAt(i).layout()
+            if item is not None and item.indexOf(anchor) >= 0:
+                at = i
+                break
+        if at >= 0:
+            break
+    if at >= 0:
+        lay.insertSpacing(at + 1, 12)
+        lay.insertLayout(at + 2, row)
+    else:
+        lay.addSpacing(12)
+        lay.addLayout(row)
+    sp.language_combo = combo
+
 
 def _ui_add_appearance_setting(self):
     """Settings > Appearance: Classic or Liquid Glass (the same choice as the first-launch picker). Needs a restart."""
@@ -44669,6 +46149,8 @@ def _itch_find_link(worker, game_url):
         for i, u in enumerate(wins):
             u["primary"] = i == 0
         picked = worker.ask_build(wins)
+        if isinstance(picked, (list, tuple)):      # the chooser allows several; itch / GameBanana take the first
+            picked = picked[0] if picked else None
         if picked is None:
             raise ValueError("CANCELLED")
         chosen = next((u for u in wins if u["id"] == picked), wins[0])
@@ -44999,6 +46481,8 @@ def _gb_find_link(worker, game_url):
         for i, b in enumerate(builds):
             b["primary"] = i == 0
         picked = worker.ask_build(builds)
+        if isinstance(picked, (list, tuple)):      # the chooser allows several; itch / GameBanana take the first
+            picked = picked[0] if picked else None
         if picked is None:
             raise ValueError("CANCELLED")
         chosen = next((b for b in builds if b["id"] == picked), builds[0])
@@ -52536,7 +54020,7 @@ class _NczElide(QLabel):
         p.setPen(self.palette().color(QPalette.ColorRole.WindowText))
         p.setFont(self.font())
         p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                   self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, self.width()))
+                   self.fontMetrics().elidedText(_i18n_tr_joined(self._full), Qt.TextElideMode.ElideRight, self.width()))
 
 
 class _NczHead(QFrame):
@@ -66131,6 +67615,7 @@ class _SvView(QWidget):
             border-top-right-radius: 0; border-bottom-right-radius: 0; font-size: 18px; font-weight: bold; letter-spacing: 1px; padding: 0 28px; }}
         QPushButton#SvPlay:hover {{ background: {c['accent'].lighter(115).name()}; }}
         QPushButton#SvPlay:disabled {{ background: {n['hover']}; color: {n['dim']}; }}
+        QPushButton#SvPlay[solo="true"] {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
         QPushButton#SvPlayDrop {{ background: {c['accent'].darker(125).name()}; color: {_sv_on_accent(c['accent'].darker(125))}; border: none; border-radius: 4px;
             border-top-left-radius: 0; border-bottom-left-radius: 0; font-size: 16px; padding: 0; }}
         QPushButton#SvPlayDrop:hover {{ background: {c['accent'].darker(105).name()}; }}
@@ -66348,6 +67833,10 @@ class _SvView(QWidget):
         has_menu = menu is not None and bool(menu.actions())
         self.drop.setVisible(has_menu)
         self.gear.setVisible(has_menu)
+        if bool(self.play.property("solo")) == has_menu:          # no arrow beside Play: round its right corners too
+            self.play.setProperty("solo", not has_menu)
+            self.play.style().unpolish(self.play)
+            self.play.style().polish(self.play)
         ub = _sv_update_btn(card)
         self.update_btn.setVisible(ub is not None)
         st = card.findChild(QLabel, "CardStatus")
@@ -66914,7 +68403,7 @@ def _ig_set_stylesheet(self, sheet):
             _ig_ensure(self)
         except Exception:
             _log_exc("ios_glass qss")
-    return _ig_orig_set_stylesheet(self, sheet)
+    return _ig_orig_set_stylesheet(self, _i18n_ss(sheet))
 
 
 # ── effects ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -67517,7 +69006,7 @@ class _IgEmbed(QObject):
         self.dlg, self.host, self.cb, self.done = dlg, host, finished_cb, False
         self.orig_parent, self.orig_flags, self.orig_qss = dlg.parentWidget(), dlg.windowFlags(), dlg.styleSheet()
         was_resized = dlg.testAttribute(Qt.WidgetAttribute.WA_Resized)
-        want = (dlg.size() if was_resized else dlg.sizeHint()).expandedTo(dlg.minimumSizeHint())
+        want = (dlg.size() if was_resized else dlg.sizeHint()).expandedTo(dlg.minimumSizeHint()).expandedTo(dlg.minimumSize())
         want = want.boundedTo(dlg.maximumSize())
         self.ov = _IgScrim(host)
         self.card = _IgCard(self.ov, dlg, lambda: _ig_close_dialog(dlg))
@@ -67723,6 +69212,7 @@ QComboBox#SvSort {{ background: {btn}; border: none; border-radius: 10px; }}
 QPushButton#SvPlay {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.name()},stop:1 {bot.name()}); color: {_sv_on_accent(acc)};
     border: none; border-top-left-radius: 14px; border-bottom-left-radius: 14px; border-top-right-radius: 0; border-bottom-right-radius: 0; }}
 QPushButton#SvPlay:hover {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.lighter(112).name()},stop:1 {acc.name()}); }}
+QPushButton#SvPlay[solo="true"] {{ border-top-right-radius: 14px; border-bottom-right-radius: 14px; }}
 QPushButton#SvPlayDrop {{ background: {bot.darker(112).name()}; color: {_sv_on_accent(bot.darker(112))}; border: none; border-top-right-radius: 14px; border-bottom-right-radius: 14px;
     border-top-left-radius: 0; border-bottom-left-radius: 0; }}
 QPushButton#SvUpdate {{ border-radius: 14px; }}
@@ -67742,7 +69232,7 @@ try:
                 sheet = sheet + "\n" + _ig_sv_qss()
             except Exception:
                 _log_exc("ios_glass library qss")
-        return _ig_orig_sv_set_ss(self, sheet)
+        return _ig_orig_sv_set_ss(self, _i18n_ss(sheet))
     _SvView.setStyleSheet = _ig_sv_set_ss
 except NameError:
     pass                                            # older main.py without the new Library view
@@ -67767,7 +69257,7 @@ def _add_shortcut_action(app, card, title, exe_fn, tool_fn=lambda: "", cover="",
     return _gs_prev_add_shortcut_action(app, card, title, exe_fn, tool_fn, cover, key)
 
 _GS_PAGES = (("General", "info"), ("Launch Options", "terminal"), ("Compatibility", "chip"), ("Saves & Sync", "globe"),
-             ("Shortcuts & Steam", "link"), ("Files & Updates", "library"), ("Other", "gear"))
+             ("Shortcuts & Steam", "link"), ("Files & Updates", "library"), ("Builds", "library"), ("Other", "gear"))
 _GS_DESC = {
     "Open Game Location": "Open the folder the game is installed in.",
     "Create Desktop Shortcut": "Put a shortcut that starts this game on your desktop.",
@@ -67912,6 +69402,10 @@ class _SvGameSettings(QDialog):
                 if not self.key and not acts:
                     continue
                 page = self._launch_page(acts)
+            elif name == "Builds":
+                page = self._builds_page()
+                if page is None:
+                    continue
             else:
                 if not acts:
                     continue
@@ -68013,6 +69507,49 @@ class _SvGameSettings(QDialog):
         b.setEnabled(a.isEnabled())
         return self._row(text, desc, b)
 
+    def _builds_page(self):
+        """Fan games (Game Jolt): pick which downloaded build the Launch button starts, or download more builds."""
+        key = self.key or ""
+        if not key.startswith("fan-"):
+            return None
+        gid = key[4:]
+        entry = next((g for g in load_fan_library() if str(g.get("id")) == gid), None)
+        title = self.title_text
+        exes = _fan_build_exes(title)
+        link = (entry or {}).get("link", "")
+        if len(exes) < 2 and not link:
+            return None
+        pg = self._page("Builds", "Pick which downloaded build the Launch button starts.")
+        cur = _fan_installed_exe(title)
+        root = installed_game_dir(sanitize_folder_name(title))
+        for exe in exes:
+            rel = os.path.relpath(exe, root)
+            try:
+                size = _fmt_size(os.path.getsize(exe))
+            except Exception:
+                size = ""
+            sel = bool(cur) and os.path.normcase(cur) == os.path.normcase(exe)
+            b = self._btn("Selected" if sel else "Launch this", lambda _c=False, e=exe: self._pick_build(e))
+            b.setEnabled(not sel)
+            pg._v.addWidget(self._row(rel, size, b))
+        if link:
+            more = self._btn("Download...", lambda _c=False: (self.accept(), _fan_more_builds(
+                self.view.app, gid, title, (entry or {}).get("cover", ""), link)))
+            pg._v.addWidget(self._row("Download more builds", "Pick extra builds of this game to download next to the ones you have.", more))
+        pg._v.addStretch(1)
+        return pg
+
+    def _pick_build(self, exe):
+        _fan_set_launch_choice(self.title_text, exe)
+        i = self.stack.currentIndex()
+        old = self.stack.widget(i)
+        new = self._builds_page()
+        if new is not None:
+            self.stack.insertWidget(i, new)
+            self.stack.removeWidget(old)
+            old.deleteLater()
+            self.stack.setCurrentIndex(i)
+
     def _actions_page(self, name, acts):
         pg = self._page(name)
         for a in acts:
@@ -68082,8 +69619,11 @@ try:
     def _gs_sv_init(self, *a, **k):
         _gs_prev_sv_init(self, *a, **k)
         try:
-            self.gear.clicked.disconnect(self._show_menu)         # the gear opens the settings window; the arrow next to Play keeps the quick menu
+            self.gear.clicked.disconnect(self._show_menu)         # the gear and the arrow next to Play both open the game settings window
             self.gear.clicked.connect(self._open_game_settings)
+            self.drop.clicked.disconnect(self._show_menu)
+            self.drop.clicked.connect(self._open_game_settings)
+            self.drop.setToolTip("Game settings")
             self.gear.setToolTip("Game settings")
         except Exception:
             _log_exc("game settings gear")
