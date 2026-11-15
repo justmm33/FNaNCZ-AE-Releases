@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtCore import (Qt, QTimer, QVariantAnimation, QSequentialAnimationGroup, QEasingCurve,
                           QRectF, QPointF, QUrl, QObject, pyqtSignal, pyqtSlot)
 from PyQt6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPixmap, QPen, QPainterPath, QGuiApplication,
-                         QFontDatabase, QMovie, QDesktopServices)
+                         QFontDatabase, QMovie, QDesktopServices, QLinearGradient, QBrush)
 
 _LOG_EXC_LAST = {}      # where -> time of its last log line
 
@@ -435,6 +435,60 @@ def _fit_font(text, px, max_w, bold=True):
     return _make_font(9, bold)
 
 
+def _is_light():
+    return _light and not _sunset
+
+
+def _glass_body(p, h, radius=26):
+    """The toast's liquid-glass body in toast units (0,0 .. W,h): smoked glass (frosted white in light mode), a soft highlight
+    along the top, and the accent bleeding in from the left edge. No outline."""
+    light = _is_light()
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, W, h), radius, radius)
+    fill = QLinearGradient(0, 0, 0, h)
+    if light:
+        fill.setColorAt(0.0, QColor(255, 255, 255, 226))
+        fill.setColorAt(1.0, QColor(232, 234, 240, 206))
+    else:
+        fill.setColorAt(0.0, QColor(52, 52, 62, 214))
+        fill.setColorAt(1.0, QColor(14, 14, 19, 230))
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.fillPath(path, QBrush(fill))
+    p.setClipPath(path)
+    hh = min(h * 0.6, 64.0)
+    hi = QLinearGradient(0, 0, 0, hh)
+    hi.setColorAt(0.0, QColor(255, 255, 255, 150 if light else 48))
+    hi.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(0, 0, W, hh), QBrush(hi))
+    gw = BAR_W * 3.4
+    glow = QLinearGradient(0, 0, gw, 0)
+    for pos, a in ((0.0, 235), (0.12, 200), (0.35, 80), (1.0, 0)):
+        c = QColor(ACCENT)
+        c.setAlpha(a if not light else int(a * 0.8))
+        glow.setColorAt(pos, c)
+    p.fillRect(QRectF(0, 0, gw, h), QBrush(glow))
+    p.restore()
+
+
+def _glass_pill(p, rect, top, bottom):
+    path = QPainterPath()
+    path.addRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+    g = QLinearGradient(0, rect.top(), 0, rect.bottom())
+    g.setColorAt(0.0, top)
+    g.setColorAt(1.0, bottom)
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.fillPath(path, QBrush(g))
+    p.setClipPath(path)
+    hh = rect.height() * 0.55
+    hi = QLinearGradient(0, rect.top(), 0, rect.top() + hh)
+    hi.setColorAt(0.0, QColor(255, 255, 255, 70))
+    hi.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(rect.left(), rect.top(), rect.width(), hh), QBrush(hi))
+    p.restore()
+
+
 class PlayingToast(QWidget):
     def __init__(self, user, game, avatar_path=None, duration_ms=4000, prefix="is playing ", image_path=None,
                  badge_path=None, plain=False):
@@ -597,15 +651,7 @@ class PlayingToast(QWidget):
         p.translate(self._off, 0)
         p.scale(SCALE, SCALE)
         p.setClipRect(QRectF(0, 0, W, h))
-        p.fillRect(0, 0, W, h, BG)
-
-        # diagonal stripes
-        p.setPen(QPen(STRIPE, 16))
-        for x in range(-h, W + h, 64):
-            p.drawLine(x, h, x + h, 0)
-
-        # accent bar
-        p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _glass_body(p, h)
         _draw_icon(p, H / 2)
 
         if self.plain:
@@ -637,7 +683,7 @@ class PlayingToast(QWidget):
             br = QRectF(r.right() - 10 - bd / 2, r.bottom() - 10 - bd / 2, bd, bd)
             p.save()
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(BG)
+            p.setBrush(QColor(240, 240, 244) if _is_light() else QColor(24, 24, 30))
             p.drawEllipse(br.adjusted(-3, -3, 3, 3))          # ring that separates it from the group icon
             bp = QPainterPath()
             bp.addEllipse(br)
@@ -756,11 +802,7 @@ class InviteToast(PlayingToast):
         p.translate(self._off, 0)
         p.scale(SCALE, SCALE)
         p.setClipRect(QRectF(0, 0, W, h))
-        p.fillRect(0, 0, W, h, BG)
-        p.setPen(QPen(STRIPE, 16))
-        for x in range(-h, W + h, 64):
-            p.drawLine(x, h, x + h, 0)
-        p.fillRect(0, 0, BAR_W, h, ACCENT)
+        _glass_body(p, h)
         _draw_icon(p, 12 + ICON_D / 2)
 
         # cover
@@ -813,14 +855,16 @@ class InviteToast(PlayingToast):
         for rect, text, primary, key in ((self._accept_r, "Accept", True, "accept"),
                                          (self._dismiss_r, "Dismiss", False, "dismiss")):
             hot = self._hover == key
-            bp = QPainterPath()
-            bp.addRoundedRect(rect, 8, 8)
             if primary:
                 col = QColor(ACCENT).lighter(115) if hot else QColor(ACCENT)
-                p.fillPath(bp, col)
+                _glass_pill(p, rect, col.lighter(112), col.darker(112))
                 txt = QColor("white") if col.lightnessF() < 0.6 else QColor("#111111")
             else:
-                p.fillPath(bp, QColor(128, 128, 128, 80 if hot else 40))
+                if _is_light():
+                    top, bot = QColor(0, 0, 0, 40 if hot else 24), QColor(0, 0, 0, 26 if hot else 14)
+                else:
+                    top, bot = QColor(255, 255, 255, 58 if hot else 38), QColor(255, 255, 255, 30 if hot else 16)
+                _glass_pill(p, rect, top, bot)
                 txt = TEXT_COLOR
             p.setPen(txt)
             p.setFont(_make_font(16, True))
