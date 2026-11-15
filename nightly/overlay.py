@@ -160,8 +160,6 @@ def _assets_dirs():
 
 
 def _toast_font_family():
-    """Registers assets/ubuntu.ttf (plus ubuntu-bold.ttf etc. next to it) once and returns its family name.
-    Runs in the helper process too, which is why it doesn't rely on the launcher having loaded it."""
     if _font_family["tried"]:
         return _font_family["name"]
     _font_family["tried"] = True
@@ -170,8 +168,8 @@ def _toast_font_family():
             names = sorted(os.listdir(d))
         except OSError:
             continue
-        files = [n for n in names if n.lower().startswith("ubuntu") and n.lower().endswith((".ttf", ".otf"))]
-        files.sort(key=lambda n: n.lower() != "ubuntu.ttf")      # ubuntu.ttf first: it decides the family name
+        files = [n for n in names if n.lower().startswith("sf-pro") and n.lower().endswith((".ttf", ".otf"))]
+        files.sort(key=lambda n: "regular" not in n.lower())
         for n in files:
             fid = QFontDatabase.addApplicationFont(os.path.join(d, n))
             if fid != -1 and not _font_family["name"]:
@@ -181,8 +179,6 @@ def _toast_font_family():
         if _font_family["name"]:
             break
     return _font_family["name"]
-
-
 def _make_font(px, bold):
     f = QFont()
     fam = _toast_font_family()
