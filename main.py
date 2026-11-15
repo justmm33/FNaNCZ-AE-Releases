@@ -98,7 +98,7 @@ from string import Template
 #   GE Proton tab (Linux only)
 #   Wine tab (Linux only)
 #   H toggles the download browser window
-#   Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store)
+#   Fangames tab (Game Jolt list from fan_games.csv, same UI as the Store)
 #   Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv)
 #   fan games in the Library (bottom section, horizontal cards)
 #   "use existing file or download again" for steam + Game Jolt installs
@@ -177,7 +177,7 @@ from string import Template
 #   itch.io fan games
 #   covers + details page (the details page reads a Game Jolt shaped dict, so we hand it one)
 #   downloading (itch.io's own download flow: page -> download_url -> file -> signed link)
-#   the "itch.io Games" button on the Fan Games page
+#   GameBanana fan games + one Scrape Games button / background refresh for itch.io and GameBanana
 #   Store: Trending / Most Popular / Works on your PC
 #   "Can I run it": processor + graphics card
 #   NCZ Big Picture mode
@@ -191,7 +191,7 @@ from string import Template
 #   Workshop tab
 #   downloads stay inside Big Picture
 #   X sidebar (the launcher's 3-dot menu)
-#   Fan Games tab
+#   Fangames tab
 #   Garry's Mod Addons tab
 #   Big Picture chat: game invites + attachments
 #   media (thumbnails, invite covers)
@@ -924,7 +924,7 @@ def load_launcher_settings():
 
 def _load_launcher_settings_file():
     settings = {"dark_mode": "system", "steamgriddb_api_key": "", "currency": "EGP", "wine_d3d": "default",
-                "library_sort": "custom", "discord_rpc": True, "install_dir": "", "library_dirs": [],
+                "library_sort": "custom", "library_layout": "steam", "discord_rpc": True, "install_dir": "", "library_dirs": [],
                 "start_on_boot": True, "auto_update": True, "xwayland_mode": True,
                 "start_minimized": True, "close_to_tray": True, "accent_color": "#a666ff",
                 "download_server": "1", "archive_tool": "", "discord_pfp_sync": True, "discord_pfp_hash": "",
@@ -945,6 +945,8 @@ def _load_launcher_settings_file():
                     settings["currency"] = loaded["currency"]       # any currency from the list (CURRENCIES is defined later)
                 if loaded.get("library_sort") in ("custom", "az"):
                     settings["library_sort"] = loaded["library_sort"]
+                if loaded.get("library_layout") in ("steam", "classic"):
+                    settings["library_layout"] = loaded["library_layout"]
                 if isinstance(loaded.get("install_dir"), str):
                     settings["install_dir"] = loaded["install_dir"].strip()
                 if isinstance(loaded.get("library_dirs"), list):
@@ -3884,6 +3886,8 @@ class SettingsPage(QWidget):
         layout.addSpacing(12)
         layout.addWidget(self._build_library_panel())
         layout.addSpacing(12)
+        layout.addWidget(self._build_library_layout_panel())
+        layout.addSpacing(12)
         layout.addWidget(self._build_archive_tool_panel())
 
         if sys.platform.startswith("linux"):
@@ -3958,6 +3962,42 @@ class SettingsPage(QWidget):
         btn_row.addStretch()
         pl.addLayout(btn_row)
         self._refresh_library_panel()
+        return panel
+
+    # ── Library layout: Steam-style or the classic card grid ──
+    def _build_library_layout_panel(self):
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(22, 18, 22, 18)
+        row = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        name = QLabel("Library Layout")
+        name.setObjectName("RowTitle")
+        desc = QLabel("Steam-style (game list on the left, big game page on the right) or the classic grid of cards. "
+                      "Restart the launcher to apply a change.")
+        desc.setObjectName("RowDesc")
+        desc.setWordWrap(True)
+        text.addWidget(name)
+        text.addWidget(desc)
+        combo = QComboBox()
+        combo.setFixedWidth(240)
+        combo.addItem("Steam-style", "steam")
+        combo.addItem("Classic grid", "classic")
+        combo.setCurrentIndex(1 if load_launcher_settings().get("library_layout") == "classic" else 0)
+        note = QLabel("")
+        note.setObjectName("RowDesc")
+        def changed(_i):
+            st = load_launcher_settings()
+            st["library_layout"] = combo.currentData()
+            save_launcher_settings(st)
+            note.setText("Saved. Restart the launcher to see the change.")
+        combo.currentIndexChanged.connect(changed)
+        row.addLayout(text, 1)
+        row.addWidget(combo)
+        pl.addLayout(row)
+        pl.addWidget(note)
         return panel
 
     # ── manual 7-Zip / WinRAR path (for PCs where auto-detection fails) ──
@@ -5334,6 +5374,18 @@ def fetch_sgdb_cover(appid, key):
 def _norm_title(text):
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
+# Games whose art must always come from Steam itself, never from SteamGridDB (Dying Light: The Beast).
+STEAM_ONLY_APPIDS = {3008130}
+
+def steam_only_art(appid=0, title=""):
+    """True for games that ignore SteamGridDB and use Steam's own art every time."""
+    try:
+        if int(appid or 0) in STEAM_ONLY_APPIDS:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return _norm_title(title).startswith("dyinglightthebeast")
+
 def fetch_sgdb_cover_by_name(title, key):
     """Last resort: find the game on SteamGridDB by exact (normalised) name, then take its best portrait cover."""
     found = _sgdb_get_json("/search/autocomplete/" + urllib.parse.quote(title, safe=""), key)
@@ -6564,14 +6616,15 @@ class CoverLoader(QObject):
         steam_path = os.path.join(folder, f"{appid}-steam.img")
         id_marker = os.path.join(folder, f"{appid}-nosgdb2")      # nothing on SteamGridDB for this Steam id
         name_marker = os.path.join(folder, f"{appid}-nosearch")   # nothing found by searching its name either
-        if os.path.exists(sgdb_path):
+        steam_only = steam_only_art(appid, title)        # Dying Light: The Beast: Steam art always, SteamGridDB is never asked
+        if os.path.exists(sgdb_path) and not steam_only:
             return sgdb_path
 
         def fresh(marker):
             return os.path.exists(marker) and time.time() - os.path.getmtime(marker) < NO_ART_RETRY_SECONDS
 
         def can_use_sgdb():
-            return bool(key) and not self._rejected
+            return bool(key) and not self._rejected and not steam_only
 
         # 1) community cover for this exact Steam game
         if can_use_sgdb() and not fresh(id_marker):
@@ -9139,7 +9192,7 @@ class AdaptiveApp(QMainWindow):
         lay = QVBoxLayout(self.fan_section)
         lay.setContentsMargins(0, 16, 0, 0)
         lay.setSpacing(12)
-        head = QLabel("Fan Games")
+        head = QLabel("Fangames")
         head.setStyleSheet("font-size: 16px; font-weight: bold;")
         lay.addWidget(head)
         holder = QWidget()
@@ -9351,7 +9404,7 @@ class AdaptiveApp(QMainWindow):
         self._fan_create_library_card(entry)
         if getattr(self.__dict__.get("fan_detail_page"), "_appid", None) == gid:
             self.fan_detail_page.set_in_library(True)
-        # show it: switch the library to the Fan Games tab
+        # show it: switch the library to the Fangames tab
         self._lib_tab = "fan"
         btns = self.library_tabs.findChildren(QPushButton) if hasattr(self, "library_tabs") else []
         if len(btns) > 1:
@@ -9993,8 +10046,8 @@ class AdaptiveApp(QMainWindow):
             self.pages.setCurrentWidget(self.fan_detail_page)
 
         self._fan_build_library_section()
-        self.fan_section.layout().itemAt(0).widget().hide()      # the tab already says "Fan Games"
-        # Games / Fan Games switch under the Library header
+        self.fan_section.layout().itemAt(0).widget().hide()      # the tab already says "Fangames"
+        # Games / Fangames switch under the Library header
         self._lib_tab = "games"
         tabs = QWidget()
         tabs.setStyleSheet("QPushButton { padding: 6px 18px; border-radius: 8px; } "
@@ -10004,7 +10057,7 @@ class AdaptiveApp(QMainWindow):
         tl.setSpacing(8)
         group = QButtonGroup(tabs)
         group.setExclusive(True)
-        for key, label in (("games", "Games"), ("fan", "Fan Games")):
+        for key, label in (("games", "Games"), ("fan", "Fangames")):
             b = QPushButton(label)
             b.setCheckable(True)
             b.setChecked(key == "games")
@@ -10016,7 +10069,7 @@ class AdaptiveApp(QMainWindow):
         tl.addStretch()
         self.library_tabs = tabs
         self.search_edit.parentWidget().layout().insertWidget(2, tabs)
-        btn = self.make_nav_button("Fan Games", checkable=True)
+        btn = self.make_nav_button("Fangames", checkable=True)
         self.nav_group.addButton(btn, self.pages.indexOf(fan_ph))
         layout = self.nav_group.button(0).parent().layout()
         i = layout.indexOf(self.nav_group.button(4))
@@ -10947,6 +11000,7 @@ class DownloadsPage(QWidget):
             w = self.container_layout.itemAt(i).widget()
             if isinstance(w, DownloadCard) and getattr(w, "state", "active") != "active":
                 self.container_layout.removeWidget(w)
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
@@ -17305,11 +17359,29 @@ class FriendsPage(QWidget):
         d = self.__dict__.setdefault("_unread", {})
         d[key] = d.get(key, 0) + 1
         self.unread_changed.emit(sum(d.values()))
+        self._refresh_row_badges()
 
     def unread_clear(self, key):
         d = self.__dict__.setdefault("_unread", {})
         if d.pop(key, None) is not None:
             self.unread_changed.emit(sum(d.values()))
+            self._refresh_row_badges()
+
+    def _refresh_row_badges(self):
+        """The red unread circle on each friend row (same count the navbar badge adds up)."""
+        try:
+            counts = self.__dict__.get("_unread", {})
+            lay = self.rows_layout
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                b = getattr(w, "_unread_badge", None) if w is not None else None
+                if b is None:
+                    continue
+                n = counts.get(getattr(w, "_uid", None), 0)
+                b.setText("99+" if n > 99 else str(n))
+                b.setVisible(n > 0)
+        except (RuntimeError, AttributeError):    # expected: rows may be mid-rebuild or already deleted
+            pass
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -17748,10 +17820,22 @@ class FriendsPage(QWidget):
         c.addStretch()
         chev = QLabel("\u203A")
         chev.setStyleSheet("color: #888888; font-size: 26px; background: transparent;")
+        badge = QLabel()                         # red unread circle: shown when this friend texted you
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedHeight(24)
+        badge.setMinimumWidth(24)
+        badge.setStyleSheet("background: #e5484d; color: white; border-radius: 12px; font-size: 12px;"
+                            " font-weight: bold; padding: 0px 6px;")
+        n_unread = self.__dict__.get("_unread", {}).get(uid, 0)
+        badge.setText("99+" if n_unread > 99 else str(n_unread))
+        badge.setVisible(n_unread > 0)
+        btn._unread_badge = badge
+        btn._uid = uid
         r.addWidget(av)
         r.addLayout(c, 1)
+        r.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         r.addWidget(chev)
-        for w in (av, n, s, dot, chev):
+        for w in (av, n, s, dot, chev, badge):
             w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         btn.clicked.connect(lambda _=False, u=uid: self.open_friend(u))
         return btn
@@ -22547,7 +22631,7 @@ class _PwHeadlessKey(_QObject):
 
 
 
-# ── Fan Games tab (Game Jolt list from fan_games.csv, same UI as the Store) ──
+# ── Fangames tab (Game Jolt list from fan_games.csv, same UI as the Store) ──
 import csv as _csv
 
 def _fan_csv_path():
@@ -22634,7 +22718,7 @@ class AddFanGameDialog(QDialog):
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Game name")
         self.link_edit = QLineEdit()
-        self.link_edit.setPlaceholderText("https://gamejolt.com/games/name/12345")
+        self.link_edit.setPlaceholderText("Game Jolt, itch.io or GameBanana link")
         self.cat_combo = QComboBox()
         for label, tag in categories:
             if tag:
@@ -23288,7 +23372,7 @@ class FanDetailPage(StoreDetailPage):
         self._shot_urls = []
         for b in self.findChildren(QPushButton):
             if b.text().startswith("< Back"):
-                b.setText("< Back to Fan Games")
+                b.setText("< Back to Fangames")
         self.price_label.hide()
         self.price_flag.hide()
         self.install_cb = None  # set by the app: (id, title, cover, link)
@@ -23993,14 +24077,14 @@ class FanGamesPage(StorePage):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.tags_btn.hide()    # Fan Games has its own tag buttons
+        self.tags_btn.hide()    # Fangames has its own tag buttons
         self.loader.shutdown()
         self.loader = FanCoverLoader()
         self.loader.loaded.connect(self._on_cover_loaded)
         self._links_map = None      # self._links is built on first use (reading 15k fan games here cost ~0.4 s at startup)
         lbl = self.findChild(QLabel, "PageTitle")
         if lbl:
-            lbl.setText("Fan Games")
+            lbl.setText("Fangames")
         self.search_edit.setPlaceholderText("Search fan games")
 
         # category buttons (All + built-in + any custom ones) and the Add Game button
@@ -24181,7 +24265,7 @@ def _fan_apply_filter(self, text=""):
         self.empty_label.setText("No games match your search.")
         self.empty_label.setVisible(n == 0)
         return
-    # Fan Games tab: no normal cards
+    # Fangames tab: no normal cards
     while self.grid.count():
         self.grid.takeAt(0)
     for card, _t in self.cards:
@@ -24201,7 +24285,7 @@ def _fan_apply_filter(self, text=""):
         self.grid.addWidget(self.fan_section, 0, 0, 1, cols)
     self.count_label.setText(f"{shown} fan game{'s' if shown != 1 else ''}")
     self.empty_label.setText("No games match your search." if query else
-                             "No fan games yet. Add some from the Fan Games page.")
+                             "No fan games yet. Add some from the Fangames page.")
     self.empty_label.setVisible(shown == 0)
 
 AdaptiveApp.apply_filter = _fan_apply_filter    # kept as patch chain: two wrappers call the original inside a condition or twice
@@ -25280,7 +25364,7 @@ class AddExistingFanGameDialog(QDialog):
         item = self.games.currentItem()
         if item is None:
             QMessageBox.warning(self, "Add Existing Fan Game", "Pick a game from the list first.\n"
-                                "Not there? Add it first with \"+ Add Game\" on the Fan Games page.")
+                                "Not there? Add it first with \"+ Add Game\" on the Fangames page.")
             return
         exe = self.exe_edit.text().strip()
         if not exe or not os.path.exists(exe):
@@ -30691,7 +30775,7 @@ def _nav_tab_icon(kind):
         icon.addPixmap(pm, mode, state)
     return icon
 
-_NAV_TAB_KINDS = {"Library": "library", "Store": "store", "Fan Games": "fan", "Friends": "friends",
+_NAV_TAB_KINDS = {"Library": "library", "Store": "store", "Fangames": "fan", "Friends": "friends",
                   "Steam Workshop": "workshop", "Garry's Mod Addon Manager": "addon",
                   "GE Proton": "proton", "Wine": "wine"}
 
@@ -31201,6 +31285,7 @@ class ProfileView(QWidget):
             item = lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
@@ -33613,7 +33698,7 @@ def _ui_stagger_library(self, base=0):
         _ui_fade_in(c, 460, base + min(i, 12) * 70)
 
 def _ui_restyle_store(self, attr="store_page"):
-    """Store (and Fan Games, which is the same page): title, count, search and Tags move into one rounded toolbar
+    """Store (and Fangames, which is the same page): title, count, search and Tags move into one rounded toolbar
     instead of a bare header row."""
     sp = getattr(self, attr)
     lay = sp.layout()
@@ -39872,6 +39957,54 @@ def _ch_bot_pic(cfg, size=64):
         return pm
     return _fo_avatar(_ch_bot_avatar_file(cfg), cfg["name"][:1].upper(), size)
 
+_ch_dom_cache = {}
+
+def _ch_bot_card_color(cfg):
+    """The most common colour in the bot's real picture (the card's side bar); the bot's own colour until its picture exists."""
+    slug = re.sub(r"[^a-z0-9]+", "", cfg["name"].lower())
+    path = None
+    for e in ("png", "jpg", "jpeg", "webp"):
+        f = os.path.join(asset_path("chess"), "bots", slug + "." + e)
+        if os.path.isfile(f):
+            path = f
+            break
+    if path is None:
+        f = os.path.join(_ch_discord_dir(), slug + ".png")
+        path = f if os.path.isfile(f) else None
+    if path is None:
+        return cfg["color"]
+    try:
+        key = (path, os.path.getmtime(path))
+        if key in _ch_dom_cache:
+            return _ch_dom_cache[key]
+        img = QImage(path)
+        if img.isNull():
+            return cfg["color"]
+        img = img.scaled(48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        buckets = {}
+        for y in range(48):
+            for x in range(48):
+                if (x - 23.5) ** 2 + (y - 23.5) ** 2 > 24 * 24:      # the picture is shown as a circle
+                    continue
+                c = img.pixelColor(x, y)
+                if c.alpha() < 128:
+                    continue
+                k = (c.red() >> 5, c.green() >> 5, c.blue() >> 5)       # 8 levels per channel
+                b = buckets.setdefault(k, [0, 0, 0, 0])
+                b[0] += 1
+                b[1] += c.red()
+                b[2] += c.green()
+                b[3] += c.blue()
+        if not buckets:
+            return cfg["color"]
+        n, r, g, bl = max(buckets.values(), key=lambda v: v[0])
+        out = QColor(r // n, g // n, bl // n).name()
+        _ch_dom_cache[key] = out
+        return out
+    except Exception:
+        return cfg["color"]
+
 def _ch_discord_log(msg):
     _ncz_log("chess: " + msg)
     try:
@@ -39904,11 +40037,15 @@ def _ch_http_bytes(url):
     if "klipy" in url:
         hdr["Referer"] = "https://klipy.com/"
     req = urllib.request.Request(url, headers=hdr)
-    with urllib.request.urlopen(req, timeout=10, context=_NCZ_SSL_CTX) as r:
+    with urllib.request.urlopen(req, timeout=8, context=_NCZ_SSL_CTX) as r:
         return r.read(), (r.headers.get("Content-Type") or "").lower()
+
+_ch_dead_lookups = set()     # lookup sites that couldn't be reached (dead / blocked): skipped for the rest of this run
 
 def _ch_discord_fetch_one(uid, out):
     for tpl in _CH_DISCORD_LOOKUPS:
+        if tpl in _ch_dead_lookups:
+            continue
         url = tpl.format(id=uid)
         try:
             data, ctype = _ch_http_bytes(url)
@@ -39931,25 +40068,25 @@ def _ch_discord_fetch_one(uid, out):
         except Exception as e:
             _ch_discord_log(f"{uid}: {url} failed: {e}")
             if isinstance(e, (urllib.error.URLError, OSError, TimeoutError)):
-                _ch_discord_state["offline"] = True          # couldn't even reach the site: probably no internet, stop waiting
-                return False
+                _ch_dead_lookups.add(tpl)       # this ONE site is unreachable: try the next one (it used to give up on everything)
     return False
 
 def _ch_discord_fetch_all():
     """Worker thread: download every bot picture that isn't saved yet. (Failures are written to chess_bot_discord/log.txt.)"""
     d = _ch_discord_dir()
     got = False
+    _ch_dead_lookups.clear()
+    _ch_discord_state["offline"] = False
     try:
         os.makedirs(d, exist_ok=True)
         open(os.path.join(d, "log.txt"), "w").close()
-        for slug, uid in _CH_BOT_DISCORD.items():
-            out = os.path.join(d, slug + ".png")
-            if os.path.isfile(out):
-                continue
-            if _ch_discord_fetch_one(uid, out):
-                got = True
-            elif _ch_discord_state["offline"]:
-                break
+        todo = [(slug, uid) for slug, uid in _CH_BOT_DISCORD.items() if not os.path.isfile(os.path.join(d, slug + ".png"))]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            results = list(ex.map(lambda su: _ch_discord_fetch_one(su[1], os.path.join(d, su[0] + ".png")), todo))
+        got = any(results)
+        if todo and not got and len(_ch_dead_lookups) >= len(_CH_DISCORD_LOOKUPS):
+            _ch_discord_state["offline"] = True      # every lookup site was unreachable: stop saying "Loading...", show the letters
     except Exception as e:
         _ncz_log(f"chess: bot picture download failed: {e}")
     finally:
@@ -41919,18 +42056,22 @@ class NczChessPage(QWidget):
         self.bg.run(_ch_fetch_win_gif, done)
 
     def _refresh_bot_avatars(self):
-        for av, cfg in getattr(self, "_bot_avs", []):
+        for av, cfg, card in getattr(self, "_bot_avs", []):
             try:
                 av.setPixmap(_ch_bot_pic(cfg, 64))
+                self._style_bot_card(card, cfg)
             except RuntimeError:    # expected: the widget or object may already be deleted
                 pass
 
-    def _bot_card(self, cfg):
-        col = cfg["color"]
-        card = QFrame()
-        card.setObjectName("ChBotCard")
+    def _style_bot_card(self, card, cfg):
+        col = _ch_bot_card_color(cfg)
         card.setStyleSheet(f"#ChBotCard {{ background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); "
                            f"border-left: 6px solid {col}; border-radius: 16px; }}")
+
+    def _bot_card(self, cfg):
+        card = QFrame()
+        card.setObjectName("ChBotCard")
+        self._style_bot_card(card, cfg)
         row = QHBoxLayout(card)
         row.setContentsMargins(14, 12, 14, 12)
         row.setSpacing(12)
@@ -41939,7 +42080,7 @@ class NczChessPage(QWidget):
         av.setPixmap(_ch_bot_pic(cfg, 64))
         if not hasattr(self, "_bot_avs"):
             self._bot_avs = []
-        self._bot_avs.append((av, cfg))
+        self._bot_avs.append((av, cfg, card))
         info = QVBoxLayout()
         info.setSpacing(2)
         top = QHBoxLayout()
@@ -43362,7 +43503,7 @@ class NczChessPage(QWidget):
 #    default). It reads your Discord user from the local Discord app (same pipe Rich Presence uses), so it needs the
 #    Discord desktop app open. It only copies when your Discord picture CHANGES, so a picture you pick by hand in the
 #    launcher stays until you change your Discord one.
-# 2) Fan Games gets an "itch.io Games" button that pulls free Windows fan games from itch.io into
+# 2) Fangames gets an "itch.io Games" button that pulls free Windows fan games from itch.io into
 #    fan_games_itch.csv (next to launcher.json). They show up in the same list/details page/library as Game Jolt ones.
 import socket as _socket
 import struct as _dstruct
@@ -43600,6 +43741,7 @@ SettingsPage.__init__ = _pfp_settings_init
 # itch.io games get the id  ITCH_ID_BASE + (itch game id)  so they never clash with Game Jolt ids and everything
 # that works on a fan game id (library, cloud sync, compat tool, uninstall) just works for them too.
 ITCH_ID_BASE = 1_000_000_000
+GB_ID_BASE = 2_000_000_000          # GameBanana mods: GB_ID_BASE + (GameBanana mod id)
 ITCH_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 # (launcher category tag, itch.io tags to browse). The empty category = generic fan game tags, shown under "All".
 ITCH_QUERIES = (("undertale", ("undertale",)),
@@ -43610,7 +43752,7 @@ ITCH_QUERIES = (("undertale", ("undertale",)),
 
 def _is_itch(gid):
     try:
-        return int(gid) >= ITCH_ID_BASE
+        return ITCH_ID_BASE <= int(gid) < GB_ID_BASE
     except (TypeError, ValueError):
         return False
 
@@ -43646,14 +43788,28 @@ def _itch_game(gid):
 _itch_orig_load_fan_games = load_fan_games
 _ITCH_MERGED = {"for": None}
 
+def _fan_dedupe_key(name):
+    """Same game, different site: "Undertale Yellow", "UNDERTALE YELLOW (Demo)" and "Undertale Yellow - Fangame" match."""
+    t = html_lib.unescape(str(name or "")).lower()
+    t = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", t)
+    t = re.sub(r"\b(fan ?game|demo|official)\b", " ", t)
+    return re.sub(r"[^a-z0-9]+", "", t) or re.sub(r"\s+", "", str(name or "").lower())
+
 def _load_fan_games_with_itch():
+    """Game Jolt list + itch.io + GameBanana in one list. Game Jolt wins, then itch.io, then GameBanana:
+    an id or a name that is already in the list is never added a second time."""
     games = _itch_orig_load_fan_games()
     if _ITCH_MERGED["for"] is not games:        # reload_fan_games() builds a new list, so this runs again then
-        have = {g[0] for g in games}
-        for gid, name, link, tags, _cover in load_itch_games():
-            if gid not in have:
+        have_ids = {g[0] for g in games}
+        have_names = {_fan_dedupe_key(g[1]) for g in games}
+        for loader in (load_itch_games, globals().get("load_gb_games", lambda: [])):
+            for gid, name, link, tags, _cover in loader():
+                key = _fan_dedupe_key(name)
+                if gid in have_ids or key in have_names:
+                    continue
                 games.append((gid, name, link, tags))
-                have.add(gid)
+                have_ids.add(gid)
+                have_names.add(key)
         _ITCH_MERGED["for"] = games
     return games
 
@@ -43978,37 +44134,605 @@ def _fan_install_itch(self, gid, title, cover_path, link):
 
 AdaptiveApp._fan_install = _fan_install_itch    # kept as patch chain: the wrapper calls the original inside a condition
 
-# ── the "itch.io Games" button on the Fan Games page ──
-def _itch_scrape_clicked(self):
-    pages, ok = QInputDialog.getInt(self, "itch.io Games",
-                                    "How many pages per category? (about 36 games per page, more pages take longer)",
-                                    3, 1, 10)
-    if not ok:
+# ── GameBanana fan games (same list, details page, library and install flow as Game Jolt / itch.io) ──
+# GameBanana mods get the id  GB_ID_BASE + (mod id). They come from the GameBanana API (apiv11), are saved to
+# fan_games_gamebanana.csv next to launcher.json, and are added to the Fangames list when no game with the same
+# name is in it already (Game Jolt first, then itch.io, then GameBanana).
+GB_API = "https://gamebanana.com/apiv11"
+GB_UA = "NCZ-Games-Launcher"
+# (launcher category tag, GameBanana game names to look up). The mods of those games are the fan content.
+GB_QUERIES = (("fnf", ("Friday Night Funkin'",)),
+              ("undertale", ("Undertale",)),
+              ("fnaf", ("Five Nights at Freddy's",)),
+              ("bendy", ("Bendy and the Ink Machine",)))
+GB_KNOWN_GAME_IDS = {"friday night funkin'": 8694}      # used when the name lookup gives nothing
+
+def _is_gb(gid):
+    try:
+        return int(gid) >= GB_ID_BASE
+    except (TypeError, ValueError):
+        return False
+
+def get_gb_csv_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "fan_games_gamebanana.csv")
+
+def _ext_csv_load(path, base):
+    """[(gid, name, link, tags(set), cover_url)] from an id,name,link,tags,cover csv whose ids are shifted by `base`."""
+    games = []
+    if not os.path.exists(path):
+        return games
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    gid = base + int(row.get("id") or 0)
+                except ValueError:
+                    continue
+                name = (row.get("name") or "").strip()
+                link = (row.get("link") or "").strip()
+                if not (name and link and gid > base):
+                    continue
+                tags = {t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()}
+                games.append((gid, name, link, tags, (row.get("cover") or "").strip()))
+    except Exception:    # expected: file may not exist yet or be unreadable
+        pass
+    return games
+
+def _ext_csv_save(path, rows):
+    """rows: {site id: [name, link, set(tags), cover]}"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["id", "name", "link", "tags", "cover"])
+        for iid, (name, link, tags, cover) in sorted(rows.items()):
+            w.writerow([iid, name, link, ",".join(sorted(tags)), cover])
+    os.replace(tmp, path)
+
+def load_gb_games():
+    return _ext_csv_load(get_gb_csv_path(), GB_ID_BASE)
+
+def _gb_game(gid):
+    return next((g for g in load_gb_games() if g[0] == gid), None)
+
+def _gb_json(url, timeout=30):
+    raw = _http_get(url, headers={"User-Agent": GB_UA, "Accept": "application/json"}, timeout=timeout)
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+def _gb_first_id(obj):
+    """First _idRow found anywhere in a reply (the name lookup's exact shape is not fixed)."""
+    if isinstance(obj, dict):
+        v = obj.get("_idRow")
+        if isinstance(v, int):
+            return v
+        for x in obj.values():
+            r = _gb_first_id(x)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for x in obj:
+            r = _gb_first_id(x)
+            if r:
+                return r
+    return 0
+
+def _gb_img_url(media):
+    imgs = (media or {}).get("_aImages") if isinstance(media, dict) else None
+    for im in imgs or []:
+        base, f = im.get("_sBaseUrl"), im.get("_sFile")
+        if base and f:
+            return f"{base}/{f}"
+    return ""
+
+def _gb_game_id(name):
+    try:
+        gid = _gb_first_id(_gb_json(f"{GB_API}/Util/Game/NameMatch?_sName={urllib.parse.quote(name)}"))
+        if gid:
+            return gid
+    except Exception:
+        _log_exc("_gb_game_id")
+    return GB_KNOWN_GAME_IDS.get(name.lower(), 0)
+
+def _gb_fetch_records(game_id, page, errors):
+    q = urllib.parse.quote("[Generic_Game]")
+    urls = [f"{GB_API}/Mod/Index?_nPage={page}&_nPerpage=50&_aFilters{q}={game_id}&_sSort=Generic_MostDownloaded",
+            f"{GB_API}/Game/{game_id}/Subfeed?_nPage={page}&_nPerpage=50&_csvModelInclusions=Mod"]
+    for url in urls:
+        try:
+            recs = _gb_json(url).get("_aRecords") or []
+            out = []
+            for r in recs:
+                if not isinstance(r, dict) or r.get("_sModelName") not in (None, "", "Mod"):
+                    continue
+                mid, name = r.get("_idRow"), html_lib.unescape(str(r.get("_sName") or "")).strip()
+                if not (isinstance(mid, int) and name):
+                    continue
+                out.append((mid, name, r.get("_sProfileUrl") or f"https://gamebanana.com/mods/{mid}",
+                            _gb_img_url(r.get("_aPreviewMedia"))))
+            if out:
+                return out
+            errors.append(f"{url}: no mods in the reply")
+        except Exception as e:
+            errors.append(f"{url}: {type(e).__name__}: {e}")
+    return []
+
+def scrape_gamebanana_games(pages=3):
+    """Merges GameBanana mods into fan_games_gamebanana.csv. Returns how many are new."""
+    found, errors = {}, []
+    for cat, names in GB_QUERIES:
+        for name in names:
+            gid = _gb_game_id(name)
+            if not gid:
+                errors.append(f"{name}: game not found on GameBanana")
+                continue
+            for page in range(1, pages + 1):
+                recs = _gb_fetch_records(gid, page, errors)
+                if not recs:
+                    break
+                for mid, title, link, cover in recs:
+                    e = found.setdefault(mid, [title, link, set(), cover])
+                    e[2].add(cat)
+                time.sleep(0.4)
+    if not found:
+        try:
+            with open(os.path.join(os.path.dirname(get_launcher_settings_path()), "gamebanana_debug.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + "\n".join(errors[-12:]) + "\n\n")
+        except Exception:
+            _log_exc("scrape_gamebanana_games")
+        raise RuntimeError("Couldn't get any games from GameBanana.\n\nLast problem: " + (errors[-1] if errors else "none") +
+                           "\n\n(Full details are in gamebanana_debug.log next to launcher.json.)")
+    old = {g[0] - GB_ID_BASE: [g[1], g[2], set(g[3]), g[4]] for g in load_gb_games()}
+    new_count = len([i for i in found if i not in old])
+    for mid, e in found.items():
+        if mid in old:
+            old[mid][2] |= e[2]
+            old[mid][3] = old[mid][3] or e[3]
+        else:
+            old[mid] = e
+    _ext_csv_save(get_gb_csv_path(), old)
+    return new_count
+
+# ── covers + details page ──
+_gb_prev_cover_fetch = FanCoverLoader._fetch
+
+def _gb_cover_fetch(self, appid, img_base, key, title):
+    if not _is_gb(appid):
+        return _gb_prev_cover_fetch(self, appid, img_base, key, title)
+    folder = get_fan_cover_dir()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{appid}.img")
+    marker = os.path.join(folder, f"{appid}-gbnone")
+    if os.path.exists(path):
+        return path
+    if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 24 * 3600:
+        return ""
+    g = _gb_game(appid)
+    url = g[4] if g else ""
+    if url:
+        try:
+            data = _http_get(url, headers={"User-Agent": GB_UA}, timeout=15)
+            if data:
+                with open(path, "wb") as f:
+                    f.write(data)
+                return path
+        except Exception:    # expected: offline or the server did not answer
+            pass
+    open(marker, "w").close()
+    return ""
+
+FanCoverLoader._fetch = _gb_cover_fetch
+
+def fetch_gb_overview(gid):
+    g = _gb_game(gid)
+    if not g:
+        raise RuntimeError("This GameBanana mod isn't in your list any more.")
+    cache_dir = os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_overview")
+    cache_file = os.path.join(cache_dir, f"{gid}.json")
+    try:
+        if time.time() - os.path.getmtime(cache_file) < 6 * 3600:
+            with open(cache_file, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:    # expected: file may not exist yet or be unreadable
+        pass
+    data = _gb_json(f"{GB_API}/Mod/{gid - GB_ID_BASE}/ProfilePage")
+    shots = []
+    for im in ((data.get("_aPreviewMedia") or {}).get("_aImages") or []):
+        if im.get("_sBaseUrl") and im.get("_sFile"):
+            shots.append(f"{im['_sBaseUrl']}/{im['_sFile']}")
+    cover = (shots[0] if shots else "") or g[4]
+    desc = str(data.get("_sText") or data.get("_sDescription") or "")
+    dev = ((data.get("_aSubmitter") or {}).get("_sName")) or "GameBanana"
+    game = {"description_compiled": desc,
+            "thumbnail_media_item": {"img_url": cover} if cover else {},
+            "developer": {"display_name": dev},
+            "mediaItems": [{"type": "image", "img_url": u} for u in shots[1:9]],
+            "compatibility": {"os_windows": True, "os_linux": False, "os_mac": False, "type_html": False}}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(game, f)
+    except Exception:    # expected: file may not exist yet or be unreadable
+        pass
+    return game
+
+_gb_orig_overview = fetch_fan_overview
+
+def fetch_fan_overview(gid):
+    if _is_gb(gid):
+        return fetch_gb_overview(gid)
+    return _gb_orig_overview(gid)
+
+_gb_prev_show_game = FanDetailPage.show_game
+
+def _gb_show_game(self, appid, title, *a, **k):
+    _gb_prev_show_game(self, appid, title, *a, **k)
+    if _is_gb(appid):
+        self.meta_label.setText("Fan game  \u2022  GameBanana")
+
+FanDetailPage.show_game = _gb_show_game
+_gb_prev_on_details = FanDetailPage._on_fan_details
+
+def _gb_on_details(self, result):
+    _gb_prev_on_details(self, result)
+    try:
+        if _is_gb(result[0]) and result[0] == self._appid:
+            dev = result[2]
+            self.meta_label.setText("  \u2022  ".join(([f"by {dev}"] if dev else []) + ["GameBanana fan game"]))
+    except Exception:
+        _log_exc("_gb_on_details")
+
+FanDetailPage._on_fan_details = _gb_on_details
+
+# ── downloading (GameBanana: mod page -> file list -> gamebanana.com/dl/<file id>) ──
+def _gb_find_link(worker, game_url):
+    """(url, headers) of the real download. Asks which file when a mod has several."""
+    m = re.search(r"gamebanana\.com/[A-Za-z]+/(\d+)", game_url or "")
+    if not m:
+        raise ValueError("This GameBanana link isn't a mod page.")
+    data = _gb_json(f"{GB_API}/Mod/{m.group(1)}/ProfilePage")
+    files = [f for f in (data.get("_aFiles") or []) if isinstance(f, dict) and f.get("_idRow")]
+    if not files:
+        raise ValueError("This GameBanana mod has no files to download.")
+    builds = []
+    for f in files:
+        fname = str(f.get("_sFile") or "")
+        builds.append({"id": str(f["_idRow"]), "pkg": fname or f"Download {f['_idRow']}", "filename": fname,
+                       "size": int(f.get("_nFilesize") or 0), "windows": True, "linux": False, "mac": False,
+                       "win64": False, "url": f.get("_sDownloadUrl") or f"https://gamebanana.com/dl/{f['_idRow']}"})
+    builds.sort(key=lambda b: (not b["filename"].lower().endswith((".zip", ".exe", ".7z", ".rar")), -b["size"]))
+    chosen = builds[0]
+    if len(builds) > 1:
+        for i, b in enumerate(builds):
+            b["primary"] = i == 0
+        picked = worker.ask_build(builds)
+        if picked is None:
+            raise ValueError("CANCELLED")
+        chosen = next((b for b in builds if b["id"] == picked), builds[0])
+    return chosen["url"], {"User-Agent": GB_UA, "Referer": game_url}
+
+class GbDownloadWorker(GameJoltDownloadWorker):
+    def run(self):
+        dest_path, fresh = None, False
+        try:
+            if self.existing_zip_path and os.path.exists(self.existing_zip_path):
+                dest_path = self.existing_zip_path
+            else:
+                url, headers = _gb_find_link(self, self.game_url)
+                self.download_url = url
+                dest_path = _gj_stream(self, url, headers, lambda: _gb_find_link(self, self.game_url))
+                fresh = True
+            if self._is_cancelled:
+                if fresh and os.path.exists(dest_path):
+                    os.remove(dest_path)
+                self.failed.emit("CANCELLED")
+                return
+            self.status_update.emit("Installing...")
+            _gj_install_file(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+            self.finished.emit(dest_path)
+        except Exception as e:
+            if self._is_cancelled or str(e) == "CANCELLED":
+                self.failed.emit("CANCELLED")
+                return
+            self.failed.emit(str(e))
+
+_gb_prev_fan_install = AdaptiveApp._fan_install
+
+def _fan_install_gb(self, gid, title, cover_path, link):
+    if not _is_gb(gid) or _fan_installed_exe(title):      # installed already: the normal code launches it
+        return _gb_prev_fan_install(self, gid, title, cover_path, link)
+    if not link:
+        QMessageBox.warning(self, "Install", "This game has no GameBanana link.")
         return
-    busy = BusyDialog("Getting fan games from itch.io...", lambda: scrape_itch_games(pages), self)
-    ok, added, error = busy.run()
-    if not ok:
-        QMessageBox.warning(self, "itch.io Games", error or "Couldn't get games from itch.io.")
+    cancelled, existing = _ask_existing_archive(self, title)
+    if cancelled:
         return
-    games = reload_fan_games()
-    self._links = {gid: l for gid, _t, l, _tg in games}
-    self._build_tag_buttons()
-    self._set_tag(self._tag)
-    QMessageBox.information(self, "itch.io Games", f"Added {added} new fan game{'s' if added != 1 else ''} from itch.io.")
+    worker = GbDownloadWorker(title, link, gid, existing)
+    worker.pick_build.connect(lambda builds, w=worker: _gj_show_build_dialog(self, w, builds))
+    worker.finished.connect(lambda _p, g=gid: self._fan_refresh(g))
+    card = DownloadCard(title, link, 0, cover_path or "", self, worker=worker)
+    self.downloads_page.add_download_card(card)
+    self.nav_group.button(6).setChecked(True)
+    self.pages.setCurrentWidget(self.downloads_page)
 
-FanGamesPage._itch_scrape_clicked = _itch_scrape_clicked
-_itch_prev_build_tags = FanGamesPage._build_tag_buttons
+AdaptiveApp._fan_install = _fan_install_gb    # kept as patch chain: the wrapper calls the original inside a condition
 
-def _itch_build_tags(self):
-    _itch_prev_build_tags(self)
-    b = QPushButton("itch.io Games")
-    b.setCursor(Qt.CursorShape.PointingHandCursor)
-    b.setFixedHeight(32)
-    b.setToolTip("Get free Windows fan games from itch.io and add them to this list")
-    b.clicked.connect(self._itch_scrape_clicked)
-    self._tag_row.addWidget(b)
+# ── one Scrape Games button for all three sites, plus a quiet background refresh (like the Game Jolt list, it just shows up) ──
+def scrape_other_fan_games(pages=3):
+    """itch.io + GameBanana. A site that fails doesn't stop the other. Returns a short summary."""
+    parts, problems = [], []
+    for label, fn in (("itch.io", scrape_itch_games), ("GameBanana", scrape_gamebanana_games)):
+        try:
+            n = fn(pages)
+            parts.append(f"{label}: {n} new")
+        except Exception as e:
+            problems.append(f"{label}: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+    if not parts:
+        raise RuntimeError("Couldn't get games from itch.io or GameBanana.\n\n" + "\n".join(problems))
+    return ", ".join(parts) + (("\n\nCouldn't update: " + "; ".join(problems)) if problems else "")
 
-FanGamesPage._build_tag_buttons = _itch_build_tags
+def _fan_ext_refresh(page):
+    try:
+        games = reload_fan_games()
+        page._links = {gid: l for gid, _t, l, _tg in games}
+        page._build_tag_buttons()
+        page._set_tag(page._tag)
+    except RuntimeError:
+        pass            # the page was deleted
+    except Exception:
+        _log_exc("_fan_ext_refresh")
+
+def _fan_scrape_games(self):
+    dlg = ScrapeOptionsDialog(self)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return
+    prog = ScrapeProgressDialog(self, dlg.count())
+    prog.exec()
+    busy = BusyDialog("Getting fan games from itch.io and GameBanana...", lambda: scrape_other_fan_games(3), self)
+    ok, summary, error = busy.run()
+    _fan_ext_refresh(self)
+    if ok:
+        QMessageBox.information(self, "Scrape Games", f"Done.\n\n{summary}")
+    elif not prog.success:
+        QMessageBox.warning(self, "Scrape Games", error or "Couldn't get games.")
+
+FanGamesPage._scrape_games = _fan_scrape_games
+
+_FAN_EXT_AUTO = {"started": False}
+
+def _fan_ext_auto(page):
+    """Once per launch: when the itch.io / GameBanana lists are missing or a week old, fetch them in the background."""
+    if _FAN_EXT_AUTO["started"]:
+        return
+    _FAN_EXT_AUTO["started"] = True
+    def stale(path):
+        try:
+            return time.time() - os.path.getmtime(path) > 7 * 86400
+        except OSError:
+            return True
+    if not (stale(get_itch_csv_path()) or stale(get_gb_csv_path())):
+        return
+    w = TaskWorker(lambda: scrape_other_fan_games(2))
+    _remote_workers.add(w)
+    w.done.connect(lambda _r, pg=page: _fan_ext_refresh(pg))
+    w.failed.connect(lambda _e: None)
+    w.finished.connect(lambda: _remote_workers.discard(w))
+    w.start()
+
+_fan_ext_prev_show = FanGamesPage.showEvent
+
+def _fan_ext_show(self, event):
+    _fan_ext_prev_show(self, event)
+    QTimer.singleShot(1500, lambda: _fan_ext_auto(self))
+
+FanGamesPage.showEvent = _fan_ext_show
+
+# ── "Refresh Cover" in the 3-dot menu of a Fangames card in the Library ──
+def _fan_fetch_fresh_cover(gid, link, title):
+    """Throws away the cached cover + page data of a fan game and downloads the cover again. Returns the new file ('' if none)."""
+    folder = get_fan_cover_dir()
+    os.makedirs(folder, exist_ok=True)
+    try:
+        for fn in os.listdir(folder):
+            if fn == f"{gid}.img" or fn.startswith(f"{gid}-"):
+                os.remove(os.path.join(folder, fn))
+    except OSError:
+        _log_exc("_fan_fetch_fresh_cover cache")
+    try:
+        os.remove(os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "fan_overview", f"{gid}.json"))
+    except OSError:    # expected: nothing cached
+        pass
+    url = ""
+    try:
+        url = fan_cover_from_game(fetch_fan_overview(gid))
+    except Exception:    # expected: offline or the server did not answer
+        pass
+    if not url and link:
+        try:
+            page = _http_get(link, headers={"User-Agent": ITCH_UA}, timeout=15).decode("utf-8", errors="replace")
+            for rx in _OG_RES:
+                m = rx.search(page)
+                if m:
+                    url = html_lib.unescape(m.group(1))
+                    break
+        except Exception:    # expected: offline or the server did not answer
+            pass
+    if not url:
+        return ""
+    data = _http_get(url, timeout=20)
+    if not data:
+        return ""
+    path = os.path.join(folder, f"{gid}.img")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+def _fan_refresh_cover(self, gid):
+    entry = next((g for g in load_fan_library() if g["id"] == gid), None)
+    if not entry:
+        return
+    title, link = entry["title"], entry.get("link", "")
+    busy = BusyDialog(f"Getting a new cover for {title}...", lambda: _fan_fetch_fresh_cover(gid, link, title), self)
+    ok, path, error = busy.run()
+    if not (ok and path and os.path.exists(path)):
+        QMessageBox.information(self, "Refresh Cover", f"Couldn't get a new cover for {title}.\n"
+                                "Check your connection and try again.")
+        return
+    try:
+        os.makedirs(get_library_cover_dir(), exist_ok=True)
+        saved = os.path.join(get_library_cover_dir(), f"fan-{gid}-{int(time.time())}.img")    # new name: nothing keeps showing the old file
+        shutil.copyfile(path, saved)
+        old = entry.get("cover", "")
+        games = load_fan_library()
+        for g in games:
+            if g["id"] == gid:
+                g["cover"] = saved
+        save_fan_library(games)
+        if old and old != saved and os.path.dirname(old) == get_library_cover_dir():
+            try:
+                os.remove(old)
+            except OSError:    # expected: cleanup that may already be done
+                pass
+        card = self.fan_lib_cards.get(gid)
+        lab = card.layout().itemAt(0).widget() if card is not None else None
+        pix = rounded_cover_pixmap(saved, FAN_COVER_W, FAN_COVER_H, 8)
+        if lab is not None and pix:
+            lab.setText("")
+            lab.setPixmap(pix)
+            lab.setStyleSheet("background: transparent; border: none;")
+    except Exception as e:
+        _log_exc("_fan_refresh_cover")
+        QMessageBox.warning(self, "Refresh Cover", f"Couldn't save the new cover: {e}")
+
+AdaptiveApp._fan_refresh_cover = _fan_refresh_cover
+_fcv_prev_create = AdaptiveApp._fan_create_library_card
+
+def _fcv_create_card(self, g):
+    _fcv_prev_create(self, g)
+    try:
+        gid = g["id"]
+        card = self.fan_lib_cards.get(gid)
+        more = card.findChild(QPushButton, "MoreButton") if card is not None else None
+        menu = more.menu() if more else None
+        if menu is None:
+            return
+        acts = menu.actions()
+        site = {"gb": "Open on GameBanana", "itch": "Open on itch.io"}.get(_fan_source(gid))
+        for a in acts:
+            if site and a.text() == "Open on Game Jolt":
+                a.setText(site)
+        if any(a.text() == "Refresh Cover" for a in acts):
+            return
+        act = QAction("Refresh Cover", menu)
+        act.triggered.connect(lambda _c=False, i=gid: self._fan_refresh_cover(i))
+        if len(acts) > 2:
+            menu.insertAction(acts[2], act)       # after View Details / Open on <site>
+        else:
+            menu.addAction(act)
+    except Exception:
+        _log_exc("_fcv_create_card")
+
+AdaptiveApp._fan_create_library_card = _fcv_create_card
+
+# ── source filter: Game Jolt / itch.io / GameBanana buttons next to the category tags ──
+FAN_SOURCES = (("Game Jolt", "gj"), ("itch.io", "itch"), ("GameBanana", "gb"))
+
+def _fan_source(gid):
+    if _is_gb(gid):
+        return "gb"
+    if _is_itch(gid):
+        return "itch"
+    return "gj"
+
+def _fan_load_page_src(self):
+    if self._exhausted:
+        return
+    self._loading = True
+    term = self._term.lower()
+    src = getattr(self, "_src", "")
+    games = [g for g in load_fan_games()
+             if term in g[1].lower() and (not self._tag or self._tag in g[3]) and (not src or _fan_source(g[0]) == src)]
+    start = self._next_start
+    chunk = [(gid, title, link) for gid, title, link, _tg in games[start:start + STORE_PAGE_SIZE]]
+    self._on_page((self._request_id, start, chunk, len(games), ""))
+    if not load_fan_games():
+        self._set_status("No fan_games.csv found next to main.py.")
+
+FanGamesPage._load_page = _fan_load_page_src
+
+def _fan_set_src(self, src):
+    self._src = "" if getattr(self, "_src", "") == src else src      # click the active one again to show all sources
+    for key, b in getattr(self, "_src_buttons", {}).items():
+        b.setObjectName("Primary" if key == self._src else "")
+        b.style().unpolish(b)
+        b.style().polish(b)
+    self._start_search()
+
+FanGamesPage._set_src = _fan_set_src
+_fan_src_prev_build_tags = FanGamesPage._build_tag_buttons
+
+def _fan_src_build_tags(self):
+    _fan_src_prev_build_tags(self)
+    self._src_buttons = {}
+    at = max(0, self._tag_row.count() - 3)          # before the stretch, Scrape Games and + Add Game
+    sep = QLabel("|")
+    sep.setStyleSheet("color: gray;")
+    self._tag_row.insertWidget(at, sep)
+    for label, key in FAN_SOURCES:
+        at += 1
+        b = QPushButton(label)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFixedHeight(36)
+        b.setToolTip(f"Only show {label} games (click again to show all)")
+        b.setObjectName("Primary" if key == getattr(self, "_src", "") else "")
+        b.clicked.connect(lambda _c=False, k=key: self._set_src(k))
+        self._tag_row.insertWidget(at, b)
+        self._src_buttons[key] = b
+
+FanGamesPage._build_tag_buttons = _fan_src_build_tags
+
+# ── "+ Add Game" takes itch.io and GameBanana links too (not only Game Jolt) ──
+_fan_ext_orig_add = add_custom_fan_game
+
+def add_custom_fan_game(name, link, category):
+    name, link, category = name.strip(), link.strip(), category.strip()
+    if link and not link.lower().startswith("http"):
+        link = "https://" + link
+    itch = re.match(r"^https?://[^/]+\.itch\.io/[^/?#]+", link, re.I)
+    gb = re.search(r"gamebanana\.com/mods/(\d+)", link, re.I)
+    if not (itch or gb):
+        return _fan_ext_orig_add(name, link, category)
+    if not name:
+        return "Enter the game's name."
+    if not category:
+        return "Pick a category (or type a custom one)."
+    if _fan_dedupe_key(name) in {_fan_dedupe_key(g[1]) for g in load_fan_games()}:
+        return "That game is already in the list."
+    try:
+        if gb:
+            iid, path, base, link = int(gb.group(1)), get_gb_csv_path(), GB_ID_BASE, f"https://gamebanana.com/mods/{gb.group(1)}"
+            cover = ""
+        else:
+            link = itch.group(0)
+            page = _http_get(link, headers={"User-Agent": ITCH_UA}, timeout=20).decode("utf-8", errors="replace")
+            m = re.search(r'itch:path"\s+content="games/(\d+)"', page) or re.search(r'content="games/(\d+)"[^>]+itch:path', page)
+            if not m:
+                return "Couldn't read that itch.io page. Check the link."
+            iid, path, base = int(m.group(1)), get_itch_csv_path(), ITCH_ID_BASE
+            cover = ""
+            for rx in _OG_RES:
+                mm = rx.search(page)
+                if mm:
+                    cover = html_lib.unescape(mm.group(1))
+                    break
+        if base + iid in {g[0] for g in load_fan_games()}:
+            return "That game is already in the list."
+        rows = {g[0] - base: [g[1], g[2], set(g[3]), g[4]] for g in
+                (load_gb_games() if gb else load_itch_games())}
+        rows[iid] = [name, link, {category.replace(",", " ").lower()}, cover]
+        _ext_csv_save(path, rows)
+    except Exception as e:
+        return f"Couldn't save the game: {e}"
+    return ""
 
 
 # ── Store: Trending / Most Popular / Works on your PC ──
@@ -46205,7 +46929,7 @@ class _BigPicture(QWidget):
 # Added as a separate layer on top of _BigPicture (same pattern as _bp_open below): the original methods keep doing their
 # job, these wrappers only take over when the keyboard is open or one of the new tabs (index >= 2) is showing.
 
-_BP_NTABS = 5                       # Library, Store, Friends, Downloads, Workshop (+ Fan Games, GMod Addons: set at runtime)
+_BP_NTABS = 5                       # Library, Store, Friends, Downloads, Workshop (+ Fangames, GMod Addons: set at runtime)
 _bp_friend_listeners = []           # called after FriendsPage finished a refresh
 
 
@@ -47773,7 +48497,7 @@ def _bpx_paint_ws(self, p, w, h, m, acc):
 
 
 # ── Big Picture: X options sidebar, in-BP download server picker,
-# Fan Games tab and Garry's Mod Addons tab. Tabs: Library, Store, Friends, Downloads, Workshop, Fan Games, (GMod Addons).
+# Fangames tab and Garry's Mod Addons tab. Tabs: Library, Store, Friends, Downloads, Workshop, Fangames, (GMod Addons).
 _bpy_o = {n: getattr(_BigPicture, n) for n in (
     "__init__", "enter", "leave", "_act", "keyPressEvent", "mousePressEvent", "wheelEvent", "_launch", "_switch_tab",
     "_tab_labels", "_x_enter", "_x_act", "_x_tag", "_x_hint", "_paint_extra", "paintEvent")}
@@ -47842,7 +48566,7 @@ def _bpy_switch_tab(self, t):
 
 @_bpm("_tab_labels")
 def _bpy_tab_labels(self):
-    return tuple(_bpy_o["_tab_labels"](self)) + ("Fan Games",) + (("GMod Addons",) if self._gm_root else ())
+    return tuple(_bpy_o["_tab_labels"](self)) + ("Fangames",) + (("GMod Addons",) if self._gm_root else ())
 
 
 # ── downloads stay inside Big Picture ──
@@ -48188,7 +48912,7 @@ def _bpy_paint_ov(self, p, w, h, acc):
     ov["rects"].append((r, ("cancel", len(ov["sids"]))))
 
 
-# ── Fan Games tab ──
+# ── Fangames tab ──
 @_bpm("_x_enter")
 def _bpy_x_enter(self, t):
     _bpy_o["_x_enter"](self, t)
@@ -48354,7 +49078,7 @@ def _bpy_fg_act(self, name):
         except Exception as ex:
             self._say("Couldn't add game: %s" % ex, 4000)
     elif name == "alt":
-        self._kb_open("Search Fan Games", fg["query"], None, self._fg_search, 80)
+        self._kb_open("Search Fangames", fg["query"], None, self._fg_search, 80)
     elif name == "x":
         tags = fg["tags"]
         fg["tag"] = tags[(tags.index(fg["tag"]) + 1) % len(tags)] if fg["tag"] in tags else ""
@@ -48379,7 +49103,7 @@ def _bpy_paint_fan(self, p, w, h, m, acc):
         self._xhits.append((r, (tag,)))
         x += bw + gap
     lst = fg["list"]
-    self._x_text(p, QRectF(x + gap, y, w - x - m, bh), "Fan Games   %d" % len(lst), 0.026, QColor(235, 235, 245), True)
+    self._x_text(p, QRectF(x + gap, y, w - x - m, bh), "Fangames   %d" % len(lst), 0.026, QColor(235, 235, 245), True)
     if not lst:
         self._x_msg(p, area, "No fan games match" if load_fan_games() else "No fan_games.csv found next to main.py")
         return
@@ -51108,6 +51832,563 @@ def _ncz_settings_show(self, e):
 SettingsPage.showEvent = _ncz_settings_show
 
 
+# ══ Settings: sidebar with icons + collapsible expanders (replaces the long single-column layout) ══
+# Left sidebar = setting areas (with icons). Right = the selected area, each panel is an expander (open/closed is remembered).
+# Searching shows every matching expander from all areas. Big Picture still reads the real controls (see _bpe_hidden).
+_NCZ_SET_CATS = [
+    ("Appearance", ("dark mode", "accent color", "interface style", "theme", "startup animation", "animation")),
+    ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut", "close button", "start in the tray")),
+    ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
+    ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
+    ("Compatibility", ("direct3d", "xwayland", "renderer")),
+    ("Voice & Audio", ("noise suppression", "voice", "microphone")),
+    ("Online & Integrations", ("discord", "ncz link", "overlay", "sync profile", "friend", "account", "group chat")),
+    ("Shortcuts", ("game shortcuts",)),
+    ("Command Line Tool", ("command line tool",)),
+    ("System", ("dependencies", "python version", "redistributables")),
+]
+_NCZ_SET_ICONS = {"Appearance": "sun", "Startup & Updates": "power", "Library & Downloads": "library",
+                  "Big Picture & Controller": "fan", "Compatibility": "chip", "Voice & Audio": "mic",
+                  "Online & Integrations": "globe", "Shortcuts": "link", "Command Line Tool": "terminal",
+                  "System": "gear", "Other": "dots", "About": "info"}
+
+
+def _ncz_set_icon(kind):
+    from PyQt6.QtCore import QPointF
+    if kind in ("library", "fan"):
+        return _nav_tab_icon(kind)
+    if kind == "gear":
+        return _nav_icon("gear")
+    import math
+    icon, P = QIcon(), QPointF
+    for mode, state, color in ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
+                               (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
+                               (QIcon.Mode.Normal, QIcon.State.On, _theme_state["nav_active"]),
+                               (QIcon.Mode.Active, QIcon.State.On, _theme_state["nav_active"])):
+        pm = QPixmap(40, 40)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "sun":
+            p.drawEllipse(P(10, 10), 3.3, 3.3)
+            for i in range(8):
+                a = i * math.pi / 4
+                p.drawLine(P(10 + 5.6 * math.cos(a), 10 + 5.6 * math.sin(a)), P(10 + 8 * math.cos(a), 10 + 8 * math.sin(a)))
+        elif kind == "power":
+            p.drawArc(QRectF(4, 4.5, 12, 12), 120 * 16, 300 * 16)
+            p.drawLine(P(10, 2.5), P(10, 9.5))
+        elif kind == "chip":
+            p.drawRoundedRect(QRectF(5.5, 5.5, 9, 9), 1.5, 1.5)
+            for v in (8, 12):
+                p.drawLine(P(v, 2.5), P(v, 5.5))
+                p.drawLine(P(v, 14.5), P(v, 17.5))
+                p.drawLine(P(2.5, v), P(5.5, v))
+                p.drawLine(P(14.5, v), P(17.5, v))
+        elif kind == "mic":
+            p.drawRoundedRect(QRectF(7.5, 2.5, 5, 9), 2.5, 2.5)
+            p.drawArc(QRectF(5, 5, 10, 9), 180 * 16, 180 * 16)
+            p.drawLine(P(10, 14), P(10, 17))
+            p.drawLine(P(7, 17), P(13, 17))
+        elif kind == "globe":
+            p.drawEllipse(P(10, 10), 7.5, 7.5)
+            p.drawEllipse(P(10, 10), 3.2, 7.5)
+            p.drawLine(P(2.5, 10), P(17.5, 10))
+        elif kind == "link":
+            p.drawRoundedRect(QRectF(3, 6, 10, 11), 2, 2)
+            p.drawLine(P(9, 11), P(17, 3))
+            p.drawPolyline([P(11.5, 3), P(17, 3), P(17, 8.5)])
+        elif kind == "terminal":
+            p.drawRoundedRect(QRectF(2.5, 4, 15, 12), 2, 2)
+            p.drawPolyline([P(6, 8), P(9, 10.5), P(6, 13)])
+            p.drawLine(P(10.5, 13), P(14, 13))
+        elif kind == "info":
+            p.drawEllipse(P(10, 10), 7.5, 7.5)
+            p.drawLine(P(10, 9), P(10, 14))
+            p.setBrush(QColor(color))
+            p.drawEllipse(P(10, 6.3), 0.9, 0.9)
+        else:
+            p.setBrush(QColor(color))
+            for x in (4.5, 10, 15.5):
+                p.drawEllipse(P(x, 10), 1.5, 1.5)
+        p.end()
+        icon.addPixmap(pm, mode, state)
+    return icon
+
+
+def _bpe_hidden(w, stop):
+    """Big Picture: a control counts as hidden only if it (or a parent) was hidden on purpose; pages the sidebar isn't showing don't count."""
+    while w is not None and w is not stop:
+        if w.isHidden() and not w.property("ncz_keep"):
+            return True
+        w = w.parentWidget()
+    return False
+
+
+class _NczElide(QLabel):
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self._full = text
+        self.setToolTip("")
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setPen(self.palette().color(QPalette.ColorRole.WindowText))
+        p.setFont(self.font())
+        p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                   self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, self.width()))
+
+
+class _NczHead(QFrame):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+class _NczExpander(QFrame):
+    """One settings panel inside a collapsible card."""
+    def __init__(self, sp, key, title, sub, open_):
+        super().__init__()
+        self.setObjectName("NczExp")
+        self._sp, self._key = sp, key
+        self.panels = []
+        self.inner = QWidget()
+        QVBoxLayout(self.inner).setContentsMargins(0, 0, 0, 0)
+        self.inner.layout().setSpacing(0)
+        self._open, self._force, self._search_hidden, self._busy = open_, False, False, False
+        self.setStyleSheet("QFrame#NczExp { background: rgba(128,128,128,0.07); border: 1px solid rgba(128,128,128,0.24); border-radius: 12px; }"
+                           "QFrame#NczExpHead { background: transparent; border: none; border-radius: 11px; }"
+                           "QFrame#NczExpHead:hover { background: rgba(128,128,128,0.10); }"
+                           "QFrame#NczExp QLabel { background: transparent; border: none; }")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self.head = _NczHead()
+        self.head.setObjectName("NczExpHead")
+        self.head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.head.setFixedHeight(48)
+        hl = QHBoxLayout(self.head)
+        hl.setContentsMargins(16, 0, 16, 0)
+        hl.setSpacing(10)
+        self.chev = QLabel()
+        self.chev.setFixedSize(14, 14)
+        self.title = _NczElide(title)
+        self.title.setFixedHeight(22)
+        f = self.title.font()
+        f.setBold(True)
+        f.setPixelSize(14)
+        self.title.setFont(f)
+        self.sub = _NczElide(sub)
+        sf = self.sub.font()
+        sf.setPixelSize(12)
+        self.sub.setFont(sf)
+        self.sub.setStyleSheet("color: rgba(128,128,128,0.95);")
+        hl.addWidget(self.chev)
+        hl.addWidget(self.title, 3)
+        hl.addWidget(self.sub, 4)
+        v.addWidget(self.head)
+        self.body = QWidget()
+        bl = QVBoxLayout(self.body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.addWidget(self.inner)
+        v.addWidget(self.body)
+        self.head.clicked.connect(lambda: self.set_open(not self._open, True))
+        self._anim = _LcAnim(self)
+        self._anim.setDuration(180)
+        self._anim.valueChanged.connect(lambda val: self.body.setMaximumHeight(int(val)))
+        self._anim.finished.connect(self._anim_done)
+        self._paint_chev()
+        _theme_listeners.append(self._safe_chev)
+        self._apply(False)
+
+    def add_panel(self, p):
+        p.setStyleSheet("QFrame#Panel { background: transparent; border: none; border-top: 1px solid rgba(128,128,128,0.20);"
+                        " border-radius: 0px; }")
+        p.installEventFilter(self)
+        self.panels.append(p)
+        self.inner.layout().addWidget(p)
+        titles = [l.text().strip() for q in self.panels for l in q.findChildren(QLabel)
+                  if l.objectName() == "RowTitle" and l.text().strip()]
+        self.sub._full = " · ".join(titles)
+        self.sub.update()
+        self.sync()
+
+    def _safe_chev(self):
+        try:
+            self._paint_chev()
+        except RuntimeError:
+            pass
+
+    def _paint_chev(self):
+        pm = QPixmap(28, 28)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(_theme_state["nav_text"]), 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        from PyQt6.QtCore import QPointF as P
+        if self._open or self._force:
+            p.drawPolyline([P(3, 5), P(7, 9.5), P(11, 5)])
+        else:
+            p.drawPolyline([P(5, 3), P(9.5, 7), P(5, 11)])
+        p.end()
+        self.chev.setPixmap(pm)
+
+    def shown_open(self):
+        return self._open or self._force
+
+    def _apply(self, animate):
+        o = self.shown_open()
+        self._paint_chev()
+        self.sub.setVisible(not o)
+        self._anim.stop()
+        if animate and self.isVisible():
+            self._anim.setStartValue(self.body.height() if self.body.maximumHeight() > 5000 or not o else self.body.maximumHeight())
+            self._anim.setEndValue(self.body.sizeHint().height() if o else 0)
+            self._anim.start()
+        else:
+            self.body.setMaximumHeight(16777215 if o else 0)
+
+    def _anim_done(self):
+        if self.shown_open():
+            self.body.setMaximumHeight(16777215)
+
+    def set_open(self, o, animate=False, save=True):
+        self._open = bool(o)
+        self._apply(animate)
+        if save:
+            st = self._sp._ncz_ui
+            st.setdefault("open", {})[self._key] = self._open
+            _ncz_ui_save(self._sp)
+
+    def set_force(self, f):
+        if f != self._force:
+            self._force = f
+            self._apply(False)
+
+    def set_search_hidden(self, h):
+        self._search_hidden = h
+        self.sync()
+
+    def sync(self):
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            self.setVisible(any(not p.isHidden() for p in self.panels) and not self._search_hidden)
+        finally:
+            self._busy = False
+        QTimer.singleShot(0, lambda: _ncz_refresh_side(self._sp))
+
+    def eventFilter(self, o, e):
+        if o in self.panels and e.type() in (QEvent.Type.Show, QEvent.Type.Hide) and not e.spontaneous():
+            self.sync()
+        return False
+
+
+def _ncz_ui_path(sp):
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "settings_ui.json")
+
+
+def _ncz_ui_save(sp):
+    try:
+        with open(_ncz_ui_path(sp), "w", encoding="utf-8") as f:
+            json.dump(sp._ncz_ui, f)
+    except Exception:
+        _log_exc("_ncz_ui_save")
+
+
+_NCZ_GROUPS = [
+    (("dark mode", "accent color", "interface style"), "Theme & Colors"), (("theme",), "Custom Themes"),
+    (("startup animation",), "Startup Animation"),
+    (("start with", "close button", "start in the tray", "desktop shortcut"), "Launch & Tray"),
+    (("automatic update", "launcher update"), "Updates"),
+    (("game library", "7-zip", "winrar"), "Storage & Tools"), (("download server",), "Downloads"),
+    (("steamgriddb", "currency", "nsfw"), "Store & Covers"),
+    (("big picture",), "Big Picture"), (("controller", "input bridge"), "Controller"),
+    (("direct3d", "xwayland", "renderer"), "Graphics & Display"),
+    (("discord", "sync profile"), "Discord"), (("friend", "group chat", "account"), "Friends & Account"),
+    (("ncz link",), "NCZ Link"), (("overlay",), "Game Overlay"),
+    (("dependencies", "python version", "redistributables"), "Dependencies & Python"),
+]
+
+
+def _ncz_group(title, page):
+    t = (title or "").lower()
+    for keys, name in _NCZ_GROUPS:
+        if any(k in t for k in keys):
+            return name
+    return title
+
+
+def _ncz_page_names():
+    return [n for n, _k in _NCZ_SET_CATS] + ["Other", "About"]
+
+
+def _ncz_build_shell(sp):
+    """Sidebar (outside the scroll area) + host widget holding one page per area."""
+    sh = sp.__dict__.get("_ncz_shell")
+    if sh is not None:
+        return sh
+    try:
+        sp._ncz_ui = json.load(open(_ncz_ui_path(sp), encoding="utf-8"))
+    except Exception:
+        sp._ncz_ui = {}
+    side = QFrame()
+    side.setObjectName("NczSetSide")
+    side.setFixedWidth(214)
+    side.setStyleSheet("QPushButton#NczSetBtn { background: transparent; border: none; border-left: 3px solid transparent;"
+                       " border-radius: 8px; text-align: left; padding: 9px 12px; font-size: 13px; font-weight: 600; }"
+                       "QPushButton#NczSetBtn:hover { background: rgba(128,128,128,0.14); }"
+                       "QPushButton#NczSetBtn:checked { background: rgba(128,128,128,0.22); border-left: 3px solid palette(highlight); }")
+    sl = QVBoxLayout(side)
+    sl.setContentsMargins(14, 28, 6, 20)
+    sl.setSpacing(3)
+    group = QButtonGroup(side)
+    group.setExclusive(True)
+    host = QWidget()
+    host.setProperty("ncz_host", True)
+    hl = QVBoxLayout(host)
+    hl.setContentsMargins(0, 0, 0, 0)
+    hl.setSpacing(0)
+    pages, btns = {}, {}
+    names = _ncz_page_names()
+    for n in names:
+        pg = QWidget()
+        pg.setProperty("ncz_keep", True)
+        pl = QVBoxLayout(pg)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(10)
+        top = QHBoxLayout()
+        lab = QLabel(n)
+        lab.setObjectName("PageTitle")
+        lab.setStyleSheet("font-size: 20px; font-weight: bold;")
+        lab.setProperty("ncz_page_title", True)
+        top.addWidget(lab)
+        top.addStretch()
+        for txt, val in (("Expand all", True), ("Collapse all", False)):
+            b = QPushButton(txt)
+            b.setFlat(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, n=n, val=val: _ncz_all(sp, n, val))
+            top.addWidget(b)
+        pl.addLayout(top)
+        pg.hide()
+        hl.addWidget(pg)
+        pages[n] = pg
+        btn = QPushButton(n.replace("&", "&&"))
+        btn.setObjectName("NczSetBtn")
+        btn.setCheckable(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setIconSize(QSize(18, 18))
+        btn.setIcon(_ncz_set_icon(_NCZ_SET_ICONS.get(n, "dots")))
+        btn.clicked.connect(lambda _c=False, n=n: _ncz_select(sp, n))
+        group.addButton(btn)
+        sl.addWidget(btn)
+        btns[n] = btn
+
+        def refresh(btn=btn, n=n):
+            try:
+                btn.setIcon(_ncz_set_icon(_NCZ_SET_ICONS.get(n, "dots")))
+            except RuntimeError:
+                pass
+        _theme_listeners.append(refresh)
+    sl.addStretch()
+    outer = sp.layout().parentWidget().layout() if False else QWidget.layout(sp)
+    outer.removeWidget(sp._scroll)
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(0)
+    row.addWidget(side)
+    row.addWidget(sp._scroll, 1)
+    outer.addLayout(row)
+    sh = {"side": side, "host": host, "pages": pages, "btns": btns, "blocks": [], "raw": [], "cur": None}
+    sp._ncz_shell = sh
+    sp._ncz_searching = False
+    orig = sp._scroll.ensureWidgetVisible
+
+    def goto(w, xm=50, ym=50):
+        par = w
+        while par is not None and not isinstance(par, _NczExpander):
+            par = par.parentWidget()
+        if par is not None:
+            _ncz_select(sp, par.page_name)
+            par.set_open(True, False, False)
+        QTimer.singleShot(40, lambda: orig(w, xm, ym))
+    sp._scroll.ensureWidgetVisible = goto
+    return sh
+
+
+def _ncz_all(sp, page, val):
+    for b in sp._ncz_shell["blocks"]:
+        if b.page_name == page:
+            b.set_open(val, True)
+
+
+def _ncz_select(sp, name, fade=True):
+    sh = sp._ncz_shell
+    if name not in sh["pages"]:
+        return
+    changed = sh["cur"] != name
+    sh["cur"] = name
+    sp._ncz_ui["page"] = name
+    for n, pg in sh["pages"].items():
+        pg.setVisible(n == name or sp._ncz_searching)
+        sh["btns"][n].setChecked(n == name and not sp._ncz_searching)
+    if changed:
+        sp._scroll.verticalScrollBar().setValue(0)
+        if fade:
+            try:
+                _ui_fade_in(sh["pages"][name], 220, 0)
+            except Exception:
+                pass
+        _ncz_ui_save(sp)
+    _ncz_refresh_side(sp)
+
+
+def _ncz_refresh_side(sp):
+    sh = sp.__dict__.get("_ncz_shell")
+    if sh is None:
+        return
+    first = None
+    for n, btn in sh["btns"].items():
+        has = any(b.page_name == n and not b.isHidden() for b in sh["blocks"]) or \
+            any(p is not None and not p.isHidden() for (p, pn) in sh["raw"] if pn == n)
+        btn.setVisible(has)
+        if has and first is None:
+            first = n
+    if sh["cur"] is not None and sh["btns"][sh["cur"]].isHidden() and first:
+        _ncz_select(sp, first, False)
+    if sp._ncz_searching:
+        for n, pg in sh["pages"].items():
+            pg.setVisible(any(b.page_name == n and not b.isHidden() for b in sh["blocks"]))
+
+
+def _ncz_organize(sp):
+    lay = getattr(sp, "_content_layout", None)
+    if lay is None:
+        return
+    sh = _ncz_build_shell(sp)
+    head, loose = [], []
+    for i in range(lay.count()):
+        w = lay.itemAt(i).widget()
+        if w is None or w is sh["host"]:
+            continue
+        if w.objectName() == "PageTitle" or w.property("ncz_settings_search") or w.property("ncz_settings_search_empty"):
+            head.append(w)
+        else:
+            loose.append(w)
+    counts = {}
+    for w in loose:
+        lay.removeWidget(w)
+        t = _ncz_block_title(w)
+        if w.objectName() == "CreditsSection":
+            name, t = "About", None
+        elif t is None:
+            name = "Other"
+        else:
+            ci = _ncz_cat_index(t)
+            if ci >= len(_NCZ_SET_CATS):                      # title didn't match: try everything written in the panel
+                blob = _ncz_search_blob(w)
+                for k, (_n, keys) in enumerate(_NCZ_SET_CATS):
+                    if any(x in blob for x in keys):
+                        ci = k
+                        break
+            name = _ncz_cat_name(ci)
+        pg = sh["pages"][name]
+        if t is None:
+            pg.layout().addWidget(w)
+            sh["raw"].append((w, name))
+            continue
+        titles = [l.text().strip() for l in w.findChildren(QLabel) if l.objectName() == "RowTitle" and l.text().strip()]
+        group = _ncz_group(titles[0], name)
+        if len(titles) > 1 and group == titles[0]:           # multi-row panel: use its own heading label as the group name
+            for l in w.findChildren(QLabel):
+                if l.objectName() not in ("RowTitle", "RowDesc") and l.text().strip() and l.pixmap() is None \
+                        and len(l.text().strip()) < 40:
+                    group = l.text().strip()
+                    l.hide()
+                    break
+        exp = next((b for b in sh["blocks"] if b.page_name == name and b._key == name + "/" + group), None)
+        if exp is None:
+            first = not any(b.page_name == name for b in sh["blocks"])
+            key = name + "/" + group
+            exp = _NczExpander(sp, key, group, "", sp._ncz_ui.get("open", {}).get(key, first))
+            exp.page_name = name
+            pg.layout().addWidget(exp)
+            sh["blocks"].append(exp)
+        exp.add_panel(w)
+    while lay.count():
+        lay.takeAt(0)
+    for w in head:
+        lay.addWidget(w)
+        lay.addSpacing(14 if w.objectName() == "PageTitle" else 10)
+    lay.addSpacing(8)
+    lay.addWidget(sh["host"])
+    lay.addStretch(1)
+    for n, pg in sh["pages"].items():                         # page widgets always hold a stretch at the end
+        if not pg.property("ncz_stretch"):
+            pg.layout().addStretch(1)
+            pg.setProperty("ncz_stretch", True)
+    for n, pg in sh["pages"].items():                         # keep the stretch last when widgets were added later
+        l = pg.layout()
+        for i in range(l.count()):
+            if l.itemAt(i).spacerItem() is not None and i != l.count() - 1:
+                l.addItem(l.takeAt(i))
+                break
+    if sh["cur"] is None:
+        want = sp._ncz_ui.get("page") or "Appearance"
+        _ncz_select(sp, want if want in sh["pages"] else "Appearance", False)
+    _ncz_refresh_side(sp)
+    try:
+        _ncz_search_apply(sp)
+    except Exception:
+        _log_exc("_ncz_search_apply")
+
+
+_ncz_search_apply_old = _ncz_search_apply
+
+
+def _ncz_search_apply(sp):
+    sh = sp.__dict__.get("_ncz_shell")
+    if sh is None:
+        return _ncz_search_apply_old(sp)
+    edit = getattr(sp, "_set_search", None)
+    if edit is None:
+        return
+    words = edit.text().casefold().split()
+    was = sp._ncz_searching
+    sp._ncz_searching = bool(words)
+    shown = 0
+    for b in sh["blocks"]:
+        hide = bool(words) and not all(x in (_ncz_search_blob(b) + " " + b.page_name.casefold()) for x in words)
+        b.set_force(bool(words) and not hide)
+        b.set_search_hidden(hide)
+        if not b.isHidden():
+            shown += 1
+    if was != sp._ncz_searching or sp._ncz_searching:
+        for n, pg in sh["pages"].items():
+            pg.setVisible(n == sh["cur"] or sp._ncz_searching)
+        for n, btn in sh["btns"].items():
+            btn.setChecked(n == sh["cur"] and not sp._ncz_searching)
+    _ncz_refresh_side(sp)
+    empty = getattr(sp, "_set_search_empty", None)
+    if empty is not None:
+        empty.setVisible(bool(words) and shown == 0)
+
+
+
 # ── Settings: "NCZ Command Line Tool" (its own section, first on the page) ──
 # Install runs `py "%ProgramData%/jsmm33/ncz-launcher/ncz_gm.py" install` (Windows) / `python3 "/opt/ncz-games-launcher/ncz_gm.py"
 # install` (Linux) and then opens a terminal that runs `ncz-gm`; Uninstall runs the same with `uninstall`.
@@ -53135,7 +54416,7 @@ _bpg_o = {n: getattr(_BigPicture, n) for n in (
 
 
 def _bpg_base(self):
-    return 6 + (1 if self._gm_root else 0)          # Library, Store, Friends, Downloads, Workshop, Fan Games, (GMod Addons)
+    return 6 + (1 if self._gm_root else 0)          # Library, Store, Friends, Downloads, Workshop, Fangames, (GMod Addons)
 
 
 def _bpg_kind(self):
@@ -55434,7 +56715,7 @@ def _ncz_convert_shortcuts_once(window):
 
 
 # ── pages built the first time they're opened ──
-# Store, Store detail, GE-Proton, Wine, GMod addons, Fan Games and Fan detail used to be built at startup although a normal
+# Store, Store detail, GE-Proton, Wine, GMod addons, Fangames and Fan detail used to be built at startup although a normal
 # start never opens them. A placeholder keeps each one's slot (so hard-coded indexes like pages.setCurrentIndex(4) and the
 # nav buttons keep working); the real page is built when the placeholder is shown or when code reads win.<name>
 # (AdaptiveApp.__getattr__). Startup wiring goes into on-built hooks. Code that only wants the page if it exists uses
@@ -55701,7 +56982,7 @@ def _mem_show_event(self, ev):
 AdaptiveApp.showEvent = _mem_show_event    # kept as patch chain: the base is inherited from Qt, so there is no method to merge into
 
 def _mem_drop_store_cards(page):
-    """Drops a Store / Fan Games page's loaded cards (and their covers). Its showEvent loads them again from the top, with
+    """Drops a Store / Fangames page's loaded cards (and their covers). Its showEvent loads them again from the top, with
     the same search and tags, the next time the page is opened."""
     if page is None or not getattr(page, "_cards", None):
         return
@@ -55729,7 +57010,7 @@ def _mem_trim():
         pass
 
 def _mem_free_hidden(self, step=0):
-    """Hidden to the tray: drop the Store / Fan Games cards, then (once Qt has deleted them) clear the pixmap cache,
+    """Hidden to the tray: drop the Store / Fangames cards, then (once Qt has deleted them) clear the pixmap cache,
     collect garbage and trim. Skipped while Big Picture is what hid the window, or if it was shown again meanwhile."""
     bp = getattr(self, "_big_picture", None)
     if not self.isHidden() or (bp is not None and getattr(bp, "_active", False)):
@@ -58991,12 +60272,14 @@ _AS_NCZ_ART = {"ae": ("fnanczae", "fnanczaecover.png"),
                "ncz2": ("fnancz2", "fnancz2cover.png"),
                "nczfront": ("nczfront", "nczfront-cover.png"),
                "nczreturn": ("tr", "fnancz-tr.png"),
-               "chess": ("ch", "nczchess.png")}
+               "chess": ("ch", "nczchess.png"),
+               "nondev-ncz-tetris": ("tetris", "ncz-tetris.png")}      # Other NCZ Games card key: nondev-<id>
 _AS_NCZ_ICON = {"ae": "ae-icon.png", "ncz2": "2-icon.png", "nczfront": "front-icon.png"}     # the Steam shortcut icon, same repository
 # Games whose art files don't follow the <prefix>-logo / <prefix>-background naming (and have no logo): the exact
 # files to download from the same repository, as piece -> file name.
 _AS_NCZ_FILES = {"nczreturn": {"logo": "nczfront-logo.png", "hero": "tr-bg.png", "icon": "tr-icon.png"},     # logo: NCZFront's
-                 "chess": {"logo": "nczfront-logo.png", "hero": "ch-bg.png", "icon": "ch-icon.png"}}
+                 "chess": {"logo": "nczfront-logo.png", "hero": "ch-bg.png", "icon": "ch-icon.png"},
+                 "nondev-ncz-tetris": {"logo": "nczfront-logo.png", "hero": "tetris-background.png", "icon": "tetris-icon.png"}}
 
 def _as_fetch_ncz_art(key, cover):
     """Artwork for an NCZ game: logo + background from the repository, portrait from assets/. Returns (art, src, missing)."""
@@ -59028,7 +60311,7 @@ def _as_fetch_ncz_art(key, cover):
 def _as_fetch_art(title, appid, key, cover):
     """{'p','w','hero','logo','icon'} -> image bytes (missing ones are absent), plus the source used per piece."""
     art, src = {}, {}
-    sgdb = get_steamgriddb_key()
+    sgdb = "" if steam_only_art(appid, title) else get_steamgriddb_key()      # Dying Light: The Beast never uses SteamGridDB
     gid = None
     if sgdb:
         try:
@@ -62686,7 +63969,7 @@ def _nd_init_fan(self):
     chess_entry = getattr(self, "chess_card_entry", None)       # NCZ Chess: built in, listed after the downloads
     if chess_entry is not None:
         _nd_adopt_builtin(self, "chess", chess_entry)
-    # third button of the Games / Fan Games switch, with a NEW badge next to it
+    # third button of the Games / Fangames switch, with a NEW badge next to it
     tabs = self.library_tabs
     holder = QWidget(tabs)
     hl = QHBoxLayout(holder)
@@ -62706,7 +63989,7 @@ def _nd_init_fan(self):
     hl.addWidget(b)
     hl.addWidget(badge)
     tl = tabs.layout()
-    tl.insertWidget(max(0, tl.count() - 1), holder)      # after Games and Fan Games, before the trailing stretch
+    tl.insertWidget(max(0, tl.count() - 1), holder)      # after Games and Fangames, before the trailing stretch
     _nd_install_status_hooks(self)
     _nd_start_creators(self)
     self.apply_filter()
@@ -62764,6 +64047,1787 @@ def _nd_apply_filter(self, text=""):
     self.empty_label.setVisible(shown == 0)
 
 AdaptiveApp.apply_filter = _nd_apply_filter    # kept as patch chain: wraps the other apply_filter wrappers
+
+
+# --launch-game <title> (Steam shortcut, desktop shortcut) and the phone's "start game" look games up with _remote_cards,
+# which only knew the Games and Fangames lists. Other NCZ Games (NCZ Tetris, ...) have their own list, so add it here.
+_nd_prev_remote_cards = _remote_cards
+
+def _nd_remote_cards(app):
+    out = _nd_prev_remote_cards(app)
+    have = {id(c) for c, _t in out}
+    for card, title in list(getattr(app, "nondev_cards", []) or []):
+        try:
+            card.objectName()          # raises if the card was deleted
+        except RuntimeError:
+            continue
+        t = pretty_game_name(title)
+        if t and id(card) not in have:
+            out.append((card, t))
+    return out
+
+_remote_cards = _nd_remote_cards
+
+
+# ── Steam-style Library: collapsible game list on the left, big hero page on the right ──
+# The old card grid is still built (and still owns every game's buttons, menus and status), it is just hidden: the new
+# view reads the same cards, so Play / Install / Update, the ••• menu, favorites, hidden, view filters and search all keep
+# working. Hero + logo art comes the same way "Add to Steam" gets it (SteamGridDB key -> Steam's CDN -> NCZ repository).
+import hashlib as _sv_hashlib
+from PyQt6.QtGui import QLinearGradient
+from PyQt6.QtWidgets import QStackedWidget
+
+_SV_GROUP_ORDER = ("FAVORITES", "NCZ GAMES", "STEAM GAMES", "ADDED GAMES", "FAN GAMES")
+_SV_LINKS = ("Edit Current Save", "Edit Current Settings", "Cloud Saves...", "Launch Options", "Open Game Location",
+             "Create Desktop Shortcut", "Add to Steam", "View Details", "Open on Game Jolt", "Save Data", "Sync Data")
+_sv_inflight = set()
+
+
+class _SvBus(QObject):
+    ready = pyqtSignal(str)          # art cache slug
+
+
+def _sv_art_dir():
+    d = os.path.join(os.path.dirname(get_library_cover_dir()), "hero_art")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _sv_slug(title, appid, key):
+    return _sv_hashlib.sha1(f"{title}|{appid}|{key}".encode("utf-8", "replace")).hexdigest()[:20]
+
+def _sv_collect_art(title, appid, key, cover):
+    """Hero / logo / icon image bytes of one game and where each came from: ({'hero': bytes, ...}, {'hero': 'Steam', ...}).
+    SteamGridDB first, then Steam's CDN; Dying Light: The Beast skips SteamGridDB and always uses Steam."""
+    art, src = {}, {}
+    if key in _AS_NCZ_ART:
+        art, src, _missing = _as_fetch_ncz_art(key, cover)
+    else:
+        if not appid and not str(key).startswith("nondev-"):
+            appid = _as_find_appid(title, key)
+        sgdb = "" if steam_only_art(appid, title) else get_steamgriddb_key()     # Dying Light: The Beast: Steam art only
+        if sgdb:
+            try:
+                game = sgdb_steam_game(appid, sgdb) if appid else None
+                if not game:
+                    hits = sgdb_search_games(title, sgdb)
+                    want = _norm_title(title)
+                    game = next((h for h in hits if _norm_title(h.get("name")) == want), hits[0] if hits else None)
+                gid = game["id"] if game else None
+            except Exception:
+                _log_exc("_sv_collect_art sgdb")
+                gid = None
+            if gid:
+                for name, path in (("hero", f"/heroes/game/{gid}?types=static"), ("logo", f"/logos/game/{gid}?types=static"),
+                                   ("icon", f"/icons/game/{gid}?types=static")):
+                    b = _as_sgdb_pick(path, sgdb)
+                    if b:
+                        art[name], src[name] = b, "SteamGridDB"
+        if appid:
+            base = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/"
+            for name, fname in (("hero", "library_hero.jpg"), ("logo", "logo.png")):
+                if name not in art:
+                    b = _as_img(base + fname)
+                    if b:
+                        art[name], src[name] = b, "Steam"
+            if "icon" not in art:          # the 1:1 community icon: its hash comes from the store's public item data
+                try:
+                    q = json.dumps({"ids": [{"appid": int(appid)}], "context": {"language": "english", "country_code": "US"},
+                                    "data_request": {"include_assets": True}})
+                    raw = _http_get("https://api.steampowered.com/IStoreBrowseService/GetItems/v1?input_json="
+                                    + urllib.parse.quote(q), timeout=12)
+                    items = (json.loads(raw.decode("utf-8", errors="replace")).get("response") or {}).get("store_items") or [{}]
+                    h = ((items[0] or {}).get("assets") or {}).get("community_icon")
+                    for host in ("https://shared.cloudflare.steamstatic.com/community_assets/images/apps/",
+                                 "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"):
+                        if not h:
+                            break
+                        ib = _as_img(f"{host}{appid}/{h}.jpg")
+                        if ib:
+                            art["icon"], src["icon"] = ib, "Steam"
+                            break
+                except Exception:
+                    _log_exc("_sv_collect_art icon")
+    return art, src
+
+def _sv_fetch_worker(bus, slug, title, appid, key, cover):
+    """Downloads the hero + logo of one game into the art cache (a .none marker when there is nothing)."""
+    try:
+        art, src = _sv_collect_art(title, appid, key, cover)
+        d = _sv_art_dir()
+        got = False
+        for name in ("hero", "logo", "icon"):
+            if art.get(name) and not os.path.exists(os.path.join(d, f"{slug}.{name}.user")):      # a picked image is never overwritten
+                with open(os.path.join(d, f"{slug}.{name}"), "wb") as f:
+                    f.write(art[name])
+                got = True
+        if got and not os.path.exists(os.path.join(d, f"{slug}.hero.user")):
+            with open(os.path.join(d, f"{slug}.src"), "w", encoding="utf-8") as f:
+                f.write(src.get("hero") or src.get("logo") or src.get("icon") or "")
+        with open(os.path.join(d, f"{slug}.done2"), "w") as f:
+            f.write("1" if got else "0")
+    except Exception:
+        _log_exc("_sv_fetch_worker")
+    finally:
+        _sv_inflight.discard(slug)
+        try:
+            bus.ready.emit(slug)
+        except RuntimeError:
+            pass
+
+
+_sv_queue = []
+_sv_pumping = {"on": False}
+
+def _sv_art_state(slug):
+    """'have' (some art cached), 'done' (asked recently, nothing found) or 'todo'."""
+    d = _sv_art_dir()
+    if os.path.exists(os.path.join(d, f"{slug}.cleared")):
+        return "done"                  # the user cleared this game's assets: stays empty until they refresh them
+    done = os.path.join(d, f"{slug}.done2")
+    if not os.path.exists(done):
+        return "todo"                  # never asked with this version (older caches had no icons): ask once
+    if any(os.path.exists(os.path.join(d, f"{slug}.{n}")) for n in ("hero", "logo", "icon")):
+        return "have"
+    return "done" if time.time() - os.path.getmtime(done) < 12 * 3600 else "todo"
+
+def _sv_enqueue(bus, slug, args, front=False):
+    """One background thread fetches art for every game in turn (the selected game jumps the queue)."""
+    if slug in _sv_inflight or any(q[0] == slug for q in _sv_queue):
+        return
+    if front:
+        _sv_queue.insert(0, (slug, args))
+    else:
+        _sv_queue.append((slug, args))
+    if not _sv_pumping["on"]:
+        _sv_pumping["on"] = True
+        def pump():
+            try:
+                while _sv_queue:
+                    sl, a = _sv_queue.pop(0)
+                    _sv_inflight.add(sl)
+                    _sv_fetch_worker(bus, sl, *a)
+            finally:
+                _sv_pumping["on"] = False
+        threading.Thread(target=pump, daemon=True).start()
+
+
+def _sv_dltb_fix(slug, title, appid):
+    """Dying Light: The Beast always uses Steam's art. Art an older version took from SteamGridDB is dropped (a picked
+    image stays) so the art fetch replaces it with Steam's. Only Refresh Game Assets calls this, never the launch check."""
+    if not steam_only_art(appid, title):
+        return
+    d = _sv_art_dir()
+    try:
+        with open(os.path.join(d, f"{slug}.src"), encoding="utf-8") as f:
+            if f.read().strip() != "SteamGridDB":
+                return
+    except OSError:
+        return
+    for ext in ("hero", "logo", "icon"):
+        if not os.path.exists(os.path.join(d, f"{slug}.{ext}.user")):
+            try:
+                os.remove(os.path.join(d, f"{slug}.{ext}"))
+            except OSError:
+                pass
+    for ext in ("src", "done2"):
+        try:
+            os.remove(os.path.join(d, f"{slug}.{ext}"))
+        except OSError:
+            pass
+
+
+# ── "Refresh Game Assets": walks the library top to bottom, re-downloads each game's art and only touches what changed ──
+class _SvRefreshBus(QObject):
+    progress = pyqtSignal(int, int, str)        # games done so far, total, title being refreshed
+    changed = pyqtSignal(str)                   # art slug whose files changed
+    fan_cover = pyqtSignal(int, str)            # fan game id, new cover file
+    steam_cover = pyqtSignal(int, str)          # Steam app id, cover file that was rewritten
+    finished = pyqtSignal(int, int, int, int)   # total, updated, already matched, skipped
+
+
+def _sv_write_if_changed(path, data):
+    """'same' when the file already holds exactly these bytes, otherwise writes it and returns 'updated'."""
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return "same"
+    except OSError:
+        pass
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return "updated"
+
+
+def _sv_sync_art(slug, art, src):
+    """Writes the hero / logo / icon that differ from what is cached. Returns (changed, matched). A picked image is never touched."""
+    d = _sv_art_dir()
+    changed = matched = 0
+    for name in ("hero", "logo", "icon"):
+        data = art.get(name)
+        if not data or os.path.exists(os.path.join(d, f"{slug}.{name}.user")):
+            continue
+        if _sv_write_if_changed(os.path.join(d, f"{slug}.{name}"), data) == "updated":
+            changed += 1
+        else:
+            matched += 1
+    if changed or matched:
+        try:
+            os.remove(os.path.join(d, f"{slug}.cleared"))
+        except OSError:
+            pass
+        if not os.path.exists(os.path.join(d, f"{slug}.hero.user")):
+            label = src.get("hero") or src.get("logo") or src.get("icon") or ""
+            _sv_write_if_changed(os.path.join(d, f"{slug}.src"), label.encode("utf-8"))
+        _sv_write_if_changed(os.path.join(d, f"{slug}.done2"), b"1")
+    return changed, matched
+
+
+def _sv_fan_sgdb_art(title, sgdb):
+    """Cover + hero / logo / icon of a fan game from SteamGridDB, but only when a SteamGridDB game has exactly this name
+    (letter for letter, capitals don't matter). {} when there is no such game."""
+    want = (title or "").strip().casefold()
+    game = next((h for h in (sgdb_search_games((title or "").strip(), sgdb) or [])
+                 if (h.get("name") or "").strip().casefold() == want), None)
+    if not game:
+        return {}
+    gid = game["id"]
+    art = {}
+    for name, path in (("cover", f"/grids/game/{gid}?dimensions={SGDB_PORTRAIT_SIZES}&types=static"),
+                       ("hero", f"/heroes/game/{gid}?types=static"),
+                       ("logo", f"/logos/game/{gid}?types=static"),
+                       ("icon", f"/icons/game/{gid}?types=static")):
+        b = _as_sgdb_pick(path, sgdb)
+        if b:
+            art[name] = b
+    return art
+
+
+def _sv_steam_portrait(appid):
+    """Steam's own portrait cover for an app id (bytes), or None."""
+    b = _as_img(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
+    if b:
+        return b
+    extra = steam_details_art_urls(appid)      # newer games keep their art under a hashed folder
+    rest = [f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"] + [u for u in extra if not u.endswith("library_600x900.jpg")]
+    for u in [u for u in extra if u.endswith("library_600x900.jpg")] + rest:
+        b = _as_img(u)
+        if b:
+            return b
+    return None
+
+
+def _sv_refresh_job(bus, job, sgdb):
+    """Refreshes one game. Returns 'updated', 'same' (everything already matched) or 'skipped' (nothing to get)."""
+    title, slug, appid, kind = job["title"], job["slug"], job["appid"], job["kind"]
+    changed = matched = 0
+    if kind == "fan":
+        # fan games: SteamGridDB only, and only when the name matches letter for letter; no match -> left alone
+        if not sgdb:
+            return "skipped"
+        art = _sv_fan_sgdb_art(title, sgdb)
+        if not art:
+            return "skipped"
+        c, m = _sv_sync_art(slug, art, {k: "SteamGridDB" for k in art})
+        changed, matched = changed + c, matched + m
+        cover = art.get("cover")
+        if cover:
+            old = job.get("fan_cover") or ""
+            same = False
+            try:
+                with open(old, "rb") as f:
+                    same = f.read() == cover
+            except OSError:
+                pass
+            if same:
+                matched += 1
+            else:
+                os.makedirs(get_library_cover_dir(), exist_ok=True)
+                new = os.path.join(get_library_cover_dir(), f"fan-{job['gid']}-{int(time.time())}.img")
+                with open(new, "wb") as f:
+                    f.write(cover)
+                bus.fan_cover.emit(job["gid"], new)
+                changed += 1
+    else:
+        if steam_only_art(appid, title):
+            _sv_dltb_fix(slug, title, appid)
+            data = _sv_steam_portrait(appid) if appid else None
+            if data and job.get("lib_cover"):
+                os.makedirs(os.path.dirname(job["lib_cover"]), exist_ok=True)
+                if _sv_write_if_changed(job["lib_cover"], data) == "updated":
+                    changed += 1
+                    bus.steam_cover.emit(int(appid), job["lib_cover"])
+                else:
+                    matched += 1
+        art, src = _sv_collect_art(title, appid, job["key"], job["cover"])
+        c, m = _sv_sync_art(slug, art, src)
+        changed, matched = changed + c, matched + m
+    if changed:
+        bus.changed.emit(slug)
+        return "updated"
+    return "same" if matched else "skipped"
+
+
+def _sv_refresh_run(bus, jobs, sgdb):
+    """Background thread: one game after another, top of the library to the bottom."""
+    updated = same = skipped = 0
+    total = len(jobs)
+    try:
+        for i, job in enumerate(jobs):
+            bus.progress.emit(i, total, job["title"])
+            _sv_inflight.add(job["slug"])
+            try:
+                result = _sv_refresh_job(bus, job, sgdb)
+            except Exception:
+                _log_exc("_sv_refresh_job")
+                result = "skipped"
+            finally:
+                _sv_inflight.discard(job["slug"])
+            if result == "updated":
+                updated += 1
+            elif result == "same":
+                same += 1
+            else:
+                skipped += 1
+        bus.finished.emit(total, updated, same, skipped)
+    except RuntimeError:        # the window closed while refreshing
+        pass
+
+
+def _sv_icon(kind, color, size=22):
+    """Vector icons drawn with QPainter (gear, heart, heart_fill, play, down, right): no font glyphs."""
+    from PyQt6.QtGui import QPainterPath, QPolygonF, QTransform
+    from PyQt6.QtCore import QPointF
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = float(size)
+    col = QColor(color)
+    pen = QPen(col, s * 0.11, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    if kind == "gear":
+        c = QPointF(s / 2, s / 2)
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.WindingFill)
+        path.addEllipse(c, s * 0.30, s * 0.30)
+        for i in range(8):
+            t = QPainterPath()
+            t.addRoundedRect(QRectF(-s * 0.09, -s * 0.47, s * 0.18, s * 0.24), 1.2, 1.2)
+            path.addPath(QTransform().translate(c.x(), c.y()).rotate(i * 45).map(t))
+        hole = QPainterPath()
+        hole.addEllipse(c, s * 0.13, s * 0.13)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPath(path.subtracted(hole))
+    elif kind in ("heart", "heart_fill"):
+        path = QPainterPath()
+        path.moveTo(s * 0.5, s * 0.86)
+        path.cubicTo(s * 0.04, s * 0.54, s * 0.12, s * 0.12, s * 0.34, s * 0.14)
+        path.cubicTo(s * 0.44, s * 0.15, s * 0.5, s * 0.24, s * 0.5, s * 0.30)
+        path.cubicTo(s * 0.5, s * 0.24, s * 0.56, s * 0.15, s * 0.66, s * 0.14)
+        path.cubicTo(s * 0.88, s * 0.12, s * 0.96, s * 0.54, s * 0.5, s * 0.86)
+        if kind == "heart_fill":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+        else:
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+    elif kind == "image":
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(s * 0.12, s * 0.18, s * 0.76, s * 0.64), s * 0.08, s * 0.08)
+        p.drawPolyline(QPolygonF([QPointF(s * 0.16, s * 0.74), QPointF(s * 0.40, s * 0.46), QPointF(s * 0.58, s * 0.64),
+                                  QPointF(s * 0.70, s * 0.52), QPointF(s * 0.84, s * 0.70)]))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawEllipse(QPointF(s * 0.68, s * 0.34), s * 0.06, s * 0.06)
+    elif kind == "play":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPolygon(QPolygonF([QPointF(s * 0.28, s * 0.16), QPointF(s * 0.84, s * 0.5), QPointF(s * 0.28, s * 0.84)]))
+    else:
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "down":
+            pts = [QPointF(s * 0.26, s * 0.38), QPointF(s * 0.5, s * 0.62), QPointF(s * 0.74, s * 0.38)]
+        else:
+            pts = [QPointF(s * 0.38, s * 0.26), QPointF(s * 0.62, s * 0.5), QPointF(s * 0.38, s * 0.74)]
+        p.drawPolyline(QPolygonF(pts))
+    p.end()
+    return QIcon(pm)
+
+
+def _sv_pal():
+    """Colours taken from the active theme (palette), so it follows every accent / dark mode setting."""
+    pal = QApplication.palette()
+    bg = pal.color(QPalette.ColorRole.Window)
+    tx = pal.color(QPalette.ColorRole.WindowText)
+    ac = pal.color(QPalette.ColorRole.Highlight)
+    def mix(a, b, t):
+        return QColor(int(a.red() * (1 - t) + b.red() * t), int(a.green() * (1 - t) + b.green() * t),
+                      int(a.blue() * (1 - t) + b.blue() * t))
+    dark = bg.lightness() < 128
+    return {"bg": bg, "text": tx, "accent": ac,
+            "side": bg.darker(118) if dark else bg.darker(104),
+            "line": mix(bg, tx, 0.12), "sub": mix(bg, tx, 0.55), "dim": mix(bg, tx, 0.40),
+            "hover": mix(bg, tx, 0.08), "sel": mix(bg, ac, 0.28), "bar": mix(bg, tx, 0.05)}
+
+
+def _sv_dominant_color(pix):
+    """The colour that appears most often in a cover (similar shades are grouped), or None when there is no cover."""
+    try:
+        if pix is None or pix.isNull():
+            return None
+        img = pix.toImage().scaled(48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        buckets = {}
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                if c.alpha() < 128:
+                    continue
+                k = (c.red() >> 4, c.green() >> 4, c.blue() >> 4)
+                n, r, g, b = buckets.get(k, (0, 0, 0, 0))
+                buckets[k] = (n + 1, r + c.red(), g + c.green(), b + c.blue())
+        if not buckets:
+            return None
+        n, r, g, b = max(buckets.values(), key=lambda v: v[0])
+        return QColor(r // n, g // n, b // n)
+    except Exception:
+        _log_exc("_sv_dominant_color")
+        return None
+
+
+class _SvHero(QWidget):
+    """Wide art with the game's logo (or its title) bottom-left, fading into the page background."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hero = QPixmap()
+        self.logo = QPixmap()
+        self.cover = QPixmap()
+        self.title = ""
+        self.credit = ""
+        self.setMinimumHeight(260)
+
+    def set_art(self, hero, logo, cover, title, credit):
+        self.hero, self.logo, self.cover, self.title, self.credit = hero, logo, cover, title, credit
+        self._dom = _sv_dominant_color(cover) if hero.isNull() else None
+        self.update()
+
+    def _backdrop(self, w, h, pal):
+        """No hero art: a gradient of the cover's most common colour (the theme accent when there is no cover)."""
+        g = QLinearGradient(0, 0, w, h)
+        ac = getattr(self, "_dom", None) or pal["accent"]
+        n = 0
+        while ac.lightness() > 140 and n < 6:        # a pale cover must not wash out the white title
+            ac = ac.darker(125)
+            n += 1
+        g.setColorAt(0.0, ac.darker(260))
+        g.setColorAt(0.55, ac.darker(150))
+        g.setColorAt(1.0, ac)
+        return g
+
+    def paintEvent(self, _e):
+        pal = _sv_pal()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, pal["bg"])
+        if not self.hero.isNull():
+            s = self.hero.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(0, 0, s, (s.width() - w) // 2, 0, w, h)
+        else:
+            p.fillRect(0, 0, w, h, self._backdrop(w, h, pal))
+        # soft shade on the left (readability) and a fade into the page at the bottom
+        left = QLinearGradient(0, 0, w * 0.6, 0)
+        left.setColorAt(0.0, QColor(0, 0, 0, 120))
+        left.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.fillRect(0, 0, w, h, left)
+        fade = QLinearGradient(0, h * 0.45, 0, h)
+        c0 = QColor(pal["bg"]); c0.setAlpha(0)
+        fade.setColorAt(0.0, c0)
+        fade.setColorAt(1.0, pal["bg"])
+        p.fillRect(0, 0, w, h, fade)
+        # logo or title
+        x, bottom = 44, h - 34
+        if not self.logo.isNull():
+            lg = self.logo.scaled(int(min(w * 0.42, 520)), 190, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap(x, bottom - lg.height(), lg)
+        else:
+            f = QFont(self.font())
+            f.setPixelSize(44)
+            f.setWeight(QFont.Weight.ExtraBold)
+            p.setFont(f)
+            r = QRectF(x, h * 0.35, w * 0.62, bottom - h * 0.35)
+            flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom | Qt.TextFlag.TextWordWrap)
+            p.setPen(QColor(0, 0, 0, 150))
+            p.drawText(r.translated(2, 2), flags, self.title.upper())
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(r, flags, self.title.upper())
+        if self.credit:
+            f = QFont(self.font())
+            f.setPixelSize(12)
+            f.setWeight(QFont.Weight.DemiBold)
+            p.setFont(f)
+            txt = f"Art: {self.credit}"
+            tw = p.fontMetrics().horizontalAdvance(txt) + 24
+            box = QRectF(w - tw - 20, 16, tw, 26)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 130))
+            p.drawRoundedRect(box, 13, 13)
+            p.setPen(QColor(255, 255, 255, 225))
+            p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), txt)
+        p.end()
+
+
+class _SvStat(QWidget):
+    def __init__(self, label):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.cap = QLabel(label)
+        self.val = QLabel("-")
+        lay.addWidget(self.cap)
+        lay.addWidget(self.val)
+
+    def set_value(self, text):
+        if self.val.text() != text:
+            self.val.setText(text)
+
+
+def _sv_card_alive(card):
+    try:
+        card.objectName()
+        return True
+    except RuntimeError:
+        return False
+
+def _sv_prim(card):
+    return card.findChild(QPushButton, "Primary")
+
+def _sv_menu(card):
+    more = card.findChild(QPushButton, "MoreButton")
+    return more.menu() if more is not None else None
+
+def _sv_update_btn(card):
+    for b in card.findChildren(QPushButton):
+        if b.text() == "Update" and not b.isHidden():
+            return b
+    return None
+
+def _sv_fmt_time(secs):
+    if secs <= 0:
+        return "Not played yet"
+    if secs < 3600:
+        return f"{max(1, secs // 60)} min"
+    return f"{secs / 3600:.1f} hours"
+
+def _sv_fmt_last(ts):
+    if not ts:
+        return "Never"
+    d = int((time.time() - ts) // 86400)
+    if d <= 0:
+        return "Today"
+    if d == 1:
+        return "Yesterday"
+    return time.strftime("%b %d", time.localtime(ts))
+
+
+def _sv_groups(app):
+    """[(group name, [(card, title)])] for the library as it is filtered right now (view filter + search)."""
+    q = app.search_edit.text().strip().lower()
+    meta = lbmeta()
+    fav = set(meta["fav"])
+    steam_ids = {id(c) for c in getattr(app, "steam_cards", {}).values()}
+    ncz_keys = {"ae", "ncz2", "nczreturn", "nczfront", "chess"}
+    ncz_ids = set()
+    for gid, lbl in app.card_status.items():
+        if gid in ncz_keys:
+            par = lbl.parentWidget()
+            if par is not None:
+                ncz_ids.add(id(par))
+    seen, groups = set(), {n: [] for n in _SV_GROUP_ORDER}
+    nondev = list(getattr(app, "nondev_cards", []) or [])
+    fan = list(getattr(app, "fan_lib_list", []) or [])
+    nondev_ids = {id(c) for c, _t in nondev}
+    fan_ids = {id(c) for c, _t in fan}
+    for card, title in list(app.cards) + nondev + fan:
+        if id(card) in seen or not _sv_card_alive(card):
+            continue
+        seen.add(id(card))
+        if not _lb_keep(title) or (q and q not in title.lower()):
+            continue
+        if title in fav and _lb_view["mode"] != "fav":
+            g = "FAVORITES"
+        elif id(card) in ncz_ids or id(card) in nondev_ids:
+            g = "NCZ GAMES"
+        elif id(card) in fan_ids:
+            g = "FAN GAMES"
+        elif id(card) in steam_ids:
+            g = "STEAM GAMES"
+        else:
+            g = "ADDED GAMES"
+        groups[g].append((card, title))
+    az = load_launcher_settings().get("library_sort") == "az"
+    out = []
+    for n in _SV_GROUP_ORDER:
+        items = groups[n]
+        if not items:
+            continue
+        if az:
+            items = sorted(items, key=lambda it: it[1].casefold())
+        out.append((n, _lb_sorted(items)))
+    return out
+
+
+def _sv_card_meta(app, card, title):
+    """(key, appid, cover_path) of a card: the same inputs Add to Steam uses to look art up."""
+    m = card.property("_sv_meta")
+    if m:
+        return m
+    key, appid, cover = "", 0, ""
+    st = card.findChild(QLabel, "CardStatus")
+    for gid, lbl in app.card_status.items():
+        if lbl is st:
+            key = str(gid)
+            break
+    for aid, c in getattr(app, "steam_cards", {}).items():
+        if c is card:
+            appid, key = int(aid), str(aid)
+            for g in load_steam_library():
+                if g["appid"] == appid:
+                    cover = g.get("cover", "")
+            break
+    for gid, w in (getattr(app, "nondev_widgets", {}) or {}).items():
+        if isinstance(w, dict) and w.get("status") is st and st is not None:
+            key = f"nondev-{gid}"
+    if key in _AS_NCZ_ART:
+        cover = asset_path(_AS_NCZ_ART[key][1])
+    m = (key, appid, cover)
+    card.setProperty("_sv_meta", m)
+    return m
+
+
+def _sv_card_pix(card):
+    for lbl in card.findChildren(QLabel):
+        pm = lbl.pixmap()
+        if pm is not None and not pm.isNull() and lbl.width() >= 60:
+            return pm
+    return QPixmap()
+
+
+_SV_KINDS = {"icon": ("Icon", (96, 96), (1, 1)), "hero": ("Background", (300, 100), (3, 1)), "logo": ("Logo", (220, 100), (2, 1))}
+
+
+class _SvArtPicker(SgdbCoverPickerDialog):
+    """The SteamGridDB cover picker, pointed at icons / backgrounds (heroes) / logos instead."""
+    def __init__(self, parent, title, key, appid, kind):
+        self._kind = kind
+        self._label = f"Use This {_SV_KINDS[kind][0]}"
+        self._tw, self._th = _SV_KINDS[kind][1]
+        super().__init__(parent, title, key, appid)
+        self.setWindowTitle(f"Pick {_SV_KINDS[kind][0]}")
+        self.use_btn.setText(self._label)
+        self.grid.setIconSize(QSize(self._tw, self._th))
+        self.grid.setGridSize(QSize(self._tw + 16, self._th + 14))
+
+    def _update_buttons(self):
+        self.use_btn.setEnabled(self.grid.currentItem() is not None and self.use_btn.text() == self._label)
+
+    def _fetch_page(self, page):
+        token, game_id, key, kind = self._grid_token, self._game_id, self._key, self._kind
+        self.status.setText("Loading...")
+        self.more_btn.setEnabled(False)
+        def work():
+            try:
+                found = _sgdb_get_json(f"/{'heroes' if kind == 'hero' else kind + 's'}/game/{game_id}?types=static&page={page}", key)
+                items = [g for g in (found or {}).get("data") or [] if isinstance(g, dict) and g.get("url")]
+                self._emit(self._sig.grids, token, page, items)
+            except Exception as e:
+                self._emit(self._sig.error, token, f"Couldn't load images: {e}")
+        self._pool.submit(work)
+
+    def _on_grids(self, token, page, grids):
+        if token != self._grid_token:
+            return
+        self._page = page
+        placeholder = QPixmap(self._tw, self._th)
+        placeholder.fill(QColor(60, 60, 66))
+        for g in grids:
+            item = QListWidgetItem(QIcon(placeholder), "")
+            item.setData(Qt.ItemDataRole.UserRole, g["url"])
+            item.setSizeHint(QSize(self._tw + 12, self._th + 10))
+            self.grid.addItem(item)
+            row = self.grid.count() - 1
+            link = g.get("thumb") or g["url"]
+            def fetch(r=row, u=link):
+                try:
+                    self._emit(self._sig.thumb, token, r, _http_get(u))
+                except Exception:    # expected: one thumbnail failing just leaves its placeholder
+                    pass
+            self._pool.submit(fetch)
+        self.more_btn.setEnabled(True)
+        self.more_btn.setVisible(len(grids) >= 50)
+        self.status.setText("" if self.grid.count() else f"SteamGridDB has no {_SV_KINDS[self._kind][0].lower()}s for this game.")
+
+    def _on_thumb(self, token, row, data):
+        if token != self._grid_token:
+            return
+        item = self.grid.item(row)
+        pix = QPixmap()
+        if item is not None and data and pix.loadFromData(data):
+            item.setIcon(QIcon(pix.scaled(self._tw, self._th, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation)))
+
+    def _on_error(self, token, message):
+        if token not in (self._games_token, self._grid_token, self._pick_token):
+            return
+        self.more_btn.setEnabled(True)
+        self.use_btn.setText(self._label)
+        self._update_buttons()
+        self.status.setText(message)
+
+    def _pick(self):
+        item = self.grid.currentItem()
+        if item is None or self.use_btn.text() != self._label:
+            return
+        url = item.data(Qt.ItemDataRole.UserRole)
+        self._pick_token += 1
+        token = self._pick_token
+        self.use_btn.setText("Downloading...")
+        self.use_btn.setEnabled(False)
+        def work():
+            try:
+                self._emit(self._sig.chosen, token, _http_get(url, timeout=30))
+            except Exception as e:
+                self._emit(self._sig.error, token, f"Couldn't download that image: {e}")
+        self._pool.submit(work)
+
+
+def _sv_save_pick(slug, kind, data):
+    d = _sv_art_dir()
+    with open(os.path.join(d, f"{slug}.{kind}"), "wb") as f:
+        f.write(data)
+    with open(os.path.join(d, f"{slug}.{kind}.user"), "w") as f:
+        f.write("1")
+    with open(os.path.join(d, f"{slug}.done2"), "w") as f:
+        f.write("1")
+    if kind == "hero":
+        with open(os.path.join(d, f"{slug}.src"), "w", encoding="utf-8") as f:
+            f.write("Custom")
+
+def _sv_reset_art(slug):
+    d = _sv_art_dir()
+    for ext in ("hero", "logo", "icon", "hero.user", "logo.user", "icon.user", "src", "done2", "cleared"):
+        try:
+            os.remove(os.path.join(d, f"{slug}.{ext}"))
+        except OSError:
+            pass
+
+def _sv_clear_art(slug):
+    """Removes every cached hero / logo / icon of a game (picked ones too) and keeps it empty until it is refreshed."""
+    _sv_reset_art(slug)
+    with open(os.path.join(_sv_art_dir(), f"{slug}.cleared"), "w") as f:
+        f.write("1")
+
+
+class _SvIcon(QIcon):
+    have_art = False
+
+
+class _SvTile(QLabel):
+    def __init__(self, title, pm, cb):
+        super().__init__()
+        self.cb = cb
+        self.setObjectName("SvTile")
+        self.setFixedSize(194, 289)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(title)
+        if pm is not None and not pm.isNull():
+            big = pm.scaled(190, 285, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(big.copy((big.width() - 190) // 2, (big.height() - 285) // 2, 190, 285))
+        else:
+            self.setText(title)
+            self.setWordWrap(True)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.cb()
+
+
+class _SvCollection(QScrollArea):
+    """A category's page: its name, a sort box and a wall of portrait covers (Steam's collection view)."""
+    SORTS = ("Alphabetical", "Recently played", "Most played", "Library order")
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        self.name = ""
+        self.items = []
+        self.sort = "Alphabetical"
+        self._cols = 0
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("SvBody")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(40, 34, 40, 30)
+        lay.setSpacing(16)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self.title = QLabel()
+        self.title.setObjectName("SvColTitle")
+        self.count = QLabel()
+        self.count.setObjectName("SvColCount")
+        line = QFrame()
+        line.setObjectName("SvColLine")
+        top.addWidget(self.title)
+        top.addWidget(self.count)
+        top.addWidget(line, 1, Qt.AlignmentFlag.AlignVCenter)
+        lay.addLayout(top)
+        srow = QHBoxLayout()
+        srow.setSpacing(10)
+        cap = QLabel("SORT BY")
+        cap.setObjectName("SvColCap")
+        self.combo = QComboBox()
+        self.combo.setObjectName("SvSort")
+        self.combo.addItems(self.SORTS)
+        self.combo.currentTextChanged.connect(self._sort_changed)
+        srow.addWidget(cap)
+        srow.addWidget(self.combo)
+        srow.addStretch(1)
+        lay.addLayout(srow)
+        self.grid_host = QWidget()
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setContentsMargins(0, 8, 0, 0)
+        self.grid.setHorizontalSpacing(22)
+        self.grid.setVerticalSpacing(26)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.grid_host)
+        lay.addStretch(1)
+        self.setWidget(body)
+
+    def _sort_changed(self, text):
+        self.sort = text
+        if self.name:
+            self.show_group(self.name, self.items)
+
+    def show_group(self, name, items):
+        self.name = name
+        self.items = list(items)
+        self.title.setText(name)
+        self.count.setText(f"({len(items)})")
+        order = list(items)
+        if self.sort == "Alphabetical":
+            order.sort(key=lambda it: it[1].casefold())
+        elif self.sort == "Recently played":
+            order.sort(key=lambda it: -lb_last(it[1]))
+        elif self.sort == "Most played":
+            order.sort(key=lambda it: -_lb_playtime(it[1]))
+        while self.grid.count():
+            w = self.grid.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        self._tiles = []
+        for card, title in order:
+            key, appid, cover = _sv_card_meta(self.view.app, card, title)
+            pm = QPixmap(cover) if cover and os.path.isfile(cover) else QPixmap()
+            if pm.isNull():
+                pm = _sv_card_pix(card)
+            self._tiles.append(_SvTile(title, pm, lambda c=card, t=title: self.view.select(c, t)))
+        self._relayout()
+
+    def _relayout(self):
+        cols = max(1, (self.viewport().width() - 80 + 22) // (194 + 22))
+        self._cols = cols
+        for t in getattr(self, "_tiles", []):
+            self.grid.removeWidget(t)
+        for i, t in enumerate(getattr(self, "_tiles", [])):
+            self.grid.addWidget(t, i // cols, i % cols)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.name and max(1, (self.viewport().width() - 80 + 22) // (194 + 22)) != self._cols:
+            self._relayout()
+
+
+class _SvView(QWidget):
+    def __init__(self, app, page, root_layout):
+        super().__init__()
+        self.app = app
+        self.sel_card = None
+        self.sel_title = ""
+        self.collapsed = set()
+        self.sig = None
+        self.rows = {}               # id(card) -> button
+        self.icon_cache = {}
+        self.bus = _SvBus(self)
+        self.bus.ready.connect(self._art_ready)
+        self.cur_slug = ""
+        self.heads = []
+        self._groups_now = []
+        self._art_timer = QTimer(self)
+        self._art_timer.setSingleShot(True)
+        self._art_timer.timeout.connect(self._art_refresh)
+        self.setObjectName("SvRoot")
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── left: search, view filter, collapsible list, add button ──
+        self.side = QFrame()
+        self.side.setObjectName("SvSide")
+        self.side.setFixedWidth(300)
+        sl = QVBoxLayout(self.side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(0)
+        self.refresh_wrap = QWidget()
+        rw = QVBoxLayout(self.refresh_wrap)
+        rw.setContentsMargins(12, 12, 12, 0)
+        rw.setSpacing(0)
+        self.refresh_btn = QPushButton("Refresh Game Assets")
+        self.refresh_btn.setObjectName("SvRefresh")
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.setFixedHeight(34)
+        self.refresh_btn.setToolTip("Re-download every game's art from the top of the library to the bottom; art that already matches is skipped")
+        self.refresh_btn.clicked.connect(self._refresh_assets)
+        rw.addWidget(self.refresh_btn)
+        sl.addWidget(self.refresh_wrap)
+        self._refreshing = False
+        self.top = QWidget()
+        self.top_l = QVBoxLayout(self.top)
+        self.top_l.setContentsMargins(12, 8, 12, 10)
+        self.top_l.setSpacing(8)
+        sl.addWidget(self.top)
+        self.list_scroll = QScrollArea()
+        self.list_scroll.setWidgetResizable(True)
+        self.list_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_host = QWidget()
+        self.list_host.setObjectName("SvListHost")
+        self.list_l = QVBoxLayout(self.list_host)
+        self.list_l.setContentsMargins(0, 0, 0, 8)
+        self.list_l.setSpacing(0)
+        self.list_l.addStretch(1)
+        self.list_scroll.setWidget(self.list_host)
+        hb = self.list_scroll.horizontalScrollBar()
+        hb.rangeChanged.connect(lambda _a, _b: hb.setValue(0))     # never let the list drift sideways
+        hb.valueChanged.connect(lambda v: hb.setValue(0) if v else None)
+        sl.addWidget(self.list_scroll, 1)
+        self.empty = QLabel("No games match.")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.hide()
+        sl.addWidget(self.empty)
+        self.add_btn = QPushButton("+  Add a Game")
+        self.add_btn.setObjectName("SvAdd")
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.clicked.connect(self._add_menu)
+        sl.addWidget(self.add_btn)
+        outer.addWidget(self.side)
+
+        # ── right: hero + action bar + links ──
+        self.detail = QScrollArea()
+        self.detail.setWidgetResizable(True)
+        self.detail.setFrameShape(QFrame.Shape.NoFrame)
+        self.detail.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("SvBody")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
+        self.hero = _SvHero()
+        bl.addWidget(self.hero)
+
+        bar = QWidget()
+        bar.setObjectName("SvBar")
+        bar_l = QHBoxLayout(bar)
+        bar_l.setContentsMargins(36, 14, 36, 14)
+        bar_l.setSpacing(0)
+        split = QHBoxLayout()
+        split.setSpacing(0)
+        self.play = QPushButton("PLAY")
+        self.play.setObjectName("SvPlay")
+        self.play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play.setFixedHeight(58)
+        self.play.setMinimumWidth(170)
+        self.play.clicked.connect(self._play)
+        self.drop = QPushButton()
+        self.drop.setIcon(_sv_icon("down", "#ffffff", 22))
+        self.drop.setIconSize(QSize(22, 22))
+        self.drop.setObjectName("SvPlayDrop")
+        self.drop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.drop.setFixedSize(44, 58)
+        self.drop.clicked.connect(self._show_menu)
+        split.addWidget(self.play)
+        split.addWidget(self.drop)
+        bar_l.addLayout(split)
+        self.update_btn = QPushButton("UPDATE")
+        self.update_btn.setObjectName("SvUpdate")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setFixedHeight(58)
+        self.update_btn.clicked.connect(self._do_update)
+        self.update_btn.hide()
+        bar_l.addSpacing(10)
+        bar_l.addWidget(self.update_btn)
+        bar_l.addSpacing(34)
+        self.st_status = _SvStat("STATUS")
+        self.st_last = _SvStat("LAST PLAYED")
+        self.st_time = _SvStat("PLAY TIME")
+        for s in (self.st_status, self.st_last, self.st_time):
+            bar_l.addWidget(s)
+            bar_l.addSpacing(34)
+        bar_l.addStretch(1)
+        self.art_btn = QPushButton()
+        self.art_btn.setObjectName("SvIcon")
+        self.art_btn.setToolTip("Artwork: pick icon, background, logo")
+        self.art_btn.setFixedSize(46, 46)
+        self.art_btn.setIconSize(QSize(24, 24))
+        self.art_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.art_btn.clicked.connect(self._art_menu)
+        self.gear = QPushButton()
+        self.gear.setIconSize(QSize(24, 24))
+        self.gear.setObjectName("SvIcon")
+        self.gear.setToolTip("Game options")
+        self.gear.setFixedSize(46, 46)
+        self.gear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.gear.clicked.connect(self._show_menu)
+        self.heart = QPushButton()
+        self.heart.setIconSize(QSize(24, 24))
+        self.heart.setObjectName("SvIcon")
+        self.heart.setToolTip("Favorite")
+        self.heart.setFixedSize(46, 46)
+        self.heart.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.heart.clicked.connect(self._toggle_fav)
+        bar_l.addWidget(self.art_btn)
+        bar_l.addSpacing(8)
+        bar_l.addWidget(self.gear)
+        bar_l.addSpacing(8)
+        bar_l.addWidget(self.heart)
+        bl.addWidget(bar)
+
+        self.links = QWidget()
+        self.links.setObjectName("SvLinks")
+        self.links_l = QHBoxLayout(self.links)
+        self.links_l.setContentsMargins(36, 0, 36, 0)
+        self.links_l.setSpacing(0)
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(36, 16, 36, 0)
+        wl.addWidget(self.links)
+        bl.addWidget(wrap)
+        bl.addStretch(1)
+        self.detail.setWidget(body)
+        self.col = _SvCollection(self)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.detail)
+        self.stack.addWidget(self.col)
+        outer.addWidget(self.stack, 1)
+        self.col_name = None
+
+        self.placeholder = QLabel("Select a game")
+        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder.hide()
+        self.apply_style()
+
+    # ── look ──
+    def apply_style(self):
+        c = _sv_pal()
+        n = {k: v.name() for k, v in c.items()}
+        self._style_key = (n["bg"], n["accent"])
+        self.setStyleSheet(f"""
+        QWidget#SvRoot, QWidget#SvBody {{ background: {n['bg']}; }}
+        QFrame#SvSide {{ background: {n['side']}; border-right: 1px solid {n['line']}; }}
+        QWidget#SvListHost {{ background: transparent; }}
+        QPushButton#SvHead {{ background: transparent; color: {n['sub']}; border: none; border-radius: 4px; text-align: left;
+            padding: 4px 8px; font-size: 11px; font-weight: bold; letter-spacing: 1px; }}
+        QPushButton#SvHead:hover {{ color: {n['text']}; background: {n['hover']}; }}
+        QPushButton#SvHead[open="true"] {{ color: {n['text']}; background: {n['sel']}; }}
+        QPushButton#SvHeadArrow {{ background: transparent; border: none; border-radius: 4px; padding: 0; }}
+        QPushButton#SvHeadArrow:hover {{ background: {n['hover']}; }}
+        QLabel#SvColTitle {{ color: {n['text']}; font-size: 20px; font-weight: 600; letter-spacing: 2px; }}
+        QLabel#SvColCount, QLabel#SvColCap {{ color: {n['sub']}; font-size: 13px; letter-spacing: 1px; }}
+        QFrame#SvColLine {{ background: {n['line']}; max-height: 1px; min-height: 1px; border: none; }}
+        QComboBox#SvSort {{ background: {n['hover']}; color: {n['text']}; border: none; border-radius: 4px; padding: 4px 10px; font-weight: 600; }}
+        QLabel#SvTile {{ background: {n['bar']}; border: 2px solid transparent; border-radius: 3px; color: {n['sub']}; }}
+        QLabel#SvTile:hover {{ border: 2px solid {n['accent']}; }}
+        QPushButton#SvRow {{ background: transparent; color: {n['text']}; border: none; border-radius: 0; text-align: left;
+            padding: 5px 14px 5px 18px; font-size: 13px; font-weight: normal; }}
+        QPushButton#SvRow[dim="true"] {{ color: {n['dim']}; }}
+        QPushButton#SvRow[upd="true"] {{ color: {n['accent']}; }}
+        QPushButton#SvRow:hover {{ background: {n['hover']}; color: {n['text']}; }}
+        QPushButton#SvRow:checked {{ background: {n['sel']}; color: #ffffff; }}
+        QPushButton#SvRefresh {{ background: {n['hover']}; color: {n['text']}; border: none; border-radius: 4px;
+            font-size: 12px; font-weight: 600; padding: 0 12px; }}
+        QPushButton#SvRefresh:hover {{ background: {n['sel']}; color: #ffffff; }}
+        QPushButton#SvRefresh:disabled {{ color: {n['dim']}; }}
+        QPushButton#SvAdd {{ background: {n['side']}; color: {n['sub']}; border: none; border-top: 1px solid {n['line']};
+            border-radius: 0; text-align: left; padding: 12px 16px; font-size: 12px; font-weight: 600; }}
+        QPushButton#SvAdd:hover {{ color: {n['text']}; background: {n['hover']}; }}
+        QWidget#SvBar {{ background: {n['bar']}; border-top: 1px solid {n['line']}; border-bottom: 1px solid {n['line']}; }}
+        QPushButton#SvPlay {{ background: {n['accent']}; color: #ffffff; border: none; border-radius: 4px;
+            border-top-right-radius: 0; border-bottom-right-radius: 0; font-size: 18px; font-weight: bold; letter-spacing: 1px; padding: 0 28px; }}
+        QPushButton#SvPlay:hover {{ background: {c['accent'].lighter(115).name()}; }}
+        QPushButton#SvPlay:disabled {{ background: {n['hover']}; color: {n['dim']}; }}
+        QPushButton#SvPlayDrop {{ background: {c['accent'].darker(125).name()}; color: #ffffff; border: none; border-radius: 4px;
+            border-top-left-radius: 0; border-bottom-left-radius: 0; font-size: 16px; padding: 0; }}
+        QPushButton#SvPlayDrop:hover {{ background: {c['accent'].darker(105).name()}; }}
+        QPushButton#SvUpdate {{ background: transparent; color: {n['accent']}; border: 2px solid {n['accent']}; border-radius: 4px;
+            font-size: 14px; font-weight: bold; padding: 0 22px; }}
+        QPushButton#SvUpdate:hover {{ background: {n['accent']}; color: #ffffff; }}
+        QPushButton#SvIcon {{ background: {n['hover']}; color: {n['text']}; border: none; border-radius: 4px; font-size: 20px; padding: 0; }}
+        QPushButton#SvIcon:hover {{ background: {n['sel']}; }}
+        QPushButton#SvLink {{ background: transparent; color: {n['sub']}; border: none; border-radius: 0; font-size: 13px;
+            font-weight: 600; padding: 12px 22px; }}
+        QPushButton#SvLink:hover {{ color: {n['text']}; background: {n['hover']}; }}
+        QWidget#SvLinks {{ background: {n['bar']}; border-radius: 4px; }}
+        """)
+        for st in (self.st_status, self.st_last, self.st_time):
+            st.cap.setStyleSheet(f"color: {n['sub']}; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+            st.val.setStyleSheet(f"color: {n['text']}; font-size: 14px; font-weight: 600;")
+        self.empty.setStyleSheet(f"color: {n['sub']}; padding: 20px;")
+        self.icon_cache = {}
+
+    # ── list ──
+    def _icon_for(self, card):
+        title = next((t for _n, items in self._groups_now for c, t in items if c is card), "")
+        key, appid, _cover = _sv_card_meta(self.app, card, title)
+        slug = _sv_slug(title, appid, key)
+        ip = os.path.join(_sv_art_dir(), f"{slug}.icon")
+        have = os.path.exists(ip)
+        ic = self.icon_cache.get(id(card))
+        if ic is not None and not ic.isNull() and ic.have_art == have:
+            return ic
+        pm = QPixmap(ip) if have else QPixmap()
+        if pm.isNull():
+            pm = _sv_card_pix(card)
+        if pm.isNull():
+            return QIcon()
+        side = min(pm.width(), pm.height())
+        sq = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side).scaled(
+            48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        ic = _SvIcon(sq)
+        ic.have_art = have
+        self.icon_cache[id(card)] = ic
+        return ic
+
+    def _signature(self, groups):
+        parts = []
+        for n, items in groups:
+            for card, title in items:
+                p = _sv_prim(card)
+                dim = bool(p is not None and (p.text().lower() in ("install", "download", "get") or not p.isEnabled()))
+                parts.append((n, id(card), title, dim, _sv_update_btn(card) is not None))
+        c = _sv_pal()
+        return (tuple(parts), c["bg"].name(), c["accent"].name())
+
+    def refresh(self):
+        app = self.app
+        groups = _sv_groups(app)
+        self._groups_now = groups
+        sig = self._signature(groups)
+        if sig != self.sig:
+            self.sig = sig
+            if sig[1:] != getattr(self, "_style_sig", None):
+                self._style_sig = sig[1:]
+                self.apply_style()
+            self._rebuild(groups)
+            self._rebuild_col(groups)
+            self._queue_art(groups)
+        self._sync_selection(groups)
+        self.refresh_detail()
+
+    def _rebuild(self, groups):
+        keep_scroll = self.list_scroll.verticalScrollBar().value()
+        while self.list_l.count() > 1:
+            it = self.list_l.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        self.rows = {}
+        self.heads = []
+        pal = _sv_pal()
+        for n, items in groups:
+            hw = QWidget()
+            hl = QHBoxLayout(hw)
+            hl.setContentsMargins(8, 8, 8, 0)
+            hl.setSpacing(0)
+            arrow = QPushButton()
+            arrow.setObjectName("SvHeadArrow")
+            arrow.setFixedSize(26, 26)
+            arrow.setIconSize(QSize(16, 16))
+            arrow.setCursor(Qt.CursorShape.PointingHandCursor)
+            arrow.setToolTip("Collapse / expand")
+            arrow.setIcon(_sv_icon("right" if n in self.collapsed else "down", pal["sub"].name(), 16))
+            head = QPushButton(f"{n}  ({len(items)})")
+            head.setObjectName("SvHead")
+            head.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            head.setToolTip("Open this collection")
+            head.setProperty("open", n == self.col_name)
+            head.setCursor(Qt.CursorShape.PointingHandCursor)
+            hl.addWidget(arrow)
+            hl.addWidget(head, 1)
+            self.list_l.insertWidget(self.list_l.count() - 1, hw)
+            self.heads.append((head, n))
+            head.clicked.connect(lambda _c=False, name=n: self.open_collection(name))
+            rows = []
+            fav = n == "FAVORITES"
+            for card, title in items:
+                b = QPushButton(title)
+                b.setObjectName("SvRow")
+                b.setCheckable(True)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setIcon(self._icon_for(card))
+                b.setIconSize(QSize(24, 24))
+                b.setFixedHeight(34)
+                b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)      # a long title must never widen the list
+                b.setToolTip(title)
+                p = _sv_prim(card)
+                b.setProperty("dim", bool(p is not None and (p.text().lower() in ("install", "download", "get") or not p.isEnabled())))
+                upd = _sv_update_btn(card) is not None
+                b.setProperty("upd", upd)
+                shown_text = title + ("  -  Update" if upd else "")
+                b.setText(b.fontMetrics().elidedText(shown_text, Qt.TextElideMode.ElideRight, 200))
+                b.clicked.connect(lambda _c=False, c=card, t=title: self.select(c, t))
+                b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                b.customContextMenuRequested.connect(lambda pos, c=card, t=title, btn=b: self._row_menu(c, t, btn, pos))
+                self.list_l.insertWidget(self.list_l.count() - 1, b)      # parent it first: a parentless setVisible(True) pops up a window
+                b.setVisible(n not in self.collapsed)
+                self.rows[id(card)] = b
+                rows.append(b)
+            arrow.clicked.connect(lambda _c=False, name=n, a=arrow, r=rows: self._toggle(name, a, r))
+        self.empty.setVisible(not groups)
+        self.list_scroll.setVisible(bool(groups))
+        QTimer.singleShot(0, lambda v=keep_scroll: self.list_scroll.verticalScrollBar().setValue(v))
+
+    def _toggle(self, name, arrow, rows):
+        if name in self.collapsed:
+            self.collapsed.discard(name)
+        else:
+            self.collapsed.add(name)
+        shown = name not in self.collapsed
+        arrow.setIcon(_sv_icon("down" if shown else "right", _sv_pal()["sub"].name(), 16))
+        for r in rows:
+            r.setVisible(shown)
+
+    def _sync_selection(self, groups):
+        flat = [(c, t) for _n, items in groups for c, t in items]
+        cur = next(((c, t) for c, t in flat if c is self.sel_card), None)
+        if cur is None:
+            cur = next(((c, t) for c, t in flat if t == self.sel_title), None)
+        if cur is None and flat:
+            cur = flat[0]
+        if cur is None:
+            self.sel_card, self.sel_title = None, ""
+        else:
+            if cur[0] is not self.sel_card:
+                self.sel_card, self.sel_title = cur
+                self.cur_slug = ""
+            self.sel_title = cur[1]
+        for cid, b in self.rows.items():
+            want = self.sel_card is not None and cid == id(self.sel_card)
+            if b.isChecked() != want:
+                b.setChecked(want)
+        self.stack.setVisible(self.sel_card is not None or self.col_name is not None)
+
+    def open_collection(self, name):
+        self.col_name = name
+        self.stack.setCurrentWidget(self.col)
+        self._rebuild_col(_sv_groups(self.app))
+        self._mark_heads()
+        self.stack.setVisible(True)
+
+    def close_collection(self):
+        self.col_name = None
+        self.stack.setCurrentWidget(self.detail)
+        self._mark_heads()
+
+    def _mark_heads(self):
+        for h, n in self.heads:
+            h.setProperty("open", n == self.col_name)
+            h.style().unpolish(h)
+            h.style().polish(h)
+
+    def _rebuild_col(self, groups):
+        if self.col_name is None:
+            return
+        items = next((it for n, it in groups if n == self.col_name), None)
+        if items is None:
+            self.close_collection()
+            return
+        self.col.show_group(self.col_name, items)
+
+    def select(self, card, title):
+        if self.col_name is not None:
+            self.close_collection()
+        self.sel_card, self.sel_title = card, title
+        self.cur_slug = ""
+        for cid, b in self.rows.items():
+            b.setChecked(cid == id(card))
+        self.refresh_detail(force=True)
+
+    # ── detail ──
+    def refresh_detail(self, force=False):
+        card = self.sel_card
+        if card is None or not _sv_card_alive(card):
+            return
+        title = self.sel_title
+        app = self.app
+        p = _sv_prim(card)
+        txt = (p.text() if p is not None else "Play") or "Play"
+        low = txt.lower()
+        self.play.setText(("  " if low in ("play", "launch") else "") + txt.upper())
+        self.play.setIcon(_sv_icon("play", "#ffffff", 20) if low in ("play", "launch") else QIcon())
+        self.play.setIconSize(QSize(20, 20))
+        self.play.setEnabled(bool(p is not None and p.isEnabled()))
+        menu = _sv_menu(card)
+        has_menu = menu is not None and bool(menu.actions())
+        self.drop.setVisible(has_menu)
+        self.gear.setVisible(has_menu)
+        ub = _sv_update_btn(card)
+        self.update_btn.setVisible(ub is not None)
+        st = card.findChild(QLabel, "CardStatus")
+        stext = (st.text() if st is not None else "").replace("●", "").strip() or "-"
+        self.st_status.set_value(stext)
+        self.st_last.set_value(_sv_fmt_last(lb_last(title)))
+        self.st_time.set_value(_sv_fmt_time(_lb_playtime(title)))
+        is_fav = title in lbmeta()["fav"]
+        pal = _sv_pal()
+        self.gear.setIcon(_sv_icon("gear", pal["text"].name(), 24))
+        self.art_btn.setIcon(_sv_icon("image", pal["text"].name(), 24))
+        self.heart.setIcon(_sv_icon("heart_fill" if is_fav else "heart", pal["accent"].lighter(125).name() if is_fav else pal["text"].name(), 24))
+        self.heart.setToolTip("Remove from favorites" if is_fav else "Add to favorites")
+        if force or self.cur_slug == "":
+            self._load_art(card, title)
+            self._build_links(card, title, menu)
+
+    def _load_art(self, card, title):
+        key, appid, cover = _sv_card_meta(self.app, card, title)
+        slug = _sv_slug(title, appid, key)
+        self.cur_slug = slug
+        d = _sv_art_dir()
+        hp, lp = os.path.join(d, f"{slug}.hero"), os.path.join(d, f"{slug}.logo")
+        hero, logo, credit = QPixmap(), QPixmap(), ""
+        if os.path.exists(hp):
+            hero = QPixmap(hp)
+        if os.path.exists(lp):
+            logo = QPixmap(lp)
+        try:
+            with open(os.path.join(d, f"{slug}.src"), encoding="utf-8") as f:
+                credit = f.read().strip()
+        except OSError:
+            pass
+        cov = QPixmap(cover) if cover and os.path.isfile(cover) else QPixmap()
+        if cov.isNull():
+            cov = _sv_card_pix(card)
+        self.hero.set_art(hero, logo, cov, title, credit)
+        if _sv_art_state(slug) == "todo":
+            _sv_enqueue(self.bus, slug, (title, appid, key, cover), front=True)
+
+    def _art_ready(self, slug):
+        if slug == self.cur_slug and self.sel_card is not None:
+            self._load_art(self.sel_card, self.sel_title)
+        self._art_timer.start(400)         # new icons: rebuild the list once the downloads settle
+
+    def _art_refresh(self):
+        self.icon_cache = {}
+        self.sig = None
+        self.refresh()
+
+    def _queue_art(self, groups):
+        for _n, items in groups:
+            for card, title in items:
+                key, appid, cover = _sv_card_meta(self.app, card, title)
+                slug = _sv_slug(title, appid, key)
+                if _sv_art_state(slug) == "todo":
+                    _sv_enqueue(self.bus, slug, (title, appid, key, cover))
+
+    # ── Refresh Game Assets ──
+    def _all_groups(self):
+        """The library as the sidebar lists it (top to bottom), ignoring whatever is typed in the search box."""
+        se = self.app.search_edit
+        q = se.text()
+        if not q:
+            return _sv_groups(self.app)
+        se.blockSignals(True)
+        try:
+            se.setText("")
+            return _sv_groups(self.app)
+        finally:
+            se.setText(q)
+            se.blockSignals(False)
+
+    def _job_maps(self):
+        return ({id(c): gid for gid, c in (getattr(self.app, "fan_lib_cards", None) or {}).items()},
+                {g["appid"]: g for g in load_steam_library()},
+                {g["id"]: g for g in load_fan_library()})
+
+    def _make_job(self, card, title, maps):
+        fan_by_card, steam_lib, fan_lib = maps
+        key, appid, cover = _sv_card_meta(self.app, card, title)
+        job = {"title": title, "slug": _sv_slug(title, appid, key), "appid": appid, "key": key, "cover": cover,
+               "kind": "other", "gid": 0, "fan_cover": "", "lib_cover": ""}
+        gid = fan_by_card.get(id(card))
+        if gid is not None:
+            job.update(kind="fan", gid=gid, fan_cover=(fan_lib.get(gid) or {}).get("cover", ""))
+        elif appid and appid in steam_lib:
+            job.update(kind="steam", lib_cover=steam_lib[appid].get("cover") or os.path.join(get_library_cover_dir(), f"{appid}.img"))
+        return job
+
+    def _refresh_assets(self):
+        """Every game, top of the library to the bottom."""
+        if self._refreshing:
+            return
+        maps = self._job_maps()
+        self._start_refresh([self._make_job(card, title, maps) for _name, items in self._all_groups() for card, title in items])
+
+    def _refresh_one(self, card, title):
+        if self._refreshing or card is None:
+            return
+        self._start_refresh([self._make_job(card, title, self._job_maps())])
+
+    def _clear_one(self, card, title):
+        if card is None:
+            return
+        if QMessageBox.question(self, "Clear Assets", f"Clear the saved artwork of {title}?\n\nIt stays empty until you refresh it "
+                                "(picked artwork is removed too).") != QMessageBox.StandardButton.Yes:
+            return
+        slug = self._make_job(card, title, self._job_maps())["slug"]
+        _sv_clear_art(slug)
+        self.icon_cache = {}
+        self.sig = None
+        if card is self.sel_card:
+            self._load_art(card, title)
+        self.refresh()
+
+    def _row_menu(self, card, title, btn, pos):
+        menu = QMenu(self)
+        menu.addAction("Refresh Assets").triggered.connect(lambda _c=False: self._refresh_one(card, title))
+        menu.addAction("Clear Assets").triggered.connect(lambda _c=False: self._clear_one(card, title))
+        menu.exec(btn.mapToGlobal(pos))
+
+    def _start_refresh(self, jobs):
+        if not jobs:
+            self._refresh_note("Nothing to refresh")
+            return
+        self._refreshing = True
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText(f"Refreshing...  0 / {len(jobs)}")
+        bus = _SvRefreshBus(self)
+        bus.progress.connect(self._on_refresh_progress)
+        bus.changed.connect(self._art_ready)
+        bus.fan_cover.connect(self._on_refresh_fan_cover)
+        bus.steam_cover.connect(self._on_refresh_steam_cover)
+        bus.finished.connect(self._on_refresh_done)
+        self._refresh_bus = bus
+        threading.Thread(target=_sv_refresh_run, args=(bus, jobs, get_steamgriddb_key()), daemon=True).start()
+
+    def _on_refresh_progress(self, done, total, title):
+        self.refresh_btn.setText(f"Refreshing...  {done + 1} / {total}")
+        self.refresh_btn.setToolTip(title)
+
+    def _set_cover_label(self, card, path, w, h, rounded):
+        lab = card.layout().itemAt(0).widget() if card is not None else None
+        pix = rounded(path, w, h, 8)
+        if lab is not None and pix:
+            lab.setObjectName("")
+            lab.setText("")
+            lab.setPixmap(pix)
+            lab.setStyleSheet("background: transparent; border: none;")
+
+    def _on_refresh_fan_cover(self, gid, path):
+        try:
+            games = load_fan_library()
+            old = ""
+            for g in games:
+                if g["id"] == gid:
+                    old = g.get("cover", "")
+                    g["cover"] = path
+            save_fan_library(games)
+            if old and old != path and os.path.dirname(old) == get_library_cover_dir():
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            self._set_cover_label(getattr(self.app, "fan_lib_cards", {}).get(gid), path, FAN_COVER_W, FAN_COVER_H, rounded_cover_pixmap)
+        except Exception:
+            _log_exc("_on_refresh_fan_cover")
+
+    def _on_refresh_steam_cover(self, appid, path):
+        try:
+            games = load_steam_library()
+            if any(g["appid"] == appid and g.get("cover") != path for g in games):
+                for g in games:
+                    if g["appid"] == appid:
+                        g["cover"] = path
+                save_steam_library(games)
+            self._set_cover_label(self.app.steam_cards.get(appid), path, COVER_W, COVER_H, self.app.get_rounded_pixmap)
+        except Exception:
+            _log_exc("_on_refresh_steam_cover")
+
+    def _on_refresh_done(self, total, updated, same, skipped):
+        self._refreshing = False
+        self.refresh_btn.setToolTip("Re-download every game's art from the top of the library to the bottom; art that already matches is skipped")
+        self._refresh_note(f"{updated} updated, {same} up to date" + (f", {skipped} skipped" if skipped else ""))
+        self._art_refresh()
+        if self.sel_card is not None:
+            self._load_art(self.sel_card, self.sel_title)
+
+    def _refresh_note(self, text):
+        """Shows a result on the button for a few seconds, then puts the label back."""
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText(text)
+        def restore():
+            try:
+                self.refresh_btn.setText("Refresh Game Assets")
+                self.refresh_btn.setEnabled(not self._refreshing)
+            except RuntimeError:
+                pass
+        QTimer.singleShot(5000, restore)
+
+    def _build_links(self, card, title, menu):
+        while self.links_l.count():
+            it = self.links_l.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        key, appid, _cover = _sv_card_meta(self.app, card, title)
+        n = 0
+        if appid:
+            b = QPushButton("Store Page")
+            b.setObjectName("SvLink")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, a=appid: QDesktopServices.openUrl(QUrl(f"https://store.steampowered.com/app/{a}")))
+            self.links_l.addWidget(b)
+            n += 1
+        if menu is not None:
+            acts = {a.text(): a for a in menu.actions() if a.text()}
+            for name in _SV_LINKS:
+                a = acts.get(name)
+                if a is None or not a.isEnabled() or n >= 6:
+                    continue
+                b = QPushButton(name.replace("Current ", "").replace("Create ", "").replace("...", ""))
+                b.setObjectName("SvLink")
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _c=False, act=a: act.trigger())
+                self.links_l.addWidget(b)
+                n += 1
+        self.links_l.addStretch(1)
+        self.links.setVisible(n > 0)
+
+    # ── actions ──
+    def _play(self):
+        p = _sv_prim(self.sel_card) if self.sel_card is not None else None
+        if p is not None and p.isEnabled():
+            p.click()
+
+    def _do_update(self):
+        ub = _sv_update_btn(self.sel_card) if self.sel_card is not None else None
+        if ub is not None:
+            ub.click()
+
+    def _show_menu(self):
+        menu = _sv_menu(self.sel_card) if self.sel_card is not None else None
+        if menu is None:
+            return
+        btn = self.sender() or self.gear
+        pos = btn.mapToGlobal(btn.rect().bottomLeft())
+        menu.exec(pos)
+        QTimer.singleShot(150, self.refresh)
+
+    def _art_menu(self):
+        card, title = self.sel_card, self.sel_title
+        if card is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Refresh Assets").triggered.connect(lambda _c=False, c=card, t=title: self._refresh_one(c, t))
+        menu.addAction("Clear Assets").triggered.connect(lambda _c=False, c=card, t=title: self._clear_one(c, t))
+        menu.addSeparator()
+        for kind in ("icon", "hero", "logo"):
+            label = _SV_KINDS[kind][0]
+            sub = menu.addMenu(label)
+            sub.addAction("Search SteamGridDB...").triggered.connect(lambda _c=False, k=kind: self._pick_sgdb(k))
+            sub.addAction("Choose a file...").triggered.connect(lambda _c=False, k=kind: self._pick_file(k))
+        menu.addSeparator()
+        menu.addAction("Reset artwork to automatic").triggered.connect(self._reset_art)
+        menu.exec(self.art_btn.mapToGlobal(self.art_btn.rect().bottomLeft()))
+
+    def _slug(self):
+        key, appid, _cover = _sv_card_meta(self.app, self.sel_card, self.sel_title)
+        return _sv_slug(self.sel_title, appid, key), appid
+
+    def _pick_sgdb(self, kind):
+        sgdb = get_steamgriddb_key()
+        if not sgdb:
+            QMessageBox.information(self, "SteamGridDB", "Add your SteamGridDB API key in Settings first, or use \"Choose a file\".")
+            return
+        slug, appid = self._slug()
+        dlg = _SvArtPicker(self, self.sel_title, sgdb, appid or None, kind)
+        if dlg.exec() and dlg.selected_bytes:
+            self._applied(slug, kind, dlg.selected_bytes)
+
+    def _pick_file(self, kind):
+        path, _f = QFileDialog.getOpenFileName(self, f"Choose {_SV_KINDS[kind][0].lower()}", "",
+                                               "Images (*.png *.jpg *.jpeg *.webp *.bmp *.ico)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return
+        if not QPixmap().loadFromData(data):
+            QMessageBox.warning(self, "Artwork", "That file isn't an image the launcher can read.")
+            return
+        self._applied(self._slug()[0], kind, data)
+
+    def _applied(self, slug, kind, data):
+        _sv_save_pick(slug, kind, data)
+        self.icon_cache = {}
+        self.sig = None
+        self._load_art(self.sel_card, self.sel_title)
+        self.refresh()
+
+    def _reset_art(self):
+        slug, _a = self._slug()
+        _sv_reset_art(slug)
+        self.icon_cache = {}
+        self.sig = None
+        self._load_art(self.sel_card, self.sel_title)
+        self.refresh()
+
+    def _toggle_fav(self):
+        if self.sel_title:
+            lb_toggle("fav", self.sel_title)
+            self.app.apply_filter(self.app.search_edit.text())
+
+    def _add_menu(self):
+        menu = None
+        for btn in self.app.findChildren(QPushButton):
+            if btn.text() == "+" and btn.findChild(QMenu) is not None:
+                menu = btn.findChild(QMenu)
+                break
+        if menu is not None:
+            menu.exec(self.add_btn.mapToGlobal(self.add_btn.rect().topRight()))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.hero.setFixedHeight(max(250, min(430, int(self.height() * 0.46))))
+
+
+def _sv_install(app):
+    """Swaps the card grid for the Steam-style view. Returns False (leaving the old grid alone) if the page isn't what we expect."""
+    page = app.search_edit.parentWidget()
+    main = page.layout() if page is not None else None
+    scroll = app.grid_container.parentWidget().parentWidget()
+    if main is None or not isinstance(scroll, QScrollArea) or main.indexOf(scroll) < 0:
+        return False
+    view = _SvView(app, page, main)
+    # search box + view filter move into the sidebar
+    for w in (app.search_edit, getattr(app, "lib_view_combo", None)):
+        if w is None:
+            continue
+        lay = w.parentWidget().layout() if w.parentWidget() is not None else None
+        if lay is not None:
+            lay.removeWidget(w)
+        view.top_l.addWidget(w)
+    app.search_edit.setMinimumWidth(0)
+    app.search_edit.setMaximumWidth(16777215)
+    app.search_edit.setFixedHeight(34)
+    # everything else in the old header goes away
+    header = main.itemAt(0).layout() if main.count() else None
+    if header is not None:
+        for i in range(header.count()):
+            w = header.itemAt(i).widget()
+            if w is not None and w.parentWidget() is page:
+                w.hide()
+    for lbl in (getattr(app, "count_label", None),):
+        if lbl is not None:
+            lbl.hide()
+    for i in range(main.count()):
+        sp = main.itemAt(i).spacerItem()
+        if sp is not None:
+            sp.changeSize(0, 0)
+        w = main.itemAt(i).widget()
+        if w is not None and w is getattr(app, "library_tabs", None):
+            w.hide()
+    page.findChild(QLabel, "PageTitle") and page.findChild(QLabel, "PageTitle").hide()
+    main.setContentsMargins(0, 0, 0, 0)
+    main.setSpacing(0)
+    scroll.hide()
+    app.empty_label.hide()
+    main.addWidget(view, 1)
+    app._sv_view = view
+    app._sv_ready = True
+    timer = QTimer(app)
+    timer.setInterval(900)
+    timer.timeout.connect(lambda: _sv_refresh(app))
+    timer.start()
+    app._sv_timer = timer
+    return True
+
+
+def _sv_refresh(app):
+    view = getattr(app, "_sv_view", None)
+    if view is None:
+        return
+    try:
+        # the combo / tabs can be created after we installed: keep them where they belong
+        combo = getattr(app, "lib_view_combo", None)
+        if combo is not None and combo.parentWidget() is not view.top:
+            if combo.parentWidget() is not None and combo.parentWidget().layout() is not None:
+                combo.parentWidget().layout().removeWidget(combo)
+            view.top_l.insertWidget(1, combo)
+            combo.show()
+        tabs = getattr(app, "library_tabs", None)
+        if tabs is not None and tabs.isVisible():
+            tabs.hide()
+        scroll = app.grid_container.parentWidget().parentWidget()
+        if scroll.isVisible():
+            scroll.hide()
+        if app.empty_label.isVisible():
+            app.empty_label.hide()
+        view.refresh()
+    except Exception:
+        _log_exc("_sv_refresh")
+
+
+_sv_prev_apply_filter = AdaptiveApp.apply_filter
+
+def _sv_apply_filter(self, text=""):
+    _sv_prev_apply_filter(self, text)
+    if getattr(self, "_sv_failed", False):
+        return
+    if not getattr(self, "_sv_ready", False) and load_launcher_settings().get("library_layout") == "classic":
+        self._sv_failed = True          # Settings > Library Layout: classic grid, leave the old page alone
+        return
+    try:
+        if not getattr(self, "_sv_ready", False):
+            if not (hasattr(self, "search_edit") and hasattr(self, "grid_container") and hasattr(self, "card_status")):
+                return
+            if not _sv_install(self):
+                self._sv_failed = True
+                return
+        _sv_refresh(self)
+    except Exception:
+        self._sv_failed = not getattr(self, "_sv_ready", False)
+        _log_exc("_sv_apply_filter")
+
+AdaptiveApp.apply_filter = _sv_apply_filter    # kept as patch chain: wraps the other apply_filter wrappers
+
 
 
 if __name__ == "__main__":
