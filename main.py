@@ -34273,21 +34273,42 @@ def _ui_restyle_store(self, attr="store_page"):
     lay.removeItem(header)
     header.deleteLater()
 
+    # The newer Store layout (_st_restyle_store) keeps a subtitle, a Search button and a chip row (with Tags) of its own.
+    # Taking the header apart used to orphan those widgets, so they floated over the toolbar. Re-home them here.
+    search_btn = getattr(sp, "search_btn", None)
+    has_chips = bool(getattr(sp, "_st_chips", None))
+    sub = next((l for l in sp.findChildren(QLabel) if l.text().startswith("Browse Steam games")), None)
+
     bar = QFrame()
     bar.setObjectName("ToolBar")
-    bar.setFixedHeight(68)
+    bar.setFixedHeight(84 if sub is not None else 68)
     bl = QHBoxLayout(bar)
     bl.setContentsMargins(22, 0, 16, 0)
     bl.setSpacing(12)
-    bl.addWidget(title)
+    if sub is not None:
+        tcol = QVBoxLayout()
+        tcol.setContentsMargins(0, 0, 0, 0)
+        tcol.setSpacing(0)
+        tcol.addStretch(1)
+        tcol.addWidget(title)
+        tcol.addWidget(sub)
+        tcol.addStretch(1)
+        bl.addLayout(tcol)
+        sub.setStyleSheet("font-size: 12px; background: transparent;")
+    else:
+        bl.addWidget(title)
     bl.addWidget(sp.count_label, 0, Qt.AlignmentFlag.AlignVCenter)
     bl.addSpacing(10)
     sp.search_edit.setMinimumSize(200, 40)
     sp.search_edit.setMaximumSize(16777215, 40)
     sp.search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    sp.tags_btn.setFixedHeight(40)
     bl.addWidget(sp.search_edit, 1)
-    bl.addWidget(sp.tags_btn)
+    if search_btn is not None:
+        search_btn.setFixedSize(104, 40)
+        bl.addWidget(search_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+    if not has_chips:                        # old layout: Tags lives in the toolbar; new layout keeps it in the chip row
+        sp.tags_btn.setFixedHeight(40)
+        bl.addWidget(sp.tags_btn)
     lay.insertWidget(0, bar)
     lay.setContentsMargins(28, 22, 20, 0)
     lay.insertSpacing(1, 6)
@@ -34314,10 +34335,19 @@ def _ui_restyle_friends(self):
     body.setSpacing(24)
 
     left = QWidget()
-    left.setFixedWidth(380)
+    left.setObjectName("FriendsSideCol")
+    left.setAutoFillBackground(False)
     ll = QVBoxLayout(left)
-    ll.setContentsMargins(0, 0, 0, 0)
+    ll.setContentsMargins(0, 0, 8, 0)
     ll.setSpacing(14)
+    left_scroll = QScrollArea()              # a short window used to crush the panels into each other; now it scrolls
+    left_scroll.setWidgetResizable(True)
+    left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    left_scroll.setFixedWidth(396)
+    left_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;} QWidget#FriendsSideCol{background:transparent;}")
+    left_scroll.viewport().setAutoFillBackground(False)
+    left_scroll.setWidget(left)
     side_head = QLabel("ADD FRIENDS")
     side_head.setObjectName("PaneHeader")
     panel.setObjectName("SidePanel")
@@ -34329,6 +34359,8 @@ def _ui_restyle_friends(self):
         if isinstance(w, QFrame):
             w.setObjectName("SidePanel")
         ll.addWidget(w)
+    for w in [panel, fp.req_box] + [o for o in others if isinstance(o, QFrame)]:
+        w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)   # never shrink below the content
     ll.addStretch()
 
     right = QVBoxLayout()
@@ -34341,7 +34373,7 @@ def _ui_restyle_friends(self):
     right.addLayout(head_row)
     right.addWidget(scroll, 1)
 
-    body.addWidget(left, 0, Qt.AlignmentFlag.AlignTop)
+    body.addWidget(left_scroll, 0)
     body.addLayout(right, 1)
     old.addLayout(body, 1)
 
@@ -65293,6 +65325,13 @@ def _sv_refresh_run(bus, jobs, sgdb):
         pass
 
 
+def _sv_on_accent(col):
+    """Text/icon colour that stays readable on `col` (dark on the Modern theme's near-white accent)."""
+    try:
+        return "#141414" if QColor(col).lightnessF() > 0.62 else "#ffffff"
+    except Exception:
+        return "#ffffff"
+
 def _sv_icon(kind, color, size=22):
     """Vector icons drawn with QPainter (gear, heart, heart_fill, play, down, right): no font glyphs."""
     from PyQt6.QtGui import QPainterPath, QPolygonF, QTransform
@@ -65975,7 +66014,7 @@ class _SvView(QWidget):
         self.play.setMinimumWidth(170)
         self.play.clicked.connect(self._play)
         self.drop = QPushButton()
-        self.drop.setIcon(_sv_icon("down", "#ffffff", 22))
+        self.drop.setIcon(_sv_icon("down", _sv_on_accent(_sv_pal()["accent"].darker(125)), 22))
         self.drop.setIconSize(QSize(22, 22))
         self.drop.setObjectName("SvPlayDrop")
         self.drop.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -66088,16 +66127,16 @@ class _SvView(QWidget):
             border-radius: 0; text-align: left; padding: 12px 16px; font-size: 12px; font-weight: bold; }}
         QPushButton#SvAdd:hover {{ color: {n['text']}; background: {n['hover']}; }}
         QWidget#SvBar {{ background: {n['bar']}; border-top: 1px solid {n['line']}; border-bottom: 1px solid {n['line']}; }}
-        QPushButton#SvPlay {{ background: {n['accent']}; color: #ffffff; border: none; border-radius: 4px;
+        QPushButton#SvPlay {{ background: {n['accent']}; color: {_sv_on_accent(n['accent'])}; border: none; border-radius: 4px;
             border-top-right-radius: 0; border-bottom-right-radius: 0; font-size: 18px; font-weight: bold; letter-spacing: 1px; padding: 0 28px; }}
         QPushButton#SvPlay:hover {{ background: {c['accent'].lighter(115).name()}; }}
         QPushButton#SvPlay:disabled {{ background: {n['hover']}; color: {n['dim']}; }}
-        QPushButton#SvPlayDrop {{ background: {c['accent'].darker(125).name()}; color: #ffffff; border: none; border-radius: 4px;
+        QPushButton#SvPlayDrop {{ background: {c['accent'].darker(125).name()}; color: {_sv_on_accent(c['accent'].darker(125))}; border: none; border-radius: 4px;
             border-top-left-radius: 0; border-bottom-left-radius: 0; font-size: 16px; padding: 0; }}
         QPushButton#SvPlayDrop:hover {{ background: {c['accent'].darker(105).name()}; }}
         QPushButton#SvUpdate {{ background: transparent; color: {n['accent']}; border: 2px solid {n['accent']}; border-radius: 4px;
             font-size: 14px; font-weight: bold; padding: 0 22px; }}
-        QPushButton#SvUpdate:hover {{ background: {n['accent']}; color: #ffffff; }}
+        QPushButton#SvUpdate:hover {{ background: {n['accent']}; color: {_sv_on_accent(n['accent'])}; }}
         QPushButton#SvIcon {{ background: {n['hover']}; color: {n['text']}; border: none; border-radius: 4px; font-size: 20px; padding: 0; }}
         QPushButton#SvIcon:hover {{ background: {n['sel']}; }}
         QPushButton#SvLink {{ background: transparent; color: {n['sub']}; border: none; border-radius: 0; font-size: 13px;
@@ -66302,7 +66341,7 @@ class _SvView(QWidget):
         txt = (p.text() if p is not None else "Play") or "Play"
         low = txt.lower()
         self.play.setText(("  " if low in ("play", "launch") else "") + txt.upper())
-        self.play.setIcon(_sv_icon("play", "#ffffff", 20) if low in ("play", "launch") else QIcon())
+        self.play.setIcon(_sv_icon("play", _sv_on_accent(_sv_pal()["accent"]), 20) if low in ("play", "launch") else QIcon())
         self.play.setIconSize(QSize(20, 20))
         self.play.setEnabled(bool(p is not None and p.isEnabled()))
         menu = _sv_menu(card)
@@ -67681,10 +67720,10 @@ QPushButton#SvHead[open="true"] {{ background: {sel}; border-radius: 8px; }}
 QPushButton#SvRefresh, QPushButton#SvIcon {{ background: {btn}; border: none; border-radius: 12px; }}
 QPushButton#SvRefresh:hover, QPushButton#SvIcon:hover {{ background: {hov}; color: {txt.name()}; }}
 QComboBox#SvSort {{ background: {btn}; border: none; border-radius: 10px; }}
-QPushButton#SvPlay {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.name()},stop:1 {bot.name()});
+QPushButton#SvPlay {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.name()},stop:1 {bot.name()}); color: {_sv_on_accent(acc)};
     border: none; border-top-left-radius: 14px; border-bottom-left-radius: 14px; border-top-right-radius: 0; border-bottom-right-radius: 0; }}
 QPushButton#SvPlay:hover {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.lighter(112).name()},stop:1 {acc.name()}); }}
-QPushButton#SvPlayDrop {{ background: {bot.darker(112).name()}; border: none; border-top-right-radius: 14px; border-bottom-right-radius: 14px;
+QPushButton#SvPlayDrop {{ background: {bot.darker(112).name()}; color: {_sv_on_accent(bot.darker(112))}; border: none; border-top-right-radius: 14px; border-bottom-right-radius: 14px;
     border-top-left-radius: 0; border-bottom-left-radius: 0; }}
 QPushButton#SvUpdate {{ border-radius: 14px; }}
 QWidget#SvLinks {{ background: {glass}; border: 1px solid {rim}; border-radius: 16px; }}
