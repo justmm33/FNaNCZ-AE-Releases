@@ -45,6 +45,7 @@ commands:
   open <game name>                        open (launch) a game from your library
   shiftq                                  open the Shift+Q overlay menu
   change-theme <theme>                    switch the launcher's theme: new, sunset, classic or legacy
+  itf [classic|liquidglass]               show or switch the interface style (Classic is only available here)
   gmod-extract <path>                     extract Garry's Mod addons (a .gma / .bin file or a folder of them)
   update                                  update the launcher
   account                                 show which account is signed in
@@ -1085,6 +1086,41 @@ def cmd_change_theme(args):
     return 0
 
 
+ITF_STYLES = {"classic": "Classic", "glass": "Liquid Glass"}
+_ITF_ALIASES = {"classic": "classic", "liquidglass": "glass", "glass": "glass", "liquid": "glass"}
+
+
+def _itf_current(cfg=None):
+    """The interface style launcher.json asks for: classic or glass (a missing setting = Liquid Glass, the default)."""
+    cfg = _read_launcher_json() if cfg is None else cfg
+    if cfg.get("appearance") in ITF_STYLES:
+        return cfg["appearance"]
+    return "classic" if cfg.get("ios_glass") is False else "glass"
+
+
+def cmd_itf(args):
+    """Classic is not selectable in the launcher any more: this command is the only way to switch to it."""
+    cur = _itf_current()
+    if not args:
+        say(paint("Interface style:", "light") + " " + paint(ITF_STYLES[cur], "bold"))
+        say(paint("usage: ncz-gm itf [classic|liquidglass]", "dim"))
+        return 0
+    want = _ITF_ALIASES.get(_norm(" ".join(args)))
+    if want is None:
+        err(f"\"{' '.join(args)}\" isn't an interface style. Available: classic, liquidglass")
+        return 2
+    if want == cur and _read_launcher_json().get("appearance") == want:
+        say(paint("\u2714", "ok") + f" Already on the {paint(ITF_STYLES[want], 'bold')} interface style.")
+        return 0
+    _write_launcher_json({"appearance": want, "ios_glass": want == "glass"})     # the same two keys main.py saves
+    say(paint("\u2714 Interface style set to", "ok") + " " + paint(ITF_STYLES[want], "bold"))
+    if launcher_running():
+        say("Restart the launcher to apply it.")
+    else:
+        say("It applies the next time the launcher opens.")
+    return 0
+
+
 # ============================================================================================== commands
 def cmd_open(args):
     if not args:
@@ -1528,6 +1564,7 @@ def cmd_status(_args):
         ("Launcher", paint("running", "ok") if running else paint("not running", "dim")),
         ("Account", paint(email or "signed in", "bold") if is_logged_in() else paint("not signed in", "warn")),
         ("Theme", _theme_label(key, cfg)),
+        ("Interface style", ITF_STYLES[_itf_current(cfg)]),
         ("Automatic Updates", paint("on", "ok") if auto else paint("off", "warn")),
         ("Library", f"{len(_known_titles())} games"),
         ("Settings folder", settings_dir()),
@@ -1651,7 +1688,7 @@ def cmd_help(_args):
 
 
 COMMANDS = {
-    "change-theme": cmd_change_theme, "theme": cmd_change_theme, "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
+    "change-theme": cmd_change_theme, "theme": cmd_change_theme, "itf": cmd_itf, "login": cmd_login, "google-login": cmd_google_login, "github-login": cmd_github_login, "workshop": cmd_workshop, "download": cmd_download, "big-pic": cmd_bigpic, "bigpic": cmd_bigpic,
     "big-picture": cmd_bigpic, "open": cmd_open, "shiftq": cmd_shiftq, "gmod-extract": cmd_gmod_extract,
     "update": cmd_update, "account": cmd_account, "logout": cmd_logout, "list": cmd_list, "auto-update": cmd_auto_update,
     "autoupdate": cmd_auto_update, "status": cmd_status, "config": cmd_config, "backup": cmd_backup, "quit": cmd_quit, "restart": cmd_restart, "demo": cmd_demo, "install": cmd_install, "uninstall": cmd_uninstall,
