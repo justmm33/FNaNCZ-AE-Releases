@@ -58,6 +58,16 @@ from concurrent.futures import ThreadPoolExecutor
 import webbrowser
 from string import Template
 
+# Hide the console windows Windows pops up for every child process (the startup "flash of tiny windows")
+if sys.platform.startswith("win"):
+    class _NoWindowPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            fl = kwargs.get("creationflags", 0) or 0
+            if not (fl & 0x00000010):     # leave CREATE_NEW_CONSOLE alone
+                kwargs["creationflags"] = fl | 0x08000000     # CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+    subprocess.Popen = _NoWindowPopen
+
 # Contents (section banners, in file order)
 #   game library (multiple partitions)
 #   wine (Linux)
@@ -2324,7 +2334,7 @@ def load_app_font():
             weights = {int(QFontDatabase.weight(family, st)) for st in QFontDatabase.styles(family)}
         except Exception:
             weights = set()
-        if len(weights) < 4:      # Qt kept the variable file as a single weight: register real static weights instead
+        if len(weights) < 4 or sys.platform.startswith("linux"):      # Qt kept the variable file as a single weight (Linux: always, FreeType renders variable SF Pro badly): register real static weights instead
             for path in _cut_static_weights(variable):
                 QFontDatabase.addApplicationFont(path)
     try:
@@ -10046,7 +10056,6 @@ class AdaptiveApp(QMainWindow):
         self.nav_group.addButton(self.gmod_btn, idx)
         sidebar_layout = self.nav_group.button(0).parent().layout()
         sidebar_layout.insertWidget(sidebar_layout.indexOf(self.nav_group.button(1)), self.gmod_btn)
-        self.gmod_btn.setStyleSheet("QPushButton#NavButton { padding: 0px 10px; }")
         self.gmod_btn.hide()
 
         def refresh_gmod():
@@ -10363,6 +10372,10 @@ class AdaptiveApp(QMainWindow):
             traceback.print_exc()
         try:
             _ui_add_appearance_setting(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            _ui_add_scale_setting(self)
         except Exception:
             traceback.print_exc()
         try:
@@ -10941,9 +10954,10 @@ def _ncz_start_lite_tray(app):
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
-#  First-launch appearance picker: Classic (left) or Liquid Glass (right). Shown before anything else loads.
+#  Appearance: Liquid Glass is the default and the only one the launcher itself offers. Classic is set from a terminal only:
+#  `ncz-gm itf classic` / `ncz-gm itf liquidglass`.
 #  Stored in launcher.json as "appearance": "classic" | "glass" (and "ios_glass": false/true, which the glass layer reads).
-#  Start the launcher with --choose-appearance to be asked again.
+#  (_AppearanceDialog below is the old first-launch picker; it is no longer shown.)
 # ════════════════════════════════════════════════════════════════════════════════════════════
 from PyQt6.QtWidgets import QAbstractButton as _ApAB
 
@@ -10964,6 +10978,21 @@ def _save_appearance(choice):
             return
     data["appearance"] = choice
     data["ios_glass"] = (choice == "glass")
+    save_launcher_settings(data)
+
+def _save_glass_perf(mode):
+    """Liquid Glass performance: "auto" | "low" | "high" (read by _ig_low_power)."""
+    path = get_launcher_settings_path()
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:    # expected: unreadable file, never overwrite it
+            data = None
+        if not isinstance(data, dict):
+            return
+    data["ios_glass_perf"] = mode
     save_launcher_settings(data)
 
 def _ap_hue_sat(acc):
@@ -11122,24 +11151,373 @@ class _AppearanceDialog(QDialog):
 
 
 def _ensure_appearance_chosen(app, quiet=False, force=False):
-    """First launch since Liquid Glass: ask Classic or Liquid Glass before anything else loads."""
+    """Liquid Glass is the only look the launcher lets you pick, so nothing is asked any more: a first launch just saves
+    Liquid Glass. Classic can only be switched on from a terminal - `ncz-gm itf classic` (an existing choice is kept)."""
     try:
-        if _appearance_saved() and not force:
-            return
-        if quiet:                         # started at login / by a game shortcut: no window; light look this run, ask next time
-            _IG["on"] = False
-            return
-        dlg = _AppearanceDialog()
-        dlg.exec()
-        _app_font_family["name"] = None          # the launcher picks its font again for the look that was chosen
-        if dlg.choice is None:            # closed without choosing: Classic for this run, ask again next start
-            _IG["on"] = False
-            return
-        _save_appearance(dlg.choice)
-        _IG["on"] = (dlg.choice == "glass")
+        if not _appearance_saved():
+            _save_appearance("glass")
     except Exception:
         _log_exc("_ensure_appearance_chosen")
 
+
+def _ncz_unify_font_rendering():
+    """Linux only: make text render like on Windows (unhinted, grayscale antialiasing, 96 dpi) no matter what the desktop's
+    fontconfig / GTK settings say. Must run before the QApplication is created."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        os.environ.setdefault("QT_FONT_DPI", "96")          # point sizes match Windows at 100% scale
+        if os.environ.get("FONTCONFIG_FILE"):                # the user set their own fontconfig: leave it
+            return
+        import tempfile    # lazy: saves memory/startup until used
+        conf = ('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n'
+                '  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>\n'
+                '  <match target="pattern">\n'
+                '    <edit name="antialias" mode="assign" binding="strong"><bool>true</bool></edit>\n'
+                '    <edit name="hinting" mode="assign" binding="strong"><bool>false</bool></edit>\n'
+                '    <edit name="hintstyle" mode="assign" binding="strong"><const>hintnone</const></edit>\n'
+                '    <edit name="autohint" mode="assign" binding="strong"><bool>false</bool></edit>\n'
+                '    <edit name="rgba" mode="assign" binding="strong"><const>none</const></edit>\n'
+                '    <edit name="lcdfilter" mode="assign" binding="strong"><const>lcdnone</const></edit>\n'
+                '    <edit name="embeddedbitmap" mode="assign" binding="strong"><bool>false</bool></edit>\n'
+                '  </match>\n</fontconfig>\n')
+        path = os.path.join(tempfile.gettempdir(), f"ncz-fonts-{os.getuid()}.conf")
+        try:
+            same = open(path, encoding="utf-8").read() == conf
+        except OSError:
+            same = False
+        if not same:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(conf)
+        os.environ["FONTCONFIG_FILE"] = path
+    except Exception:
+        _log_exc("_ncz_unify_font_rendering")
+
+
+class _StrayWindowGuard(QObject):
+    """Startup only: plain parentless widgets that get shown by accident (they flash as tiny windows) are hidden again and logged."""
+    def __init__(self, seconds=12):
+        super().__init__()
+        self._until = time.time() + seconds
+        self._seen = 0
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Type.Show and isinstance(obj, QWidget):
+                if (obj.isWindow() and obj.parent() is None and not isinstance(obj, (QMainWindow, QDialog, QMenu))
+                        and obj.windowType() == Qt.WindowType.Window):
+                    # Liquid Glass never opens external windows: block them for the whole session. Classic: only while starting up.
+                    if (time.time() < self._until or _glass_on()) and not os.environ.get("NCZ_ALLOW_WINDOWS"):
+                        if self._seen < 30:
+                            self._seen += 1
+                            print(f"[stray-window] blocked {type(obj).__name__} (name={obj.objectName()!r}, title={obj.windowTitle()!r}, {obj.width()}x{obj.height()})", file=sys.stderr)
+                        obj.hide()
+        except Exception:
+            pass
+        return False
+
+
+# ---- Region lock: the launcher only opens from Egypt, UAE, Qatar and Saudi Arabia --------------------------------------
+_NCZ_ALLOWED_COUNTRIES = ("EG", "AE", "QA", "SA")
+
+def _ncz_geo_lookup():
+    """Country codes from public IP-geolocation services, asked all at once. Returns as soon as one service says
+    "allowed" or two say "outside" (usually well under a second), else when they all answered / after 4 s."""
+    import queue    # lazy: saves memory/startup until used
+    providers = (
+        "https://api.country.is/",
+        "https://ipapi.co/country/",
+        "https://ipwho.is/",
+        "https://ipinfo.io/country",
+    )
+    q = queue.Queue()
+
+    def ask(url):
+        code = ""
+        try:
+            raw = _http_get(url, timeout=3).decode("utf-8", errors="replace").strip()
+            if raw.startswith("{"):
+                data = json.loads(raw)
+                code = data.get("country") or data.get("country_code") or ""
+            else:
+                code = raw
+            code = str(code).strip().upper()
+            if not (len(code) == 2 and code.isalpha()):
+                code = ""
+        except Exception:    # expected: offline, timed out or the service is down
+            code = ""
+        q.put(code)
+
+    for url in providers:
+        threading.Thread(target=ask, args=(url,), daemon=True).start()
+    codes, deadline = [], time.time() + 4.0
+    for _ in providers:
+        try:
+            code = q.get(timeout=max(0.05, deadline - time.time()))
+        except queue.Empty:
+            break
+        if not code:
+            continue
+        codes.append(code)
+        if code in _NCZ_ALLOWED_COUNTRIES or len(codes) >= 2:
+            break
+    return codes
+
+def _ncz_region_blocked():
+    """True when the public IP is outside Egypt, UAE, Qatar and Saudi Arabia. A single service saying "outside" is
+    double-checked with a second one first. When no service answers (offline) it returns False, so being offline
+    never locks anybody out."""
+    codes = _ncz_geo_lookup()
+    if not codes:
+        return False
+    return not any(c in _NCZ_ALLOWED_COUNTRIES for c in codes)
+
+class _NczVpnBlockDialog(QDialog):
+    """Liquid Glass pop-up (the launcher's own glass look and accent) shown when the IP is outside the allowed countries.
+    Built and painted ahead of time (see _ncz_region_gate), so showing it is instant."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("NCZ Games Launcher")
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._drag = None
+        self._pm = None
+        self._pm_dpr = 0.0
+        try:
+            ip = asset_path("icon.png")
+            if os.path.exists(ip):
+                self.setWindowIcon(QIcon(ip))
+        except Exception:
+            pass
+        fam = ""
+        try:
+            fam = load_app_font() or ""
+        except Exception:
+            pass
+        pal = QApplication.palette()
+        txt = QColor(255, 255, 255)           # the glass is always dark, so the text is always light
+        acc = _gl_accent()
+        self._m, self._w, self._h, self._rad = 36, 540, 290, 24
+        self.setFixedSize(self._w + 2 * self._m, self._h + 2 * self._m)
+        force = ('QLabel, QPushButton { font-family: "%s"; }' % fam) if fam else ""
+        self.setStyleSheet(force + "QLabel{background:transparent;}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(self._m + 34, self._m + 30, self._m + 34, self._m + 28)
+        lay.setSpacing(8)
+        lay.addStretch(1)
+        title = QLabel("Your VPN might be on")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size:28px;font-weight:700;color:%s;" % txt.name())
+        sub = QLabel("Turn it off and restart to continue")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet("font-size:15px;font-weight:500;color:rgba(%d,%d,%d,0.66);" % (txt.red(), txt.green(), txt.blue()))
+        lay.addWidget(title)
+        lay.addWidget(sub)
+        lay.addStretch(1)
+        logo = QLabel()                                  # the launcher's top-left wordmark, in the accent colour, just above Close
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        try:
+            lpm = _ncz_wordmark_pixmap(acc.name(), False, max(1.0, float(self.devicePixelRatioF())))
+            if lpm is not None:
+                logo.setFixedSize(int(round(lpm.width() / lpm.devicePixelRatio())), int(round(lpm.height() / lpm.devicePixelRatio())))
+                logo.setPixmap(lpm)
+        except Exception:
+            _log_exc("_NczVpnBlockDialog.logo")
+        logo_row = QHBoxLayout()
+        logo_row.addStretch(1)
+        logo_row.addWidget(logo)
+        logo_row.addStretch(1)
+        lay.addLayout(logo_row)
+        lay.addSpacing(6)
+        btn = QPushButton("Close")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(44)
+        btn.setStyleSheet(
+            "QPushButton{color:%s;font-size:15px;font-weight:700;border-radius:14px;padding:0 34px;"
+            "background:#2c2c2e;border:none;}"
+            "QPushButton:hover{background:#38383b;}"
+            "QPushButton:pressed{background:#242426;}" % txt.name())
+        btn.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._render(self.devicePixelRatioF())      # the glass is painted now, not when the pop-up opens
+        self.ensurePolished()
+
+    def _render(self, dpr):
+        """The launcher's dark card (same as the friends-code card): a soft diagonal grey-to-black gradient, a faint sheen
+        at the top-left and a thin light rim. No accent glow, no screen grab."""
+        dpr = max(1.0, float(dpr))
+        w, h, rad = self._w, self._h, self._rad
+        pm = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(r, rad, rad)
+        g = _GlLG(0, 0, w, h)                                   # diagonal: lighter top-left, near-black bottom-right
+        g.setColorAt(0.0, QColor(58, 58, 60))
+        g.setColorAt(0.45, QColor(34, 34, 36))
+        g.setColorAt(1.0, QColor(18, 18, 19))
+        q.fillPath(path, _GlBrush(g))
+        q.setClipPath(path)
+        sheen = _GlRG(QPointF(w * 0.12, 0), max(w, h) * 0.55)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 16))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        q.fillRect(QRectF(0, 0, w, h), _GlBrush(sheen))
+        q.setClipping(False)
+        q.setPen(QPen(QColor(255, 255, 255, 30), 1.0))          # thin light rim
+        q.setBrush(Qt.BrushStyle.NoBrush)
+        q.drawPath(path)
+        q.end()
+        self._pm, self._pm_dpr = pm, dpr
+
+    def showEvent(self, e):
+        try:
+            if abs(self.devicePixelRatioF() - self._pm_dpr) > 0.01:     # opened on a screen with another scale
+                self._render(self.devicePixelRatioF())
+        except Exception:
+            pass
+        super().showEvent(e)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self._m, self._m, self._w, self._h)
+        _gl_shadow(p, r, self._rad, spread=22.0, dy=8.0)
+        if self._pm is not None:
+            p.drawPixmap(QPoint(self._m, self._m), self._pm)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+            self.move(e.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, _e):
+        self._drag = None
+
+def _ncz_region_gate(app):
+    """Starts the region check in a background thread right away; the answer is collected by _ncz_region_wait, just
+    before the launcher window would be built, so startup work and the lookup overlap."""
+    st = {"done": threading.Event(), "blocked": False}
+    app._ncz_region = st
+
+    def work():
+        try:
+            st["blocked"] = bool(_ncz_region_blocked())
+        except Exception:
+            _log_exc("_ncz_region_gate")
+        finally:
+            st["done"].set()
+
+    threading.Thread(target=work, daemon=True).start()
+
+def _ncz_region_wait(app):
+    """Outside Egypt / UAE / Qatar / Saudi Arabia: the glass pop-up alone (no full-screen backdrop), then the launcher exits before
+    any launcher window was shown. Waits for the check if it is still running (never longer than the lookup's own limit)."""
+    st = getattr(app, "_ncz_region", None)
+    if not st:
+        return
+    end = time.time() + 5.0
+    while not st["done"].is_set() and time.time() < end:
+        st["done"].wait(0.03)
+        app.processEvents()
+    if not st["blocked"]:
+        return
+    try:
+        dlg = _NczVpnBlockDialog()
+        dlg.exec()
+    except Exception:
+        _log_exc("_ncz_region_wait")
+    os._exit(0)                                      # nothing of the launcher (tray, threads) may keep running
+
+# ---- UI scale (Settings > Appearance > UI Scale). Default 125%. Applied through QT_SCALE_FACTOR before the QApplication exists ----
+_NCZ_UI_SCALE_DEFAULT = 125
+_NCZ_UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150, 175, 200)
+
+def _ncz_ui_scale_percent():
+    try:
+        v = int(round(float(_raw_setting("ui_scale"))))
+    except Exception:    # expected: not saved yet
+        v = _NCZ_UI_SCALE_DEFAULT
+    return max(50, min(200, v))
+
+def _ncz_apply_ui_scale():
+    """Sets QT_SCALE_FACTOR from the saved UI scale. A QT_SCALE_FACTOR you set yourself in the environment wins; one this
+    launcher set for its previous copy (see restart_launcher, the child inherits the environment) is replaced."""
+    try:
+        if os.environ.get("QT_SCALE_FACTOR") and not os.environ.get("NCZ_QT_SCALE_AUTO"):
+            return
+        pct = _ncz_ui_scale_percent()
+        if pct == 100:
+            os.environ.pop("QT_SCALE_FACTOR", None)
+            os.environ.pop("NCZ_QT_SCALE_AUTO", None)
+            return
+        os.environ["QT_SCALE_FACTOR"] = "%.2f" % (pct / 100.0)
+        os.environ["NCZ_QT_SCALE_AUTO"] = "1"
+    except Exception:
+        _log_exc("_ncz_apply_ui_scale")
+
+def _save_ui_scale(pct):
+    path = get_launcher_settings_path()
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:    # expected: unreadable file, never overwrite it
+            data = None
+        if not isinstance(data, dict):
+            return
+    data["ui_scale"] = int(pct)
+    save_launcher_settings(data)
+
+def _ncz_region_arm(app):
+    """Non-blocking version of _ncz_region_wait: the launcher starts right away and never waits for the region check.
+    The check keeps running in its background thread; a timer on the Qt event loop picks up the answer. If the IP is
+    outside Egypt / UAE / Qatar / Saudi Arabia (VPN on?), the glass pop-up shows on top of the launcher as soon as the
+    answer is in, and closing it quits the launcher. Nothing happens when the IP is fine or the check can't tell."""
+    st = getattr(app, "_ncz_region", None)
+    if not st:
+        return
+    started = time.time()
+    timer = QTimer(app)
+    timer.setInterval(100)
+    app._ncz_region_timer = timer                    # keep a reference so it isn't garbage-collected
+    busy = {"v": False}
+
+    def poll():
+        if busy["v"]:
+            return
+        if not st["done"].is_set():
+            if time.time() - started > 10.0:         # the lookup has its own 4 s limit; this is only a safety net
+                timer.stop()
+            return
+        timer.stop()
+        if not st["blocked"]:
+            return
+        busy["v"] = True
+        try:
+            dlg = _NczVpnBlockDialog()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            dlg.exec()
+        except Exception:
+            _log_exc("_ncz_region_arm")
+        os._exit(0)                                  # nothing of the launcher (tray, threads) may keep running
+
+    timer.timeout.connect(poll)
+    timer.start()
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
@@ -11156,10 +11534,14 @@ def main():
         except Exception:    # expected: optional module may be missing
             pass
     _prefer_xwayland()
+    _ncz_unify_font_rendering()
+    _ncz_apply_ui_scale()                # saved UI scale (default 125%) -> QT_SCALE_FACTOR, must be set before QApplication
     if _HAS_WEBENGINE:      # lets QtWebEngine be imported after the QApplication exists (it's only loaded when NCZFront opens)
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("NCZ Games Launcher")
+    app._stray_guard = _StrayWindowGuard()
+    app.installEventFilter(app._stray_guard)
     if "--friends" in sys.argv:          # toggles the friends panel of the running launcher, then exits
         try:
             from PyQt6.QtNetwork import QLocalSocket    # lazy: saves memory/startup until used
@@ -11179,6 +11561,7 @@ def main():
         _ncz_spawn_game_exe(_game_exe, _game_args)     # the game starts right away, before anything else loads
     if _launch_title and _ncz_send_launch(_launch_title):
         sys.exit(0)                      # the launcher is already open: it starts the game, nothing else to do here
+    _ncz_region_gate(app)                # background check: outside Egypt / UAE / Qatar / Saudi Arabia (VPN on?) -> glass pop-up, then exit
     got_lock = _acquire_instance_lock()
     if got_lock and _another_instance_running(wake=False):
         got_lock = False             # an older launcher (one that doesn't use the lock) is already running
@@ -11204,8 +11587,7 @@ def main():
             _another_instance_running(wake=True)
             sys.exit(0)  # it wouldn't go away: bring it to the front instead
     _start_instance_server(app)                 # listen right away, not only once the window is built
-    # First launch since Liquid Glass arrived: ask Classic or Liquid Glass before anything else loads
-    # (--choose-appearance asks again). Started at login / by a game shortcut: no window, Classic for that run.
+    # First launch: save Liquid Glass as the look (Classic is only available through `ncz-gm itf classic`).
     _ensure_appearance_chosen(app, quiet=bool(_game_exe or "--startup" in sys.argv), force="--choose-appearance" in sys.argv)
 
     _saved_accent = load_launcher_settings().get("accent_color", "#a666ff")
@@ -11237,6 +11619,7 @@ def main():
 
     apply_startup_setting()
     register_cli()
+    _ncz_region_arm(app)                 # region check no longer delays startup: if a VPN is detected, the pop-up appears over the launcher once the check finishes, then it exits
     # Started with the system (or a game's Wine/Proton shortcut) and set to start minimized -> stay in the tray.
     start_hidden = bool(_game_exe or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)))
     if start_hidden and not _launch_title and _ncz_start_lite_tray(app):
@@ -33338,7 +33721,7 @@ def load_launcher_settings():
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
     s["ui_defaults_applied"] = _raw_setting("ui_defaults_applied") or []
-    for _k in ("appearance", "ios_glass", "ios_glass_motion"):       # Classic / Liquid Glass choice must survive every other settings save
+    for _k in ("appearance", "ios_glass", "ios_glass_motion", "ios_glass_perf", "ui_scale"):       # Classic / Liquid Glass choice and the UI scale must survive every other settings save
         _v = _raw_setting(_k)
         if _v is not None:
             s[_k] = _v
@@ -33994,6 +34377,15 @@ Language => اللغة
 Choose the launcher's language. English is the default. => اختر لغة المشغّل. الإنجليزية هي الافتراضية.
 Theme => السمة
 Interface Style => نمط الواجهة
+Glass Performance => أداء الزجاج
+UI Scale => حجم الواجهة
+Zoom for the whole launcher. Default is 125%. Needs a restart. => تكبير المشغّل بالكامل. الافتراضي 125%. يتطلب إعادة التشغيل.
+(default) => (الافتراضي)
+Auto lightens Liquid Glass on PCs with 4 or fewer CPU threads. Low turns off the moving background, page fades and the glass on game cards. High keeps every effect. Only applies to Liquid Glass. Needs a restart. => يخفف تلقائي تأثير Liquid Glass على الأجهزة ذات 4 معالجات منطقية أو أقل. المنخفض يوقف الخلفية المتحركة وتلاشي الصفحات والزجاج على بطاقات الألعاب. العالي يبقي كل التأثيرات. ينطبق على Liquid Glass فقط. يتطلب إعادة التشغيل.
+Auto => تلقائي
+Low (lighter) => منخفض (أخف)
+High (full effects) => عالٍ (كل التأثيرات)
+Restart the launcher now to apply this? => إعادة تشغيل المشغّل الآن لتطبيق هذا؟
 Dark Mode => الوضع الداكن
 System => النظام
 Accent Color => لون التمييز
@@ -35355,16 +35747,19 @@ def _ui_add_appearance_setting(self):
     col.setSpacing(2)
     title = QLabel("Interface Style")
     title.setObjectName("RowTitle")
-    desc = QLabel("Classic is the lightest, best for older PCs. Liquid Glass adds frosted glass and smooth animations. Needs a restart.")
+    desc = QLabel("Liquid Glass adds frosted glass and smooth animations. Needs a restart.")
     desc.setObjectName("RowDesc")
     desc.setWordWrap(True)
     col.addWidget(title)
     col.addWidget(desc)
     combo = QComboBox()
     combo.setFixedWidth(160)
-    combo.addItem("Classic", "classic")
-    combo.addItem("Liquid Glass", "glass")
     start = _appearance_saved() or ("glass" if _glass_on() else "classic")
+    if start == "classic":
+        # Classic can't be picked here. It is only listed (greyed out) while it is the active look, set by `ncz-gm itf classic`.
+        combo.addItem("Classic (ncz-gm itf)", "classic")
+        combo.model().item(0).setEnabled(False)
+    combo.addItem("Liquid Glass", "glass")
     combo.setCurrentIndex(max(0, combo.findData(start)))
 
     def changed():
@@ -35393,6 +35788,107 @@ def _ui_add_appearance_setting(self):
         lay.addSpacing(12)
         lay.addLayout(row)
     sp.appearance_combo = combo
+
+    # ── Glass Performance (Auto / Low / High), right under Interface Style ──
+    prow = QHBoxLayout()
+    pcol = QVBoxLayout()
+    pcol.setSpacing(2)
+    ptitle = QLabel("Glass Performance")
+    ptitle.setObjectName("RowTitle")
+    pdesc = QLabel("Auto lightens Liquid Glass on PCs with 4 or fewer CPU threads. Low turns off the moving background, page fades "
+                   "and the glass on game cards. High keeps every effect. Only applies to Liquid Glass. Needs a restart.")
+    pdesc.setObjectName("RowDesc")
+    pdesc.setWordWrap(True)
+    pcol.addWidget(ptitle)
+    pcol.addWidget(pdesc)
+    pcombo = QComboBox()
+    pcombo.setFixedWidth(160)
+    pcombo.addItem("Auto", "auto")
+    pcombo.addItem("Low (lighter)", "low")
+    pcombo.addItem("High (full effects)", "high")
+    _pv = _raw_setting("ios_glass_perf")
+    _pv = _pv.strip().lower() if isinstance(_pv, str) else "auto"
+    if _pv not in ("auto", "low", "high"):
+        _pv = "auto"
+    pcombo.setCurrentIndex(max(0, pcombo.findData(_pv)))
+    pstate = {"cur": _pv}
+    pcombo.setEnabled(combo.currentData() == "glass")
+    combo.currentIndexChanged.connect(lambda _i=0: pcombo.setEnabled(combo.currentData() == "glass"))
+
+    def pchanged(_i=0):
+        choice = pcombo.currentData()
+        if choice == pstate["cur"]:
+            return
+        pstate["cur"] = choice
+        _save_glass_perf(choice)
+        ask = QMessageBox.question(sp, "Glass Performance", "Restart the launcher now to apply this?")
+        if ask == QMessageBox.StandardButton.Yes:
+            restart_launcher(self)
+    pcombo.currentIndexChanged.connect(pchanged)
+    prow.addLayout(pcol, 1)
+    prow.addWidget(pcombo)
+    pi = lay.indexOf(row)
+    if pi >= 0:
+        lay.insertSpacing(pi + 1, 12)
+        lay.insertLayout(pi + 2, prow)
+    else:
+        lay.addSpacing(12)
+        lay.addLayout(prow)
+    sp.glass_perf_combo = pcombo
+
+def _ui_add_scale_setting(self):
+    """Settings > Appearance: UI Scale (zoom of the whole launcher). Default 125%. Needs a restart."""
+    sp = self.settings_page
+    lay = sp.dark_mode_combo.parentWidget().layout()
+    row = QHBoxLayout()
+    col = QVBoxLayout()
+    col.setSpacing(2)
+    title = QLabel("UI Scale")
+    title.setObjectName("RowTitle")
+    desc = QLabel("Zoom for the whole launcher. Default is 125%. Needs a restart.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    col.addWidget(title)
+    col.addWidget(desc)
+    combo = QComboBox()
+    combo.setFixedWidth(160)
+    cur = _ncz_ui_scale_percent()
+    choices = list(_NCZ_UI_SCALE_CHOICES)
+    if cur not in choices:
+        choices.append(cur)
+        choices.sort()
+    for v in choices:
+        combo.addItem("%d%%" % v + (" (default)" if v == _NCZ_UI_SCALE_DEFAULT else ""), v)
+    combo.setCurrentIndex(max(0, combo.findData(cur)))
+    state = {"cur": cur}
+
+    def changed(_i=0):
+        v = combo.currentData()
+        if v is None or v == state["cur"]:
+            return
+        state["cur"] = v
+        _save_ui_scale(v)
+        ask = QMessageBox.question(sp, "UI Scale", "Restart the launcher now to apply this?")
+        if ask == QMessageBox.StandardButton.Yes:
+            restart_launcher(self)
+    combo.currentIndexChanged.connect(changed)
+    row.addLayout(col, 1)
+    row.addWidget(combo)
+    at = -1                                   # right under the Glass Performance row
+    anchor = getattr(sp, "glass_perf_combo", None) or getattr(sp, "appearance_combo", None)
+    if anchor is not None:
+        for i in range(lay.count()):
+            item = lay.itemAt(i).layout()
+            if item is not None and item.indexOf(anchor) >= 0:
+                at = i
+                break
+    if at >= 0:
+        lay.insertSpacing(at + 1, 12)
+        lay.insertLayout(at + 2, row)
+    else:
+        lay.addSpacing(12)
+        lay.addLayout(row)
+    sp.ui_scale_combo = combo
 
 def _ui_add_nsfw_setting(self):
     sp = self.settings_page
@@ -53613,7 +54109,7 @@ def _adm_open(window):
 _NCZ_SET_CATS = [
     ("Shortcuts", ("game shortcuts",)),
     ("NCZ Command Line Tool", ("command line tool",)),
-    ("Appearance", ("dark mode", "accent color", "interface style")),
+    ("Appearance", ("dark mode", "accent color", "interface style", "ui scale")),
     ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
     ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut")),
     ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
@@ -53914,7 +54410,7 @@ SettingsPage.showEvent = _ncz_settings_show
 # Left sidebar = setting areas (with icons). Right = the selected area, each panel is an expander (open/closed is remembered).
 # Searching shows every matching expander from all areas. Big Picture still reads the real controls (see _bpe_hidden).
 _NCZ_SET_CATS = [
-    ("Appearance", ("dark mode", "accent color", "interface style", "theme", "startup animation", "animation")),
+    ("Appearance", ("dark mode", "accent color", "interface style", "theme", "startup animation", "animation", "ui scale")),
     ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut", "close button", "start in the tray")),
     ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
     ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
@@ -54098,6 +54594,9 @@ class _NczExpander(QFrame):
         sh = getattr(p, "_ig_sheen", None)
         if sh is not None:
             sh.hide()
+        bd = getattr(p, "_ig_bd", None)
+        if bd is not None:
+            bd.hide()
         p.installEventFilter(self)
         self.panels.append(p)
         self.inner.layout().addWidget(p)
@@ -65962,6 +66461,99 @@ def _nd_resolve_mediafire(page_url):
             _log_exc("_nd_resolve_mediafire")
     raise RuntimeError("Couldn't find the download link on the MediaFire page.")
 
+# ── update check: the MediaFire file behind each link is fingerprinted (hash + size from MediaFire's public file info,
+# or the size from the download headers when that is unavailable). The fingerprint seen at install time is saved; when the
+# file on MediaFire no longer matches it, the card shows "Update" instead of "Launch".
+_ND_MF_KEY_RE = re.compile(r"mediafire\.com/(?:file|view|download)/([A-Za-z0-9]+)")
+
+def _nd_versions_path():
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "nondev_versions.json")
+
+def _nd_version_key(g):
+    _url, fname = _nd_platform(g)
+    return f"{g['id']}|{fname}"
+
+def _nd_load_versions():
+    try:
+        with open(_nd_versions_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _nd_save_version(g, fp):
+    """Remembers the fingerprint of the build that was just installed (None forgets it)."""
+    try:
+        data = _nd_load_versions()
+        if fp:
+            data[_nd_version_key(g)] = fp
+        else:
+            data.pop(_nd_version_key(g), None)
+        with open(_nd_versions_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        _log_exc("nondev versions save")
+
+def _nd_remote_fingerprint(page_url, direct_url=None):
+    """{'hash', 'size'} of the file on MediaFire (either key may be missing), or None when it can't be read."""
+    fp = {}
+    m = _ND_MF_KEY_RE.search(page_url or "")
+    if m:
+        try:
+            api = "https://www.mediafire.com/api/1.5/file/get_info.php?" + urllib.parse.urlencode(
+                {"quick_key": m.group(1), "response_format": "json"})
+            req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8", errors="replace")).get("response", {})
+            info = resp_json.get("file_info", {})
+            if isinstance(info, list):
+                info = info[0] if info else {}
+            if resp_json.get("result") == "Success" and isinstance(info, dict):
+                if info.get("hash"):
+                    fp["hash"] = str(info["hash"])
+                if str(info.get("size", "")).isdigit():
+                    fp["size"] = int(info["size"])
+        except Exception:
+            _log_exc("_nd_remote_fingerprint api")
+    if not fp:                 # fall back to the size the download server reports (no body is read)
+        try:
+            url = direct_url or _nd_resolve_mediafire(page_url)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
+                total = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range", "") or "")
+                if total:
+                    fp["size"] = int(total.group(1))
+                elif resp.status == 200 and (resp.headers.get("Content-Length", "") or "").isdigit():
+                    fp["size"] = int(resp.headers["Content-Length"])
+        except Exception:
+            _log_exc("_nd_remote_fingerprint headers")
+    return fp or None
+
+def _nd_update_available(g):
+    """True / False, or None when MediaFire couldn't be reached (the card then keeps what it shows)."""
+    page, _fname = _nd_platform(g)
+    exe = _nd_exe(g)
+    if not page or not exe:
+        return False
+    remote = _nd_remote_fingerprint(page)
+    if not remote:
+        return None
+    saved = _nd_load_versions().get(_nd_version_key(g)) or {}
+    if saved.get("hash") and remote.get("hash"):
+        return saved["hash"] != remote["hash"]
+    if saved.get("size") and remote.get("size"):
+        return saved["size"] != remote["size"]
+    # installed before updates were tracked: compare with the file on disk, and use today's file as the baseline
+    if remote.get("size"):
+        try:
+            if os.path.getsize(exe) == remote["size"]:
+                _nd_save_version(g, remote)
+                return False
+        except OSError:
+            return None
+        return True
+    return False
+
 def _nd_exe(g):
     """Installed game file of this OS, '' if it isn't installed."""
     _url, fname = _nd_platform(g)
@@ -66022,6 +66614,11 @@ class NondevDownloadWorker(QThread):
             self.status_update.emit("Resolving MediaFire link...")
             headers = {"User-Agent": "Mozilla/5.0"}
             first = (_nd_resolve_mediafire(page), headers)
+            fp = None
+            try:
+                fp = _nd_remote_fingerprint(page, first[0])      # taken before the download, so a newer upload isn't missed
+            except Exception:
+                _log_exc("nondev fingerprint")
             part = resumable_download(self, lambda: (_nd_resolve_mediafire(page), headers),
                                       lambda _r, _u: ".nondev-" + fname, first=first)
             if self._is_cancelled:
@@ -66033,6 +66630,7 @@ class NondevDownloadWorker(QThread):
                 os.remove(final)
             shutil.move(part, final)
             part = ""
+            _nd_save_version(g, fp)
             if not sys.platform.startswith("win"):
                 os.chmod(final, 0o755)
             self.finished.emit(final)
@@ -66050,14 +66648,19 @@ def _nd_refresh_card(app, g):
         return
     page, _f = _nd_platform(g)
     installed = bool(_nd_exe(g))
+    update = installed and g["id"] in getattr(app, "_nd_updates", set())
+    label = "Update" if update else ("Launch" if installed else "Install")
     if w["btn"].text() != "Stop":                  # the Stop sync owns the text while the game runs
-        w["btn"].setText("Launch" if installed else "Install")
-        w["btn"].setProperty("ncz_orig_text", "Launch" if installed else "Install")
+        w["btn"].setText(label)
+    w["btn"].setProperty("ncz_orig_text", label)
     w["btn"].setEnabled(bool(page))
     w["uninstall"].setEnabled(installed)
     w["open"].setEnabled(installed)
     if not page:
         w["status"].setText("Not available on this OS")
+        w["status"].setStyleSheet(f"color: {ORANGE};")
+    elif update:
+        w["status"].setText("\u25CF Update available")
         w["status"].setStyleSheet(f"color: {ORANGE};")
     elif installed:
         w["status"].setText("\u25CF Installed")
@@ -66071,13 +66674,19 @@ def _nd_install(app, g):
         app.nav_group.button(6).setChecked(True)
         app.pages.setCurrentWidget(app.downloads_page)
         return
+    if _nd_exe(g) and pretty_game_name(g["title"]).lower() in {str(n).lower() for n in list(_running)}:
+        QMessageBox.information(app, "Update", f"Close {g['title']} first, then press Update.")
+        return
     worker = NondevDownloadWorker(g)
     card = DownloadCard(g["title"], "", 0, asset_path(g["cover"]), app, worker=worker)
     app.__dict__.setdefault("_nd_installing", {})[g["id"]] = True
     def done(*_a):
         app._nd_installing[g["id"]] = False
         _nd_refresh_card(app, g)
-    worker.finished.connect(done)
+    def installed_ok(*_a):
+        getattr(app, "_nd_updates", set()).discard(g["id"])      # now on the newest build
+        done()
+    worker.finished.connect(installed_ok)
     worker.failed.connect(done)
     app.downloads_page.add_download_card(card)
     app.nav_group.button(6).setChecked(True)
@@ -66260,7 +66869,12 @@ def _nd_build_card(app, g):
     btn.setObjectName("Primary")
     btn.setFixedHeight(38)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.clicked.connect(lambda _c=False: _nd_launch(app, g) if _nd_exe(g) else _nd_install(app, g))
+    def on_primary(_c=False):
+        if not _nd_exe(g) or g["id"] in getattr(app, "_nd_updates", set()):
+            _nd_install(app, g)          # Install, or Update (downloads the new build over the old one)
+        else:
+            _nd_launch(app, g)
+    btn.clicked.connect(on_primary)
     more = QPushButton("\u2022\u2022\u2022")
     more.setObjectName("MoreButton")
     more.setFixedSize(42, 38)
@@ -66270,6 +66884,8 @@ def _nd_build_card(app, g):
     more.setMenu(menu)
     act_open = menu.addAction("Open Game Location")
     act_open.triggered.connect(lambda _c=False: app.open_game_location(g["folder"]))
+    act_chk = menu.addAction("Check for updates")
+    act_chk.triggered.connect(lambda _c=False: _nd_check_now(app, g, act_chk))
     act_un = menu.addAction("Uninstall")
     act_un.triggered.connect(lambda _c=False: _nd_uninstall(app, g))
     actions.addWidget(btn, 1)
@@ -66284,6 +66900,71 @@ def _nd_build_card(app, g):
         _add_shortcut_action(app, card, g["title"], lambda: _nd_exe(g), cover=cover_file, key=f"nondev-{g['id']}")
     except Exception:
         _log_exc("nondev shortcut action")
+
+def _nd_check_now(app, g, action):
+    """Check for updates (the game's ••• menu / Files & Updates page): asks MediaFire now and says what it found."""
+    if not _nd_exe(g):
+        QMessageBox.information(app, "Check for updates", f"{g['title']} isn't installed yet.")
+        return
+    action.setEnabled(False)
+    worker = TaskWorker(lambda: _nd_update_available(g))
+    def finish(res):
+        action.setEnabled(True)
+        if res is None:
+            QMessageBox.warning(app, "Check for updates", "Couldn't reach MediaFire. Check your connection and try again.")
+            return
+        (app._nd_updates.add if res else app._nd_updates.discard)(g["id"])
+        _nd_refresh_card(app, g)
+        QMessageBox.information(app, "Check for updates",
+                                f"A new version of {g['title']} is available. Press Update to install it." if res
+                                else f"{g['title']} is up to date.")
+    worker.done.connect(finish)
+    worker.failed.connect(lambda _m: finish(None))
+    app._nd_manual_worker = worker
+    worker.start()
+
+def _nd_start_update_checks(app):
+    """Checks MediaFire shortly after start and every 30 minutes; games with a newer file get Update instead of Launch."""
+    app._nd_updates = set()
+    state = {"busy": False}
+    def check():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        def job():
+            out = {}
+            for g in NONDEV_GAMES:
+                try:
+                    res = _nd_update_available(g)
+                except Exception:
+                    _log_exc("nondev update check")
+                    res = None
+                if res is not None:
+                    out[g["id"]] = res
+            return out
+        worker = TaskWorker(job)
+        def ok(res):
+            state["busy"] = False
+            if not isinstance(res, dict):
+                return
+            for gid, has in res.items():
+                (app._nd_updates.add if has else app._nd_updates.discard)(gid)
+            for g in NONDEV_GAMES:
+                try:
+                    _nd_refresh_card(app, g)
+                except RuntimeError:
+                    pass          # the card was deleted
+        def bad(_msg):
+            state["busy"] = False          # offline: tried again at the next check
+        worker.done.connect(ok)
+        worker.failed.connect(bad)
+        app._nd_update_worker = worker
+        worker.start()
+    QTimer.singleShot(4000, check)
+    app._nd_update_timer = QTimer(app)
+    app._nd_update_timer.setInterval(30 * 60 * 1000)
+    app._nd_update_timer.timeout.connect(check)
+    app._nd_update_timer.start()
 
 def _nd_cover_paths(g):
     path = asset_path(g["cover"])
@@ -66406,6 +67087,7 @@ def _nd_init_fan(self):
     tl.insertWidget(max(0, tl.count() - 1), holder)      # after Games and Fangames, before the trailing stretch
     _nd_install_status_hooks(self)
     _nd_start_creators(self)
+    _nd_start_update_checks(self)
     self.apply_filter()
 
 AdaptiveApp._init_fan = _nd_init_fan
@@ -67838,7 +68520,7 @@ class _SvView(QWidget):
             self.play.style().unpolish(self.play)
             self.play.style().polish(self.play)
         ub = _sv_update_btn(card)
-        self.update_btn.setVisible(ub is not None)
+        self.update_btn.setVisible(ub is not None and ub is not _sv_prim(card))      # Other NCZ Games: Play itself reads "Update", no second button
         st = card.findChild(QLabel, "CardStatus")
         stext = (st.text() if st is not None else "").replace("●", "").strip() or "-"
         self.st_status.set_value(stext)
@@ -68289,20 +68971,44 @@ AdaptiveApp.apply_filter = _sv_apply_filter    # kept as patch chain: wraps the 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 import math as _ig_math
 import re as _ig_re
+import weakref as _ig_weakref
 from PyQt6.QtCore import (QPropertyAnimation as _IgPA, QEasingCurve as _IgEC, QParallelAnimationGroup as _IgPAG,
-                          pyqtProperty as _ig_prop, QRect as _IgRect, QPointF as _IgPF, QRectF as _IgRF,
+                          pyqtProperty as _ig_prop, QRect as _IgRect, QPoint as _IgPt, QPointF as _IgPF, QRectF as _IgRF,
                           QAbstractAnimation as _IgAA, QEventLoop as _IgLoop, QSize as _IgSize)
 from PyQt6.QtGui import (QLinearGradient as _IgLG, QRadialGradient as _IgRG, QPainter as _IgPainter, QColor as _IgCol,
                          QPen as _IgPen, QPainterPath as _IgPath, QGuiApplication as _IgGA, QImage as _IgImg,
-                         QBrush as _IgBrush, QTransform as _IgTr)
+                         QBrush as _IgBrush, QTransform as _IgTr, QConicalGradient as _IgCG)
 from PyQt6.QtWidgets import (QGraphicsEffect as _IgFx, QScrollArea as _IgSA, QMenu as _IgMenu, QFrame as _IgFrame,
                              QPushButton as _IgBtn, QToolButton as _IgTB, QApplication as _IgApp, QWidget as _IgW, QDialog as _IgDlg,
                              QMessageBox as _IgMB, QInputDialog as _IgInp, QHBoxLayout as _IgHB, QVBoxLayout as _IgVB,
                              QLabel as _IgLbl, QAbstractButton as _IgAB, QMainWindow as _IgMW)
 
-_IG = {"on": None, "pill": False, "motion": True}
+_IG = {"on": None, "pill": False, "motion": True, "low": False}
 _IG_MARK_A, _IG_MARK_B = "/*IOSGLASS*/", "/*/IOSGLASS*/"
 _IG_RE = _ig_re.compile(_ig_re.escape(_IG_MARK_A) + r".*?" + _ig_re.escape(_IG_MARK_B), _ig_re.S)
+
+
+def _ig_low_power():
+    """True when the glass should run in its light mode (older / weak PCs): the same look, but no moving aurora, no page fades,
+    no press animation, no inertial scrolling, and no glass layer on the many small game cards.
+    launcher.json "ios_glass_perf": "auto" (default: 4 or fewer CPU threads) | "low" | "high"; env NCZ_IOS_GLASS_LOW=1 forces it."""
+    if os.environ.get("NCZ_IOS_GLASS_LOW", "") in ("1", "true", "on"):
+        return True
+    mode = "auto"
+    try:
+        v = _raw_setting("ios_glass_perf")
+        if isinstance(v, str):
+            mode = v.strip().lower()
+    except Exception:
+        pass
+    if mode == "low":
+        return True
+    if mode == "high":
+        return False
+    try:
+        return (os.cpu_count() or 8) <= 4
+    except Exception:
+        return False
 
 
 def _ig_enabled():
@@ -68313,6 +69019,9 @@ def _ig_enabled():
             _IG["motion"] = _raw_setting("ios_glass_motion") is not False
         except Exception:
             pass
+        _IG["low"] = _ig_low_power()
+        if _IG["low"]:
+            _IG["motion"] = False            # static glow: no per-frame repaint of the whole window
         _IG["on"] = on
     return _IG["on"]
 
@@ -68469,7 +69178,7 @@ class _IgPressFx(_IgFx):
 
 def _ig_enter(w, ms=340, delay=0):
     """Replacement for _ui_fade_in (used by the Sunset UI's page fades, intro and card stagger): fade + rise + scale."""
-    if w is None:
+    if w is None or _IG["low"]:
         return
     try:
         fx = _IgSlideFx(w, dy=14 if ms < 500 else 20)
@@ -68505,11 +69214,84 @@ def _ig_enter(w, ms=340, delay=0):
 
 
 # ── painted extras: sheen overlay, sliding nav pill, aurora ───────────────────────────────────────────────
-_IG_SHEEN_RADIUS = {"Panel": 18, "AccountCard": 18, "SyncCard": 18, "SidePanel": 18, "ToolBar": 18, "GameCard": 16}
+_IG_SHEEN_RADIUS = {"NczExp": 18, "Panel": 18, "AccountCard": 18, "SyncCard": 18, "SidePanel": 18, "ToolBar": 18, "GameCard": 16}
+
+
+_IG_BACKDROPS = _ig_weakref.WeakSet()     # every glass frame's backdrop layer (the aurora tick repaints them)
+
+
+def _ig_rim_strength():
+    """How bright the glass edge light is (1.0 = default, 0 = none). launcher.json: "ios_glass_rim": 0.0 - 2.0."""
+    try:
+        v = _raw_setting("ios_glass_rim")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return max(0.0, min(2.0, float(v)))
+    except Exception:
+        pass
+    return 1.0
+
+
+class _IgBackdrop(_IgW):
+    """The glass body of a frame, sitting UNDER its content: the aurora behind the frame, magnified a little at the
+    edges like a thick lens (the light bends there), plus a bit of colour boost and a milky tint. Stays 2px inside the frame so the
+    stylesheet border (selection ring) still shows."""
+    def __init__(self, parent, radius):
+        super().__init__(parent)
+        self.r = radius
+        self._retry = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setGeometry(parent.rect())
+        self.show()
+        self.lower()
+        _IG_BACKDROPS.add(self)
+
+    def _rr(self, rect, d):
+        path = _IgPath()
+        rr = max(1.0, self.r - d)
+        path.addRoundedRect(rect.adjusted(d, d, -d, -d), rr, rr)
+        return path
+
+    def paintEvent(self, _e):
+        light, acc, txt = _ig_pal()
+        par = self.parentWidget()
+        p = _IgPainter(self)
+        p.setRenderHint(_IgPainter.RenderHint.Antialiasing)
+        p.setRenderHint(_IgPainter.RenderHint.SmoothPixmapTransform)
+        rect = _IgRF(self.rect())
+        if rect.width() < 12 or rect.height() < 12:
+            p.end()
+            return
+        p.setClipPath(self._rr(rect, 2.0))
+        p.fillRect(rect, _IgApp.palette().color(QPalette.ColorRole.Window))
+        au = getattr(self.window(), "_ig_aurora", None)
+        img = getattr(au, "img", None) if au is not None else None
+        if img is not None and not img.isNull() and au.width() > 0 and au.height() > 0:
+            tl = au.mapFromGlobal(self.mapToGlobal(_IgPt(0, 0)))
+            sx, sy = img.width() / float(au.width()), img.height() / float(au.height())
+            p.drawImage(rect, img, _IgRF(tl.x() * sx, tl.y() * sy, self.width() * sx, self.height() * sy))   # what is behind, blurred
+        elif self._retry < 8:
+            self._retry += 1
+            QTimer.singleShot(80, self.update)           # the aurora has not painted its first frame yet
+        hot = False
+        try:
+            hot = par is not None and par.objectName() == "GameCard" and par.underMouse()
+        except RuntimeError:
+            pass
+        g = _IgLG(rect.left(), rect.top(), rect.right() * 0.6, rect.bottom())      # soft, neutral: lighter top-left, darker bottom-right
+        if light:
+            g.setColorAt(0.0, _IgCol(255, 255, 255, 150 + (25 if hot else 0)))
+            g.setColorAt(1.0, _IgCol(255, 255, 255, 84 + (25 if hot else 0)))
+        else:
+            g.setColorAt(0.0, _IgCol(255, 255, 255, 24 + (16 if hot else 0)))
+            g.setColorAt(1.0, _IgCol(255, 255, 255, 6 + (12 if hot else 0)))
+        p.fillRect(rect, _IgBrush(g))
+        p.end()
 
 
 class _IgSheen(_IgW):
-    """Transparent overlay on a glass frame: bright rim that fades along the edge + a soft specular highlight on top."""
+    """Transparent overlay on a glass frame (above its content): the lit edge of the glass (bright at the top-left and
+    bottom-right corners, fading along the sides, with a faint colour fringe), a soft inner glow and a curved specular highlight."""
     def __init__(self, parent, radius):
         super().__init__(parent)
         self.r = radius
@@ -68519,18 +69301,59 @@ class _IgSheen(_IgW):
         self.show()
         self.raise_()
 
+    def _edge(self, cx, cy, stops):
+        g = _IgCG(_IgPF(cx, cy), 135.0)               # angle 0 = 3 o'clock, counter-clockwise: 135 = top-left, 315 = bottom-right
+        for pos, col in stops:
+            g.setColorAt(pos, col)
+        return g
+
     def paintEvent(self, _e):
+        """The edge light never changes between repaints, so it is drawn once into a pixmap and only that is blitted."""
         light = _ig_pal()[0]
-        p = _IgPainter(self)
+        k = _ig_rim_strength()
+        par = self.parentWidget()
+        selected = False
+        try:
+            selected = par is not None and str(par.property("selected")).lower() == "true"
+        except RuntimeError:
+            pass
+        w, h = self.width(), self.height()
+        if w < 12 or h < 12:
+            return
+        dpr = self.devicePixelRatioF()
+        key = (w, h, dpr, light, k, selected)
+        if getattr(self, "_pm_key", None) != key:
+            pm = QPixmap(int(w * dpr), int(h * dpr))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = _IgPainter(pm)
+            self._draw(q, w, h, light, k, selected)
+            self._pm, self._pm_key = pm, key
+        out = _IgPainter(self)
+        out.drawPixmap(0, 0, self._pm)
+        out.end()
+
+    def _draw(self, p, w, h, light, k, selected):
         p.setRenderHint(_IgPainter.RenderHint.Antialiasing)
-        r = _IgRF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        r = _IgRF(0, 0, w, h).adjusted(0.5, 0.5, -0.5, -0.5)
         path = _IgPath()
         path.addRoundedRect(r, self.r, self.r)
-        hi = _IgLG(0, r.top(), 0, r.top() + min(r.height(), 90))
-        hi.setColorAt(0.0, _IgCol(255, 255, 255, 22 if not light else 90))
-        hi.setColorAt(1.0, _IgCol(255, 255, 255, 0))
+        a = lambda v: max(0, min(255, int(v * k)))
+        p.save()                                         # very soft light along the top
         p.setClipPath(path)
-        p.fillRect(r.adjusted(0, 0, 0, 0), _IgBrush(hi))
+        hh = min(r.height() * 0.45, 60.0)
+        hi = _IgLG(0, r.top(), 0, r.top() + hh)
+        hi.setColorAt(0.0, _IgCol(255, 255, 255, 14 if not light else 90))
+        hi.setColorAt(1.0, _IgCol(255, 255, 255, 0))
+        p.fillRect(_IgRF(r.left(), r.top(), r.width(), hh), _IgBrush(hi))
+        p.restore()
+        if not selected:                                 # hairline edge: a little brighter at the top-left / bottom-right corners
+            g = _IgCG(r.center(), 135.0)
+            for pos, v in ((0.0, 70), (0.12, 30), (0.3, 14), (0.5, 40), (0.7, 14), (0.88, 30), (1.0, 70)):
+                g.setColorAt(pos, _IgCol(255, 255, 255, a(v)))
+            p.setPen(_IgPen(_IgBrush(g), 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
         p.end()
 
 
@@ -68543,25 +69366,35 @@ class _IgPill(_IgW):
 
     def paintEvent(self, _e):
         light, acc, txt = _ig_pal()
+        k = _ig_rim_strength()
         p = _IgPainter(self)
         p.setRenderHint(_IgPainter.RenderHint.Antialiasing)
         r = _IgRF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        g = _IgLG(0, r.top(), 0, r.bottom())
-        base = _IgCol(txt)
+        rad = min(14.0, r.height() / 2.0)
+        path = _IgPath()
+        path.addRoundedRect(r, rad, rad)
+        base = _IgCol(txt) if light else _IgCol(255, 255, 255)
+        g = _IgLG(r.left(), r.top(), r.right() * 0.6, r.bottom())          # same neutral glass as the cards, a bit brighter
         c1, c2 = _IgCol(base), _IgCol(base)
-        c1.setAlpha(46 if not light else 34)
-        c2.setAlpha(18 if not light else 14)
+        c1.setAlpha(40 if not light else 30)
+        c2.setAlpha(14 if not light else 12)
         g.setColorAt(0, c1)
         g.setColorAt(1, c2)
-        p.setBrush(_IgBrush(g))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(r, 14, 14)
-        sh = _IgLG(0, r.top(), 0, r.top() + r.height() * 0.5)
-        sh.setColorAt(0, _IgCol(255, 255, 255, 40 if not light else 110))
+        p.fillPath(path, _IgBrush(g))
+        p.save()
+        p.setClipPath(path)
+        hh = r.height() * 0.5
+        sh = _IgLG(0, r.top(), 0, r.top() + hh)
+        sh.setColorAt(0, _IgCol(255, 255, 255, 16 if not light else 90))
         sh.setColorAt(1, _IgCol(255, 255, 255, 0))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_IgBrush(sh))
-        p.drawRoundedRect(r.adjusted(2, 1.5, -2, -r.height() * 0.5), 12, 12)
+        p.fillRect(_IgRF(r.left(), r.top(), r.width(), hh), _IgBrush(sh))
+        p.restore()
+        rg = _IgCG(r.center(), 135.0)                                       # hairline edge, brighter at two opposite corners
+        for pos, v in ((0.0, 80), (0.12, 36), (0.3, 16), (0.5, 46), (0.7, 16), (0.88, 36), (1.0, 80)):
+            rg.setColorAt(pos, _IgCol(255, 255, 255, max(0, min(255, int(v * k * (1.0 if not light else 1.6))))))
+        p.setPen(_IgPen(_IgBrush(rg), 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
         p.end()
 
 
@@ -68609,7 +69442,7 @@ class _IgPillCtl(QObject):
         if not _IG["pill"]:
             _IG["pill"] = True                      # first pill: the checked tab's own fill goes transparent
             _IgApp.instance().setStyleSheet(_IgApp.instance().styleSheet())
-        if not self.pill.isVisible() or not animate:
+        if not self.pill.isVisible() or not animate or _IG["low"]:
             self.pill.setGeometry(r)
             self.pill.show()
             self.pill.lower()
@@ -68656,6 +69489,14 @@ class _IgAurora(_IgW):
             return
         self.t0 += 0.045
         self.update()
+        self._n = getattr(self, "_n", 0) + 1
+        if self._n % 3 == 0:                          # the glass frames re-sample the moving aurora
+            for b in list(_IG_BACKDROPS):
+                try:
+                    if b.isVisible():
+                        b.update()
+                except RuntimeError:
+                    pass
 
     def paintEvent(self, _e):
         light, acc, _t = _ig_pal()
@@ -68711,6 +69552,8 @@ class _IgFilter(QObject):
                     nm = o.objectName()
                     r = _IG_SHEEN_RADIUS.get(nm)
                     if r and not getattr(o, "_ig_sheen", None) and not getattr(o, "_ig_nosheen", False):
+                        if not (_IG["low"] and nm == "GameCard"):
+                            o._ig_bd = _IgBackdrop(o, r)
                         o._ig_sheen = _IgSheen(o, r)
                         o.installEventFilter(self)
                     elif nm in ("SideRail", "Sidebar") and not getattr(o, "_ig_pillctl", None):
@@ -68723,8 +69566,14 @@ class _IgFilter(QObject):
                 o.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
                 o.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
             elif t == QEvent.Type.Resize and getattr(o, "_ig_sheen", None) is not None:
+                bd = getattr(o, "_ig_bd", None)
+                if bd is not None:
+                    bd.setGeometry(o.rect())
+                    bd.lower()
                 o._ig_sheen.setGeometry(o.rect())
                 o._ig_sheen.raise_()
+            elif t in (QEvent.Type.Enter, QEvent.Type.Leave, QEvent.Type.Move) and getattr(o, "_ig_bd", None) is not None:
+                o._ig_bd.update()
             elif t == QEvent.Type.MouseButtonPress and isinstance(o, _IgBtn) and e.button() == Qt.MouseButton.LeftButton:
                 self.press(o)
             elif t == QEvent.Type.Wheel and o.objectName() == "qt_scrollarea_viewport" and isinstance(o.parent(), _IgSA):
@@ -68767,7 +69616,7 @@ class _IgFilter(QObject):
             pass
 
     def press(self, b):
-        if (b.objectName() in ("NavButton", "MinButton", "ExitButton") or b.graphicsEffect() is not None
+        if (_IG["low"] or b.objectName() in ("NavButton", "MinButton", "ExitButton") or b.graphicsEffect() is not None
                 or not b.isEnabled() or b.width() > 460 or b.isFlat()):
             return
         fx = _IgPressFx(b)
@@ -68803,8 +69652,8 @@ class _IgFilter(QObject):
         QTimer.singleShot(4000, lambda: release() if b.graphicsEffect() is fx and not b.isDown() else None)
 
     def smooth_wheel(self, area, e):
-        if not e.pixelDelta().isNull() or e.modifiers() != Qt.KeyboardModifier.NoModifier:
-            return False                                     # trackpads already scroll smoothly
+        if _IG["low"] or not e.pixelDelta().isNull() or e.modifiers() != Qt.KeyboardModifier.NoModifier:
+            return False                                     # trackpads already scroll smoothly (low mode: plain stepped scrolling)
         bar = area.verticalScrollBar()
         if bar is None or bar.maximum() <= bar.minimum():
             return False
@@ -69268,6 +70117,7 @@ _GS_DESC = {
     "Uninstall": "Remove the game from this computer.",
     "View Details": "Show the game's details.",
     "Update game": "Download and install the latest version of the game.",
+    "Check for updates": "See if a newer version of this game is available.",
     "Apply update zip": "Install an update from a zip file you already downloaded.",
     "Edit Current Save": "Open this game's save so you can edit it.",
     "Edit Current Settings": "Open this game's settings file so you can edit it.",
@@ -69296,7 +70146,7 @@ def _gs_button_text(text):
     low = text.lower()
     for keys, label in ((("uninstall",), "Uninstall"), (("location", "folder"), "Open Folder"), (("shortcut",), "Create"),
                         (("add to steam",), "Add"), (("switch compat", "compatibility tool"), "Change"), (("redist",), "Install"),
-                        (("winetricks",), "Launch"), (("apply",), "Apply"), (("update",), "Update"), (("sync",), "Sync"),
+                        (("winetricks",), "Launch"), (("apply",), "Apply"), (("check for update",), "Check"), (("update",), "Update"), (("sync",), "Sync"),
                         (("cloud",), "Manage"), (("save data",), "Back Up"), (("edit",), "Edit"), (("details",), "View"),
                         (("game jolt", "store page"), "Open Page"), (("verify", "repair"), "Run"), (("reset",), "Reset"),
                         (("install",), "Install"), (("download",), "Download")):
@@ -69631,6 +70481,253 @@ try:
     _SvView._open_game_settings = _gs_open
 except NameError:
     pass                                                           # older main.py without the new Library view
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  Settings backup (Firebase) + ONE liquid-glass card for every popup
+#  * Backup: launcher settings are stored under users/<uid>/games/launcher_settings_backup - the same place (and the same
+#    record shape) the cloud saves already use, so NO new database rules are needed. Paths, API keys and other
+#    per-PC values are left out and stay on this PC.
+#  * Popups: the glass sheet (_IgCard) now has the same frosted body + lit edge as every other glass panel, and dialogs
+#    opened with .show() (not only exec/open) land in the same sheet instead of a separate OS window.
+# ════════════════════════════════════════════════════════════════════════════════════════════
+_SB_NODE = "launcher_settings_backup"
+_SB_SKIP = {"install_dir", "library_dirs", "archive_tool", "bridge_pin", "controller_bridge", "start_on_boot",
+            "discord_pfp_hash"}
+_SB_BAD = ("token", "secret", "password", "api_key", "_path", "_dir", "_exe")
+
+
+def _sb_clean(d):
+    """Only the settings that make sense on another PC (no folders, keys, tokens, PINs)."""
+    out = {}
+    for k, v in (d or {}).items():
+        kl = str(k).lower()
+        if k in _SB_SKIP or any(s in kl for s in _SB_BAD):
+            continue
+        out[k] = v
+    return out
+
+
+def settings_backup_upload():
+    data = _sb_clean(_raw_launcher_json())
+    if not data:
+        raise CloudError("There are no settings to back up yet.", "NOTHING")
+    payload = {"updated": {".sv": "timestamp"}, "device": platform.system() or "Unknown",
+               "settings_text": json.dumps(data, ensure_ascii=False), "settings_null": False}
+    _ss_put(_SB_NODE, payload, timeout=30)
+    return len(data)
+
+
+def settings_backup_fetch():
+    """(settings dict, upload time in ms) or None when there is no backup yet."""
+    rec = _ss_get(_SB_NODE, timeout=20)
+    if not isinstance(rec, dict) or not isinstance(rec.get("settings_text"), str):
+        return None
+    data = json.loads(rec["settings_text"])
+    if not isinstance(data, dict):
+        return None
+    return _sb_clean(data), rec.get("updated")
+
+
+def settings_backup_apply(data):
+    cur = _raw_launcher_json()
+    cur.update(_sb_clean(data))
+    save_launcher_settings(cur)
+
+
+class _SbWorker(QObject):
+    done = pyqtSignal(str, object)
+
+
+def _sb_panel(sp):
+    panel = QFrame()
+    panel.setObjectName("Panel")
+    pl = QVBoxLayout(panel)
+    pl.setContentsMargins(22, 18, 22, 18)
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    name = QLabel("Settings Backup")
+    name.setObjectName("RowTitle")
+    desc = QLabel("Saves your launcher settings to your account so you can restore them on another PC or after a reinstall. "
+                  "Folders and API keys stay on this PC.")
+    desc.setObjectName("RowDesc")
+    desc.setWordWrap(True)
+    status = QLabel("")
+    status.setObjectName("RowDesc")
+    status.setWordWrap(True)
+    text.addWidget(name)
+    text.addWidget(desc)
+    text.addWidget(status)
+    btns = QVBoxLayout()
+    btns.setSpacing(8)
+    up = QPushButton("Back up now")
+    dn = QPushButton("Restore")
+    for b in (up, dn):
+        b.setFixedWidth(160)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        btns.addWidget(b)
+    row.addLayout(text, 1)
+    row.addLayout(btns)
+    pl.addLayout(row)
+
+    worker = _SbWorker(sp)
+    sp._sb_worker = worker
+
+    def busy(on, msg=""):
+        up.setEnabled(not on)
+        dn.setEnabled(not on)
+        if msg:
+            status.setText(msg)
+
+    def start(kind):
+        busy(True, "Working...")
+
+        def job():
+            try:
+                worker.done.emit(kind, settings_backup_upload() if kind == "up" else settings_backup_fetch())
+            except CloudError as e:
+                worker.done.emit("err", str(e))
+            except Exception as e:
+                _log_exc("settings_backup")
+                worker.done.emit("err", f"Something went wrong: {e}")
+        threading.Thread(target=job, daemon=True).start()
+
+    def on_done(kind, res):
+        busy(False)
+        if kind == "err":
+            status.setText(str(res))
+        elif kind == "up":
+            status.setText(f"Backed up {res} settings.")
+        elif res is None:
+            status.setText("No backup found yet. Press \"Back up now\" on the PC that has your settings.")
+        else:
+            data, stamp = res
+            when = format_cloud_time(stamp) if stamp else "an unknown time"
+            ans = QMessageBox.question(sp, "Restore settings",
+                                       f"Restore {len(data)} settings from the backup made on {when}?\n\n"
+                                       "They replace the matching settings on this PC. Restart the launcher afterwards.")
+            if ans != QMessageBox.StandardButton.Yes:
+                status.setText("Restore cancelled.")
+                return
+            try:
+                settings_backup_apply(data)
+                status.setText("Restored. Restart the launcher to apply everything.")
+            except Exception as e:
+                _log_exc("settings_backup_apply")
+                status.setText(f"Could not restore: {e}")
+
+    worker.done.connect(on_done)
+    up.clicked.connect(lambda: start("up"))
+    dn.clicked.connect(lambda: start("dn"))
+    layout = sp.layout()
+    idx = max(layout.count() - 1, 0)
+    layout.insertSpacing(idx, 12)
+    layout.insertWidget(idx + 1, panel)
+
+
+_sb_prev_settings_init = SettingsPage.__init__
+
+
+def _sb_settings_init(self, *a, **k):
+    _sb_prev_settings_init(self, *a, **k)
+    try:
+        _sb_panel(self)
+    except Exception:
+        _log_exc("_sb_panel")
+
+
+SettingsPage.__init__ = _sb_settings_init
+try:    # list it under "Online & Integrations" in the grouped Settings page
+    _i = [n for n, _k in _NCZ_SET_CATS].index("Online & Integrations")
+    _NCZ_SET_CATS[_i] = (_NCZ_SET_CATS[_i][0], tuple(_NCZ_SET_CATS[_i][1]) + ("settings backup",))
+except Exception:
+    _log_exc("settings backup category")
+
+
+# ── one glass card for every popup ──
+_IG_SHEEN_RADIUS["IgDialogCard"] = 20        # the shared glass body + lit edge, same as Panel / ToolBar / cards
+
+
+class _SgSep(_IgW):
+    """The hairline under the title bar (a child on top of the glass body, which would hide a line painted by the card)."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def paintEvent(self, _e):
+        _l, _a, txt = _ig_pal()
+        c = _IgCol(txt)
+        c.setAlpha(22)
+        p = _IgPainter(self)
+        p.fillRect(self.rect(), c)
+        p.end()
+
+
+_sg_orig_card_init = _IgCard.__init__
+
+
+def _sg_card_init(self, *a, **k):
+    _sg_orig_card_init(self, *a, **k)
+    self._sg_sep = _SgSep(self)
+    self._sg_sep.setGeometry(18, 46, max(0, self.width() - 36), 1)
+    self._sg_sep.show()
+    self._sg_sep.raise_()
+
+
+def _sg_card_resize(self, e):
+    _IgFrame.resizeEvent(self, e)
+    sep = getattr(self, "_sg_sep", None)
+    if sep is not None:
+        sep.setGeometry(18, 46, max(0, self.width() - 36), 1)
+        sep.raise_()
+        sh = getattr(self, "_ig_sheen", None)
+        if sh is not None:
+            sh.raise_()
+
+
+def _sg_card_paint(self, _e):
+    # only the base under the glass (it shows in the 2px rim); the body, edge light and highlight come from _IgBackdrop / _IgSheen
+    p = _IgPainter(self)
+    p.setRenderHint(_IgPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(_IgApp.palette().color(QPalette.ColorRole.Window))
+    p.drawRoundedRect(_IgRF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 20, 20)
+    p.end()
+
+
+_IgCard.__init__ = _sg_card_init
+_IgCard.resizeEvent = _sg_card_resize
+_IgCard.paintEvent = _sg_card_paint
+
+_sg_orig_show = _IgDlg.show
+
+
+def _sg_embeddable(d):
+    if getattr(d, "_ig_noembed", False) or d.isVisible():
+        return False
+    if d.windowType() in (Qt.WindowType.Tool, Qt.WindowType.Popup, Qt.WindowType.ToolTip, Qt.WindowType.SplashScreen):
+        return False
+    f = d.windowFlags()
+    return not (bool(f & Qt.WindowType.WindowStaysOnTopHint) or bool(f & Qt.WindowType.FramelessWindowHint))
+
+
+def _sg_show(self):
+    """Dialogs opened with .show() go into the same glass sheet as exec() / open() ones."""
+    try:
+        if _sg_embeddable(self):
+            host = _ig_host(self)
+            if host is not None:
+                self.setResult(0)
+                _IgEmbed(self, host)
+                return
+    except Exception:
+        _log_exc("glass show")
+    return _sg_orig_show(self)
+
+
+_IgDlg.show = _sg_show
 
 
 if __name__ == "__main__":
