@@ -69,7 +69,7 @@ REQUIRE_DISCORD_FOR_NEW_ACCOUNTS = True
 # next login counts as "already in the database".
 WRITE_PROFILE_FOR_NEW_ACCOUNTS = True
 BAN_CLOSE_DELAY_MS = 16
-VERSION_TEXT = "v12.4.0"
+VERSION_TEXT = "v13.4.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
@@ -418,7 +418,32 @@ def load_account():
     return None
 
 
+def _signin_marker():
+    return os.path.join(settings_dir(), "signed_in_version")
+
+
+def enforce_resignin():
+    """After an update (VERSION_TEXT changed) everyone has to sign in again once: the saved session is removed when it
+    was made on another version. save_account() writes the marker for the current version."""
+    try:
+        with open(_signin_marker(), encoding="utf-8") as f:
+            ok = f.read().strip() == VERSION_TEXT
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            os.remove(account_path())
+        except OSError:
+            pass
+
+
 def save_account(acct):
+    try:
+        os.makedirs(settings_dir(), exist_ok=True)
+        with open(_signin_marker(), "w", encoding="utf-8") as f:
+            f.write(VERSION_TEXT)
+    except OSError:
+        pass
     path = account_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1311,7 +1336,8 @@ class PrimaryButton(QPushButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
-        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        rad = r.height() * 0.28
+        path.addRoundedRect(r, rad, rad)
         bg = QLinearGradient(0, r.top(), 0, r.bottom())
         bg.setColorAt(0, THEME["btn"][0])
         bg.setColorAt(1, THEME["btn"][1])
@@ -1393,11 +1419,8 @@ class SocialButton(QPushButton):
         p.setOpacity(1.0 if on else 0.45)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
-        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
-        p.fillPath(path, QColor(255, 255, 255, 46 if hov else 19))
-        p.setPen(QPen(QColor(255, 255, 255, 150 if hov else 46), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        path.addRoundedRect(r, r.height() * 0.28, r.height() * 0.28)
+        p.fillPath(path, QColor(255, 255, 255, 43 if hov else 23))      # launcher glass button: soft white fill, no outline
         p.setFont(self.font())
         tw = QFontMetricsF(self.font()).horizontalAdvance(self.text())
         isz, gap = h * 0.42, h * 0.26
@@ -1497,7 +1520,7 @@ class ProgressBar(QWidget):
         th = h - ty
         p.setPen(QColor(255, 255, 255, 170))
         p.setFont(f)
-        left = fm.elidedText(self.text, Qt.TextElideMode.ElideMiddle, w * 0.8)
+        left = fm.elidedText(tr(self.text), Qt.TextElideMode.ElideMiddle, w * 0.8)
         p.drawText(QRectF(0, ty, w * 0.8, th), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, left)
         fb = QFont(f)
         p.setFont(fb)
@@ -1505,6 +1528,130 @@ class ProgressBar(QWidget):
         p.drawText(QRectF(w * 0.8, ty, w * 0.2, th), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
                    f"{round(self.value * 100)}%")
         p.end()
+
+
+# ------------------------------------------------------------------------------------------------ fonts download
+FONT_ASSETS = ("ubuntu.ttf", "SF-Pro.ttf", "SF-Arabic.ttf")      # ubuntu.ttf first: the wait screen is written in it
+
+
+def missing_fonts():
+    return [n for n in FONT_ASSETS if not os.path.isfile(os.path.join(ASSETS_DIR, n))]
+
+
+class FontWorker(QThread):
+    one = pyqtSignal(str, int, int)          # file name, files done, files total
+
+    def __init__(self, names, parent=None):
+        super().__init__(parent)
+        self.names = list(names)
+
+    def run(self):
+        for i, name in enumerate(self.names):
+            try:
+                url = RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=ASSETS_PREFIX + name)
+                _download_to(url, os.path.join(ASSETS_DIR, name), lambda n: None, lambda: False)
+            except Exception:
+                pass                         # no network / not in the repo: the app falls back to a system font
+            self.one.emit(name, i + 1, len(self.names))
+
+
+class FontSplash(QWidget):
+    """Small wait window shown before the sign-in screen while the fonts are fetched."""
+
+    def __init__(self, names):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("NCZ Games Launcher")
+        self.frac, self.t = 0.0, 0.0
+        self.shown_frac = 0.0
+        self.family = None
+        self._use_ubuntu()
+        self.resize(620, 190)
+        geo = QApplication.primaryScreen().geometry()
+        self.move(geo.x() + (geo.width() - self.width()) // 2, geo.y() + (geo.height() - self.height()) // 2)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)
+        self.worker = FontWorker(names, self)
+        self.worker.one.connect(self._on_one)
+
+    def _use_ubuntu(self):
+        path = os.path.join(ASSETS_DIR, "ubuntu.ttf")
+        if self.family is None and os.path.isfile(path):
+            fid = QFontDatabase.addApplicationFont(path)
+            fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+            self.family = fams[0] if fams else None
+
+    def _on_one(self, name, done, total):
+        self.frac = done / float(total)
+        if name == "ubuntu.ttf":
+            self._use_ubuntu()
+
+    def _tick(self):
+        self.t += 0.016
+        self.shown_frac += (self.frac - self.shown_frac) * 0.15
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        card = QRectF(24, 24, w - 48, h - 48)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 7))
+        for i in range(8, 0, -1):
+            g = 20 * i / 8.0
+            p.drawRoundedRect(card.adjusted(-g, -g + 6, g, g + 6), 24 + g, 24 + g)
+        path = QPainterPath()
+        path.addRoundedRect(card, 24, 24)
+        g = QLinearGradient(card.topLeft(), card.bottomRight())
+        g.setColorAt(0.0, QColor(58, 58, 60))
+        g.setColorAt(0.45, QColor(34, 34, 36))
+        g.setColorAt(1.0, QColor(18, 18, 19))
+        p.fillPath(path, QBrush(g))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        f = QFont(self.family or QApplication.font().family())
+        f.setPixelSize(22)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(QRectF(card.x(), card.y() + 30, card.width(), 40), int(Qt.AlignmentFlag.AlignCenter),
+                   "Please wait.... downloading assets.")
+        bx, by, bw, bh = card.x() + 50, card.bottom() - 52, card.width() - 100, 8
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 30))
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), 4, 4)
+        fw = max(bh, bw * self.shown_frac)
+        p.setBrush(QColor(255, 255, 255, 230))
+        p.drawRoundedRect(QRectF(bx, by, fw, bh), 4, 4)
+        sx = (self.t * 0.8 % 1.0) * (fw + 60) - 30
+        p.setClipRect(QRectF(bx, by, fw, bh))
+        sheen = QLinearGradient(bx + sx, 0, bx + sx + 60, 0)
+        sheen.setColorAt(0, QColor(255, 255, 255, 0))
+        sheen.setColorAt(0.5, QColor(160, 160, 160, 140))
+        sheen.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillRect(QRectF(bx, by, fw, bh), QBrush(sheen))
+        p.end()
+
+
+def ensure_fonts():
+    """Before the sign-in window: fetches SF-Pro.ttf / SF-Arabic.ttf (and ubuntu.ttf) from the repo's assets/ folder
+    when they aren't on this PC yet, behind a small wait window. Never blocks forever: failures just fall back."""
+    names = missing_fonts()
+    if not names:
+        return
+    splash = FontSplash(names)
+    splash.show()
+    splash.worker.start()
+    while not splash.worker.isFinished():             # keeps the window animating until the downloads are done
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    splash._timer.stop()
+    splash.close()
 
 
 # ------------------------------------------------------------------------------------------------ window
@@ -1515,7 +1662,7 @@ TITLES = {"form": TITLE_TEXT, "create": "Create account", "forgot": "Reset your 
 
 
 def load_font_family():
-    paths = [os.path.join(ASSETS_DIR, "ubuntu.ttf")]
+    paths = [os.path.join(ASSETS_DIR, "SF-Pro.ttf"), os.path.join(ASSETS_DIR, "ubuntu.ttf")]
     if os.path.isdir(ASSETS_DIR):
         paths += sorted(os.path.join(ASSETS_DIR, f) for f in os.listdir(ASSETS_DIR)
                         if f.lower().startswith("ubuntu") and f.lower().endswith((".ttf", ".otf"))
@@ -1550,6 +1697,15 @@ def load_fonts():
                 fam = fams[0]
         out[role] = fam
     return out
+
+
+_N_LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEsCAYAAAAsHG0rAAAf50lEQVR42u2dd5iV1bXGf3uUPkMZQI0dFbtY6R1sMeq1RVGjYmxoYqxJrrlJTO5NjDEmlsSoKBELCPYSOyoGe0HFAogiKk16GTrMvn+sfZwBzoHznTn9e9/n4Tn4h+fh7O9b7171XY4A7/3WwO5AG6AR4MKfXME38P9P59+2DlgKTAe+ds4tQ4g9vPcO2BXYEWgNVER8t3yW3tN8f88aYDHwGTDbOVfrwmFUA+cBJwG7AZXhUFyun0WOCWBNMP5xwOPAWOfcAplArI1/C6Aj8DOgfyCCLQtEAFG+q6Hf44HlwDTgYeBOYKbz3jcCTgNuA5qW8bOfAlwD3O+cWyVTiC0BVAI3A2cCW8T1GIDLgGEVgf3OD25/OWNX4GLgQJlBrF3/KmBQjI0/4U38CKiqCK7+bknioHJDBbAn8EvvfRuZQyyxBbAd0ExHYaFPIs5vHpMf3RzoBVzqvW+sdyB2qIjRu745VAIVFTH84e2Ac4EewSUUhFgzYhyxNfAPoJVeAUEEEM9YcBfgRnkBxDEDLoRen4oYH0BT4HjgjFAKFYhNBlyAtYCviPmLUAX8AegYGkQEIVaeUAW6DbYDrgfaKhwQlAOI5xn0xSoDSgoKIoAYojlwAVYaVJOIIAKIIXYErgR2Uz5AEAHEEz2wuYjtdBSCCCB+aIKNRB/hva/WcQgigPhhG+Bs4ADvfRMdhyACiB+6AKcDu6o0KJQzttQRkKpV+Djgc2ARMFNHIsgDiBeqgVOBPt77FjoOQQQQP+wHnAx0UmlQUAgQTxyJCSnOCp+CIA8gRmiGlQaP89631HEIIoD4YQfghJAP0OiwIAIgnl2Cg4BdVBoURADEsjT4A6xJqFLHIYgA4ofWwDHAD733OjtBBBBD7I31BxygoxBEAPHNB1zqvW+toxBEAMSyNDgAuEQJQUEEQCy1BLcBjsUSg4IgAiB+VYG9gCHe+x10HIIIIJ6hQFfgCjUICSKAeKINcDS2blkQRAAxDAV2AM7z3u+n4xBEAPFDY6BTCAU0MCSIAIjnboGjgXNVGhREAMSyNNgaGIJNDUpARBABxHTt+C+AHTQvIIgA4kkCRwCDgZYKBwQRQDxJ4CfAQKxXQBBEADFDO+AyYG81CQkigHiiJ3AmsJ3yAYIIIJ44L+QEWukoBBFA/NAUWzveWbsGBRFAPLEbcC6wh0IBQQQQT5wEfB9LDgqCCID4dQpeDvT33jfWcQgigPhhK+AioLuOQhABENvS4Ane+110FIIIgFh2Cf4I+C/vvRaMCCIA4qkiNBhLCgqCCID4JQT3BE723nfVcQiFwpY6AgqpIjQQmOq9/8o5N1tHIsgDiF8ocBxwvAaGBBFAPNEBOBk4TEchiADih0bAQcAp3vs9dByCCCB+aIntGhzkva/ScQgigPhhW+B44GjJiAkigHg+iz0wAZEDdByCCIBYagccApzjvW+v4xBEAMRSS/AYbF5AfRqCCCCm+YAhwRsQBBEA8evQ7Aj83Hu/rY5DEAHEDy2w0uBgaQmSzRmMpjoGEUCpoBVwMdBVpcGGIWgxtgB212mIAErpxmoH3ABsJRLI2PhdMP79gR/oREQApZYP6AT8BqgSCWRk/M2D8V8ewipBBFByJHAR0B9QPiCa8TfDGqsuwQauJMgqAijZcOA2YCftFkjb+JsG478UOFbkKQIodWwNXA9so6PYrPFXAr2B/8ak13TziwDKwgs4DDjNe99Wx5HS+FsDvYCzgX4hByCIAMoCTbC14wd771XT3hjNw81/Sbj5KwNxCiKAssE2wFXYrkG93OHm995XA0dhbdTdMZ0FnY8IoCyfW1dsdHgnGb93wdi7YvJqPYAqGb8IoJzRDBgEDPTet0Zt032AHwN9dfOLAIjR1OB5QOe4qgqH7Uq9sW1L/bDOSRm/CCA2OBDbMrRPDGP+hPEPxpqkqmX8aDEI8VswcjgwyXs/xzk3MyYxf6vg9p8ejF83vzwA4qwidBLQ13vfLAbGX41tWT4T6+1vm6bxe2C5XhcRQDliH+AU4KAyLw22wFaqnR08gOo032MP1AAf6FVRCECZrh3vD0wDZgFTy7TDr08w/ih1/lpgITAOeAsrEwryACjHBSNHA8d471uV4Tx/D+DC8BnF+BcF478VeE+viQignLErcALQoxxUhevN8/cAzgC6kX6Tjw83/1hgOPAusFqviAig3JHoEuxYJvP8BwM/w9p8o9z8C4BXsDHq50IOwOv1EAEQg4GhhKBomxLW8KvEFqdeijX5VEaM+ccG438NWKXXQgQQJ2wVbsxjvfeNS9D4q4K7f1nIa7SIePOPA+4Jnyucc7r5RQCxw97AWcA+pVIarGf8hwC/xkQ8021zTiT8xgA3Ay8Dq2T8IoA4P9/OwJVY51wpxPxVWInvPCzxl66MVyLh9xSW7X8DqJHxiwDijkqsdj7Ee79FCWT7D8G0Dk4kWp/K8npu/1u6+UUAQh22w6bluhf5PP9hmPx5t4jGXwM8iuklvuqck/GLAATW1xLsCPxfsWkJ1mvyORgb7OlKNAHPmhDz3w9MULZfBCCQcmrwAOCPFJ+GX08s23840Xb3rQCexBJ+44BluvlFAAKbbBU+ynt/ahHN8/cEzg15iqoICb8lwCPAnVh7b41zrlaPWAQgbPp5fw9bO96hCGL+vli2/9CI7b3LgBeAu7D2XmX7RQAC6U+A7gX8qRBrx+uJeRxJ3bqzVhHEPJYBDwBDgfHAUt38IgCByK3CRwAX5pME6ol59MHUe3tGlPFaEIx/OFbqW6ybXwQgkFFVoBVwMXBIHgVFK7FS37mYll8U9d4V2EDPcEzUQze/CEBoIAnsgu3O2zaXC0dDwq8d1tZ7RjD+KBp+NcDDWMLvAyX8RABC9nAYcA6mtpPL9t6eWJ2/R4SY3wNLgZeAYcDbWUj4KWTgOwUpEYBAE0xW+9BQlsuF298f60TsGtH4a6jr7R8PLFfMn9XL34kABIAdgJ8A+2ZrdHiDOv9gTJ+gXcR5/uewef5XFPMrBBByiz4hPt++oaPD9dz+XtQl/NpENP5XgFuC278yize/dgfUnbMXAQj1cSq2Urs6C8Y/ADgfk/CujmD887De/uHYSO9Kuf05wTp5AMKGaIMlBLtlsmCkXodfN6zEeGiEmH8dMAd4EfgnJuaxWsafW+9fBCCQZNfgacCeUfQD6k319cPae7uQvoafx5p8Xgwx/9s5bO8VofBdFcBpMYiQDCcCU4BvgZlpyni1xNSHrgjG3yRCLLoA+A91Yh66+ZUEFChsafDMUBpsnqbx98LEPLpGNP6F4eb/OzBOYh4iAKE40CGEAl1ThQL1pLsTK8q7k76Yh8cEPP8DjMSm+lbm+Dd5hQDrh0IKAQQ20yX4GbZn8KsUGn4HAb8Msf+WEV6+pVi2/9bg9ucj2+906X2HtSoDCul4iKcDJ3vvmyZJ+B0EXBKMv0lEMY+n82z8gkIAIQNUY/0Bx4buvoTxd8Xkxn8Q0fhrsBLfMFTnR+vBhVJAJ+AkYFIIBfpj67o6k/7SjoSSz8PA3cB455wEPEUAAqVRMz4iuO5jAhl0IZqA5wJMuns4NtK7QscqAig2vA7si5W1hPVRBRwX4v32wfijinncB3xIYaf6FG7U2b6rUGlkPSSWSdboKEiWQa/GyoNRBDyXYJr9Q4H3i0C6W8NAfNd6rSrABpgL/AX4GCuTCMnLaOka0VLgeazO/34Y6dVlQ/H0ASQeplixDh9i/ehf6CgahBWYbv/t1On2y/iVAyh6rAb+DeyPTcdtpSOJfLMsxTb2DA83vzT8UB9A6fi5zs0PL++b5L49tdyMvwZb2jE03PxS8hEBlCQ+xpKCHytJGunmfxhr8nkP7epTCFDCXkCt934MtlW3HbCzToXNKfk8H2L+T5GApzyAMiCBxVgiawxWzhJIOVjyGdbb/4Gy/SKAciKBz7B1VG+rNLjJ8mAjYAageX4RQNlhHDAKU8kRNkYjrIPy1AizAYIIoGS8gJXAM1iCa75OJCmaA5cBvbz3yi2JAMqOBGYCT2DyVat1IknDgHbA74EOUQRFBRFAqWA81tc+CZUGU71PvTBV4OqGLhgRRADF5gWswzbWDMPGW4Xk+Cm2aaiZjkIEUG4ksBB4FhitUCAlmgHXAHspHyACKNfS4Aisz12hQHLsjiUFd1QoIAIoR7wHXIvp2gvJcRqmJNSa4lI3EkQADfYCVgGvBRKQF5C6MvB7oLP3vlGR9Cu012MRAWQL87Cx1yd0FCnRDrgKExYtGIKs+X7Az/VIRADZ8gI8JhzyF+BrnUhKL6AHcIr3fucCGv+BWGJyPz0SEUA2SWAN8BHwW8LOdWEjNAbOAgZ47yvzaPjOe98CW1f+C2x1WRM9DhFAtlGDTQwO01GkRHtgCNYqXJEP48eUi7sAvwIGRpQxFwEI6WsHYKu0/xG8ASF5KNAJGxjqlAfjbx5Cj4vDZ5UegQgglySwFpgMXI0p46gyQNK1498HjvHeb5ND428W3P6LgAHYKjNBBJBzrAmhwI2oS3BTocApwOHe+yY5MP6Wwd2/OBh/Kx25CCCfVYEa4A5grEggJfYIJNAty8ZfjW0uOisYf2sdtQgg7yTgnPsGuB6YhioDpNCi7A6c5L3fLUvGXxmM/nygr2J+EUCh8TImjT1f+YCkaFMvH1DZQONvgU0fnhmMv52OVwRQDKPD92BKudo1mBwdgBOAvpmUBuvF/D2BwUBvJfxEAMVEAnMxpdyPlA9I+f4dCJwB7JVhqa8PJkDSHyX8RABFSAKvY2uxv8H084X10SLc3Kd776sjGn934BzgcKCtjlIEUKy4D9s3KBWh5NgWOBY4cnNTg/U6/LoBFyrhJwIoBS9gKbYx5zVguU6EVAIiF7CJYZ162f7umOzYQKKV+mpRPkYEUCASmIipCH2KSoOkmNU/ALjMe58qi18Vbv5fBbe/VQa7C9/SUYsACoXHMO2A2TqKpGiJJfPO2LBLMIz09sM6/LqEHECUm38htuDlIR2zCKCQo8N3YqKiCgVS5wMuBA5KaAl67xsD+wO/wSTGqiIa/3wsB3MFJukuiAAKRgKzQijwuqoCKacGdwL+DLQOnsDemOjKfpi2QBS3fx620em3wFc6cxFAMZDAy9jW4a90GqQSEDkA0xPcH7iO6GIeHliEDWfdgJVh1ZHJxj3ZQmEwEtgRuAQt0CBFwu9CrF24A9HVfOeHeP864BvnXK33sn95AMWDJSEUeERHsckLapcMjH8OttL9BuDroNUgiACKbnR4UohP39GJZO0dnR9I9WbgyzCTIYgAilZF6F1MO2CNTqTBmBFCqzuC8etMRQDFC+99S+BgLOGl9VkNw2LghUAAE0WoSgIWs+Enxlj7YmOsXbSyqkGYgy1rvRf4BFgZQixBBFCUxt8aOBQbg+0ZyEAeQGaYDozCEqoTw8o2QQRQtMa/Vbj5Twd6BTKQ8ZPxaraHE26/jF8EUOzG3wo4EhgEdJbxNwiz6938k2T8IoBiN/62wfh/FGL+Khk/DU36jQE+BmT8qApQzMbfBptkO0PGTza3DncEWirhJwIoZrTC2lnPCm5/usbvMR1BDa8kR1vgNKCb916t1CKAorz9q8LNf3b4TDfmXwfMxaTF39NJpsTB2K7BvfOxcFQ5ACGqVn1vTLG2c/jvdI1/fjD+O7GqwfXA93SySS+wo4AvsF6Ab3Qk8gCKwfirMLnqC8Nnum5/LVbaGgPcDbyKKQjdhxJdbEJF6ERs16DEQUUABTX+Cizh1w24nLrNtOne/HOAl4BbsPmAVcAyTAzjTUBTbcmxJ3AS0Nl7L69WBFAw42+Jdfhdgu2kbx7h5v8WeAZTD36P0M4aMtzzgau0W2CTGID1V+ysoxABFML4WwejvyIo1jaLoFk3FxtkuQN4wzm3qn5pyzlX65x7A9sytEDKNqRSEToWGKRQQASQb+NvFWL9q4GDSD+5WhsM+tlg3OOdc5taIXZTyAus0Mknxdb1FowoFBAB5M34uwPnYmWpLSNo1i3Esv2jsCm21ZvRD1gNXAlM0W4BNlUaHATsmlAVFkQAuSz19QJ+F9p8o4z0LgOeA24EXnTO1aTT0eac+wL4KzYFJyR/pw/DNgepQUgEQC6XWvbAFlXsH8H4PdbHPhqTrRqfgXLNCCxhuFCPgVSCot/HFocKIoDs3vwhydQL+FmI/RtHNP5nghFPIIP6vnOuFpPMfkdrx1OiA/BD7303HYUIINsjvYdidf6+RNOqX46p1f4d0wJsiHLNHOBabBpOSP5uHwxc7r3X6nARQFaMvz1W4vsxlvhrHuHmn4Ml++4BPgSWNWSKLXgBbwAPogUjqdAMa8e+QglBEUA2ZLwOA4YEt79FhKm+xcFQ7wQ+AJYHA6aBqsIrA6GMRWuvU60Za4+VBk/UcYgAMjX+duEl+jFwCNFGeheHeP9e4KNg/Nls5JkFDMVahdUluDG2AHYFLgqfggggsphHX+BkbKqvMqLxPxNu/09zYPyJBSPvA/djvQTCxmiKNWj9IvxdCP0q6pbaNNoAR2Mz510iGD8h4fdwtmL+zZDACu/908Bu2Pjw1np0JCsNHiUlpvXCIycPIHWprxUwEFOd6RHIwEXYSjsKuAvL9i/JRsy/GRKYjVUYXkKlwVTebttA6IJ1kkpFJcWLUk2dbn+XiPP8i4DnscGeD4AVedSs+yQQz9t6jCnzASoJ1r2rCgGSuEWJm38QNtffOoLxL8YWU96PJfzyafw459Z478dhTTDbo9FYQUnAyDF/P0zAs1dEDb9vsam+24DX82389UhgYfh3PBXmDQQBaQKmh27h1jyY9BN+CSWfJ7FS3wRgTYGlqqdglYeOIZQR0QsigDRwGNY40jSi8T8L/IvMBnty4QXUeu/fxSoQOwO769EKybx/3QzrY3usfTRd45+HzfMPBT4opn30zrllwCtYE5KmBgWSJERVBswwJ5KQ8XoxuP0fU4SlN+fcdOBRTGVYgqKCkoBkp346Lxj/P6OIeRQIk4OHMlmPThABNNz454eY/xbg3WJy+zchI/YucAPWoyAIIgAya5yYj3Xa3YdJd5dEx51zLtGcNEqhgEBdx6oIIKJ675PhJn3VObe6xLbSzsCESCbpcQpqBY7GlHMxDb9bscGelaX2I8IswlRsb4EUhYUtVQVIz/iXAI9jdf4JGy7tKDGsAsZj+QtBUCNQGvP8I7Gpvk+LPeFHenPxe2C6BoKgHMBmRnqfxmb6J5f6dl7vfXOs1fkPWKuzEG+sBbQ+idRLOx4KN/9HuRTzyKOS8QBswei+pC9jLpR5FUAEkPzmH4310U8gBzJeBRAz7YutLusk4xeUA0iNpcHtH5EjAc98G39lMP4rZfyCCGDzeAG4O9z8y8rE+C8IMb/EMAURwGbwCibjVVPixl+FLcQ4D+gp4xdEAOlhdraWdhTQ+FtiCb9zMFWjKj1WAZUBSbs9ssRv/j7A2cH9b0X0JSOL1SkoD0AozZu/HzA4uP+VEb9mLjbk1Ag4HthJJysCEErD+KsxObMzQ8zfMuLXfAP8GxgeFppUYrv02uiEFQIIxW/8/bGEX/8MjH8+1u04FJjqnJuGqRy9S4l3PwoigHI3/irq1pUfRLRsf/0px7uxMeGEwb+KaQd8Xqo5EUEhQLkbfwss4XcB0DWi8ddiasaPAH8CZjnn1m2gKvwotmuwPbZvUJAHIBSJ8TfH9hX+lOhNPrWYpuFo4M/AzPrGv8GCkQcx1eMVOnkRgFAcaBGM/zKszl8Zscw5B9sa9Ddg+qZ6Hpxz72NDUR8ndskJCgGEwt3+TYFDgKszuPkT68seAa4HZqTZ8PQUsAOwHbCtnoI8AKEw68qbYIm+32bo9s8FHgOuA75J5van8AJWYFWCByhBKTRBBFAOMX+TYPR/DW5/JjH/U8D/Rrj565PA19iCkZfVJSgCEPJr/M2wtt4RmJRXo4ilvtnYuvK/AXMbMOfwKqaRMF1PRgQg5C/b3wv4Fdaau0XEr1mI7QMYCnzWkCGn8P8+B/yDEtmHIIgAShlNgP2Ba4HuaS4sZYPJxuHA74LxZ2MhyKJAAqPUICQCEHIr4Nkda9LZN6LbT3DT7wFuC6W+tVnaLeCxjsGRwCd6UiIAIfvZ/spg/FdhHX5RjX8OdYKm09LN9kcggTXAm8CNmISaIAIQsijj1Q/4NTbV1yTi13wV3P67gC9zuMdgCbZy/FY9ORGAkD3j7wX8JNz8zYk+0jsyuP6TyWGiLoQCM7FW4TF6giIAoeFTff2Bi8PN34zoYh6jAgF8no/1ZcG7mIitGZuhJykCEDIz/nbAMcAlmJJPVA2/qViPwGgs278qjwtHlwHjsK3Da/RERQBCNONvG27+M7ABn6gyXt9iHXojgInOuULU5xeFUOBxPVURgBDN7R+ACXh2zUC6ezom5DES+JQCjeyGKsP04AVIQEQEIKQp4Nkf0/Drja3vImLCbwRhd6FzrqAbjILn8TZwE7ZXUSQgAhA2cfP3w3b19cbm+4mY8BsRbv8vimhl+SpMVfgB5QNEAELqLb0Dg/H3yUDAcwZ1Gn6fF5HxJ0qDi4G/AONFAiIAYeM6f29gSAbqvR5L+I0IsXYx3fzrkYBzblIIBWYgFSERgIz/O+PvE4y/e0S3P3GzjsY676YWo/FvgIcw5aFFygeIAOT2241/GTbXXxVRxms2NtL7V0zJZ22x/+7wb7weeAupCCFNQHX4/Q+wH9CY6DJeo4A72YyAZxGSwCzv/U2YjuA+etdEAHFD03DjXwTsFdH41wXjfwa4HUv4lVw87Zx7znvfFet23DYDTQNBIUDJCngegAl49iHaYE9CvfchbCR4SrZHevOMG4FXsP4AQQRQ9m5/Y0y990agUwZu/7dYwu+6Bmr4FYsXsCT8lvckKCoCKHfjbxqM/iZMxbdxxGz/AmxL7/WZqPcWMQl8iPUufKY3RTkAyljDrzM2HrsX0QU8Z2Lqvf8EZpeL8dfDCEzebBu0dlweQJnd/s2C8f8xQ+OfhWX7bwG+LkPjT8wL/B0raa7VWyMCKBfjb4GJeFwLdMnA+BcBT2DS3dNLPOFHGkNM92KagoJCgJKP+dsAhwM/x2rdjSN+zZdYx9zIoOFX1jejc26d934ssAe2b3AnvUnyAErV+Ftjdf7zsCafJhmIeTyBTdBNLIH23myqCD0QfrvWjosASrq3/1Iyk+7+GhiGdfhNIn7tsjOxnMcLeqNEAKUo5jEAG+zpTPR5/i9DHDwS0/BbWUgxjwJ5AbXAh5iU2AS9WcoBlJLx9wPOxyS8m2WQ7R+Jlfs+L5CGX9GEAt77F4EOwPZAtd4yeQClkPAbgs31V2ag3ntviH+n5FO9t4gxGxMTfRJ1CYoAitj4twaOwAQ8M5HuTmj43QNMjvPNn0RFaHLIB7ylExEBFOtI7+FYtr9nhhp+94c/uvk3JoFVwDtYNUQLRkQARWX87YGjgcGYkk9UDb9pwfDvwWS8dPMnJ4H52NrxB5GAiAigSIy/GhPwvABb2tE0g5t/NLaie4qMn3QWm94HjNVRiAAKeiFhCb6BwFnYXH+TiFN9s0Nce69u/kgLRiZhuodf6kREAIU0/t7h5o8q3V2Llfrux2bgJ8n4I3cJvgn8C6jRiYgAKICMV29MwLMr0er8tfUSfjcAs8p8sCdXmBtCgZckK44agfKMTlim/0Ciy3jNBp7G1Hu/LceR3nyVBr33M7DR6n2AXXUq8gDyhcFYe29U40+4/dfI+LNCAmuAT4A/KRQQAeQTW5GZht+j4eb/Wsaf9anBx5GAiAigCFELzAkv6HXAHBl/1lGD5WO+UD5ABFBM8NhI6zDgd8BMGX/OWoXnY8tUl+pERADFgvlYwm84ME/Gn/PR4dcxsVSRgAig4Jgebv5rgGky/ryRwJ+xteOapRABFMzt/wrr678T0+1Xcip/WAJciakpaeOwCCDvSGzsuQv4SsZfkHzABExafJZORASQT3yBtafeG4x/jY6kYLsFRmJagot1IiKAXCMxoHJXMP4pMv6iGB2+EXgf0JyFCIBc1vknhpv/QWCqxDyKBh9jU4PaNYhmAXKBlcA4rBPtRWxjj27+4vEC1nrvn8dmN9oA2+lU5AFk0/gTElX/xtp7ZfzFRwKLQj7gNWCZTkQEkA2sBd4Ibv9LWJOPRnqLF5Ow3MyHahVWCJANTMD22D8r4y+NBqGwa7AjNsi1m05FHkBD8DTwsoy/pEigBhvIehZYqBMRATQEnwILZPwlRwJTgYewmQHla0QAGWO1YsmSxRuYEOtEHYVyADSg318o0S5B7/1zwE7ANiEnIMgDEGJEAnOx0u2zaGpQBCAQ10rOKOAjeXQiACGeU4OvAkMxiXFBBCDEjASWAmMw7QYNDIkAhBiSwJfYLMfrCgVEAEI88QEmJTZPRyECEOK5YORt4PfyAkQAQjyxEHgO29wkiACEGFYFpmEqQhIQEQEIcRQQweY8fo2qAiIAIZZYDvwHuEVHIQIQ4hkKzMMahN5BSUERgBA7EliHSbxfja138yIAQYhfaXAsts59pQhAEIil8GtC+m2FCEAQYpYPcM7NAv4GTMHEYEUAghAzvAbcju199CIAQYhfZWAk8BTx2zVYIQIQRAK2YOR2bNdgnJKCTgQgCEYC4zHtgKnYQljion9ZEf6i9kjDGtWGY4vRwGPAHOKzBes7ApijFx+ABXHOCMfcC1gBDMOWwsZh1+AsYG0FpoP/jvTwmQ3M0iLQ2C8YuRt4l/JXFX4PWL1lcHtvAboB2wJNgS2IV1PIEuDm4AEI8SaBp7337YDGwD5Ac8pnf8a6QGwLgDuAJe67jID3fYHzgX2BVjFJENZiG2YfA+5xzi2XCQjBHvoDJwFdKY8lIx5YCkwGbgPGOufWuA1+tMtD3VUQhCLB/wPxwtMA4fjzNwAAAABJRU5ErkJggg=="
+
+
+def load_n_logo():
+    pm = QPixmap()
+    pm.loadFromData(base64.b64decode(_N_LOGO_B64), "PNG")
+    return pm
 
 
 def load_logo():
@@ -1670,6 +1826,156 @@ def ncz_logo_pixmap(default):
     return default
 
 
+# ------------------------------------------------------------------------------------------------ language
+_AR = {
+    "Sign in or create account": "سجّل الدخول أو أنشئ حسابًا", "Create account": "إنشاء حساب",
+    "Reset your password": "إعادة تعيين كلمة المرور", "Downloading Launcher...": "جارٍ تنزيل المشغّل...",
+    "Launching...": "جارٍ التشغيل...", "Download failed": "فشل التنزيل",
+    "You are banned from this launcher": "أنت محظور من هذا المشغّل",
+    "Email Address": "البريد الإلكتروني", "Password": "كلمة المرور", "Invite Code": "رمز الدعوة",
+    "Required to create an account": "مطلوب لإنشاء حساب", "Sign in": "تسجيل الدخول",
+    "Create Account": "إنشاء حساب", "Forgot Password?": "نسيت كلمة المرور؟",
+    "Back to sign in": "العودة لتسجيل الدخول", "Retry": "إعادة المحاولة", "Send reset link": "إرسال رابط إعادة التعيين",
+    "Enter a valid email address.": "أدخل بريدًا إلكترونيًا صالحًا.",
+    "Password must be at least 6 characters.": "يجب ألا تقل كلمة المرور عن 6 أحرف.",
+    "Enter your password.": "أدخل كلمة المرور.", "Signing in...": "جارٍ تسجيل الدخول...",
+    "Setting up your account...": "جارٍ إعداد حسابك...",
+    "That invite code isn't valid or was already used.": "رمز الدعوة غير صالح أو سبق استخدامه.",
+    "You need an invite code or a preapproved email to create an account.": "تحتاج إلى رمز دعوة أو بريد إلكتروني معتمد مسبقًا لإنشاء حساب.",
+    "Discord sign-in isn't set up yet.": "تسجيل الدخول عبر Discord غير مفعّل بعد.",
+    "Enter your invite code.": "أدخل رمز الدعوة.", "Checking invite code...": "جارٍ التحقق من رمز الدعوة...",
+    "Creating your account...": "جارٍ إنشاء حسابك...", "Checking...": "جارٍ التحقق...",
+    "Enter the email address of your account.": "أدخل البريد الإلكتروني لحسابك.",
+    "If an account exists for that email, a reset link is on its way.": "إذا كان هناك حساب بهذا البريد، فسيصلك رابط إعادة التعيين قريبًا.",
+    "Sending reset email...": "جارٍ إرسال رسالة إعادة التعيين...", "Connecting to GitHub...": "جارٍ الاتصال بـ GitHub...",
+    "Download complete": "اكتمل التنزيل", "That invite code was already used.": "رمز الدعوة هذا مستخدم من قبل.",
+    "That invite code isn't valid.": "رمز الدعوة غير صالح.",
+    "An account with this email already exists. Try signing in instead.": "يوجد حساب بهذا البريد بالفعل. جرّب تسجيل الدخول.",
+    "Wrong email or password.": "البريد الإلكتروني أو كلمة المرور غير صحيحة.",
+    "That doesn't look like a valid email address.": "هذا لا يبدو بريدًا إلكترونيًا صالحًا.",
+    "Too many attempts. Please wait a bit and try again.": "محاولات كثيرة. انتظر قليلًا ثم حاول مرة أخرى.",
+    "This account has been disabled.": "تم تعطيل هذا الحساب.",
+    "Discord didn't accept that sign-in. Please try again.": "لم يقبل Discord عملية تسجيل الدخول. حاول مرة أخرى.",
+    "Couldn't reach Discord. Please try again in a moment.": "تعذّر الوصول إلى Discord. حاول مرة أخرى بعد قليل.",
+    "Couldn't reach the cloud. Check your internet connection.": "تعذّر الاتصال بالسحابة. تحقق من اتصالك بالإنترنت.",
+    "Sign-in cancelled.": "تم إلغاء تسجيل الدخول.", "Sign-in was cancelled.": "تم إلغاء تسجيل الدخول.",
+    "Sign-in timed out. Please try again.": "انتهت مهلة تسجيل الدخول. حاول مرة أخرى.",
+    "Couldn't open your web browser.": "تعذّر فتح المتصفح.",
+    "Open the Discord desktop app, then try again.": "افتح تطبيق Discord على الكمبيوتر ثم حاول مرة أخرى.",
+    "Couldn't reach GitHub. Check your internet connection.": "تعذّر الوصول إلى GitHub. تحقق من اتصالك بالإنترنت.",
+    "Cancelled.": "تم الإلغاء.",
+}
+_AR_PATTERNS = (
+    (re.compile(r"(.+) sign-in isn't set up yet\."), "تسجيل الدخول عبر {0} غير مفعّل بعد."),
+    (re.compile(r"Finish signing in with (.+) in your browser\.\.\."), "أكمل تسجيل الدخول عبر {0} في المتصفح..."),
+)
+LANGS = {"en": "English", "ar": "العربية"}
+LANG = _read_json_file("launcher.json").get("ui_language")
+LANG = LANG if LANG in LANGS else "en"           # same setting main.py uses
+
+
+def tr(text):
+    if LANG != "ar" or not text:
+        return text
+    if text in _AR:
+        return _AR[text]
+    for rx, tpl in _AR_PATTERNS:
+        m = rx.fullmatch(text)
+        if m:
+            return tpl.format(*m.groups())
+    return text
+
+
+def save_language(code):
+    try:
+        d = _read_json_file("launcher.json")
+        d["ui_language"] = code
+        os.makedirs(settings_dir(), exist_ok=True)
+        path = os.path.join(settings_dir(), "launcher.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+
+
+def load_arabic_font():
+    path = os.path.join(ASSETS_DIR, "SF-Arabic.ttf")
+    if os.path.isfile(path):
+        fid = QFontDatabase.addApplicationFont(path)
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+        if fams:
+            return fams[0]
+    return None
+
+
+def _paint_flag(p, box, kind):
+    """UK or Qatar flag, drawn by hand, clipped to a small rounded rectangle."""
+    x, y, w, h = box.x(), box.y(), box.width(), box.height()
+    clip = QPainterPath()
+    clip.addRoundedRect(box, h * 0.18, h * 0.18)
+    p.save()
+    p.setClipPath(clip)
+    if kind == "ar":                                   # Qatar: maroon with a serrated white band on the left
+        p.fillRect(box, QColor("#8A1538"))
+        band = QPainterPath()
+        b, t = w * 0.26, w * 0.40
+        band.moveTo(x, y)
+        band.lineTo(x + b, y)
+        for i in range(9):
+            band.lineTo(x + t, y + (i + 0.5) * h / 9)
+            band.lineTo(x + b, y + (i + 1) * h / 9)
+        band.lineTo(x, y + h)
+        band.closeSubpath()
+        p.fillPath(band, QColor(255, 255, 255))
+    else:                                              # United Kingdom
+        p.fillRect(box, QColor("#012169"))
+        for col, wd in ((QColor(255, 255, 255), h * 0.22), (QColor("#C8102E"), h * 0.09)):
+            p.setPen(QPen(col, wd))
+            p.drawLine(QPointF(x, y), QPointF(x + w, y + h))
+            p.drawLine(QPointF(x, y + h), QPointF(x + w, y))
+        for col, wd in ((QColor(255, 255, 255), h * 0.36), (QColor("#C8102E"), h * 0.20)):
+            p.setPen(QPen(col, wd))
+            p.drawLine(QPointF(x + w / 2, y), QPointF(x + w / 2, y + h))
+            p.drawLine(QPointF(x, y + h / 2), QPointF(x + w, y + h / 2))
+    p.restore()
+
+
+class LangButton(QPushButton):
+    """Glass pill with the current language's flag and name; click switches English <-> Arabic."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, h * 0.3, h * 0.3)
+        p.fillPath(path, QColor(255, 255, 255, 43 if self.underMouse() else 23))
+        fh = h * 0.46
+        fw = fh * 1.5
+        p.setFont(self.font())
+        tw = QFontMetricsF(self.font()).horizontalAdvance(self.text())
+        gap = h * 0.26
+        x0 = (w - (fw + gap + tw)) / 2
+        _paint_flag(p, QRectF(x0, (h - fh) / 2, fw, fh), LANG)
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(QRectF(x0 + fw + gap, 0, tw + 6, h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+        p.end()
+
+
 def _a(v):
     return int(max(0, min(255, v)))
 
@@ -1709,6 +2015,60 @@ def _glow(p, cx, cy, rx, ry, rgb, alpha):
     p.restore()
 
 
+def _accent_rgb():
+    """Accent of the active theme; a white / grey accent (the "new" look) uses the launcher's stock purple glow."""
+    r, g, b = THEME["glow"]
+    c = QColor(r, g, b)
+    if c.hsvSaturationF() < 0.15:
+        c = QColor("#a97cff")
+    return c.red(), c.green(), c.blue()
+
+
+_FOCUS_RGB = THEME["glow"] if QColor(*THEME["glow"]).hsvSaturationF() >= 0.15 else (255, 255, 255)
+CARD = QRectF(470, 470, 980, 576)          # form height; the loading screens use a shorter card
+CARD_SHORT = 450          # glass card behind the form (design px)
+
+
+def _gl_shadow(p, rect, radius, spread=22.0, dy=8.0):
+    """Soft drop shadow under a rounded rect (same as the launcher's)."""
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(0, 0, 0, 14))
+    for i in range(8, 0, -1):
+        g = spread * i / 8.0
+        p.drawRoundedRect(QRectF(rect).adjusted(-g, -g + dy, g, g + dy), radius + g, radius + g)
+    p.restore()
+
+
+def _glass_card(w, h, rad, dpr):
+    """Liquid glass panel (the launcher's _gl_paint): a vertical white gradient fill, a specular highlight over the top
+    part and a faint reflection low in the corner. No outline."""
+    pm = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    q = QPainter(pm)
+    q.setRenderHint(QPainter.RenderHint.Antialiasing)
+    rect = QRectF(0, 0, w, h)
+    path = QPainterPath()
+    path.addRoundedRect(rect, rad, rad)
+    g = QLinearGradient(0, 0, w, h)                      # the launcher's card: lighter top-left, near-black bottom-right
+    g.setColorAt(0.0, QColor(62, 62, 66, 120))
+    g.setColorAt(0.45, QColor(34, 34, 37, 92))
+    g.setColorAt(1.0, QColor(16, 16, 18, 104))
+    q.fillPath(path, QBrush(g))
+    q.setClipPath(path)
+    sheen = QRadialGradient(QPointF(w * 0.12, 0), max(w, h) * 0.6)
+    sheen.setColorAt(0.0, QColor(255, 255, 255, 26))
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    q.fillRect(rect, QBrush(sheen))
+    q.setClipping(False)
+    q.setPen(QPen(QColor(255, 255, 255, 38), 1.0))       # thin light rim
+    q.setBrush(Qt.BrushStyle.NoBrush)
+    q.drawPath(path)
+    q.end()
+    return pm
+
+
 class LoginWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -1716,8 +2076,10 @@ class LoginWindow(QWidget):
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
         self.family = load_font_family()          # fallback when an akt_*.ttf is missing
         self.fonts = load_fonts()
+        self.ar_family = load_arabic_font()          # assets/SF-Arabic.ttf, used for Arabic text
         self._logo = load_logo()
         self._ncz_logo = self._logo
+        self._n_logo = load_n_logo()
         self._fact, self._fact_t0 = ("", ""), 0.0
         lc_prefetch()                       # icon + facts download while you sign in
         self.setWindowIcon(QIcon(self._logo))
@@ -1738,24 +2100,24 @@ class LoginWindow(QWidget):
         self._busy_flag = False
 
         W = QFont.Weight
-        self.lbl_title = self._label(TITLE_TEXT, 482, 518, 1000, 60, W.Bold, Qt.AlignmentFlag.AlignCenter,
-                                     fit=(TITLE_TEXT, 513), cap=50)
-        self.lbl_email = self._label("Email Address", 641, 618, 215, 40, W.Light,
+        self.lbl_title = self._label(TITLE_TEXT, 460, 518, 1000, 60, W.Bold, Qt.AlignmentFlag.AlignCenter,
+                                     fit=(TITLE_TEXT, 513), cap=46)
+        self.lbl_email = self._label("Email Address", 690, 616, 190, 48, W.Light,
                                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                     fit=("Email Address", 190), cap=31)
-        self.lbl_pw = self._label("Password", 641, 680, 180, 40, W.Light,
+                                     fit=("Email Address", 190), cap=25)
+        self.lbl_pw = self._label("Password", 690, 678, 190, 48, W.Light,
                                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                  fit=("Password", 128), cap=31)
-        self.lbl_invite = self._label("Invite Code", 641, 742, 190, 40, W.Light,
+                                  fit=("Password", 128), cap=25)
+        self.lbl_invite = self._label("Invite Code", 690, 740, 190, 48, W.Light,
                                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                      fit=("Invite Code", 160), cap=31)
-        self.lbl_status = self._label("", 602, 733, 760, 44, W.Normal, Qt.AlignmentFlag.AlignCenter,
+                                      fit=("Invite Code", 160), cap=25)
+        self.lbl_status = self._label("", 590, 744, 740, 36, W.Normal, Qt.AlignmentFlag.AlignCenter,
                                       fit=None, cap=21)
         self.lbl_handle = self._label(HANDLE_TEXT, 35, 1016, 320, 36, W.Normal,
                                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                       fit=(HANDLE_TEXT, 102), cap=24)
-        self.lbl_version = self._label(VERSION_TEXT, 1569, 1019, 320, 36, W.Normal,
-                                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        self.lbl_version = self._label(VERSION_TEXT, 35, 978, 320, 36, W.Normal,
+                                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                        fit=(VERSION_TEXT, 71), cap=24)
         for lab in (self.lbl_handle, self.lbl_version):
             lab.setStyleSheet("background:transparent;color:rgba(255,255,255,0.85);")
@@ -1767,37 +2129,41 @@ class LoginWindow(QWidget):
         self.invite.setMaxLength(64)
         self.invite.setPlaceholderText("Required to create an account")
         self.email.setMaxLength(254)
-        self._track(self.email, 860, 621, 416, 39, 23, W.Normal, 0.5)
-        self._track(self.pw, 827, 683, 436, 39, 23, W.Normal, 0.5)
-        self._track(self.invite, 827, 745, 436, 39, 23, W.Normal, 0.5)
+        self._track(self.email, 880, 616, 350, 48, 23, W.Normal, 0.5)
+        self._track(self.pw, 880, 678, 350, 48, 23, W.Normal, 0.5)
+        self._track(self.invite, 880, 740, 350, 48, 23, W.Normal, 0.5)
         self.email.returnPressed.connect(self._email_enter)
         self.pw.returnPressed.connect(self._pw_enter)
         self.invite.returnPressed.connect(self.on_primary)
 
         self.btn_primary = PrimaryButton("Sign in", self)
         self.btn_primary.clicked.connect(self.on_primary)
-        self._track(self.btn_primary, 713, 814, 537, 63, self._fit("Sign in", W.Normal, 92, 32), W.Normal, 0)
+        self._track(self.btn_primary, 690, 836, 540, 62, self._fit("Sign in", W.DemiBold, 92, 27), W.DemiBold, 0)
         self.btn_create = LinkButton("Create Account", self)
         self.btn_create.clicked.connect(self.on_create)
-        self._track(self.btn_create, 650, 896, 249, 48, self._fit("Create Account", W.Normal, 209, 31), W.Normal, 0)
+        self._track(self.btn_create, 690, 910, 249, 44, self._fit("Create Account", W.DemiBold, 209, 24), W.DemiBold, 0)
         self.btn_forgot = LinkButton("Forgot Password?", self)
         self.btn_forgot.clicked.connect(self.on_forgot)
-        self._track(self.btn_forgot, 1075, 897, 261, 48, self._fit("Forgot Password?", W.Normal, 241, 31), W.Normal, 0)
+        self._track(self.btn_forgot, 969, 910, 261, 44, self._fit("Forgot Password?", W.DemiBold, 241, 24), W.DemiBold, 0)
         self.btn_back = LinkButton("Back to sign in", self)
         self.btn_back.clicked.connect(self.on_back)
-        self._track(self.btn_back, 835, 896, 290, 48, self._fit("Back to sign in", W.Normal, 200, 31), W.Normal, 0)
+        self._track(self.btn_back, 815, 910, 290, 44, self._fit("Back to sign in", W.DemiBold, 200, 24), W.DemiBold, 0)
 
         # social sign-in row, same width as the primary button (x 713..1250), just below the Create / Forgot links
         self._social_buttons = []
         for i, (kind, text) in enumerate((("google", "Google"), ("discord", "Discord"), ("github", "GitHub"))):
             b = SocialButton(kind, text, self)
             b.clicked.connect(lambda _=False, k=kind: self.on_social(k))
-            self._track(b, 713 + i * 183, 958, 171, 50, 22, W.Normal, 0)
+            self._track(b, 690 + i * 184, 968, 172, 50, 20, W.DemiBold, 0)
             self._social_buttons.append(b)
         self._social_buttons = tuple(self._social_buttons)
 
         self.progress = ProgressBar(self)
         self._track(self.progress, 560, 628, 800, 70, 21, W.Normal, 0)
+
+        self.btn_lang = LangButton(self)
+        self.btn_lang.clicked.connect(self.on_language)
+        self._track(self.btn_lang, DW - 35 - 190, 1010, 190, 48, 22, W.DemiBold, 0)
 
         self.btn_min = CtrlButton("min", self)
         self.btn_close = CtrlButton("close", self)
@@ -1816,7 +2182,7 @@ class LoginWindow(QWidget):
         # animated background
         rnd = random.Random(7)
         self._stars = [[rnd.random(), rnd.random() * 0.78, rnd.uniform(0.7, 2.3), rnd.uniform(0.002, 0.008),
-                        rnd.uniform(0, 6.28), rnd.uniform(0.25, 1.0), rnd.uniform(0.8, 2.2)] for _ in range(150)]
+                        rnd.uniform(0, 6.28), rnd.uniform(0.25, 1.0), rnd.uniform(0.8, 2.2)] for _ in range(42)]
         self._shoot = None
         self._next_shoot = 3.0
         self._bg_cache = None
@@ -1827,6 +2193,7 @@ class LoginWindow(QWidget):
         self._hover = {self.btn_primary: 0.0}
         self._focus = {self.email: 0.0, self.pw: 0.0, self.invite: 0.0}
         self._ban_t = 0.0
+        self._card_h = float(CARD.height())
         self._logo_reveal = 0.0
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -1838,13 +2205,17 @@ class LoginWindow(QWidget):
 
     # ---- layout helpers
     def make_font(self, weight, px):
-        """weight doubles as the role: Bold -> akt_bold, Light -> akt_light, anything else -> akt_reg."""
-        role = "bold" if weight == QFont.Weight.Bold else "light" if weight == QFont.Weight.Light else "reg"
-        fam = self.fonts.get(role)
-        f = QFont(fam or self.family)
+        """Every text uses assets/ubuntu.ttf (SF Pro, variable weight): Bold title, Regular labels, DemiBold buttons."""
+        if weight == QFont.Weight.Light:
+            weight = QFont.Weight.Normal                 # labels are Regular
+        f = QFont(self.ar_family if (LANG == "ar" and self.ar_family) else self.family)
         f.setPixelSize(max(1, round(px)))
-        if fam is None or len({v for v in self.fonts.values() if v}) == 1:
-            f.setWeight(weight)          # fallback font, or all three files share one family name
+        f.setWeight(weight)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 100 if LANG == "ar" else 102)
+        try:                                             # variable font: ask for the exact weight on the wght axis (Qt 6.7+)
+            f.setVariableAxis(QFont.Tag("wght"), float(int(weight)))
+        except Exception:
+            pass
         return f
 
     def _fit(self, text, weight, target_w, cap_px):
@@ -1890,16 +2261,19 @@ class LoginWindow(QWidget):
         s = self._scale()
         for widget, _x, _y, _w, h, px, weight, radius in self._items:
             f = self.make_font(weight, max(6, round(px * s)))
+            if isinstance(widget, SocialButton):          # Google / Discord / GitHub stay English (and in the Latin font) in Arabic
+                f.setFamily(self.family)
+                f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 102)
             f.setUnderline(isinstance(widget, LinkButton) and widget.underMouse())
             f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
             widget.setFont(f)
             if isinstance(widget, QLineEdit):
-                r = max(0, int(h * s * radius) - 2)
+                r = max(0, int(h * s * 0.30) - 1)
                 widget.setStyleSheet(
-                    f"QLineEdit{{background:rgba(255,255,255,19);color:#fff;border:1px solid rgba(255,255,255,36);"
+                    f"QLineEdit{{background:rgba(0,0,0,0.38);color:#fff;border:1px solid rgba(255,255,255,0.09);"
                     f"border-radius:{r}px;padding:0 {round(22 * s)}px;"
                     "selection-background-color:rgba(255,255,255,90);}"
-                    "QLineEdit:focus{background:rgba(255,255,255,33);border:1px solid rgba(255,255,255,150);}"
+                    f"QLineEdit:focus{{border:1px solid rgba({_FOCUS_RGB[0]},{_FOCUS_RGB[1]},{_FOCUS_RGB[2]},0.95);}}"
                     "QLineEdit:disabled{color:#777;}")
 
     def resizeEvent(self, e):
@@ -1953,6 +2327,8 @@ class LoginWindow(QWidget):
         for wd in self._focus:
             tgt = 1.0 if (wd.isVisible() and wd.hasFocus()) else 0.0
             self._focus[wd] += (tgt - self._focus[wd]) * 0.2
+        _tgt = CARD_SHORT if self.state in ("downloading", "launching") else CARD.height()
+        self._card_h += (_tgt - self._card_h) * 0.18
         self._ban_t += ((1.0 if self.state == "banned" else 0.0) - self._ban_t) * 0.06
         if self.state in ("downloading", "launching") and t - self._fact_t0 > 10.0:
             self._fact, self._fact_t0 = lc_next_fact(), t
@@ -1983,18 +2359,10 @@ class LoginWindow(QWidget):
         pm = QPixmap(round(w * dpr), round(h * dpr))
         pm.setDevicePixelRatio(dpr)
         p = QPainter(pm)
-        g = QLinearGradient(0, 0, 0, h)
-        for pos, col in THEME["bg"]:
-            g.setColorAt(pos, QColor(*col))
-        p.fillRect(QRectF(0, 0, w, h), QBrush(g))
-        r = QRadialGradient(QPointF(w * 0.5, h * 0.80), w * 0.46)       # darker middle, lighter lower corners
-        r.setColorAt(0.0, QColor(0, 0, 0, 135))
-        r.setColorAt(0.6, QColor(0, 0, 0, 60))
-        r.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.fillRect(QRectF(0, 0, w, h), QBrush(r))
+        p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0))                   # launcher background: pure black
         v = QRadialGradient(QPointF(w / 2, h * 0.46), max(w, h) * 0.78)  # vignette
         v.setColorAt(0.55, QColor(0, 0, 0, 0))
-        v.setColorAt(1.0, QColor(0, 0, 0, 120))
+        v.setColorAt(1.0, QColor(0, 0, 0, 90))
         p.fillRect(QRectF(0, 0, w, h), QBrush(v))
         p.end()
         return pm
@@ -2010,23 +2378,29 @@ class LoginWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.drawPixmap(0, 0, self._bg_cache)
 
-        # slow drifting mist near the bottom
-        _glow(p, w * (0.22 + 0.06 * math.sin(t * 0.13)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
-        _glow(p, w * (0.78 + 0.06 * math.cos(t * 0.11)), h * 1.0, w * 0.42, h * 0.34, THEME["mist"], 30)
+        ar, ag, ab = 255, 255, 255
+        _glow(p, 0, 0, w * 0.55, h * 0.75, (255, 255, 255), 70)                   # soft light in the top-left corner
 
-        # stars (parallax with the mouse, twinkling, fading out towards the bottom)
+        # moving stars (parallax with the mouse, twinkling, fading out towards the bottom)
         p.setPen(Qt.PenStyle.NoPen)
         for x, y, r, _sp, ph, depth, tw in self._stars:
-            tw_a = 0.55 + 0.45 * math.sin(t * tw + ph)
+            tw_a = 0.6 + 0.4 * math.sin(t * tw + ph)
             fade = max(0.0, 1.0 - y / 0.8)
-            a = 255 * tw_a * fade * (0.35 + 0.65 * depth)
+            a = 255 * tw_a * fade * (0.5 + 0.5 * depth)
             if a < 3:
                 continue
             px = x * w + self._mx * depth * 46 * s
             py = y * h + self._my * depth * 30 * s
             p.setBrush(QColor(255, 255, 255, _a(a)))
-            rr = r * s * (0.7 + 0.5 * depth)
-            p.drawEllipse(QPointF(px, py), rr, rr)
+            rr = r * 4.2 * s * (0.7 + 0.5 * depth)
+            star = QPainterPath()                       # 4-point sparkle
+            for k in range(8):
+                ang = k * math.pi / 4 - math.pi / 2
+                rad = rr if k % 2 == 0 else rr * 0.32
+                pt = QPointF(px + math.cos(ang) * rad, py + math.sin(ang) * rad)
+                star.moveTo(pt) if k == 0 else star.lineTo(pt)
+            star.closeSubpath()
+            p.drawPath(star)
         if self._shoot:
             age = t - self._shoot["t0"]
             hx = (self._shoot["x"] - age * 0.55) * w
@@ -2042,44 +2416,30 @@ class LoginWindow(QWidget):
             p.drawLine(QPointF(hx, hy), QPointF(tx, ty))
             p.setPen(Qt.PenStyle.NoPen)
 
-        # soft light that follows the cursor
-        if self.rect().contains(self._spot.toPoint()):
-            _glow(p, self._spot.x(), self._spot.y(), 360 * s, 360 * s, THEME["halo"], 17)
+        # liquid glass panel behind the form (not on the ban screen)
+        if self.state != "banned":
+            ox0, oy0 = self._origin()
+            cr = QRectF(ox0 + CARD.x() * s, oy0 + CARD.y() * s, CARD.width() * s, self._card_h * s)
+            rad = 24 * s
+            dpr = self.devicePixelRatioF()
+            key = (round(cr.width()), round(cr.height()), dpr)
+            if getattr(self, "_card_key", None) != key:
+                self._card_pm, self._card_key = _glass_card(cr.width(), cr.height(), rad, dpr), key
+            _gl_shadow(p, cr, rad, spread=22.0 * s, dy=8.0 * s)
+            p.drawPixmap(QPointF(cr.x(), cr.y()), self._card_pm)
 
         ox, oy = self._origin()
         # logo: halo + floating rounded icon
         e = self._logo_reveal
         if e > 0.001:
             bob = math.sin(t * 1.1) * 5 * s
-            size = 260 * s * (0.9 + 0.1 * e)
-            cx, cy = ox + 982 * s, oy + (232 + 130) * s + bob + (1 - e) * 22 * s
+            lh = 150 * s * (0.9 + 0.1 * e)
+            lw = lh * self._n_logo.width() / max(1, self._n_logo.height())
+            cx, cy = ox + 960 * s, oy + 330 * s + bob + (1 - e) * 22 * s
             p.save()
             p.setOpacity(e)
-            _glow(p, cx, cy, 330 * s, 330 * s, THEME["halo"], 34 + 12 * math.sin(t * 1.6))
-            rect = QRectF(cx - size / 2, cy - size / 2, size, size)
-            path = QPainterPath()
-            if self.state in ("downloading", "launching") and not self._ncz_logo.isNull():
-                # loading: the round NCZ logo, spinning
-                spin = self._spin_pixmap(size)
-                half = spin.width() / spin.devicePixelRatio() / 2
-                p.save()
-                p.translate(cx, cy)
-                p.rotate((t * 140) % 360)
-                p.drawPixmap(QPointF(-half, -half), spin)
-                p.restore()
-                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawEllipse(rect)
-            else:
-                path.addRoundedRect(rect, 12 * s, 12 * s)
-                if not self._logo.isNull():
-                    p.save()
-                    p.setClipPath(path)
-                    p.drawPixmap(rect.toRect(), self._logo)
-                    p.restore()
-                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawPath(path)
+            _glow(p, cx, cy, lw * 1.5, lh * 1.1, (255, 255, 255), 30 + 10 * math.sin(t * 1.6))
+            p.drawPixmap(QRectF(cx - lw / 2, cy - lh / 2, lw, lh), self._n_logo, QRectF(self._n_logo.rect()))
             p.restore()
 
         # glow under the primary button and the focused field
@@ -2087,11 +2447,11 @@ class LoginWindow(QWidget):
             g = self.btn_primary.geometry()
             hv = self._hover[self.btn_primary]
             _glow(p, g.center().x(), g.center().y() + 4 * s, g.width() * 0.62, g.height() * 1.7,
-                  THEME["halo"], 30)
+                  (255, 255, 255), 10)
         for field, amt in self._focus.items():
             if field.isVisible() and amt > 0.01:
                 g = field.geometry()
-                _glow(p, g.center().x(), g.center().y(), g.width() * 0.62, g.height() * 1.9, (255, 255, 255), 46 * amt)
+                _glow(p, g.center().x(), g.center().y(), g.width() * 0.62, g.height() * 1.9, (ar, ag, ab), 22 * amt)
 
         # spinner next to the status text while something is happening
         if self._busy_flag and self.lbl_status.isVisible():
@@ -2115,13 +2475,13 @@ class LoginWindow(QWidget):
             text, src = self._fact
             opt = QTextOption(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
             opt.setWrapMode(QTextOption.WrapMode.WordWrap)
-            p.setFont(self.make_font(QFont.Weight.Light, 27 * s))
+            p.setFont(self.make_font(QFont.Weight.Light, 24 * s))
             p.setPen(QColor(255, 255, 255, _a(215 * fa)))
-            p.drawText(QRectF(ox + 460 * s, oy + 735 * s, 1000 * s, 110 * s), text, opt)
+            p.drawText(QRectF(ox + 580 * s, oy + 730 * s, 760 * s, 100 * s), text, opt)
             if src:
                 p.setFont(self.make_font(QFont.Weight.Normal, 18 * s))
                 p.setPen(QColor(255, 255, 255, _a(120 * fa)))
-                p.drawText(QRectF(ox + 460 * s, oy + 850 * s, 1000 * s, 30 * s), int(Qt.AlignmentFlag.AlignCenter), src)
+                p.drawText(QRectF(ox + 580 * s, oy + 862 * s, 760 * s, 30 * s), int(Qt.AlignmentFlag.AlignCenter), src)
 
         if self._ban_t > 0.01:
             _glow(p, w / 2, h * 0.5, w * 0.55, h * 0.55, (170, 20, 20), 60 * self._ban_t)
@@ -2194,13 +2554,14 @@ class LoginWindow(QWidget):
         anim.start()
         self._intro_anim = anim
         self._reveal_visible(base=260)
-        for wd in (self.lbl_handle, self.lbl_version, self.btn_min, self.btn_close):
+        for wd in (self.lbl_handle, self.lbl_version, self.btn_lang, self.btn_min, self.btn_close):
             self._reveal(wd, 900, dur=700, rise=0)
 
     # ---- state / status
     def set_status(self, text, error=True):
         self.lbl_status.setStyleSheet(f"background:transparent;color:{'#ff9b9b' if error else '#d6d6d6'};")
-        self.lbl_status.setText(text)
+        self._status_raw = text
+        self.lbl_status.setText(tr(text))
         if error and text:
             self._shake()
 
@@ -2233,10 +2594,30 @@ class LoginWindow(QWidget):
         }[self.state]
         for wd in self._dynamic:
             wd.setVisible(wd in visible)
-        self._move_item(self.lbl_status, 786 if self.state == "create" else 733, 28 if self.state == "create" else 44)
-        self.btn_primary.setText({"dl_error": "Retry", "create": "Create Account",
-                                  "forgot": "Send reset link"}.get(self.state, "Sign in"))
-        self.lbl_title.setText(TITLES[self.state])
+        self._move_item(self.lbl_status, 796 if self.state == "create" else 744, 30 if self.state == "create" else 36)
+        self.btn_primary.setText(tr({"dl_error": "Retry", "create": "Create Account",
+                                     "forgot": "Send reset link"}.get(self.state, "Sign in")))
+        self.lbl_title.setText(tr(TITLES[self.state]))
+        self.lbl_email.setText(tr("Email Address"))
+        self.lbl_pw.setText(tr("Password"))
+        self.lbl_invite.setText(tr("Invite Code"))
+        self.invite.setPlaceholderText(tr("Required to create an account"))
+        self.btn_create.setText(tr("Create Account"))
+        self.btn_forgot.setText(tr("Forgot Password?"))
+        self.btn_back.setText(tr("Back to sign in"))
+        self.btn_lang.setText(LANGS[LANG])
+        al = (Qt.AlignmentFlag.AlignRight if LANG == "ar" else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter
+        for lab in (self.lbl_email, self.lbl_pw, self.lbl_invite):
+            lab.setAlignment(al)
+        self.lbl_status.setText(tr(getattr(self, "_status_raw", "")))
+
+    def on_language(self):
+        global LANG
+        LANG = "ar" if LANG == "en" else "en"
+        save_language(LANG)
+        self._apply_state()
+        self.relayout()
+        self.progress.update()
 
     def _go(self, state):
         if state in ("downloading", "launching") and self.state not in ("downloading", "launching"):
@@ -2608,6 +2989,7 @@ class LoginWindow(QWidget):
 def main():
     # signed in and installed: skip the window completely and open the launcher
     changed = []
+    enforce_resignin()                                # first start after an update: sign in again
     if not is_flagged_banned() and load_account() and install_complete():
         # silent: new or modified files in assets/, plus main.py and the other scripts when Automatic Updates is on
         # (empty when offline)
@@ -2620,6 +3002,7 @@ def main():
                 pass                                  # couldn't start it -> fall through to the window
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    ensure_fonts()                                    # SF Pro / SF Arabic first, then the sign-in screen
     win = LoginWindow()
     win.show()
     win.play_intro()
