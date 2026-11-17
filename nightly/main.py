@@ -10375,10 +10375,6 @@ class AdaptiveApp(QMainWindow):
         except Exception:
             traceback.print_exc()
         try:
-            _ui_add_scale_setting(self)
-        except Exception:
-            traceback.print_exc()
-        try:
             _ui_add_language_setting(self)
         except Exception:
             traceback.print_exc()
@@ -11205,7 +11201,8 @@ class _StrayWindowGuard(QObject):
         try:
             if ev.type() == QEvent.Type.Show and isinstance(obj, QWidget):
                 if (obj.isWindow() and obj.parent() is None and not isinstance(obj, (QMainWindow, QDialog, QMenu))
-                        and obj.windowType() == Qt.WindowType.Window):
+                        and obj.windowType() == Qt.WindowType.Window
+                        and not getattr(obj, "_ncz_own_window", False)):     # Big Picture is a real window of ours
                     # Liquid Glass never opens external windows: block them for the whole session. Classic: only while starting up.
                     if (time.time() < self._until or _glass_on()) and not os.environ.get("NCZ_ALLOW_WINDOWS"):
                         if self._seen < 30:
@@ -11440,85 +11437,6 @@ def _ncz_region_wait(app):
         _log_exc("_ncz_region_wait")
     os._exit(0)                                      # nothing of the launcher (tray, threads) may keep running
 
-# ---- UI scale (Settings > Appearance > UI Scale). Default 125%. Applied through QT_SCALE_FACTOR before the QApplication exists ----
-_NCZ_UI_SCALE_DEFAULT = 125
-_NCZ_UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150, 175, 200)
-
-def _ncz_ui_scale_percent():
-    try:
-        v = int(round(float(_raw_setting("ui_scale"))))
-    except Exception:    # expected: not saved yet
-        v = _NCZ_UI_SCALE_DEFAULT
-    return max(50, min(200, v))
-
-def _ncz_apply_ui_scale():
-    """Sets QT_SCALE_FACTOR from the saved UI scale. A QT_SCALE_FACTOR you set yourself in the environment wins; one this
-    launcher set for its previous copy (see restart_launcher, the child inherits the environment) is replaced."""
-    try:
-        if os.environ.get("QT_SCALE_FACTOR") and not os.environ.get("NCZ_QT_SCALE_AUTO"):
-            return
-        pct = _ncz_ui_scale_percent()
-        if pct == 100:
-            os.environ.pop("QT_SCALE_FACTOR", None)
-            os.environ.pop("NCZ_QT_SCALE_AUTO", None)
-            return
-        os.environ["QT_SCALE_FACTOR"] = "%.2f" % (pct / 100.0)
-        os.environ["NCZ_QT_SCALE_AUTO"] = "1"
-    except Exception:
-        _log_exc("_ncz_apply_ui_scale")
-
-def _save_ui_scale(pct):
-    path = get_launcher_settings_path()
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:    # expected: unreadable file, never overwrite it
-            data = None
-        if not isinstance(data, dict):
-            return
-    data["ui_scale"] = int(pct)
-    save_launcher_settings(data)
-
-def _ncz_region_arm(app):
-    """Non-blocking version of _ncz_region_wait: the launcher starts right away and never waits for the region check.
-    The check keeps running in its background thread; a timer on the Qt event loop picks up the answer. If the IP is
-    outside Egypt / UAE / Qatar / Saudi Arabia (VPN on?), the glass pop-up shows on top of the launcher as soon as the
-    answer is in, and closing it quits the launcher. Nothing happens when the IP is fine or the check can't tell."""
-    st = getattr(app, "_ncz_region", None)
-    if not st:
-        return
-    started = time.time()
-    timer = QTimer(app)
-    timer.setInterval(100)
-    app._ncz_region_timer = timer                    # keep a reference so it isn't garbage-collected
-    busy = {"v": False}
-
-    def poll():
-        if busy["v"]:
-            return
-        if not st["done"].is_set():
-            if time.time() - started > 10.0:         # the lookup has its own 4 s limit; this is only a safety net
-                timer.stop()
-            return
-        timer.stop()
-        if not st["blocked"]:
-            return
-        busy["v"] = True
-        try:
-            dlg = _NczVpnBlockDialog()
-            dlg.show()
-            dlg.raise_()
-            dlg.activateWindow()
-            dlg.exec()
-        except Exception:
-            _log_exc("_ncz_region_arm")
-        os._exit(0)                                  # nothing of the launcher (tray, threads) may keep running
-
-    timer.timeout.connect(poll)
-    timer.start()
-
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":      # the `ncz-gm` command (packaged builds run the CLI through this flag)
         import ncz_gm    # lazy: saves memory/startup until used
@@ -11535,7 +11453,6 @@ def main():
             pass
     _prefer_xwayland()
     _ncz_unify_font_rendering()
-    _ncz_apply_ui_scale()                # saved UI scale (default 125%) -> QT_SCALE_FACTOR, must be set before QApplication
     if _HAS_WEBENGINE:      # lets QtWebEngine be imported after the QApplication exists (it's only loaded when NCZFront opens)
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
@@ -11619,7 +11536,7 @@ def main():
 
     apply_startup_setting()
     register_cli()
-    _ncz_region_arm(app)                 # region check no longer delays startup: if a VPN is detected, the pop-up appears over the launcher once the check finishes, then it exits
+    _ncz_region_wait(app)                # result of the background region check: blocked -> black screen + pop-up, exit
     # Started with the system (or a game's Wine/Proton shortcut) and set to start minimized -> stay in the tray.
     start_hidden = bool(_game_exe or ("--startup" in sys.argv and load_launcher_settings().get("start_minimized", True)))
     if start_hidden and not _launch_title and _ncz_start_lite_tray(app):
@@ -33721,7 +33638,7 @@ def load_launcher_settings():
     s["ui_theme"] = _raw_setting("ui_theme") or ""
     s["ui_theme_choice"] = _raw_setting("ui_theme_choice") or ""
     s["ui_defaults_applied"] = _raw_setting("ui_defaults_applied") or []
-    for _k in ("appearance", "ios_glass", "ios_glass_motion", "ios_glass_perf", "ui_scale"):       # Classic / Liquid Glass choice and the UI scale must survive every other settings save
+    for _k in ("appearance", "ios_glass", "ios_glass_motion", "ios_glass_perf"):       # Classic / Liquid Glass choice must survive every other settings save
         _v = _raw_setting(_k)
         if _v is not None:
             s[_k] = _v
@@ -34378,9 +34295,6 @@ Choose the launcher's language. English is the default. => اختر لغة ال�
 Theme => السمة
 Interface Style => نمط الواجهة
 Glass Performance => أداء الزجاج
-UI Scale => حجم الواجهة
-Zoom for the whole launcher. Default is 125%. Needs a restart. => تكبير المشغّل بالكامل. الافتراضي 125%. يتطلب إعادة التشغيل.
-(default) => (الافتراضي)
 Auto lightens Liquid Glass on PCs with 4 or fewer CPU threads. Low turns off the moving background, page fades and the glass on game cards. High keeps every effect. Only applies to Liquid Glass. Needs a restart. => يخفف تلقائي تأثير Liquid Glass على الأجهزة ذات 4 معالجات منطقية أو أقل. المنخفض يوقف الخلفية المتحركة وتلاشي الصفحات والزجاج على بطاقات الألعاب. العالي يبقي كل التأثيرات. ينطبق على Liquid Glass فقط. يتطلب إعادة التشغيل.
 Auto => تلقائي
 Low (lighter) => منخفض (أخف)
@@ -35835,60 +35749,6 @@ def _ui_add_appearance_setting(self):
         lay.addSpacing(12)
         lay.addLayout(prow)
     sp.glass_perf_combo = pcombo
-
-def _ui_add_scale_setting(self):
-    """Settings > Appearance: UI Scale (zoom of the whole launcher). Default 125%. Needs a restart."""
-    sp = self.settings_page
-    lay = sp.dark_mode_combo.parentWidget().layout()
-    row = QHBoxLayout()
-    col = QVBoxLayout()
-    col.setSpacing(2)
-    title = QLabel("UI Scale")
-    title.setObjectName("RowTitle")
-    desc = QLabel("Zoom for the whole launcher. Default is 125%. Needs a restart.")
-    desc.setObjectName("RowDesc")
-    desc.setWordWrap(True)
-    col.addWidget(title)
-    col.addWidget(desc)
-    combo = QComboBox()
-    combo.setFixedWidth(160)
-    cur = _ncz_ui_scale_percent()
-    choices = list(_NCZ_UI_SCALE_CHOICES)
-    if cur not in choices:
-        choices.append(cur)
-        choices.sort()
-    for v in choices:
-        combo.addItem("%d%%" % v + (" (default)" if v == _NCZ_UI_SCALE_DEFAULT else ""), v)
-    combo.setCurrentIndex(max(0, combo.findData(cur)))
-    state = {"cur": cur}
-
-    def changed(_i=0):
-        v = combo.currentData()
-        if v is None or v == state["cur"]:
-            return
-        state["cur"] = v
-        _save_ui_scale(v)
-        ask = QMessageBox.question(sp, "UI Scale", "Restart the launcher now to apply this?")
-        if ask == QMessageBox.StandardButton.Yes:
-            restart_launcher(self)
-    combo.currentIndexChanged.connect(changed)
-    row.addLayout(col, 1)
-    row.addWidget(combo)
-    at = -1                                   # right under the Glass Performance row
-    anchor = getattr(sp, "glass_perf_combo", None) or getattr(sp, "appearance_combo", None)
-    if anchor is not None:
-        for i in range(lay.count()):
-            item = lay.itemAt(i).layout()
-            if item is not None and item.indexOf(anchor) >= 0:
-                at = i
-                break
-    if at >= 0:
-        lay.insertSpacing(at + 1, 12)
-        lay.insertLayout(at + 2, row)
-    else:
-        lay.addSpacing(12)
-        lay.addLayout(row)
-    sp.ui_scale_combo = combo
 
 def _ui_add_nsfw_setting(self):
     sp = self.settings_page
@@ -48231,6 +48091,7 @@ def _bp_bold_weight(family):
 
 
 class _BigPicture(QWidget):
+    _ncz_own_window = True  # tells _StrayWindowGuard (Liquid Glass) not to hide this top-level window
     LIB_TH = 0.36           # library tile height as a fraction of the window height
 
     def __init__(self, app):
@@ -48979,6 +48840,10 @@ class _BigPicture(QWidget):
     def _font(self, px, bold=False):
         f = QFont(self.font())
         f.setPixelSize(max(9, int(px)))
+        try:                       # SF Pro is variable: its optical-size axis switches to the tight "Display" design on big text.
+            f.setVariableAxis(QFont.Tag("opsz"), 17.0)      # keep the regular "Text" design at every size (needs Qt 6.7+)
+        except Exception:    # expected: older Qt / a font without that axis
+            pass
         w = _bp_bold_weight(f.family()) if bold else None
         if w is not None:
             f.setWeight(QFont.Weight(w))        # Linux: a real face, never Qt's heavy fake bold
@@ -49173,7 +49038,7 @@ class _BigPicture(QWidget):
         elif self._detail is not None:
             hint = "Left / Right  Choose      A / Enter  Select      Y  Reviews      B / Esc  Close"
         elif self._tab == 0:
-            hint = "Left / Right  Browse      A / Enter  Launch      X  Game options      Y  Library view      LB / RB  Switch tab      B / Esc  Exit"
+            hint = "Up / Down  Browse      A / Enter  Launch      X  Game options      Y  Library view      LB / RB  Switch tab      B / Esc  Exit"
         elif self._tab == 1:
             hint = "Arrows  Browse      A / Enter  Details      Y or type  Search      LB / RB  Switch tab      B / Esc  Back"
         else:
@@ -50278,6 +50143,9 @@ def _bpx_fr_build(self):
         fl.sort(key=lambda kv: (_friend_status(kv[1])[0] == "Offline", (kv[1].get("username") or "").lower()))
         for u, d in fl:
             rows.append({"kind": "friend", "uid": u, "name": d.get("username") or "Unknown", "d": d})
+        for gid, g in sorted((getattr(fp, "groups", None) or {}).items(), key=lambda kv: str(kv[1].get("name", "")).lower()):
+            if isinstance(g, dict):                              # group chats: their id is "group:<gid>" (media + messages route on that)
+                rows.append({"kind": "group", "uid": "group:" + gid, "name": g.get("name") or "Group", "d": g, "gid": gid})
     fr["rows"] = rows
     fr["sel"] = next((i for i, r in enumerate(rows) if keep and (r["kind"], r["uid"]) == keep),
                      min(fr["sel"], max(0, len(rows) - 1)))
@@ -50343,7 +50211,7 @@ def _bpx_fr_act(self, name):
         else:
             fr["chat"], fr["cbtn"] = r["uid"], 0
             self._fr_load_chat(r["uid"])
-    elif name == "alt" and rows and rows[fr["sel"]]["kind"] == "friend":
+    elif name == "alt" and rows and rows[fr["sel"]]["kind"] in ("friend", "group"):
         self._fr_compose(rows[fr["sel"]]["uid"])
 
 
@@ -50431,14 +50299,15 @@ def _bpx_paint_friends(self, p, w, h, m, acc):
         return
     rows = fr["rows"]
     online = sum(1 for r in rows if r["kind"] == "friend" and _friend_status(r["d"])[0] != "Offline")
+    ngr = sum(1 for r in rows if r["kind"] == "group")
     cx, cw = w * 0.18, w * 0.64
-    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Friends   %d online" % online, 0.028, QColor(235, 235, 245), True)
+    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Friends   %d online" % online + ("   -   %d group chat%s" % (ngr, "" if ngr == 1 else "s") if ngr else ""), 0.028, QColor(235, 235, 245), True)
     top, bot, rh, pitch = h * 0.19, h * 0.86, h * 0.09, h * 0.102
     if not rows:
         if fr["loading"]:
             self._paint_loading(p, w, h, QRectF(0, top, w, bot - top), "Loading friends...")
         else:
-            self._x_msg(p, area, "No friends yet. Add friends from the main launcher.")
+            self._x_msg(p, area, "No friends or group chats yet. Add friends from the main launcher.")
         return
     focus = self._zone == "content"
     p.save()
@@ -50459,8 +50328,8 @@ def _bpx_paint_friends(self, p, w, h, m, acc):
         ar = QRectF(cx + rh * 0.15, y + (rh - ad) / 2, ad, ad)
         self._x_avatar(p, ar, r)
         tx = ar.right() + rh * 0.22
-        if r["kind"] == "friend":
-            st, col = _friend_status(r["d"])
+        if r["kind"] in ("friend", "group"):
+            st, col = _bpg_row_status(r)
             self._x_text(p, QRectF(tx, y + rh * 0.08, cw - tx + cx - rh * 0.3, rh * 0.45), r["name"], 0.028, QColor(245, 245, 252), True)
             self._x_text(p, QRectF(tx, y + rh * 0.5, cw - tx + cx - rh * 0.3, rh * 0.4), st, 0.021, QColor(col))
         else:
@@ -50483,7 +50352,7 @@ def _bpx_paint_chat(self, p, w, h, acc):
     if row is not None:
         ad = h * 0.075
         self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
-        st, col = _friend_status(row["d"])
+        st, col = _bpg_row_status(row)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
     top = h * 0.24
@@ -52066,7 +51935,7 @@ def _bpz_paint_chat(self, p, w, h, acc):
     if row is not None:
         ad = h * 0.075
         self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
-        st, col = _friend_status(row["d"])
+        st, col = _bpg_row_status(row)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
     top = h * 0.24
@@ -52083,6 +51952,8 @@ def _bpz_paint_chat(self, p, w, h, acc):
     maxw, padx, pady, gap = cw * 0.72, h * 0.018, h * 0.012, h * 0.01
     inner = cw * 0.72 - 2 * padx
     y, idx, first = bot, len(msgs) - 1 - fr["moff"], True
+    grp_chat = str(fr["chat"]).startswith("group:")
+    fp_ = getattr(self._app, "friends_page", None)
     focus = self._zone == "content" and fr["cfocus"] == "msgs"
     al_c = int(Qt.AlignmentFlag.AlignCenter)
     while idx >= 0 and y > top:
@@ -52154,6 +52025,14 @@ def _bpz_paint_chat(self, p, w, h, acc):
                 self._x_text(p, QRectF(tx, r.top() + r.height() * 0.66, tw, r.height() * 0.26),
                              "A  Join" if (first and focus and not mine) else ("Press A to join" if not mine else ""), 0.0175, ink)
             yy += pt["h"] + gap * 0.6
+        if grp_chat and not mine:                                   # group chats: who wrote it, above their bubble
+            nh = h * 0.03
+            y -= nh
+            try:
+                who = _grp_author(fp_, mg.get("from"))
+            except Exception:
+                who = "Someone"
+            self._x_text(p, QRectF(bx + h * 0.006, y, cw * 0.6, nh), who, 0.0185, QColor(170, 170, 200), True)
         y -= gap
         first = False
     p.restore()
@@ -54109,7 +53988,7 @@ def _adm_open(window):
 _NCZ_SET_CATS = [
     ("Shortcuts", ("game shortcuts",)),
     ("NCZ Command Line Tool", ("command line tool",)),
-    ("Appearance", ("dark mode", "accent color", "interface style", "ui scale")),
+    ("Appearance", ("dark mode", "accent color", "interface style")),
     ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
     ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut")),
     ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
@@ -54410,7 +54289,7 @@ SettingsPage.showEvent = _ncz_settings_show
 # Left sidebar = setting areas (with icons). Right = the selected area, each panel is an expander (open/closed is remembered).
 # Searching shows every matching expander from all areas. Big Picture still reads the real controls (see _bpe_hidden).
 _NCZ_SET_CATS = [
-    ("Appearance", ("dark mode", "accent color", "interface style", "theme", "startup animation", "animation", "ui scale")),
+    ("Appearance", ("dark mode", "accent color", "interface style", "theme", "startup animation", "animation")),
     ("Startup & Updates", ("start with", "automatic update", "launcher update", "desktop shortcut", "close button", "start in the tray")),
     ("Library & Downloads", ("game library", "download server", "7-zip", "winrar", "steamgriddb", "currency", "nsfw")),
     ("Big Picture & Controller", ("big picture", "controller", "input bridge")),
@@ -66461,99 +66340,6 @@ def _nd_resolve_mediafire(page_url):
             _log_exc("_nd_resolve_mediafire")
     raise RuntimeError("Couldn't find the download link on the MediaFire page.")
 
-# ── update check: the MediaFire file behind each link is fingerprinted (hash + size from MediaFire's public file info,
-# or the size from the download headers when that is unavailable). The fingerprint seen at install time is saved; when the
-# file on MediaFire no longer matches it, the card shows "Update" instead of "Launch".
-_ND_MF_KEY_RE = re.compile(r"mediafire\.com/(?:file|view|download)/([A-Za-z0-9]+)")
-
-def _nd_versions_path():
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "nondev_versions.json")
-
-def _nd_version_key(g):
-    _url, fname = _nd_platform(g)
-    return f"{g['id']}|{fname}"
-
-def _nd_load_versions():
-    try:
-        with open(_nd_versions_path(), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-def _nd_save_version(g, fp):
-    """Remembers the fingerprint of the build that was just installed (None forgets it)."""
-    try:
-        data = _nd_load_versions()
-        if fp:
-            data[_nd_version_key(g)] = fp
-        else:
-            data.pop(_nd_version_key(g), None)
-        with open(_nd_versions_path(), "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        _log_exc("nondev versions save")
-
-def _nd_remote_fingerprint(page_url, direct_url=None):
-    """{'hash', 'size'} of the file on MediaFire (either key may be missing), or None when it can't be read."""
-    fp = {}
-    m = _ND_MF_KEY_RE.search(page_url or "")
-    if m:
-        try:
-            api = "https://www.mediafire.com/api/1.5/file/get_info.php?" + urllib.parse.urlencode(
-                {"quick_key": m.group(1), "response_format": "json"})
-            req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8", errors="replace")).get("response", {})
-            info = resp_json.get("file_info", {})
-            if isinstance(info, list):
-                info = info[0] if info else {}
-            if resp_json.get("result") == "Success" and isinstance(info, dict):
-                if info.get("hash"):
-                    fp["hash"] = str(info["hash"])
-                if str(info.get("size", "")).isdigit():
-                    fp["size"] = int(info["size"])
-        except Exception:
-            _log_exc("_nd_remote_fingerprint api")
-    if not fp:                 # fall back to the size the download server reports (no body is read)
-        try:
-            url = direct_url or _nd_resolve_mediafire(page_url)
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
-            with urllib.request.urlopen(req, timeout=NET_TIMEOUT, context=_NCZ_SSL_CTX) as resp:
-                total = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range", "") or "")
-                if total:
-                    fp["size"] = int(total.group(1))
-                elif resp.status == 200 and (resp.headers.get("Content-Length", "") or "").isdigit():
-                    fp["size"] = int(resp.headers["Content-Length"])
-        except Exception:
-            _log_exc("_nd_remote_fingerprint headers")
-    return fp or None
-
-def _nd_update_available(g):
-    """True / False, or None when MediaFire couldn't be reached (the card then keeps what it shows)."""
-    page, _fname = _nd_platform(g)
-    exe = _nd_exe(g)
-    if not page or not exe:
-        return False
-    remote = _nd_remote_fingerprint(page)
-    if not remote:
-        return None
-    saved = _nd_load_versions().get(_nd_version_key(g)) or {}
-    if saved.get("hash") and remote.get("hash"):
-        return saved["hash"] != remote["hash"]
-    if saved.get("size") and remote.get("size"):
-        return saved["size"] != remote["size"]
-    # installed before updates were tracked: compare with the file on disk, and use today's file as the baseline
-    if remote.get("size"):
-        try:
-            if os.path.getsize(exe) == remote["size"]:
-                _nd_save_version(g, remote)
-                return False
-        except OSError:
-            return None
-        return True
-    return False
-
 def _nd_exe(g):
     """Installed game file of this OS, '' if it isn't installed."""
     _url, fname = _nd_platform(g)
@@ -66614,11 +66400,6 @@ class NondevDownloadWorker(QThread):
             self.status_update.emit("Resolving MediaFire link...")
             headers = {"User-Agent": "Mozilla/5.0"}
             first = (_nd_resolve_mediafire(page), headers)
-            fp = None
-            try:
-                fp = _nd_remote_fingerprint(page, first[0])      # taken before the download, so a newer upload isn't missed
-            except Exception:
-                _log_exc("nondev fingerprint")
             part = resumable_download(self, lambda: (_nd_resolve_mediafire(page), headers),
                                       lambda _r, _u: ".nondev-" + fname, first=first)
             if self._is_cancelled:
@@ -66630,7 +66411,6 @@ class NondevDownloadWorker(QThread):
                 os.remove(final)
             shutil.move(part, final)
             part = ""
-            _nd_save_version(g, fp)
             if not sys.platform.startswith("win"):
                 os.chmod(final, 0o755)
             self.finished.emit(final)
@@ -66648,19 +66428,14 @@ def _nd_refresh_card(app, g):
         return
     page, _f = _nd_platform(g)
     installed = bool(_nd_exe(g))
-    update = installed and g["id"] in getattr(app, "_nd_updates", set())
-    label = "Update" if update else ("Launch" if installed else "Install")
     if w["btn"].text() != "Stop":                  # the Stop sync owns the text while the game runs
-        w["btn"].setText(label)
-    w["btn"].setProperty("ncz_orig_text", label)
+        w["btn"].setText("Launch" if installed else "Install")
+        w["btn"].setProperty("ncz_orig_text", "Launch" if installed else "Install")
     w["btn"].setEnabled(bool(page))
     w["uninstall"].setEnabled(installed)
     w["open"].setEnabled(installed)
     if not page:
         w["status"].setText("Not available on this OS")
-        w["status"].setStyleSheet(f"color: {ORANGE};")
-    elif update:
-        w["status"].setText("\u25CF Update available")
         w["status"].setStyleSheet(f"color: {ORANGE};")
     elif installed:
         w["status"].setText("\u25CF Installed")
@@ -66674,19 +66449,13 @@ def _nd_install(app, g):
         app.nav_group.button(6).setChecked(True)
         app.pages.setCurrentWidget(app.downloads_page)
         return
-    if _nd_exe(g) and pretty_game_name(g["title"]).lower() in {str(n).lower() for n in list(_running)}:
-        QMessageBox.information(app, "Update", f"Close {g['title']} first, then press Update.")
-        return
     worker = NondevDownloadWorker(g)
     card = DownloadCard(g["title"], "", 0, asset_path(g["cover"]), app, worker=worker)
     app.__dict__.setdefault("_nd_installing", {})[g["id"]] = True
     def done(*_a):
         app._nd_installing[g["id"]] = False
         _nd_refresh_card(app, g)
-    def installed_ok(*_a):
-        getattr(app, "_nd_updates", set()).discard(g["id"])      # now on the newest build
-        done()
-    worker.finished.connect(installed_ok)
+    worker.finished.connect(done)
     worker.failed.connect(done)
     app.downloads_page.add_download_card(card)
     app.nav_group.button(6).setChecked(True)
@@ -66869,12 +66638,7 @@ def _nd_build_card(app, g):
     btn.setObjectName("Primary")
     btn.setFixedHeight(38)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    def on_primary(_c=False):
-        if not _nd_exe(g) or g["id"] in getattr(app, "_nd_updates", set()):
-            _nd_install(app, g)          # Install, or Update (downloads the new build over the old one)
-        else:
-            _nd_launch(app, g)
-    btn.clicked.connect(on_primary)
+    btn.clicked.connect(lambda _c=False: _nd_launch(app, g) if _nd_exe(g) else _nd_install(app, g))
     more = QPushButton("\u2022\u2022\u2022")
     more.setObjectName("MoreButton")
     more.setFixedSize(42, 38)
@@ -66884,8 +66648,6 @@ def _nd_build_card(app, g):
     more.setMenu(menu)
     act_open = menu.addAction("Open Game Location")
     act_open.triggered.connect(lambda _c=False: app.open_game_location(g["folder"]))
-    act_chk = menu.addAction("Check for updates")
-    act_chk.triggered.connect(lambda _c=False: _nd_check_now(app, g, act_chk))
     act_un = menu.addAction("Uninstall")
     act_un.triggered.connect(lambda _c=False: _nd_uninstall(app, g))
     actions.addWidget(btn, 1)
@@ -66900,71 +66662,6 @@ def _nd_build_card(app, g):
         _add_shortcut_action(app, card, g["title"], lambda: _nd_exe(g), cover=cover_file, key=f"nondev-{g['id']}")
     except Exception:
         _log_exc("nondev shortcut action")
-
-def _nd_check_now(app, g, action):
-    """Check for updates (the game's ••• menu / Files & Updates page): asks MediaFire now and says what it found."""
-    if not _nd_exe(g):
-        QMessageBox.information(app, "Check for updates", f"{g['title']} isn't installed yet.")
-        return
-    action.setEnabled(False)
-    worker = TaskWorker(lambda: _nd_update_available(g))
-    def finish(res):
-        action.setEnabled(True)
-        if res is None:
-            QMessageBox.warning(app, "Check for updates", "Couldn't reach MediaFire. Check your connection and try again.")
-            return
-        (app._nd_updates.add if res else app._nd_updates.discard)(g["id"])
-        _nd_refresh_card(app, g)
-        QMessageBox.information(app, "Check for updates",
-                                f"A new version of {g['title']} is available. Press Update to install it." if res
-                                else f"{g['title']} is up to date.")
-    worker.done.connect(finish)
-    worker.failed.connect(lambda _m: finish(None))
-    app._nd_manual_worker = worker
-    worker.start()
-
-def _nd_start_update_checks(app):
-    """Checks MediaFire shortly after start and every 30 minutes; games with a newer file get Update instead of Launch."""
-    app._nd_updates = set()
-    state = {"busy": False}
-    def check():
-        if state["busy"]:
-            return
-        state["busy"] = True
-        def job():
-            out = {}
-            for g in NONDEV_GAMES:
-                try:
-                    res = _nd_update_available(g)
-                except Exception:
-                    _log_exc("nondev update check")
-                    res = None
-                if res is not None:
-                    out[g["id"]] = res
-            return out
-        worker = TaskWorker(job)
-        def ok(res):
-            state["busy"] = False
-            if not isinstance(res, dict):
-                return
-            for gid, has in res.items():
-                (app._nd_updates.add if has else app._nd_updates.discard)(gid)
-            for g in NONDEV_GAMES:
-                try:
-                    _nd_refresh_card(app, g)
-                except RuntimeError:
-                    pass          # the card was deleted
-        def bad(_msg):
-            state["busy"] = False          # offline: tried again at the next check
-        worker.done.connect(ok)
-        worker.failed.connect(bad)
-        app._nd_update_worker = worker
-        worker.start()
-    QTimer.singleShot(4000, check)
-    app._nd_update_timer = QTimer(app)
-    app._nd_update_timer.setInterval(30 * 60 * 1000)
-    app._nd_update_timer.timeout.connect(check)
-    app._nd_update_timer.start()
 
 def _nd_cover_paths(g):
     path = asset_path(g["cover"])
@@ -67087,7 +66784,6 @@ def _nd_init_fan(self):
     tl.insertWidget(max(0, tl.count() - 1), holder)      # after Games and Fangames, before the trailing stretch
     _nd_install_status_hooks(self)
     _nd_start_creators(self)
-    _nd_start_update_checks(self)
     self.apply_filter()
 
 AdaptiveApp._init_fan = _nd_init_fan
@@ -68520,7 +68216,7 @@ class _SvView(QWidget):
             self.play.style().unpolish(self.play)
             self.play.style().polish(self.play)
         ub = _sv_update_btn(card)
-        self.update_btn.setVisible(ub is not None and ub is not _sv_prim(card))      # Other NCZ Games: Play itself reads "Update", no second button
+        self.update_btn.setVisible(ub is not None)
         st = card.findChild(QLabel, "CardStatus")
         stext = (st.text() if st is not None else "").replace("●", "").strip() or "-"
         self.st_status.set_value(stext)
@@ -70117,7 +69813,6 @@ _GS_DESC = {
     "Uninstall": "Remove the game from this computer.",
     "View Details": "Show the game's details.",
     "Update game": "Download and install the latest version of the game.",
-    "Check for updates": "See if a newer version of this game is available.",
     "Apply update zip": "Install an update from a zip file you already downloaded.",
     "Edit Current Save": "Open this game's save so you can edit it.",
     "Edit Current Settings": "Open this game's settings file so you can edit it.",
@@ -70146,7 +69841,7 @@ def _gs_button_text(text):
     low = text.lower()
     for keys, label in ((("uninstall",), "Uninstall"), (("location", "folder"), "Open Folder"), (("shortcut",), "Create"),
                         (("add to steam",), "Add"), (("switch compat", "compatibility tool"), "Change"), (("redist",), "Install"),
-                        (("winetricks",), "Launch"), (("apply",), "Apply"), (("check for update",), "Check"), (("update",), "Update"), (("sync",), "Sync"),
+                        (("winetricks",), "Launch"), (("apply",), "Apply"), (("update",), "Update"), (("sync",), "Sync"),
                         (("cloud",), "Manage"), (("save data",), "Back Up"), (("edit",), "Edit"), (("details",), "View"),
                         (("game jolt", "store page"), "Open Page"), (("verify", "repair"), "Run"), (("reset",), "Reset"),
                         (("install",), "Install"), (("download",), "Download")):
@@ -70728,6 +70423,986 @@ def _sg_show(self):
 
 
 _IgDlg.show = _sg_show
+
+
+# ── Big Picture: group chats in the Friends tab ──
+# A group row's chat id is "group:<gid>". Messages / sends / attachments for such an id go to the group chat functions (the DM
+# functions the Friends tab already calls are wrapped), so the existing chat screen, file sending and game invites just work.
+def _bpg_row_status(row):
+    if row.get("kind") == "group":
+        g = row.get("d") or {}
+        n = len(g.get("members") or {})
+        me = (load_account() or {}).get("uid")
+        return "Group chat  -  %d member%s  -  %s" % (n, "" if n == 1 else "s", GROUP_ROLE_LABEL.get((g.get("members") or {}).get(me), "Member")), "#aaaac8"
+    return _friend_status(row["d"])
+
+
+_bpg_prev_get_messages = cloud_get_messages
+_bpg_prev_send_message = cloud_send_message
+
+
+def cloud_get_messages(other):
+    if isinstance(other, str) and other.startswith("group:"):
+        return cloud_get_group_messages(other[6:])
+    return _bpg_prev_get_messages(other)
+
+
+def cloud_send_message(other, text, attachments=None, reply=None):
+    if isinstance(other, str) and other.startswith("group:"):
+        return cloud_send_group_message(other[6:], text, attachments, reply)
+    return _bpg_prev_send_message(other, text, attachments, reply)
+
+
+_bpg_prev_avatar = _BigPicture._x_avatar
+
+
+def _bpg_avatar(self, p, r, row):
+    if row.get("kind") == "group":
+        cache = self._fr["av"]
+        if row["uid"] not in cache:
+            pm = None
+            try:
+                path = _grp_icon_of(row.get("gid"), row.get("d"))
+                q = QPixmap(path) if path else QPixmap()
+                if not q.isNull():
+                    pm = q.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            except Exception:
+                pm = None
+            cache[row["uid"]] = pm
+    _bpg_prev_avatar(self, p, r, row)
+
+
+_BigPicture._x_avatar = _bpg_avatar
+
+_bpg_prev_rebuild_rows = _grp_rebuild_rows
+
+
+def _grp_rebuild_rows(fp):                                  # the launcher's group list changed: update Big Picture's Friends tab too
+    _bpg_prev_rebuild_rows(fp)
+    try:
+        bp = _bpy_active_bp()
+        if bp is not None and bp._tab == 2:
+            bp._fr["av"].pop("__none__", None)
+            bp._fr_changed()
+    except Exception:
+        _log_exc("_grp_rebuild_rows bp")
+
+
+# ── Big Picture: Steam-style Library ───────────────────────────────────────────────────────────────────────────────
+# The Library tab uses the same layout as the launcher's Steam-style Library: the grouped game list on the left (Favorites,
+# NCZ, Steam, Added, Fan games - same order, same filters) and the big game page on the right (hero art + logo, Play, status /
+# last played / play time, favorite heart and the quick links). It reads the launcher's own art cache (hero / logo / icon, the
+# same files the normal Library uses, including art you picked there) and the same cards, so Play / Install / Update and the
+# game menu behave exactly like the normal Library. Up / Down browse, A launches, X opens the game options, Y changes the view.
+_BPL_NOFF = QRectF(-100000.0, -100000.0, 1.0, 1.0)
+# Where the hero art is cropped horizontally (0.0 = left edge of the image, 0.5 = centre, 1.0 = right edge), per game key.
+# Five Nights at NCZ AE: its title sits on the left of the art and was cut off by the centred crop, so it is shifted left.
+_BPL_HERO_X = {"ae": 0.25}
+_BigPicture._tile_rect = lambda self, i: _BPL_NOFF          # the old cover carousel is gone: nothing sits on its tiles any more
+
+
+def _bpl_state(self):
+    st = getattr(self, "_bpl", None)
+    if st is None:
+        st = self._bpl = {"art": {}, "icons": {}, "bus": None}
+        try:
+            bus = _SvBus(self)
+            bus.ready.connect(lambda slug, s=self: _bpl_ready(s, slug))
+            st["bus"] = bus
+        except Exception:
+            _log_exc("_bpl_state")
+    return st
+
+
+def _bpl_ready(self, slug):
+    st = self._bpl
+    st["art"].pop(slug, None)
+    for k in [k for k in st["icons"] if k[0] == slug]:
+        del st["icons"][k]
+    if self._active and not self._asleep:
+        self.update()
+
+
+def _bpl_meta(self, it):
+    m = it.get("_m")
+    if m is None:
+        title = it["title"]
+        try:
+            key, appid, cover = _sv_card_meta(self._app, it["card"], title)
+        except Exception:
+            key, appid, cover = "", 0, ""
+        m = it["_m"] = (title, appid, key, cover, _sv_slug(title, appid, key))
+    return m
+
+
+def _bpl_art(self, it, front=False):
+    st = _bpl_state(self)
+    title, appid, key, cover, slug = _bpl_meta(self, it)
+    d = st["art"].get(slug)
+    if d is None:
+        if len(st["art"]) > 80:
+            st["art"].clear()
+            st["icons"].clear()
+        dirp = _sv_art_dir()
+
+        def ld(n):
+            fp = os.path.join(dirp, "%s.%s" % (slug, n))
+            return QPixmap(fp) if os.path.exists(fp) else QPixmap()
+        d = st["art"][slug] = {"hero": ld("hero"), "logo": ld("logo"), "icon": ld("icon"), "hs": None, "hk": None, "hx": 0.5}
+        try:                                               # per-game override (a hero you picked yourself is never shifted)
+            _hx = _BPL_HERO_X.get(key)
+            if _hx is not None and not os.path.exists(os.path.join(dirp, "%s.hero.user" % slug)):
+                d["hx"] = _hx
+        except Exception:
+            _log_exc("_bpl_art hx")
+        try:
+            if _sv_art_state(slug) == "todo" and st["bus"] is not None:
+                _sv_enqueue(st["bus"], slug, (title, appid, key, cover), front=front)
+        except Exception:
+            _log_exc("_bpl_art")
+    return d
+
+
+def _bpl_icon(self, it, side):
+    st = _bpl_state(self)
+    slug = _bpl_meta(self, it)[4]
+    dpr = self.devicePixelRatioF()
+    key = (slug, int(side), dpr)
+    pm = st["icons"].get(key)
+    if pm is None:
+        d = _bpl_art(self, it)
+        src = d["icon"] if not d["icon"].isNull() else it.get("pix")
+        if src is None or src.isNull():
+            pm = QPixmap()
+        else:
+            sq = min(src.width(), src.height())
+            c = src.copy((src.width() - sq) // 2, (src.height() - sq) // 2, sq, sq)
+            px = max(8, int(side * dpr))
+            pm = c.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pm.setDevicePixelRatio(dpr)
+        st["icons"][key] = pm
+    return pm
+
+
+def _bpl_hero_pix(self, d, w, h):
+    dpr = self.devicePixelRatioF()
+    key = (int(w), int(h), dpr)
+    if d["hk"] != key:
+        pw, ph = max(8, int(w * dpr)), max(8, int(h * dpr))
+        s = d["hero"].scaled(pw, ph, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        hs = s.copy(max(0, int((s.width() - pw) * d.get("hx", 0.5))), 0, pw, ph)
+        hs.setDevicePixelRatio(dpr)
+        d["hs"], d["hk"] = hs, key
+    return d["hs"]
+
+
+def _bpl_heart(p, r, col, filled):
+    path = QPainterPath()
+    x, y, s = r.left(), r.top(), r.width()
+    def pt(a, b):
+        return QPointF(x + a * s, y + b * s)
+    path.moveTo(pt(0.5, 0.92))
+    path.cubicTo(pt(0.05, 0.60), pt(0.0, 0.25), pt(0.25, 0.12))
+    path.cubicTo(pt(0.40, 0.04), pt(0.50, 0.16), pt(0.50, 0.26))
+    path.cubicTo(pt(0.50, 0.16), pt(0.60, 0.04), pt(0.75, 0.12))
+    path.cubicTo(pt(1.0, 0.25), pt(0.95, 0.60), pt(0.5, 0.92))
+    p.save()
+    if filled:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+    else:
+        p.setPen(QPen(col, max(1.6, s * 0.09)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(path)
+    p.restore()
+
+
+def _bpl_paint(self, p, w, h, m, acc, k):
+    al_c = int(Qt.AlignmentFlag.AlignCenter)
+    al_l = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    self._bpl_ui = []
+    n = len(self._items)
+    if n == 0:
+        p.setOpacity(k)
+        p.setFont(self._font(h * 0.035))
+        p.setPen(QColor(200, 200, 220))
+        p.drawText(self.rect(), al_c, "No games in your library yet\nOpen the Store tab to add some")
+        return
+    content_on = self._zone != "tabs"
+    top, bot = h * 0.205, h * 0.915
+    rad = h * 0.025
+    lp = QRectF(m, top, w * 0.27, bot - top)
+    hx = lp.right() + w * 0.016
+    hp = QRectF(hx, top, w - m - hx, bot - top)
+    self._bpl_hero = hp
+    p.setOpacity(k)
+    p.setPen(Qt.PenStyle.NoPen)
+
+    # ── left: grouped game list ──
+    p.setBrush(QColor(20, 20, 32, 245))
+    p.drawRoundedRect(lp, rad, rad)
+    rh, hh = h * 0.064, h * 0.036
+    counts = {}
+    for it in self._items:
+        g = it.get("group") or "GAMES"
+        counts[g] = counts.get(g, 0) + 1
+    rows, y, last, yc = [], 0.0, None, {}
+    for i, it in enumerate(self._items):
+        g = it.get("group") or "GAMES"
+        if g != last:
+            rows.append(("h", y, hh, g))
+            y += hh
+            last = g
+        rows.append(("i", y, rh, i))
+        yc[i] = y + rh / 2.0
+        y += rh
+    view_top, view_h = lp.top() + h * 0.012, lp.height() - h * 0.024
+    f = max(0, min(n - 1, int(self._pos)))
+    c = min(n - 1, f + 1)
+    cen = yc[f] + (yc[c] - yc[f]) * max(0.0, min(1.0, self._pos - f))
+    off = max(0.0, min(max(0.0, y - view_h), cen - view_h / 2.0))
+    p.save()
+    p.setClipRect(QRectF(lp.left(), view_top, lp.width(), view_h))
+    side = rh * 0.72
+    for kind, ry0, rhh, arg in rows:
+        ry = view_top + ry0 - off
+        if ry + rhh < view_top or ry > view_top + view_h:
+            continue
+        if kind == "h":
+            p.setFont(self._font(h * 0.0165, True))
+            p.setPen(QColor(150, 150, 175))
+            p.drawText(QRectF(lp.left() + h * 0.02, ry, lp.width() - h * 0.04, rhh), al_l, "%s   %d" % (arg, counts.get(arg, 0)))
+            continue
+        it = self._items[arg]
+        sel = (arg == self._sel)
+        rr = QRectF(lp.left() + h * 0.012, ry + h * 0.003, lp.width() - h * 0.024, rhh - h * 0.006)
+        p.setPen(Qt.PenStyle.NoPen)
+        if sel:
+            p.setBrush(QColor(255, 255, 255, 48))
+            p.drawRoundedRect(rr, h * 0.014, h * 0.014)
+            if content_on:
+                g = h * 0.003
+                p.setPen(QPen(QColor(255, 255, 255, 230), max(2.0, h * 0.0035)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(rr.adjusted(-g, -g, g, g), h * 0.014 + g, h * 0.014 + g)
+        ir = QRectF(rr.left() + h * 0.009, rr.center().y() - side / 2.0, side, side)
+        pm = _bpl_icon(self, it, side)
+        if not pm.isNull():
+            clip = QPainterPath()
+            clip.addRoundedRect(ir, h * 0.007, h * 0.007)
+            p.save()
+            p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
+            p.drawPixmap(ir, pm, QRectF(pm.rect()))
+            p.restore()
+        tf = self._font(h * 0.0215, sel)
+        p.setFont(tf)
+        p.setPen(QColor(245, 245, 252) if sel else QColor(200, 200, 218))
+        tx = ir.right() + h * 0.014
+        p.drawText(QRectF(tx, rr.top(), rr.right() - tx - h * 0.008, rr.height()), al_l,
+                   QFontMetrics(tf).elidedText(it["title"], Qt.TextElideMode.ElideRight, int(rr.right() - tx - h * 0.012)))
+        self._bpl_ui.append((rr, "row", arg))
+    p.restore()
+
+    # ── right: the game page ──
+    it = self._items[self._sel]
+    title = it["title"]
+    d = _bpl_art(self, it, True)
+    p.setOpacity(k)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(20, 20, 32, 245))
+    p.drawRoundedRect(hp, rad, rad)
+    hero_h = hp.height() * 0.70
+    hr = QRectF(hp.left(), hp.top(), hp.width(), hero_h)
+    inner = QPainterPath()
+    inner.addRoundedRect(hp.adjusted(1.5, 1.5, -1.5, -1.5), rad, rad)
+    p.save()
+    p.setClipPath(inner, Qt.ClipOperation.IntersectClip)
+    if not d["hero"].isNull():
+        hs = _bpl_hero_pix(self, d, hr.width(), hr.height())
+        p.drawPixmap(hr, hs, QRectF(hs.rect()))
+    else:                                                  # no hero art: a gradient of the cover's colour
+        base = QColor(acc)
+        if self._bg_cur is not None and not self._bg_cur.isNull():
+            _ck = self._bg_cur.cacheKey()
+            _bc = _BPG.setdefault("bgcol", {})
+            if _ck not in _bc:
+                _bc[_ck] = self._bg_cur.toImage().pixelColor(0, 0)
+            base = QColor(_bc[_ck])
+        n_ = 0
+        while base.lightness() > 140 and n_ < 6:
+            base = base.darker(125)
+            n_ += 1
+        g = QLinearGradient(hr.topLeft(), hr.bottomRight())
+        g.setColorAt(0.0, base.darker(260))
+        g.setColorAt(0.55, base.darker(150))
+        g.setColorAt(1.0, base)
+        p.fillRect(hr, g)
+    shade = QLinearGradient(hr.left(), 0, hr.left() + hr.width() * 0.6, 0)
+    shade.setColorAt(0.0, QColor(0, 0, 0, 120))
+    shade.setColorAt(1.0, QColor(0, 0, 0, 0))
+    p.fillRect(hr, shade)
+    fade = QLinearGradient(0, hr.top() + hero_h * 0.40, 0, hr.bottom())
+    fade.setColorAt(0.0, QColor(24, 24, 26, 0))
+    fade.setColorAt(1.0, QColor(24, 24, 26, 255))
+    p.fillRect(hr, fade)
+    lx, lbot = hp.left() + h * 0.04, hr.bottom() - h * 0.085
+    if not d["logo"].isNull():
+        lg = d["logo"].scaled(int(min(hp.width() * 0.42, h * 0.5)), int(hero_h * 0.30), Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        p.drawPixmap(QPointF(lx, lbot - lg.height()), lg)
+    else:
+        tf = self._font(h * 0.05, True)
+        p.setFont(tf)
+        tr = QRectF(lx, hr.top() + hero_h * 0.30, hp.width() * 0.62, lbot - (hr.top() + hero_h * 0.30))
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom | Qt.TextFlag.TextWordWrap)
+        p.setPen(QColor(0, 0, 0, 150))
+        p.drawText(tr.translated(2, 2), flags, title.upper())
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(tr, flags, title.upper())
+    p.restore()
+
+    # action bar: Play (+ Update), the three stats, favorite heart
+    pad = h * 0.04
+    bar_h = h * 0.066
+    bar_y = hp.top() + hero_h - h * 0.02
+    btn = it.get("btn")
+    on = bool(btn is not None and btn.isEnabled())
+    label = ((it.get("action") or "Play").upper())
+    bf = self._font(h * 0.026, True)
+    pw_ = max(h * 0.24, QFontMetrics(bf).horizontalAdvance(label) + h * 0.09)
+    pr = QRectF(hp.left() + pad, bar_y, pw_, bar_h)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(acc if on else QColor(255, 255, 255, 30))
+    p.drawRoundedRect(pr, bar_h / 2, bar_h / 2)
+    p.setFont(bf)
+    p.setPen(QColor(_on_accent()) if on else QColor(150, 150, 170))
+    p.drawText(pr, al_c, label)
+    self._bpl_ui.append((pr, "play", None))
+    xe = pr.right()
+    _now = time.time()
+    _pc = getattr(self, "_bpl_pc", None)
+    if _pc is None or _pc[0] is not it["card"] or _now - _pc[1] > 0.5:
+        try:
+            ub = _sv_update_btn(it["card"])
+        except Exception:
+            ub = None
+        try:
+            menu = _sv_menu(it["card"])
+            acts = {a.text(): a for a in menu.actions() if a.text()} if menu is not None else {}
+        except Exception:
+            acts = {}
+        _pc = self._bpl_pc = (it["card"], _now, ub, acts, _sv_fmt_last(lb_last(title)), _sv_fmt_time(_lb_playtime(title)))
+    ub, acts = _pc[2], _pc[3]
+    if ub is not None and label != "UPDATE":
+        uf = self._font(h * 0.022, True)
+        ur = QRectF(xe + h * 0.014, bar_y, QFontMetrics(uf).horizontalAdvance("UPDATE") + h * 0.07, bar_h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 34))
+        p.drawRoundedRect(ur, bar_h / 2, bar_h / 2)
+        p.setFont(uf)
+        p.setPen(QColor(225, 225, 240))
+        p.drawText(ur, al_c, "UPDATE")
+        self._bpl_ui.append((ur, "update", ub))
+        xe = ur.right()
+    hd = bar_h * 0.82
+    heart = QRectF(hp.right() - pad - hd, bar_y + (bar_h - hd) / 2, hd, hd)
+    is_fav = title in lbmeta()["fav"]
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(255, 255, 255, 28))
+    p.drawEllipse(heart)
+    _bpl_heart(p, heart.adjusted(hd * 0.25, hd * 0.25, -hd * 0.25, -hd * 0.25),
+               QColor(255, 85, 110) if is_fav else QColor(225, 225, 240), is_fav)
+    self._bpl_ui.append((heart, "heart", None))
+    sx = xe + h * 0.05
+    cw = max(h * 0.12, (heart.left() - h * 0.03 - sx) / 3.0)
+    stats = (("STATUS", (it.get("status") or "").replace("●", "").strip() or "-"),
+             ("LAST PLAYED", _pc[4]), ("PLAY TIME", _pc[5]))
+    for n_, (cap, val) in enumerate(stats):
+        x0 = sx + n_ * cw
+        p.setFont(self._font(h * 0.0155, True))
+        p.setPen(QColor(140, 140, 165))
+        p.drawText(QRectF(x0, bar_y, cw, bar_h * 0.45), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom), cap)
+        vf = self._font(h * 0.023, True)
+        p.setFont(vf)
+        p.setPen(QColor(235, 235, 245))
+        p.drawText(QRectF(x0, bar_y + bar_h * 0.5, cw - h * 0.01, bar_h * 0.5), al_l,
+                   QFontMetrics(vf).elidedText(val, Qt.TextElideMode.ElideRight, int(cw - h * 0.02)))
+
+    # quick links (the same game-menu entries the normal Library page shows)
+    lf = self._font(h * 0.0175, True)
+    lfm = QFontMetrics(lf)
+    lx, ly, lh = hp.left() + pad, bar_y + bar_h + h * 0.03, h * 0.044
+    cnt = 0
+    acts = dict(acts)
+    acts = {"Game Settings": _bpl_settings_action(self), **acts}      # the launcher's per-game settings window comes first
+    for name in ("Game Settings",) + tuple(_SV_LINKS):
+        a = acts.get(name)
+        if a is None or not a.isEnabled() or cnt >= 6:
+            continue
+        txt = name.replace("Current ", "").replace("Create ", "").replace("...", "")
+        bw = lfm.horizontalAdvance(txt) + h * 0.05
+        if lx + bw > hp.right() - pad:
+            break
+        r = QRectF(lx, ly, bw, lh)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 22))
+        p.drawRoundedRect(r, lh / 2, lh / 2)
+        p.setFont(lf)
+        p.setPen(QColor(215, 215, 232))
+        p.drawText(r, al_c, txt)
+        self._bpl_ui.append((r, "link", a))
+        lx += bw + h * 0.012
+        cnt += 1
+    p.setOpacity(k)
+
+
+_bpg_o["_paint_library"] = _bpl_paint
+
+
+# ── Big Picture: per-game settings (the normal Library's game settings, grouped the same way) ──
+# X (and the "Game Settings" pill) opens Big Picture's own side panel with the settings pages as its entries: General, Launch Options,
+# Compatibility, Saves & Sync, Shortcuts & Steam, Files & Updates, Other. Each page lists that game's actions, so every game type keeps
+# exactly the options it has. It replaces the old flat X menu and is painted by Big Picture itself (controller + mouse).
+def _bpl_settings_action(self):
+    a = getattr(self, "_bpl_gs_act", None)
+    if a is None:
+        a = self._bpl_gs_act = QAction("Game Settings", self)
+        a.triggered.connect(lambda _c=False, s=self: s._side_open())
+    return a
+
+
+def _bpl_side_open(self):
+    if not self._items or not (0 <= self._sel < len(self._items)):
+        return
+    it = self._items[self._sel]
+    try:
+        menu = _sv_menu(it["card"])
+        if menu is not None:
+            try:
+                menu.aboutToShow.emit()                    # some menus fill themselves in lazily
+            except Exception:
+                _log_exc("_bpl_side_open emit")
+        acts = _gs_flat_actions(menu) if menu is not None else []
+    except Exception:
+        acts = []
+    groups = {name: [] for name, _i in _GS_PAGES}
+    for a in acts:
+        groups[_gs_page_of(a.text())].append(a)
+    gen = getattr(self, "_bpl_fav_act", None)
+    if gen is None:
+        gen = self._bpl_fav_act = QAction("Favorite", self)
+        gen.triggered.connect(lambda _c=False, s=self: s._lb_apply(("fav",)))
+    gen.setText("Remove from favorites" if it["title"] in lbmeta()["fav"] else "Add to favorites")
+    groups["General"].insert(0, gen)
+    holder = getattr(self, "_bpl_gs_menus", None)
+    if holder is not None:
+        for m in holder:
+            m.deleteLater()
+    self._bpl_gs_menus = holder = []
+    ents = []
+    for name, _icon in _GS_PAGES:
+        lst = groups[name]
+        if not lst:
+            continue
+        m = QMenu(self)
+        for a in lst:
+            m.addAction(a)
+        holder.append(m)
+        ents.append({"text": name, "enabled": True, "act": None, "sub": m, "checked": None})
+    self._ov = {"kind": "side", "title": it["title"] + "  -  Settings", "stack": [("Settings", ents)], "sel": 0, "scroll": 0, "rects": []}
+    self.setCursor(Qt.CursorShape.BlankCursor)
+    self.update()
+
+
+_BigPicture._side_open = _bpl_side_open
+
+
+# ── list order = the launcher's groups ──
+_bpl_prev_refresh = _BigPicture._refresh
+
+
+def _bpl_refresh(self):
+    _bpl_prev_refresh(self)
+    try:                                                   # "Other NCZ Games" (NCZ Chess, NCZ Tetris...) live outside app.cards
+        have = {id(i["card"]) for i in self._items}
+        for card, title in list(getattr(self._app, "nondev_cards", []) or []):
+            if id(card) in have or not _sv_card_alive(card) or not _lb_keep(title):
+                continue
+            btn = card.findChild(QPushButton, "Primary")
+            if btn is None:
+                btn = next((b for b in card.findChildren(QPushButton) if b.objectName() != "MoreButton"), None)
+            st_ = card.findChild(QLabel, "CardStatus")
+            pix = None
+            for l in card.findChildren(QLabel):
+                pm = l.pixmap()
+                if pm is not None and not pm.isNull() and l.width() >= 100:
+                    pix = pm
+                    break
+            status = st_.text() if st_ else ""
+            if any(b.text().strip() == "Update" for b in card.findChildren(QPushButton)):
+                status = "Update available"
+            self._items.append({"card": card, "title": title, "btn": btn, "pix": pix, "status": status,
+                                "action": btn.text().strip() if btn else ""})
+            have.add(id(card))
+    except Exception:
+        _log_exc("_bpl_refresh nondev")
+    try:
+        order = {}
+        for gi, (name, items) in enumerate(_sv_groups(self._app)):
+            for pi, (card, _t) in enumerate(items):
+                order[id(card)] = (gi, pi, name)
+        keep = self._items[self._sel]["card"] if self._items and 0 <= self._sel < len(self._items) else None
+        for it in self._items:
+            o = order.get(id(it["card"]))
+            it["group"] = o[2] if o else "GAMES"
+            it["_o"] = (o[0], o[1]) if o else (99, 0)
+        self._items.sort(key=lambda i: i["_o"])
+        self._sel = next((n for n, i in enumerate(self._items) if i["card"] is keep), 0)
+        self._pos = float(self._sel)
+        self._sync_bg(animate=False)
+    except Exception:
+        _log_exc("_bpl_refresh")
+
+
+_BigPicture._refresh = _bpl_refresh
+
+_bpl_prev_leave = _BigPicture.leave
+
+
+def _bpl_leave(self, show_main=True):
+    st = getattr(self, "_bpl", None)
+    if st is not None:
+        st["art"].clear()
+        st["icons"].clear()
+    _bpl_prev_leave(self, show_main)
+
+
+_BigPicture.leave = _bpl_leave
+
+_bpl_prev_act = _BigPicture._act
+
+
+def _bpl_act(self, name):
+    if _bpg_plain(self) and self._tab == 0 and self._zone == "content" and self._items:
+        if name == "down" or (name == "up" and self._sel > 0):
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            self._move_to(self._sel + (1 if name == "down" else -1))
+            return
+    _bpl_prev_act(self, name)
+
+
+_BigPicture._act = _bpl_act
+
+# favorite toggles regroup the list: stay on the same game instead of the same row number
+_bpl_prev_lbapply = _BigPicture._lb_apply
+
+
+def _bpl_lbapply(self, tag):
+    title = self._items[self._sel]["title"] if self._items and 0 <= self._sel < len(self._items) else None
+    _bpl_prev_lbapply(self, tag)
+    if tag and tag[0] == "fav" and title:
+        idx = next((n for n, i in enumerate(self._items) if i["title"] == title), None)
+        if idx is not None:
+            self._sel, self._pos = idx, float(idx)
+            self._sync_bg(animate=False)
+            self.update()
+
+
+_BigPicture._lb_apply = _bpl_lbapply
+
+_bpl_prev_mouse = _BigPicture.mousePressEvent
+
+
+def _bpl_mouse(self, e):
+    if self._tab == 0 and _bpg_plain(self) and e.button() == Qt.MouseButton.LeftButton:
+        pt = e.position()
+        chrome = [self._exit_rect, getattr(self, "_cog_rect", QRectF())] + list(self._tab_rects) + [r for r, _t in self._lb_rects]
+        if not any(r.contains(pt) for r in chrome) and pt.y() > self.height() * 0.19:
+            for r, kind, arg in reversed(getattr(self, "_bpl_ui", [])):
+                if not r.contains(pt):
+                    continue
+                self._zone = "content"
+                try:
+                    if kind == "row":
+                        self._move_to(arg)
+                    elif kind == "play":
+                        self._launch()
+                    elif kind == "update":
+                        self.leave(True)
+                        arg.click()
+                    elif kind == "heart":
+                        self._lb_apply(("fav",))
+                    elif kind == "link":
+                        arg.trigger()
+                except Exception:
+                    _log_exc("_bpl_mouse")
+                self.update()
+                return
+            return                                           # nothing else lives in the library content area
+    _bpl_prev_mouse(self, e)
+
+
+_BigPicture.mousePressEvent = _bpl_mouse
+
+
+# ── Big Picture: Liquid Glass ─────────────────────────────────────────────────────────────────────────────────────
+# Big Picture is painted by ONE widget with flat translucent fills. Instead of rewriting every paint method (Library, Store,
+# Friends, Downloads, Workshop, the keyboard, the X sidebar, the Settings menu, chat ...), its paintEvent runs with a QPainter
+# that knows what a flat fill means and paints glass instead:
+#   * soft white fills (tab bar, chips, Exit / cog, keys, rows, ghost buttons) -> a glass piece with a specular edge
+#   * accent fills (active tab / chip, primary buttons, selected rows, badges) -> accent-tinted glass
+#   * the dark opaque panels (store detail, keyboard, X sidebar, Settings, dialogs) -> frosted glass: soft shadow, smoked body,
+#     accent glow inside, bright rim
+#   * the toast -> smoked glass pill; the focus / selection rings get a soft glow (they stay solid, so the controller focus
+#     is still easy to see); the page dims are a bit lighter so the glass has something to refract
+#   * the background gets the same slow accent "aurora" the rest of the launcher has (it follows the selected library tile)
+# Classic look (_glass_on() False) paints exactly as before. Glass Performance "Low" drops the shadows and the focus glow.
+_BPG = {"first": False}
+_BPG_QPAINTER = QPainter
+
+
+class _BPGlassPainter(_BPG_QPAINTER):
+    def __init__(self, *a):
+        super().__init__(*a)
+        dev = a[0] if a else None
+        self._bp = dev if isinstance(dev, _BigPicture) else None
+        self._main = bool(self._bp is not None and _BPG.pop("first", False))    # the first painter of a paintEvent draws the backdrop
+        self._nfull = 0
+        self._low = _ig_low_power()
+
+    # ── what is this flat fill? ──
+    def _kind(self, rect):
+        try:
+            br = self.brush()
+            if br.style() != Qt.BrushStyle.SolidPattern:
+                return None
+            c = br.color()
+            a = c.alpha()
+            rgb = (c.red(), c.green(), c.blue())
+            bp = self._bp
+            if a >= 240 and max(rgb) < 60 and rect.width() >= bp.width() * 0.15 and rect.height() >= bp.height() * 0.15:
+                return "panel"
+            if self.pen().style() != Qt.PenStyle.NoPen:
+                return None
+            if rgb == (255, 255, 255) and a <= 110:
+                return "glass"
+            acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+            if rgb == (acc.red(), acc.green(), acc.blue()) and a >= 60:
+                return "acc"
+            if rgb == (0, 0, 0) and 120 <= a <= 230:
+                return "smoke"
+        except Exception:
+            _log_exc("_BPGlassPainter._kind")
+        return None
+
+    def _hs(self):
+        """(hue, sat) for glows: the accent's when it is really coloured, otherwise neutral (the launcher itself stays black)."""
+        acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        if acc.hsvSaturationF() < 0.25:
+            return 0.0, 0.0
+        return _gl_hue_sat()
+
+    def _rim(self, rect, radius, ellipse=False, k=1.0):
+        """The launcher's card edge: a thin, even light line (a touch brighter at the top)."""
+        k *= _ig_rim_strength()
+        if k <= 0 or rect.width() < 10 or rect.height() < 10:
+            return
+        r = QRectF(rect).adjusted(0.6, 0.6, -0.6, -0.6)
+        path = QPainterPath()
+        if ellipse:
+            path.addEllipse(r)
+        else:
+            rad = min(radius, r.width() / 2.0, r.height() / 2.0)
+            path.addRoundedRect(r, rad, rad)
+        g = _GlLG(0, r.top(), 0, r.bottom())
+        g.setColorAt(0.0, QColor(255, 255, 255, int(min(255, 52 * k))))
+        g.setColorAt(1.0, QColor(255, 255, 255, int(min(255, 24 * k))))
+        _BPG_QPAINTER.save(self)
+        _BPG_QPAINTER.setPen(self, QPen(_GlBrush(g), 1.2))
+        _BPG_QPAINTER.setBrush(self, Qt.BrushStyle.NoBrush)
+        _BPG_QPAINTER.drawPath(self, path)
+        _BPG_QPAINTER.restore(self)
+
+    def _glass(self, kind, rect, radius, ellipse=False):
+        rect = QRectF(rect)
+        c = self.brush().color()
+        a = c.alpha()
+        if kind == "glass":          # rows, chips, keys, ghost buttons: dark charcoal like the launcher's cards, a hair lighter when selected
+            self._card(rect, radius, 30 + a * 0.28, ellipse)
+        elif kind == "acc":          # primary buttons / active tab / selected row (white in the New theme)
+            if a >= 240:
+                _gl_paint(self, rect, radius, tint=c, alpha=(250, 238), ellipse=ellipse)
+            else:
+                _gl_paint(self, rect, radius, tint=c, alpha=(int(a * 1.5), int(a * 1.2)), ellipse=ellipse)
+        elif kind == "smoke":
+            self._panel(rect, radius, shadow=False)
+        elif kind == "panel":
+            self._panel(rect, radius)
+
+    def _card(self, rect, radius, v, ellipse=False):
+        v = int(max(24, min(70, v)))
+        path = QPainterPath()
+        if ellipse:
+            path.addEllipse(rect)
+        else:
+            rad = min(radius, rect.width() / 2.0, rect.height() / 2.0)
+            path.addRoundedRect(rect, rad, rad)
+        _BPG_QPAINTER.save(self)
+        _BPG_QPAINTER.setPen(self, Qt.PenStyle.NoPen)
+        g = _GlLG(rect.left(), rect.top(), rect.left() + rect.width() * 0.4, rect.bottom())
+        g.setColorAt(0.0, QColor(v + 5, v + 5, v + 7, 240))
+        g.setColorAt(1.0, QColor(max(0, v - 9), max(0, v - 9), max(0, v - 7), 244))
+        _BPG_QPAINTER.fillPath(self, path, _GlBrush(g))
+        _BPG_QPAINTER.setClipPath(self, path)
+        sh = _GlLG(0, rect.top(), 0, rect.top() + min(rect.height() * 0.6, 60.0))
+        sh.setColorAt(0.0, QColor(255, 255, 255, 10))
+        sh.setColorAt(1.0, QColor(255, 255, 255, 0))
+        _BPG_QPAINTER.fillRect(self, QRectF(rect.left(), rect.top(), rect.width(), min(rect.height() * 0.6, 60.0)), _GlBrush(sh))
+        _BPG_QPAINTER.restore(self)
+        self._rim(rect, radius, ellipse, 0.7)
+
+    def _cached_shadow(self, rect, radius, spread=14.0, dy=6.0):
+        """The drop shadow is 8 huge translucent rounded rects: painting them every frame (the airbrush repaints ~30x/s) is what made
+        Big Picture's Library laggy. It is drawn once per size into a pixmap and blitted from then on."""
+        try:
+            dpr = self.device().devicePixelRatioF() if hasattr(self.device(), "devicePixelRatioF") else 1.0
+            pad = int(spread + dy + 2)
+            w, h = int(rect.width()) + 2 * pad, int(rect.height()) + 2 * pad
+            key = (w, h, int(radius * 10), dpr)
+            cache = _BPG.setdefault("shadows", {})
+            pm = cache.get(key)
+            if pm is None:
+                if len(cache) > 24:
+                    cache.clear()
+                pm = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
+                pm.setDevicePixelRatio(dpr)
+                pm.fill(Qt.GlobalColor.transparent)
+                q = _BPG_QPAINTER(pm)
+                q.setRenderHint(_BPG_QPAINTER.RenderHint.Antialiasing, True)
+                q.setPen(Qt.PenStyle.NoPen)
+                q.setBrush(QColor(0, 0, 0, 7))
+                base = QRectF(pad, pad, rect.width(), rect.height())
+                for i in range(8, 0, -1):
+                    g = spread * i / 8.0
+                    q.drawRoundedRect(base.adjusted(-g, -g + dy, g, g + dy), radius + g, radius + g)
+                q.end()
+                cache[key] = pm
+            _BPG_QPAINTER.drawPixmap(self, QPointF(rect.left() - pad, rect.top() - pad), pm)
+        except Exception:
+            _log_exc("_BPGlassPainter._cached_shadow")
+            _gl_shadow(self, rect, radius, spread=spread, dy=dy)
+
+    def _panel(self, rect, radius, shadow=True):
+        """The launcher's glass card: charcoal gradient, a faint sheen at the top, a thin even rim, a soft shadow."""
+        if shadow and not self._low:
+            self._cached_shadow(rect, radius)
+        path = QPainterPath()
+        rad = min(radius, rect.width() / 2.0, rect.height() / 2.0)
+        path.addRoundedRect(rect, rad, rad)
+        _BPG_QPAINTER.save(self)
+        _BPG_QPAINTER.setPen(self, Qt.PenStyle.NoPen)
+        body = _GlLG(rect.left(), rect.top(), rect.right() * 0.4 + rect.left() * 0.6, rect.bottom())
+        body.setColorAt(0.0, QColor(36, 36, 38, 238))
+        body.setColorAt(1.0, QColor(17, 17, 19, 242))
+        _BPG_QPAINTER.fillPath(self, path, _GlBrush(body))
+        _BPG_QPAINTER.setClipPath(self, path)
+        sh = _GlLG(0, rect.top(), 0, rect.top() + min(rect.height() * 0.5, 160.0))
+        sh.setColorAt(0.0, QColor(255, 255, 255, 12))
+        sh.setColorAt(1.0, QColor(255, 255, 255, 0))
+        _BPG_QPAINTER.fillRect(self, QRectF(rect.left(), rect.top(), rect.width(), min(rect.height() * 0.5, 160.0)), _GlBrush(sh))
+        _BPG_QPAINTER.restore(self)
+        self._rim(rect, rad, False, 1.0)
+
+    def _airbrush(self):
+        """The background is plain charcoal. Whatever wants a colour (the selected cover) airbrushes it around itself: a few soft
+        blobs of the cover's colour that drift slowly around the cover. Returns True when something was drawn (it keeps moving)."""
+        bp = self._bp
+        rect = None
+        try:
+            if bp._tab == 0 and bp._items:
+                hero = getattr(bp, "_bpl_hero", None)
+                rect = QRectF(hero) if hero is not None else QRectF(bp.width() * 0.3, bp.height() * 0.2, bp.width() * 0.5, bp.height() * 0.5)
+            elif bp._tab == 1 and bp._sitems:
+                rect = QRectF(bp._srect(bp._ssel))
+                g = rect.width() * 0.04
+                rect.adjust(-g, -g, g, g)
+        except Exception:
+            rect = None
+        if rect is None:
+            return False
+        t = 0.0 if self._low else time.time()
+        drew = False
+        for pm, k in ((bp._bg_prev, 1.0 - bp._bg_t), (bp._bg_cur, bp._bg_t)):
+            if pm is None or pm.isNull() or k <= 0.01:
+                continue
+            ck = pm.cacheKey()
+            cc_ = _BPG.setdefault("bgcol", {})
+            col = cc_.get(ck)
+            if col is None:
+                if len(cc_) > 16:
+                    cc_.clear()
+                col = cc_[ck] = pm.toImage().pixelColor(0, 0)
+            self._blobs(rect, col, k, t)
+            drew = True
+        return drew
+
+    def _blobs(self, rect, col, k, t):
+        import math
+        hue = col.hsvHueF()
+        sat = col.hsvSaturationF() if hue >= 0 else 0.0
+        hue = max(0.0, hue)
+        val = max(0.8, col.valueF())
+        base_s = min(1.0, sat * 1.1 + (0.12 if sat > 0.1 else 0.0))
+        cx, cy = rect.center().x(), rect.center().y()
+        cap = self._bp.height() * 0.5                       # big pages (the library game page) must not tint the whole screen
+        rw, rh = min(rect.width(), cap), min(rect.height(), cap)
+        R = max(rw, rh)
+        # (phase, speed, orbit x, orbit y, radius, hue shift, strength)
+        specs = ((0.0, 0.00, 0.00, 0.00, 1.25, 0.00, 0.40),            # the steady halo right around the cover
+                 (0.0, 0.35, 0.55, 0.50, 1.10, 0.00, 0.34), (2.1, -0.28, 0.65, 0.42, 1.00, 0.04, 0.28),
+                 (4.2, 0.22, 0.50, 0.60, 1.05, -0.04, 0.28), (1.0, -0.42, 0.75, 0.38, 0.85, 0.07, 0.22),
+                 (3.3, 0.31, 0.40, 0.55, 0.95, -0.07, 0.24))
+        if self._low:
+            specs = specs[:3]
+        _BPG_QPAINTER.save(self)
+        _BPG_QPAINTER.setPen(self, Qt.PenStyle.NoPen)
+        for ph, sp, ox, oy, rm, hs, st in specs:
+            ang = t * sp + ph
+            bx, by = cx + math.cos(ang) * rw * ox, cy + math.sin(ang * 1.3) * rh * oy
+            r = R * rm * (1.0 + 0.08 * math.sin(t * 0.7 + ph))
+            al = st * k * (0.85 + 0.15 * math.sin(t * 0.9 + ph))
+            c = QColor.fromHsvF((hue + hs) % 1.0, base_s, val)
+            g = _GlRG(QPointF(bx, by), r)
+            for stop, mul in ((0.0, 1.0), (0.35, 0.6), (0.7, 0.18), (1.0, 0.0)):    # soft airbrush fall-off
+                cc = QColor(c)
+                cc.setAlphaF(al * mul)
+                g.setColorAt(stop, cc)
+            _BPG_QPAINTER.fillRect(self, QRectF(bx - r, by - r, 2 * r, 2 * r), _GlBrush(g))
+        _BPG_QPAINTER.restore(self)
+
+    def _ring_glow(self, a):
+        """A soft glow behind a solid selection / focus ring (the ring itself is still drawn on top)."""
+        try:
+            if self._low or self.brush().style() != Qt.BrushStyle.NoBrush:
+                return
+            pen = self.pen()
+            pc = pen.color()
+            if pen.widthF() < 2.0 or pen.style() == Qt.PenStyle.NoPen:
+                return
+            acc = QApplication.palette().color(QPalette.ColorRole.Highlight)
+            is_acc = (pc.red(), pc.green(), pc.blue()) == (acc.red(), acc.green(), acc.blue())
+            is_white = (pc.red(), pc.green(), pc.blue()) == (255, 255, 255) and pc.alpha() >= 225
+            if not (is_acc or is_white) or pc.alpha() < 20:
+                return
+            _BPG_QPAINTER.save(self)
+            for mul, al in ((4.0, 14), (2.4, 30)):
+                gc = QColor(pc)
+                gc.setAlpha(int(al * pc.alpha() / 255.0))
+                _BPG_QPAINTER.setPen(self, QPen(gc, pen.widthF() * mul))
+                _BPG_QPAINTER.drawRoundedRect(self, *a)
+            _BPG_QPAINTER.restore(self)
+        except Exception:
+            _log_exc("_BPGlassPainter._ring_glow")
+
+    # ── intercepted calls (only for the Big Picture widget itself) ──
+    def drawRoundedRect(self, *a):
+        if self._bp is not None and a and isinstance(a[0], (QRectF, QRect)) and len(a) >= 2:
+            kind = self._kind(a[0])
+            if kind:
+                self._glass(kind, a[0], float(a[1]))
+                return
+            self._ring_glow(a)
+        super().drawRoundedRect(*a)
+
+    def drawEllipse(self, *a):
+        if self._bp is not None and len(a) == 1 and isinstance(a[0], (QRectF, QRect)):
+            kind = self._kind(a[0])
+            if kind in ("glass", "acc", "smoke"):
+                self._glass(kind, a[0], 0.0, ellipse=True)
+                return
+        super().drawEllipse(*a)
+
+    def drawPixmap(self, *a):
+        bp = self._bp
+        if (bp is not None and self._main and self._nfull < 2 and len(a) == 3 and isinstance(a[0], QRectF)
+                and a[0].width() > bp.width() * 1.05):
+            return                                          # the old full-screen blurred cover art: replaced by the airbrush
+        super().drawPixmap(*a)
+
+    def drawRect(self, *a):
+        if self._bp is not None and len(a) == 1 and isinstance(a[0], (QRectF, QRect)):
+            if self._kind(a[0]) == "panel":                 # the X sidebar slides in from the screen edge
+                self._panel(QRectF(a[0]), 0.0)
+                return
+        super().drawRect(*a)
+
+    def fillRect(self, *a):
+        bp = self._bp
+        if bp is not None and len(a) == 2 and isinstance(a[0], (QRectF, QRect)):
+            r = a[0]
+            if r.width() >= bp.width() - 1 and r.height() >= bp.height() - 1:
+                b = a[1]
+                if isinstance(b, QColor) and b.alpha() >= 140 and max(b.red(), b.green(), b.blue()) < 12:
+                    d = QColor(b)                           # page dims behind panels: lighter, so the glass has something to refract
+                    d.setAlpha(int(b.alpha() * 0.7))
+                    super().fillRect(r, d)
+                    return
+                if self._main and self._nfull == 0:         # always charcoal (no accent / art wash)
+                    gb = _GlLG(0, 0, 0, bp.height())
+                    gb.setColorAt(0.0, QColor(22, 22, 25))
+                    gb.setColorAt(1.0, QColor(15, 15, 17))
+                    super().fillRect(r, _GlBrush(gb))
+                elif self._main and self._nfull == 1:       # the old dark fade over the blurred art: not needed any more
+                    pass
+                else:
+                    super().fillRect(*a)
+                self._nfull += 1
+                if self._main and self._nfull == 2:         # background done: airbrush the selected cover's colour around it
+                    bp._bpg_glow = self._airbrush()
+                return
+        super().fillRect(*a)
+
+
+_bpg_prev_paint = _BigPicture.paintEvent
+
+
+def _bpg_tick(self):
+    if not (self._active and not self._asleep and self.isVisible()):
+        self._bpg_tm.stop()
+        return
+    self.update()
+
+
+def _bpg_paint(self, e):
+    """Big Picture's whole paintEvent (Library, Store, tabs, sidebars, Settings ...) with the glass painter swapped in."""
+    if not _glass_on():
+        return _bpg_prev_paint(self, e)
+    g = globals()
+    old = g["QPainter"]
+    g["QPainter"] = _BPGlassPainter
+    _BPG["first"] = True
+    self._bpg_glow = False
+    try:
+        _bpg_prev_paint(self, e)
+    finally:
+        g["QPainter"] = old
+        _BPG["first"] = False
+    try:                                                    # the airbrush drifts: repaint ~30x/s only while it is on screen
+        tm = getattr(self, "_bpg_tm", None)
+        if self._bpg_glow and not _ig_low_power() and self._active and not self._asleep:
+            if tm is None:
+                tm = self._bpg_tm = QTimer(self)
+                tm.setInterval(33)
+                tm.timeout.connect(lambda: _bpg_tick(self))
+            if not tm.isActive():
+                tm.start()
+        elif tm is not None and tm.isActive():
+            tm.stop()
+    except Exception:
+        _log_exc("_bpg_paint timer")
+
+
+_BigPicture.paintEvent = _bpg_paint
 
 
 if __name__ == "__main__":
