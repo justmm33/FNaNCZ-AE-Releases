@@ -55860,22 +55860,67 @@ def _act_game_of(it):
     return m.group(1).strip() if m else ""
 
 def _act_cover_path(game):
-    return os.path.join(os.path.dirname(get_launcher_settings_path()), "activity_covers",
+    return os.path.join(os.path.dirname(get_launcher_settings_path()), "activity_covers_v2",     # v2: older files could hold Steam's guess (FNaF) for NCZ games / fangames
                         _hashlib.md5(game.casefold().encode("utf-8")).hexdigest()[:16] + ".png")
 
 class _ActCoverBus(QObject):
     ready = pyqtSignal(str, str)           # game, cover file
 
-_act_state = {"bus": None, "pool": ThreadPoolExecutor(max_workers=3), "pending": set(), "missing": {}}
+_act_state = {"bus": None, "pool": ThreadPoolExecutor(max_workers=3), "pending": set(), "missing": {}, "uids": {}}
 
 def _act_bus():
     if _act_state["bus"] is None:           # created on the GUI thread so the signal reaches it from the workers
         _act_state["bus"] = _ActCoverBus()
     return _act_state["bus"]
 
+def _act_is_ncz_or_fan(game):
+    """NCZ games and fangames are not on Steam; a Steam name search for them lands on the original game (FNaF)."""
+    low = str(game).casefold()
+    if "ncz" in low:
+        return True
+    try:
+        return any(str(g.get("title", "")).casefold() == low for g in load_fan_library())
+    except Exception:
+        return False
+
+def _act_local_cover_bytes(game):
+    """The launcher's own cover for the game (NCZ assets, library, fan library, custom games), as file bytes."""
+    low = pretty_game_name(game).casefold()
+    try:
+        for title, path in library_cover_paths().items():
+            if str(title).casefold() == low and os.path.exists(path):
+                with open(path, "rb") as f:
+                    data = f.read()
+                if data and not QImage.fromData(data).isNull():
+                    return data
+    except Exception:
+        _log_exc("_act_local_cover_bytes")
+    return None
+
+def _act_friend_cover_bytes(game, uid):
+    """The cover the friend published for this game (what the friend's profile shows), for games we don't own."""
+    if not uid:
+        return None
+    try:
+        covers = cloud_fetch_covers(uid)
+        for name in (game, pretty_game_name(game)):
+            raw = _decode_photo(covers.get(_cover_key(name)))
+            if raw and not QImage.fromData(raw).isNull():
+                return raw
+    except Exception:    # expected: offline or the friend has no covers
+        pass
+    return None
+
 def _act_find_cover_bytes(game):
-    """Vertical cover: SteamGridDB first when an API key is set (by Steam id, then by name); otherwise, or when
-    SteamGridDB has nothing, Steam's own portrait art."""
+    """Vertical cover: the launcher's own cover first (NCZ games, fangames, anything in the library), then the cover
+    the friend published; NCZ games and fangames never fall through to Steam. Everything else: SteamGridDB first
+    when an API key is set (by Steam id, then by name); otherwise, or when SteamGridDB has nothing, Steam's own
+    portrait art."""
+    data = _act_local_cover_bytes(game)
+    if data:
+        return data
+    if _act_is_ncz_or_fan(game):
+        return _act_friend_cover_bytes(game, _act_state["uids"].get(game))
     key = get_steamgriddb_key()
     appid = 0
     try:
@@ -55980,6 +56025,7 @@ def _act_refresh(self):
             cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cover.setStyleSheet("background: rgba(128,128,128,40); border-radius: 4px; color: gray; font-weight: 700;")
             cover.setText(game[:1].upper())
+            _act_state["uids"][game] = it.get("u")      # lets the cover lookup use the friend's published cover
             path = _act_cover_request(game)
             if path:
                 pm = _act_cover_pixmap(path)
