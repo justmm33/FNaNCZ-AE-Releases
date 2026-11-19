@@ -3884,7 +3884,7 @@ class SettingsPage(QWidget):
         self.sgdb_key_edit = QLineEdit()
         self.sgdb_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.sgdb_key_edit.setPlaceholderText("Paste your API key")
-        self.sgdb_key_edit.setText(get_steamgriddb_key())
+        self.sgdb_key_edit.setText(get_steamgriddb_key(own_only=True))
         self.sgdb_key_edit.returnPressed.connect(self.on_save_sgdb_key)
         self.sgdb_save_btn = QPushButton("Save")
         self.sgdb_save_btn.setFixedWidth(100)
@@ -4264,7 +4264,7 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
         self.steamgriddb_key_changed.emit()
         if not key:
-            self.sgdb_status.setText("Key removed. The Store will use Steam's own art.")
+            self.sgdb_status.setText("Key removed. The launcher's default SteamGridDB key will be used.")
             return
         self.sgdb_status.setText("Checking key...")
         self.sgdb_save_btn.setEnabled(False)
@@ -5303,8 +5303,11 @@ STORE_CARD_W = STORE_COVER_W + 18
 STORE_GRID_GAP = 18
 NO_ART_RETRY_SECONDS = 14 * 24 * 3600
 
-def get_steamgriddb_key():
-    return load_launcher_settings().get("steamgriddb_api_key", "").strip()
+NCZ_DEFAULT_SGDB_KEY = "8e7d118f238c43c8767711f51e8d72b0"     # used when the user hasn't set their own SteamGridDB key
+
+def get_steamgriddb_key(own_only=False):
+    key = load_launcher_settings().get("steamgriddb_api_key", "").strip()
+    return key if (key or own_only) else NCZ_DEFAULT_SGDB_KEY
 
 def get_store_cache_dir():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "covers")
