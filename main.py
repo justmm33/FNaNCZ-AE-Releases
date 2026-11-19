@@ -10831,8 +10831,10 @@ def _lite_publish_presence():
         if _presence_state["offline"]:
             return
         token, uid = get_id_token()
-        _http_json(_fdb(f"public/{uid}", token), "PATCH",
-                   {"playing": _now_playing["name"] or "", "idle": True, "seen": {".sv": "timestamp"}})
+        payload = {"idle": True, "seen": {".sv": "timestamp"}}
+        _playing_fields(payload)
+        _http_json(_fdb(f"public/{uid}", token), "PATCH", payload)
+        _refresh_self_game(token, uid)
 
 def _ncz_lite_services(app):
     """What the tray-only launcher still does, without building the window: notice which library game is running
@@ -15788,6 +15790,38 @@ _presence_lock = threading.Lock()
 _presence_state = {"offline": False, "full_sig": None, "full_at": 0.0}
 _clock_skew = {"ms": 0.0}          # server time minus this PC's time, so a wrong PC clock can't fake "online"
 PRESENCE_FULL_EVERY = 600          # seconds: re-send the whole profile at least this often
+_published_playing = {"v": ""}     # what this launcher last wrote to public/<uid>/playing
+
+def _playing_fields(payload):
+    """Adds "playing" to a heartbeat only when the launcher itself has something to say about it: it is tracking a
+    game, or it must clear a game it published earlier. Otherwise the key is left alone, so a game that reports
+    itself (e.g. FNaNCZ: The Return writing public/<uid>/playing) is not wiped by an empty value every 45 seconds."""
+    name = _now_playing["name"] or ""
+    if name or _published_playing["v"]:
+        payload["playing"] = name
+        payload["playing_ts"] = None      # the launcher's own value has no game heartbeat; drop any old one
+    _published_playing["v"] = name
+
+_self_game = {"name": "", "ts": 0}   # a game on this PC that reports itself (e.g. FNaNCZ: The Return), read back from the cloud
+
+def _refresh_self_game(token, uid):
+    """Reads back what a game wrote to public/<uid>/playing, so your own profile can show it too.
+    Only a value with a recent playing_ts counts (that is what a self-reporting game writes)."""
+    try:
+        name = _http_json(_fdb(f"public/{uid}/playing", token))
+        ts = _http_json(_fdb(f"public/{uid}/playing_ts", token))
+    except Exception:    # expected: offline or the server did not answer
+        return
+    if isinstance(name, str) and name and isinstance(ts, (int, float)) and ts > 0:
+        _self_game["name"], _self_game["ts"] = name, ts
+    else:
+        _self_game["name"], _self_game["ts"] = "", 0
+
+def _self_game_name():
+    n, ts = _self_game["name"], _self_game["ts"]
+    if n and ts and time.time() * 1000 + _clock_skew["ms"] - ts < 150000:
+        return n
+    return ""
 
 def cloud_publish_presence():
     """Light heartbeat (seen/playing/idle) normally. The heavy profile (photo, library, covers, playtime)
@@ -15817,10 +15851,10 @@ def cloud_publish_presence():
         full = (sig != _presence_state["full_sig"]
                 or time.time() - _presence_state["full_at"] > PRESENCE_FULL_EVERY)
         payload = {
-            "playing": _now_playing["name"] or "",
             "idle": is_idle(),
             "seen": {".sv": "timestamp"},
         }
+        _playing_fields(payload)
         if full:
             payload.update({"username": username, "library": library, "installed": installed, "country": country, "ptime": ptime,
                             "photo": None})
@@ -15829,6 +15863,7 @@ def cloud_publish_presence():
                     payload["photo"] = base64.b64encode(f.read()).decode("ascii")
         t0 = time.time() * 1000
         resp = _http_json(_fdb(f"public/{uid}", token), "PATCH", payload)
+        _refresh_self_game(token, uid)
         if full:
             _presence_state["full_sig"] = sig
             _presence_state["full_at"] = time.time()
@@ -15848,7 +15883,7 @@ def cloud_publish_offline():
     _presence_state["offline"] = True       # stops any heartbeat that is still in flight or starts later
     token, uid = get_id_token()
     with _presence_lock:                    # waits for an in-flight heartbeat so "offline" is always the last write
-        _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "idle": False, "playing": ""})
+        _http_json(_fdb(f"public/{uid}", token), "PATCH", {"seen": 0, "idle": False, "playing": "", "playing_ts": None})
 
 def cloud_accept_friend(other):
     token, uid = get_id_token()
@@ -16800,10 +16835,22 @@ def _friend_is_fresh(d):
     now = time.time() * 1000 + _clock_skew["ms"]
     return -30000 < now - seen < FRIEND_ONLINE_WINDOW_MS
 
+def _friend_playing(d):
+    """The game a friend is playing, or "". A game that reports itself also writes playing_ts about every 30 seconds;
+    if that stops for a couple of minutes the game closed or crashed and the status is ignored."""
+    p = d.get("playing")
+    if not isinstance(p, str) or not p:
+        return ""
+    ts = d.get("playing_ts")
+    if isinstance(ts, (int, float)) and ts > 0:
+        if time.time() * 1000 + _clock_skew["ms"] - ts > 150000:
+            return ""
+    return p
+
 def _friend_status(d):
     fresh = _friend_is_fresh(d)
-    if fresh and d.get("playing"):
-        return f"Playing {pretty_game_name(d['playing'])}", GREEN
+    if fresh and _friend_playing(d):
+        return f"Playing {pretty_game_name(_friend_playing(d))}", GREEN
     if fresh:
         if d.get("idle") is True:
             return "Idle", "#3b82f6"
@@ -18262,7 +18309,7 @@ class FriendsPage(QWidget):
     def _detect_events(self):
         state = {}
         for uid, d in self.friends.items():
-            state[uid] = (_friend_status(d)[0] != "Offline", d.get("playing") or "")
+            state[uid] = (_friend_status(d)[0] != "Offline", _friend_playing(d))
         if self._prev_state is not None:
             for uid, (online, playing) in state.items():
                 was_online, was_playing = self._prev_state.get(uid, (False, ""))
@@ -31972,7 +32019,7 @@ def profile_info_self():
     acct = load_account() or {}
     username, avatar = load_profile_cache()
     name = username or acct.get("email", "").split("@")[0] or "Player"
-    playing = _now_playing.get("name") or ""
+    playing = _now_playing.get("name") or _self_game_name() or ""
     playing = pretty_game_name(playing) if playing else ""
     if playing:
         status, color = "Currently In-Game", GREEN
@@ -32011,8 +32058,8 @@ def profile_info_from_public(uid, d, raw_covers=None):
     if isinstance(lib, dict):
         lib = list(lib.values())
     titles = [pretty_game_name(t) for t in lib if isinstance(t, str)] if isinstance(lib, list) else []
-    playing = (pretty_game_name(d["playing"])
-               if _friend_is_fresh(d) and isinstance(d.get("playing"), str) and d.get("playing") else "")
+    playing = (pretty_game_name(_friend_playing(d))
+               if _friend_is_fresh(d) and _friend_playing(d) else "")
     covers = {}
     for t in titles + ([playing] if playing and playing not in titles else []):
         key = _cover_key(t)
@@ -50143,9 +50190,6 @@ def _bpx_fr_build(self):
         fl.sort(key=lambda kv: (_friend_status(kv[1])[0] == "Offline", (kv[1].get("username") or "").lower()))
         for u, d in fl:
             rows.append({"kind": "friend", "uid": u, "name": d.get("username") or "Unknown", "d": d})
-        for gid, g in sorted((getattr(fp, "groups", None) or {}).items(), key=lambda kv: str(kv[1].get("name", "")).lower()):
-            if isinstance(g, dict):                              # group chats: their id is "group:<gid>" (media + messages route on that)
-                rows.append({"kind": "group", "uid": "group:" + gid, "name": g.get("name") or "Group", "d": g, "gid": gid})
     fr["rows"] = rows
     fr["sel"] = next((i for i, r in enumerate(rows) if keep and (r["kind"], r["uid"]) == keep),
                      min(fr["sel"], max(0, len(rows) - 1)))
@@ -50211,7 +50255,7 @@ def _bpx_fr_act(self, name):
         else:
             fr["chat"], fr["cbtn"] = r["uid"], 0
             self._fr_load_chat(r["uid"])
-    elif name == "alt" and rows and rows[fr["sel"]]["kind"] in ("friend", "group"):
+    elif name == "alt" and rows and rows[fr["sel"]]["kind"] == "friend":
         self._fr_compose(rows[fr["sel"]]["uid"])
 
 
@@ -50299,15 +50343,14 @@ def _bpx_paint_friends(self, p, w, h, m, acc):
         return
     rows = fr["rows"]
     online = sum(1 for r in rows if r["kind"] == "friend" and _friend_status(r["d"])[0] != "Offline")
-    ngr = sum(1 for r in rows if r["kind"] == "group")
     cx, cw = w * 0.18, w * 0.64
-    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Friends   %d online" % online + ("   -   %d group chat%s" % (ngr, "" if ngr == 1 else "s") if ngr else ""), 0.028, QColor(235, 235, 245), True)
+    self._x_text(p, QRectF(cx, h * 0.125, cw, h * 0.05), "Friends   %d online" % online, 0.028, QColor(235, 235, 245), True)
     top, bot, rh, pitch = h * 0.19, h * 0.86, h * 0.09, h * 0.102
     if not rows:
         if fr["loading"]:
             self._paint_loading(p, w, h, QRectF(0, top, w, bot - top), "Loading friends...")
         else:
-            self._x_msg(p, area, "No friends or group chats yet. Add friends from the main launcher.")
+            self._x_msg(p, area, "No friends yet. Add friends from the main launcher.")
         return
     focus = self._zone == "content"
     p.save()
@@ -50328,8 +50371,8 @@ def _bpx_paint_friends(self, p, w, h, m, acc):
         ar = QRectF(cx + rh * 0.15, y + (rh - ad) / 2, ad, ad)
         self._x_avatar(p, ar, r)
         tx = ar.right() + rh * 0.22
-        if r["kind"] in ("friend", "group"):
-            st, col = _bpg_row_status(r)
+        if r["kind"] == "friend":
+            st, col = _friend_status(r["d"])
             self._x_text(p, QRectF(tx, y + rh * 0.08, cw - tx + cx - rh * 0.3, rh * 0.45), r["name"], 0.028, QColor(245, 245, 252), True)
             self._x_text(p, QRectF(tx, y + rh * 0.5, cw - tx + cx - rh * 0.3, rh * 0.4), st, 0.021, QColor(col))
         else:
@@ -50352,7 +50395,7 @@ def _bpx_paint_chat(self, p, w, h, acc):
     if row is not None:
         ad = h * 0.075
         self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
-        st, col = _bpg_row_status(row)
+        st, col = _friend_status(row["d"])
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
     top = h * 0.24
@@ -51935,7 +51978,7 @@ def _bpz_paint_chat(self, p, w, h, acc):
     if row is not None:
         ad = h * 0.075
         self._x_avatar(p, QRectF(cx, h * 0.14, ad, ad), row)
-        st, col = _bpg_row_status(row)
+        st, col = _friend_status(row["d"])
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.138, cw - ad * 1.25, h * 0.045), row["name"], 0.03, QColor(245, 245, 252), True)
         self._x_text(p, QRectF(cx + ad * 1.25, h * 0.18, cw - ad * 1.25, h * 0.035), st, 0.021, QColor(col))
     top = h * 0.24
@@ -51952,8 +51995,6 @@ def _bpz_paint_chat(self, p, w, h, acc):
     maxw, padx, pady, gap = cw * 0.72, h * 0.018, h * 0.012, h * 0.01
     inner = cw * 0.72 - 2 * padx
     y, idx, first = bot, len(msgs) - 1 - fr["moff"], True
-    grp_chat = str(fr["chat"]).startswith("group:")
-    fp_ = getattr(self._app, "friends_page", None)
     focus = self._zone == "content" and fr["cfocus"] == "msgs"
     al_c = int(Qt.AlignmentFlag.AlignCenter)
     while idx >= 0 and y > top:
@@ -52025,14 +52066,6 @@ def _bpz_paint_chat(self, p, w, h, acc):
                 self._x_text(p, QRectF(tx, r.top() + r.height() * 0.66, tw, r.height() * 0.26),
                              "A  Join" if (first and focus and not mine) else ("Press A to join" if not mine else ""), 0.0175, ink)
             yy += pt["h"] + gap * 0.6
-        if grp_chat and not mine:                                   # group chats: who wrote it, above their bubble
-            nh = h * 0.03
-            y -= nh
-            try:
-                who = _grp_author(fp_, mg.get("from"))
-            except Exception:
-                who = "Someone"
-            self._x_text(p, QRectF(bx + h * 0.006, y, cw * 0.6, nh), who, 0.0185, QColor(170, 170, 200), True)
         y -= gap
         first = False
     p.restore()
@@ -70423,69 +70456,6 @@ def _sg_show(self):
 
 
 _IgDlg.show = _sg_show
-
-
-# ── Big Picture: group chats in the Friends tab ──
-# A group row's chat id is "group:<gid>". Messages / sends / attachments for such an id go to the group chat functions (the DM
-# functions the Friends tab already calls are wrapped), so the existing chat screen, file sending and game invites just work.
-def _bpg_row_status(row):
-    if row.get("kind") == "group":
-        g = row.get("d") or {}
-        n = len(g.get("members") or {})
-        me = (load_account() or {}).get("uid")
-        return "Group chat  -  %d member%s  -  %s" % (n, "" if n == 1 else "s", GROUP_ROLE_LABEL.get((g.get("members") or {}).get(me), "Member")), "#aaaac8"
-    return _friend_status(row["d"])
-
-
-_bpg_prev_get_messages = cloud_get_messages
-_bpg_prev_send_message = cloud_send_message
-
-
-def cloud_get_messages(other):
-    if isinstance(other, str) and other.startswith("group:"):
-        return cloud_get_group_messages(other[6:])
-    return _bpg_prev_get_messages(other)
-
-
-def cloud_send_message(other, text, attachments=None, reply=None):
-    if isinstance(other, str) and other.startswith("group:"):
-        return cloud_send_group_message(other[6:], text, attachments, reply)
-    return _bpg_prev_send_message(other, text, attachments, reply)
-
-
-_bpg_prev_avatar = _BigPicture._x_avatar
-
-
-def _bpg_avatar(self, p, r, row):
-    if row.get("kind") == "group":
-        cache = self._fr["av"]
-        if row["uid"] not in cache:
-            pm = None
-            try:
-                path = _grp_icon_of(row.get("gid"), row.get("d"))
-                q = QPixmap(path) if path else QPixmap()
-                if not q.isNull():
-                    pm = q.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            except Exception:
-                pm = None
-            cache[row["uid"]] = pm
-    _bpg_prev_avatar(self, p, r, row)
-
-
-_BigPicture._x_avatar = _bpg_avatar
-
-_bpg_prev_rebuild_rows = _grp_rebuild_rows
-
-
-def _grp_rebuild_rows(fp):                                  # the launcher's group list changed: update Big Picture's Friends tab too
-    _bpg_prev_rebuild_rows(fp)
-    try:
-        bp = _bpy_active_bp()
-        if bp is not None and bp._tab == 2:
-            bp._fr["av"].pop("__none__", None)
-            bp._fr_changed()
-    except Exception:
-        _log_exc("_grp_rebuild_rows bp")
 
 
 # ── Big Picture: Steam-style Library ───────────────────────────────────────────────────────────────────────────────
