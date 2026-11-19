@@ -11269,6 +11269,11 @@ def _ncz_region_blocked():
     """True when the public IP is outside Egypt, UAE, Qatar and Saudi Arabia. A single service saying "outside" is
     double-checked with a second one first. When no service answers (offline) it returns False, so being offline
     never locks anybody out."""
+    try:    # anybody whose profile country is the UAE passes, VPN or not
+        if load_profile_country() == "AE":
+            return False
+    except Exception:    # expected: no account / no cached profile yet -> normal IP check
+        pass
     codes = _ncz_geo_lookup()
     if not codes:
         return False
@@ -66988,7 +66993,7 @@ _remote_cards = _nd_remote_cards
 GTA6_ID = 900_000_006                       # below ITCH_ID_BASE, so it never counts as an itch.io / GameBanana game
 GTA6_TITLE = "Grand Theft Auto VI"
 GTA6_LINK_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gtavi.txt"
-GTA6_TRAILERS = (("Trailer 1", "VQRLujxTm3c"), ("Trailer 2", "6COmYeLsz4c"))      # official Rockstar uploads on YouTube
+GTA6_TRAILERS = (("Trailer 1", "QdBZY2fkU-0"), ("Trailer 2", "VQRLujxTm3c"))      # official Rockstar uploads on YouTube
 GTA6_SITE = "https://www.rockstargames.com/VI"
 GTA6_WIKI_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/Grand_Theft_Auto_VI"
 GTA6_ABOUT = ("Grand Theft Auto VI heads to the state of Leonida: the neon streets of Vice City, plus the swamps, beaches "
