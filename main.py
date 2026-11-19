@@ -59076,8 +59076,17 @@ SettingsPage.__init__ = _dep_settings_init
 # adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
     """Settings > "Game shortcuts open the launcher". Always on now (there is no switch): library games' desktop shortcuts open
-    the launcher in the tray, which then starts the game (`--launch-game`). The settings button only rewrites the shortcuts."""
-    return True
+    the launcher in the tray, which then starts the game (`--launch-game`). The "Turn off" button next to Rewrite switches it off
+    (shortcuts go back to their plain .exe, no launcher involved); Rewrite switches it back on."""
+    try:
+        return bool(load_launcher_settings().get("shortcuts_via_launcher", True))
+    except Exception:
+        return True
+
+def _slr_set_enabled(on):
+    st = load_launcher_settings()
+    st["shortcuts_via_launcher"] = bool(on)
+    save_launcher_settings(st)
 
 def _sc_args_text(a):
     if not a:
@@ -61463,9 +61472,37 @@ def _slr_panel(sp):
     b = QPushButton("Rewrite")
     b.setFixedWidth(160)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
-    b.clicked.connect(lambda _c=False: _slr_run(True, sp.window()))
+    off = QPushButton("Turn off")
+    off.setFixedWidth(160)
+    off.setCursor(Qt.CursorShape.PointingHandCursor)
+    def refresh():
+        on = get_shortcuts_via_launcher()
+        off.setEnabled(on)
+        off.setText("Turn off" if on else "Off")
+        b.setText("Rewrite" if on else "Turn on")
+        d.setText(("Always on: the desktop shortcuts of the games in your library open the launcher in the tray, which then "
+                   "starts the game. Shortcuts of games that aren't in your library go back to starting their .exe. "
+                   "Press Rewrite to rewrite your desktop shortcuts now, or Turn off to send every game shortcut straight "
+                   "to its .exe without the launcher.") if on else
+                  "Off: your game shortcuts start their .exe directly and the launcher is not involved. "
+                  "Press Turn on to make library game shortcuts open the launcher again.")
+    def do_rewrite(_c=False):
+        if not get_shortcuts_via_launcher():
+            _slr_set_enabled(True)
+            refresh()
+        _slr_run(True, sp.window())
+    def do_off(_c=False):
+        if _ncz_profile or _SLR["busy"]:
+            return
+        _slr_set_enabled(False)
+        refresh()
+        _slr_run(False, sp.window())
+    b.clicked.connect(do_rewrite)
+    off.clicked.connect(do_off)
+    refresh()
     row.addLayout(col, 1)
     row.addWidget(b)
+    row.addWidget(off)
     pl.addLayout(row)
     sp._content_layout.addWidget(panel)                          # the section sorter puts it under its own header, first on the page
     sp._slr_panel = panel
