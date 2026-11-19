@@ -3884,7 +3884,7 @@ class SettingsPage(QWidget):
         self.sgdb_key_edit = QLineEdit()
         self.sgdb_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.sgdb_key_edit.setPlaceholderText("Paste your API key")
-        self.sgdb_key_edit.setText(get_steamgriddb_key())
+        self.sgdb_key_edit.setText(get_steamgriddb_key(own_only=True))
         self.sgdb_key_edit.returnPressed.connect(self.on_save_sgdb_key)
         self.sgdb_save_btn = QPushButton("Save")
         self.sgdb_save_btn.setFixedWidth(100)
@@ -4264,7 +4264,7 @@ class SettingsPage(QWidget):
         save_launcher_settings(settings)
         self.steamgriddb_key_changed.emit()
         if not key:
-            self.sgdb_status.setText("Key removed. The Store will use Steam's own art.")
+            self.sgdb_status.setText("Key removed. The launcher's default SteamGridDB key will be used.")
             return
         self.sgdb_status.setText("Checking key...")
         self.sgdb_save_btn.setEnabled(False)
@@ -5303,8 +5303,11 @@ STORE_CARD_W = STORE_COVER_W + 18
 STORE_GRID_GAP = 18
 NO_ART_RETRY_SECONDS = 14 * 24 * 3600
 
-def get_steamgriddb_key():
-    return load_launcher_settings().get("steamgriddb_api_key", "").strip()
+NCZ_DEFAULT_SGDB_KEY = "8e7d118f238c43c8767711f51e8d72b0"     # used when the user hasn't set their own SteamGridDB key
+
+def get_steamgriddb_key(own_only=False):
+    key = load_launcher_settings().get("steamgriddb_api_key", "").strip()
+    return key if (key or own_only) else NCZ_DEFAULT_SGDB_KEY
 
 def get_store_cache_dir():
     return os.path.join(os.path.dirname(get_launcher_settings_path()), "store_cache", "covers")
@@ -59076,8 +59079,17 @@ SettingsPage.__init__ = _dep_settings_init
 # adds / rewrites desktop shortcuts by itself; launcher-routed shortcuts of games downloaded through the launcher are made direct once (_ncz_convert_shortcuts_once).
 def get_shortcuts_via_launcher():
     """Settings > "Game shortcuts open the launcher". Always on now (there is no switch): library games' desktop shortcuts open
-    the launcher in the tray, which then starts the game (`--launch-game`). The settings button only rewrites the shortcuts."""
-    return True
+    the launcher in the tray, which then starts the game (`--launch-game`). The "Turn off" button next to Rewrite switches it off
+    (shortcuts go back to their plain .exe, no launcher involved); Rewrite switches it back on."""
+    try:
+        return bool(load_launcher_settings().get("shortcuts_via_launcher", True))
+    except Exception:
+        return True
+
+def _slr_set_enabled(on):
+    st = load_launcher_settings()
+    st["shortcuts_via_launcher"] = bool(on)
+    save_launcher_settings(st)
 
 def _sc_args_text(a):
     if not a:
@@ -61463,9 +61475,37 @@ def _slr_panel(sp):
     b = QPushButton("Rewrite")
     b.setFixedWidth(160)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
-    b.clicked.connect(lambda _c=False: _slr_run(True, sp.window()))
+    off = QPushButton("Turn off")
+    off.setFixedWidth(160)
+    off.setCursor(Qt.CursorShape.PointingHandCursor)
+    def refresh():
+        on = get_shortcuts_via_launcher()
+        off.setEnabled(on)
+        off.setText("Turn off" if on else "Off")
+        b.setText("Rewrite" if on else "Turn on")
+        d.setText(("Always on: the desktop shortcuts of the games in your library open the launcher in the tray, which then "
+                   "starts the game. Shortcuts of games that aren't in your library go back to starting their .exe. "
+                   "Press Rewrite to rewrite your desktop shortcuts now, or Turn off to send every game shortcut straight "
+                   "to its .exe without the launcher.") if on else
+                  "Off: your game shortcuts start their .exe directly and the launcher is not involved. "
+                  "Press Turn on to make library game shortcuts open the launcher again.")
+    def do_rewrite(_c=False):
+        if not get_shortcuts_via_launcher():
+            _slr_set_enabled(True)
+            refresh()
+        _slr_run(True, sp.window())
+    def do_off(_c=False):
+        if _ncz_profile or _SLR["busy"]:
+            return
+        _slr_set_enabled(False)
+        refresh()
+        _slr_run(False, sp.window())
+    b.clicked.connect(do_rewrite)
+    off.clicked.connect(do_off)
+    refresh()
     row.addLayout(col, 1)
     row.addWidget(b)
+    row.addWidget(off)
     pl.addLayout(row)
     sp._content_layout.addWidget(panel)                          # the section sorter puts it under its own header, first on the page
     sp._slr_panel = panel
