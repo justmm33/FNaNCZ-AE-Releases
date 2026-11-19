@@ -11269,6 +11269,11 @@ def _ncz_region_blocked():
     """True when the public IP is outside Egypt, UAE, Qatar and Saudi Arabia. A single service saying "outside" is
     double-checked with a second one first. When no service answers (offline) it returns False, so being offline
     never locks anybody out."""
+    try:    # anybody whose profile country is the UAE passes, VPN or not
+        if load_profile_country() == "AE":
+            return False
+    except Exception:    # expected: no account / no cached profile yet -> normal IP check
+        pass
     codes = _ncz_geo_lookup()
     if not codes:
         return False
@@ -66980,6 +66985,700 @@ def _nd_remote_cards(app):
 _remote_cards = _nd_remote_cards
 
 
+# ── GTA VI tab (own tab next to Fangames: cover, trailers, details, Add to Library, gated Download) ──
+# The Download button only lights up while gtavi.txt (justmm33/FNaNCZ-AE-Releases, main branch) is NOT empty. The file's
+# contents are the game's download link. The game goes into the library through the fan-game library (same cards,
+# Launch / Uninstall / shortcuts / cloud library as every other game) and downloads + installs through the same
+# download queue and archive installer as Game Jolt / itch.io games.
+GTA6_ID = 900_000_006                       # below ITCH_ID_BASE, so it never counts as an itch.io / GameBanana game
+GTA6_TITLE = "Grand Theft Auto VI"
+GTA6_LINK_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gtavi.txt"
+GTA6_TRAILERS = (("Trailer 1", "QdBZY2fkU-0"), ("Trailer 2", "VQRLujxTm3c"))      # official Rockstar uploads on YouTube
+GTA6_SITE = "https://www.rockstargames.com/VI"
+GTA6_WIKI_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/Grand_Theft_Auto_VI"
+GTA6_ABOUT = ("Grand Theft Auto VI heads to the state of Leonida: the neon streets of Vice City, plus the swamps, beaches "
+              "and small towns around it. Jason and Lucia, two partners in crime, get dragged into a heist gone wrong and "
+              "a scheme far bigger than they bargained for. It is Rockstar Games' next open-world action-adventure and "
+              "the first mainline Grand Theft Auto since GTA V.")
+GTA6_DETAILS = (("Developer", "Rockstar Games"), ("Publisher", "Rockstar Games"), ("Genre", "Action-adventure, open world"),
+                ("Setting", "Vice City, Leonida (USA)"), ("Protagonists", "Lucia Caminos, Jason Duval"),
+                ("Official platforms", "PlayStation 5, Xbox Series X|S"), ("Release", "November 19, 2026"))
+
+
+def _gta_parse_link(text):
+    """First non-empty line of gtavi.txt if it is an http(s) link, '' for an empty file (or anything that isn't a link)."""
+    for line in (text or "").replace("\ufeff", "").splitlines():
+        line = line.strip()
+        if line:
+            return line if re.match(r"^https?://\S+$", line) else ""
+    return ""
+
+
+def _gta_read_link():
+    """The download link in gtavi.txt, '' while the file is empty / missing. Raises when GitHub can't be reached."""
+    url = f"{GTA6_LINK_URL}?nocache={int(time.time())}"
+    req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as resp:
+            return _gta_parse_link(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:                       # the file isn't there (yet): same as empty
+            return ""
+        raise
+
+
+def _gta_cache_dir():
+    d = os.path.join(os.path.dirname(get_launcher_settings_path()), "gtavi")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _gta_cached_cover():
+    p = os.path.join(_gta_cache_dir(), "cover-sgdb.img")        # new name: an older cover.img (wrong art) is never reused
+    return p if os.path.exists(p) and os.path.getsize(p) > 0 else ""
+
+
+_GTA6_SGDB_NAMES = {"grand theft auto vi", "grand theft auto 6", "gta vi", "gta 6", "gta6"}
+
+
+def _gta_sgdb_cover():
+    """Image bytes of the best portrait cover SteamGridDB has for GTA VI (None when it has none)."""
+    key = get_steamgriddb_key()
+    games = sgdb_search_games("Grand Theft Auto VI", key)
+    games = sorted(games, key=lambda g: 0 if str(g.get("name", "")).strip().lower() in _GTA6_SGDB_NAMES else 1)
+    for game in games[:3]:
+        if str(game.get("name", "")).strip().lower() not in _GTA6_SGDB_NAMES:
+            break                                   # never fall back to another game's art (GTA V, ...)
+        for grid in sgdb_game_grids(game["id"], key):
+            for link in (grid.get("url"), grid.get("thumb")):
+                if not link:
+                    continue
+                try:
+                    data = _http_get(link, timeout=20)
+                except Exception:
+                    continue
+                if data and len(data) > 1000:
+                    return data
+    return None
+
+
+def _gta_fetch_media():
+    """Worker thread: cover (the box art from Wikipedia, else the Trailer 2 thumbnail) + a thumbnail per trailer, cached on disk.
+    Returns {'cover': path or '', video id: path or ''}."""
+    d = _gta_cache_dir()
+
+    def grab(urls, dest):
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
+        for u in urls:
+            try:
+                data = _http_get(u, timeout=20)
+                if data and len(data) > 1000:
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                    return dest
+            except Exception:    # expected: offline, or that size doesn't exist
+                continue
+        return ""
+
+    def yt(vid):
+        return [f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"]
+
+    out = {}
+    cover_dest = os.path.join(d, "cover-sgdb.img")
+    if not (os.path.exists(cover_dest) and os.path.getsize(cover_dest) > 0):
+        try:
+            data = _gta_sgdb_cover()
+            if data and len(data) > 1000:
+                with open(cover_dest, "wb") as f:
+                    f.write(data)
+        except Exception:    # expected: offline / no SteamGridDB result: the placeholder stays
+            _log_exc("gta sgdb cover")
+    out["cover"] = cover_dest if (os.path.exists(cover_dest) and os.path.getsize(cover_dest) > 0) else ""
+    for _name, vid in GTA6_TRAILERS:
+        out[vid] = grab(yt(vid), os.path.join(d, f"thumb-{vid}.img"))
+    return out
+
+
+class GtaViDownloadWorker(GameJoltDownloadWorker):
+    """Reads the link from gtavi.txt (again whenever a fresh one is needed), downloads it and installs it like any other game."""
+    def __init__(self, title, existing_zip_path=None):
+        super().__init__(title, "", GTA6_ID, existing_zip_path)
+
+    @staticmethod
+    def _find_link(*_a):
+        link = _gta_read_link()
+        if not link:
+            raise ValueError("Grand Theft Auto VI isn't available to download yet.")
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if re.match(r"^https?://(?:www\.)?mediafire\.com/(?:file|view)/", link):
+            return _nd_resolve_mediafire(link), headers          # a MediaFire page -> its direct link
+        return link, headers
+
+    def run(self):
+        dest_path, fresh = None, False
+        try:
+            if self.existing_zip_path and os.path.exists(self.existing_zip_path):
+                dest_path = self.existing_zip_path
+            else:
+                self.status_update.emit("Getting the download link...")
+                url, headers = self._find_link()
+                self.download_url = url
+                dest_path = _gj_stream(self, url, headers, self._find_link)
+                fresh = True
+            if self._is_cancelled:
+                if fresh and dest_path and os.path.exists(dest_path):
+                    os.remove(dest_path)
+                self.failed.emit("CANCELLED")
+                return
+            self.status_update.emit("Installing...")
+            _gj_install_file(dest_path, installed_game_dir(sanitize_folder_name(self.title)))
+            self.finished.emit(dest_path)
+        except Exception as e:
+            if self._is_cancelled or str(e) == "CANCELLED":
+                self.failed.emit("CANCELLED")
+                return
+            self.failed.emit(str(e))
+
+
+class _GtaThumb(QLabel):
+    clicked = pyqtSignal()
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
+def _gta_with_play_icon(pm):
+    """A copy of the thumbnail with a round play button in the middle."""
+    from PyQt6.QtGui import QPolygonF    # lazy: saves memory/startup until used
+    out = QPixmap(pm)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    w, h = out.width(), out.height()
+    r = min(w, h) * 0.14
+    c = QPointF(w / 2.0, h / 2.0)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(0, 0, 0, 160))
+    p.drawEllipse(c, r, r)
+    p.setBrush(QColor(255, 255, 255, 235))
+    p.drawPolygon(QPolygonF([QPointF(c.x() - r * 0.28, c.y() - r * 0.48), QPointF(c.x() - r * 0.28, c.y() + r * 0.48),
+                             QPointF(c.x() + r * 0.52, c.y())]))
+    p.end()
+    return out
+
+
+class _GtaTrailerDialog(QDialog):
+    """Plays a trailer inside the launcher (QtWebEngine). Without WebEngine the page opens it in the browser instead."""
+    def __init__(self, parent, name, vid):
+        super().__init__(parent)
+        self.setWindowTitle(f"GTA VI \u2013 {name}")
+        self.resize(960, 600)
+        self._vid = vid
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        from PyQt6.QtWebEngineWidgets import QWebEngineView    # lazy: saves memory/startup until used
+        self.view = QWebEngineView()
+        try:                                                    # let the trailer start by itself
+            from PyQt6.QtWebEngineCore import QWebEngineSettings
+            self.view.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        except Exception:
+            _log_exc("gta trailer settings")
+        # the embedded player (youtube.com/embed) answers "video unavailable, error 152-4" inside QtWebEngine, so the normal
+        # watch page is loaded instead; if that fails to load, the browser opens
+        self.view.loadFinished.connect(lambda ok, _v=vid: None if ok else webbrowser.open(f"https://www.youtube.com/watch?v={_v}"))
+        self.view.setUrl(QUrl(f"https://www.youtube.com/watch?v={vid}&autoplay=1"))
+        lay.addWidget(self.view, 1)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(12, 8, 12, 8)
+        ext = QPushButton("Open in browser")
+        ext.clicked.connect(lambda: webbrowser.open(f"https://www.youtube.com/watch?v={vid}"))
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        bar.addWidget(ext)
+        bar.addStretch()
+        bar.addWidget(close)
+        lay.addLayout(bar)
+
+    def done(self, r):
+        try:
+            self.view.setUrl(QUrl("about:blank"))        # stops the sound
+        except Exception:
+            _log_exc("gta trailer close")
+        super().done(r)
+
+
+class GtaViPage(QWidget):
+    add_requested = pyqtSignal()
+    remove_requested = pyqtSignal()
+    play_requested = pyqtSignal()           # Download / Launch
+    COVER_W, COVER_H = 300, 450
+    THUMB_W, THUMB_H = 420, 236
+    CHIP_STYLE = "background: rgba(128,128,128,0.22); border-radius: 11px; padding: 3px 12px; font-size: 12px;"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Content")
+        self.state_cb = None                # set by the app: () -> (installed, in library)
+        self._link_ok = None                # None = not checked yet, True = gtavi.txt has a link, False = empty
+        self._net_err = False
+        self._checking = False
+        self._last_check = 0.0
+        self._media_started = False
+        self._cover_path = _gta_cached_cover()
+        self._workers = []
+        self._thumbs = {}
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        outer.addWidget(scroll)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(32, 28, 32, 32)
+        lay.setSpacing(0)
+        scroll.setWidget(body)
+
+        # header: cover + title / chips / buttons
+        head = QHBoxLayout()
+        head.setSpacing(28)
+        self.cover = QLabel()
+        self.cover.setFixedSize(self.COVER_W, self.COVER_H)
+        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover.setObjectName("CoverPlaceholder")
+        self.cover.setText("GTA VI")
+        head.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(10)
+        self.title_label = QLabel(GTA6_TITLE)
+        self.title_label.setWordWrap(True)
+        self.title_label.setStyleSheet("font-size: 34px; font-weight: 800;")
+        self.meta_label = QLabel("Rockstar Games  \u2022  Action-adventure  \u2022  Open world")
+        self.meta_label.setStyleSheet("font-size: 14px; color: rgba(160,160,170,1);")
+        chips = QHBoxLayout()
+        chips.setSpacing(8)
+        for t in ("PlayStation 5", "Xbox Series X|S", "Vice City", "Singleplayer + Online"):
+            c = QLabel(t)
+            c.setStyleSheet(self.CHIP_STYLE)
+            chips.addWidget(c)
+        chips.addStretch()
+        self.about_label = QLabel(GTA6_ABOUT)
+        self.about_label.setWordWrap(True)
+        self.about_label.setStyleSheet("font-size: 14px;")
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+        self.dl_btn = QPushButton("Download")
+        self.dl_btn.setObjectName("Primary")
+        self.dl_btn.setFixedHeight(42)
+        self.dl_btn.setMinimumWidth(180)
+        self.dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_btn.clicked.connect(self.play_requested.emit)
+        self.lib_btn = QPushButton("Add to Library")
+        self.lib_btn.setFixedHeight(42)
+        self.lib_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lib_btn.clicked.connect(self._lib_clicked)
+        self.site_btn = QPushButton("Rockstar page")
+        self.site_btn.setFixedHeight(42)
+        self.site_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.site_btn.clicked.connect(lambda: webbrowser.open(GTA6_SITE))
+        btns.addWidget(self.dl_btn)
+        btns.addWidget(self.lib_btn)
+        btns.addWidget(self.site_btn)
+        btns.addStretch()
+        col.addWidget(self.title_label)
+        col.addWidget(self.meta_label)
+        col.addLayout(chips)
+        col.addSpacing(6)
+        col.addWidget(self.about_label)
+        col.addSpacing(10)
+        col.addLayout(btns)
+        col.addWidget(self.status_label)
+        col.addStretch()
+        head.addLayout(col, 1)
+        lay.addLayout(head)
+        lay.addSpacing(24)
+
+        # trailers
+        tw = QFrame()
+        tw.setObjectName("Panel")
+        tl = QVBoxLayout(tw)
+        tl.setContentsMargins(22, 18, 22, 18)
+        tl.setSpacing(12)
+        tt = QLabel("Trailers")
+        tt.setStyleSheet("font-size: 16px; font-weight: bold;")
+        tl.addWidget(tt)
+        row = QHBoxLayout()
+        row.setSpacing(18)
+        for name, vid in GTA6_TRAILERS:
+            cell = QVBoxLayout()
+            cell.setSpacing(6)
+            th = _GtaThumb(f"{name}\n\u25B6")
+            th.setFixedSize(self.THUMB_W, self.THUMB_H)
+            th.setStyleSheet("background: rgba(128,128,128,0.18); border-radius: 12px; font-size: 18px; font-weight: bold;")
+            th.clicked.connect(lambda _n=name, _v=vid: self._play_trailer(_n, _v))
+            self._thumbs[vid] = th
+            cap = QLabel(f"Grand Theft Auto VI \u2013 {name}")
+            cap.setStyleSheet("font-size: 13px; color: rgba(160,160,170,1);")
+            cell.addWidget(th)
+            cell.addWidget(cap)
+            row.addLayout(cell)
+        row.addStretch()
+        tl.addLayout(row)
+        lay.addWidget(tw)
+        lay.addSpacing(20)
+
+        # details
+        dw = QFrame()
+        dw.setObjectName("Panel")
+        dl = QVBoxLayout(dw)
+        dl.setContentsMargins(22, 18, 22, 18)
+        dl.setSpacing(8)
+        dt = QLabel("Details")
+        dt.setStyleSheet("font-size: 16px; font-weight: bold;")
+        dl.addWidget(dt)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        for n, (k, v) in enumerate(GTA6_DETAILS):
+            kl = QLabel(k.upper())
+            kl.setStyleSheet("font-size: 11px; font-weight: bold; color: rgba(160,160,170,1);")
+            vl = QLabel(v)
+            vl.setWordWrap(True)
+            vl.setStyleSheet("font-size: 14px;")
+            grid.addWidget(kl, n, 0)
+            grid.addWidget(vl, n, 1)
+        dl.addLayout(grid)
+        lay.addWidget(dw)
+        lay.addStretch()
+
+        # gtavi.txt is checked whenever the tab opens and then every minute while it is on screen
+        self._timer = QTimer(self)
+        self._timer.setInterval(60000)
+        self._timer.timeout.connect(lambda: self.check_link())
+        self.refresh_state()
+
+    # ── state ──
+    def _lib_clicked(self):
+        (self.remove_requested if self._in_library() else self.add_requested).emit()
+
+    def _state(self):
+        try:
+            return self.state_cb() if self.state_cb else (False, False)
+        except Exception:
+            _log_exc("GtaViPage state")
+            return (False, False)
+
+    def _in_library(self):
+        return bool(self._state()[1])
+
+    def refresh_state(self):
+        installed, in_lib = self._state()
+        self.lib_btn.setText("Remove from Library" if in_lib else "Add to Library")
+        if installed:                                   # an installed game can always be launched
+            self.dl_btn.setText("Launch")
+            self.dl_btn.setEnabled(True)
+            self.dl_btn.setToolTip("")
+            self._set_status("\u25CF Installed", GREEN)
+            return
+        self.dl_btn.setText("Download")
+        if self._link_ok:
+            self.dl_btn.setEnabled(True)
+            self.dl_btn.setToolTip("Download and install Grand Theft Auto VI")
+            self._set_status("\u25CF Download available", GREEN)
+        else:
+            self.dl_btn.setEnabled(False)
+            if self._link_ok is None:
+                self.dl_btn.setToolTip("Checking whether the download is available...")
+                self._set_status("Checking if the download is available...", "")
+            elif self._net_err:
+                self.dl_btn.setToolTip("Couldn't check whether the download is available.")
+                self._set_status("Couldn't check if the download is available. Check your connection.", ORANGE)
+            else:
+                self.dl_btn.setToolTip("The download isn't available yet.")
+                self._set_status("The download isn't available yet. This button lights up as soon as it is.", ORANGE)
+
+    def _set_status(self, text, color):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("font-size: 13px; font-weight: 600;" + (f" color: {color};" if color else ""))
+
+    # ── gtavi.txt ──
+    def check_link(self, force=False):
+        if self._checking or (not force and time.time() - self._last_check < 10):
+            return
+        self._checking = True
+        self._last_check = time.time()
+        worker = TaskWorker(_gta_read_link)
+        worker.done.connect(lambda link: self._on_link(link, False))
+        worker.failed.connect(lambda _m: self._on_link(None, True))
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+
+    def _on_link(self, link, net_err):
+        self._checking = False
+        self._net_err = net_err
+        if not net_err:
+            self._link_ok = bool(link)
+        elif not self._link_ok:
+            self._link_ok = False               # offline and never saw a link: stays off
+        self.refresh_state()
+
+    # ── cover + trailer thumbnails ──
+    def _load_media(self):
+        if self._media_started:
+            return
+        self._media_started = True
+        if self._cover_path:
+            self._set_cover(self._cover_path)
+        worker = TaskWorker(_gta_fetch_media)
+        worker.done.connect(self._on_media)
+        worker.failed.connect(lambda _m: setattr(self, "_media_started", False))      # try again next time the tab opens
+        self._workers = [w for w in self._workers if w.isRunning()] + [worker]
+        worker.start()
+
+    def _set_cover(self, path):
+        pix = rounded_cover_pixmap(path, self.COVER_W, self.COVER_H, 14)
+        if pix is not None and not pix.isNull():
+            self._cover_path = path
+            self.cover.setText("")
+            self.cover.setPixmap(pix)
+
+    def _on_media(self, res):
+        if not isinstance(res, dict):
+            return
+        if res.get("cover"):
+            self._set_cover(res["cover"])
+        for vid, th in self._thumbs.items():
+            path = res.get(vid)
+            if not path:
+                continue
+            pix = rounded_cover_pixmap(path, self.THUMB_W, self.THUMB_H, 12)
+            if pix is not None and not pix.isNull():
+                th.setText("")
+                th.setPixmap(_gta_with_play_icon(pix))
+
+    def _play_trailer(self, name, vid):
+        if _HAS_WEBENGINE:
+            try:
+                _GtaTrailerDialog(self.window(), name, vid).exec()
+                return
+            except Exception:
+                _log_exc("gta trailer")
+        webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
+
+    # ── page shown / hidden ──
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.refresh_state()
+        self._load_media()
+        self.check_link()
+        self._timer.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._timer.stop()
+
+
+# ── app side: nav button + icon, library card, download ──
+_NAV_TAB_KINDS["GTA VI"] = "gta"
+_gta_prev_nav_tab_icon = _nav_tab_icon
+
+def _gta_nav_tab_icon(kind):
+    """The 'VI' glyph for the GTA VI tab; every other tab icon comes from the existing function."""
+    if kind != "gta":
+        return _gta_prev_nav_tab_icon(kind)
+    icon = QIcon()
+    states = ((QIcon.Mode.Normal, QIcon.State.Off, _theme_state["nav_text"]),
+              (QIcon.Mode.Active, QIcon.State.Off, _theme_state["nav_active"]),
+              (QIcon.Mode.Normal, QIcon.State.On, _theme_state["nav_active"]),
+              (QIcon.Mode.Active, QIcon.State.On, _theme_state["nav_active"]))
+    P = QPointF
+    for mode, state, color in states:
+        pm = QPixmap(40, 40)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 1.9)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolyline([P(2.5, 4.5), P(6.8, 15.5), P(11.1, 4.5)])                  # V
+        p.drawLine(P(15.5, 4.5), P(15.5, 15.5))                                    # I
+        p.drawLine(P(13.5, 4.5), P(17.5, 4.5))
+        p.drawLine(P(13.5, 15.5), P(17.5, 15.5))
+        p.end()
+        icon.addPixmap(pm, mode, state)
+    return icon
+
+_nav_tab_icon = _gta_nav_tab_icon       # _set_tab_icon + its theme refresh look the function up by name each time
+
+
+_gta_prev_init_fan = AdaptiveApp._init_fan
+
+def _gta_init_fan(self):
+    _gta_prev_init_fan(self)
+
+    def wire(page):
+        page.state_cb = lambda: (bool(_fan_installed_exe(GTA6_TITLE)), GTA6_ID in self.fan_lib_cards)
+        page.add_requested.connect(self._gta_add)
+        page.remove_requested.connect(lambda: self._fan_remove(GTA6_ID))
+        page.play_requested.connect(lambda: self._fan_install(GTA6_ID, GTA6_TITLE, self._gta_cover(), ""))
+        page.refresh_state()
+
+    ph = _lazy_page(self, "gtavi_page", GtaViPage, wire)
+    btn = self.make_nav_button("GTA VI", checkable=True)
+    self.nav_group.addButton(btn, self.pages.indexOf(ph))
+    layout = self.nav_group.button(0).parent().layout()
+    fan_slot = _lazy_slot(self, "fan_page")
+    fan_btn = self.nav_group.button(self.pages.indexOf(fan_slot)) if fan_slot is not None else None
+    at = layout.indexOf(fan_btn) + 1 if fan_btn is not None else 0
+    layout.insertWidget(at if at > 0 else layout.count(), btn)       # right after Fangames
+
+AdaptiveApp._init_fan = _gta_init_fan
+
+
+def _gta_cover(self):
+    entry = next((g for g in load_fan_library() if g["id"] == GTA6_ID), None)
+    path = (entry or {}).get("cover", "")
+    return path if path and os.path.exists(path) else _gta_cached_cover()
+
+def _gta_refresh(self):
+    page = self.__dict__.get("gtavi_page")          # never builds the page just to refresh it
+    if page is not None:
+        page.refresh_state()
+
+def _gta_open(self):
+    page = self.gtavi_page                          # builds the page when it isn't built yet
+    btn = self.nav_group.button(self.pages.indexOf(page))
+    if btn is not None:
+        btn.setChecked(True)
+    self.pages.setCurrentWidget(page)
+
+def _gta_add(self):
+    if GTA6_ID in self.fan_lib_cards:
+        return
+    cover = self._gta_cover()
+    saved = ""
+    if cover and os.path.exists(cover):
+        try:
+            os.makedirs(get_library_cover_dir(), exist_ok=True)
+            saved = os.path.join(get_library_cover_dir(), f"fan-{GTA6_ID}.img")
+            shutil.copyfile(cover, saved)
+        except Exception:
+            saved = cover
+    entry = {"id": GTA6_ID, "title": GTA6_TITLE, "link": "", "tags": [], "cover": saved}
+    save_fan_library([g for g in load_fan_library() if g["id"] != GTA6_ID] + [entry])
+    self._fan_create_library_card(entry)
+    self.apply_filter()
+    self._gta_refresh()
+
+def _gta_download(self, cover_path=""):
+    ok, link, _err = BusyDialog("Checking if the download is available...", _gta_read_link, self).run()
+    page = self.__dict__.get("gtavi_page")
+    if not ok:
+        QMessageBox.warning(self, "Grand Theft Auto VI", "Couldn't check if the download is available.\n"
+                            "Check your connection and try again.")
+        return
+    if not link:
+        QMessageBox.information(self, "Grand Theft Auto VI", "The download isn't available yet.")
+        if page is not None:
+            page.check_link(force=True)
+        return
+    cancelled, existing = _ask_existing_archive(self, GTA6_TITLE)
+    if cancelled:
+        return
+    worker = GtaViDownloadWorker(GTA6_TITLE, existing)
+    worker.finished.connect(lambda _p: (self._fan_refresh(GTA6_ID), self._gta_refresh()))
+    worker.failed.connect(lambda _m: self._gta_refresh())
+    card = DownloadCard(GTA6_TITLE, "", 0, cover_path or self._gta_cover(), self, worker=worker)
+    self.downloads_page.add_download_card(card)
+    self.nav_group.button(6).setChecked(True)
+    self.pages.setCurrentWidget(self.downloads_page)
+
+AdaptiveApp._gta_cover = _gta_cover
+AdaptiveApp._gta_refresh = _gta_refresh
+AdaptiveApp._gta_open = _gta_open
+AdaptiveApp._gta_add = _gta_add
+AdaptiveApp._gta_download = _gta_download
+
+
+# the library card of GTA VI: "Rockstar Games" instead of "Fan game", no Game Jolt entries, View Details opens the tab
+_gta_prev_card = AdaptiveApp._fan_create_library_card
+
+def _gta_fan_card(self, g):
+    _gta_prev_card(self, g)
+    if g.get("id") != GTA6_ID:
+        return
+    try:
+        card = self.fan_lib_cards.get(GTA6_ID)
+        if card is None:
+            return
+        st = card.findChild(QLabel, "CardStatus")
+        if st is not None:
+            st.setText("Rockstar Games")
+        for menu in card.findChildren(QMenu):
+            for act in list(menu.actions()):
+                t = act.text().replace("&", "")
+                if "Game Jolt" in t or "Refresh Cover" in t:
+                    menu.removeAction(act)
+    except Exception:
+        _log_exc("gta library card")
+
+AdaptiveApp._fan_create_library_card = _gta_fan_card
+
+_gta_prev_fan_view = AdaptiveApp._fan_view
+
+def _gta_fan_view(self, gid):
+    if gid == GTA6_ID:
+        self._gta_open()
+        return
+    return _gta_prev_fan_view(self, gid)
+
+AdaptiveApp._fan_view = _gta_fan_view
+
+_gta_prev_fan_install = AdaptiveApp._fan_install
+
+def _gta_fan_install(self, gid, title, cover_path, link):
+    if gid == GTA6_ID and not _fan_installed_exe(title):        # installed: the normal code launches it
+        return self._gta_download(cover_path)
+    return _gta_prev_fan_install(self, gid, title, cover_path, link)
+
+AdaptiveApp._fan_install = _gta_fan_install
+
+_gta_prev_fan_remove = AdaptiveApp._fan_remove
+
+def _gta_fan_remove(self, gid):
+    _gta_prev_fan_remove(self, gid)
+    if gid == GTA6_ID:
+        self._gta_refresh()
+
+AdaptiveApp._fan_remove = _gta_fan_remove
+
+_gta_prev_fan_uninstall = AdaptiveApp._fan_uninstall
+
+def _gta_fan_uninstall(self, gid, title):
+    _gta_prev_fan_uninstall(self, gid, title)
+    if gid == GTA6_ID:
+        self._gta_refresh()
+
+AdaptiveApp._fan_uninstall = _gta_fan_uninstall
+
+
 # ── Steam-style Library: collapsible game list on the left, big hero page on the right ──
 # The old card grid is still built (and still owns every game's buttons, menus and status), it is just hidden: the new
 # view reads the same cards, so Play / Install / Update, the ••• menu, favorites, hidden, view filters and search all keep
@@ -67575,6 +68274,8 @@ def _sv_groups(app):
     fan = list(getattr(app, "fan_lib_list", []) or [])
     nondev_ids = {id(c) for c, _t in nondev}
     fan_ids = {id(c) for c, _t in fan}
+    gta_card = (getattr(app, "fan_lib_cards", {}) or {}).get(GTA6_ID)     # GTA VI is stored with the fan library but belongs under STEAM GAMES
+    gta_id = id(gta_card) if gta_card is not None else None
     for card, title in list(app.cards) + nondev + fan:
         if id(card) in seen or not _sv_card_alive(card):
             continue
@@ -67585,6 +68286,8 @@ def _sv_groups(app):
             g = "FAVORITES"
         elif id(card) in ncz_ids or id(card) in nondev_ids:
             g = "NCZ GAMES"
+        elif gta_id is not None and id(card) == gta_id:
+            g = "STEAM GAMES"
         elif id(card) in fan_ids:
             g = "FAN GAMES"
         elif id(card) in steam_ids:
@@ -67600,7 +68303,15 @@ def _sv_groups(app):
             continue
         if az:
             items = sorted(items, key=lambda it: it[1].casefold())
-        out.append((n, _lb_sorted(items)))
+        items = _lb_sorted(items)
+        if n == "STEAM GAMES" and gta_id is not None and not az:
+            # custom order: GTA VI comes from the fan list (so it lands last), slot it in alphabetically instead
+            gi = next((i for i, it in enumerate(items) if id(it[0]) == gta_id), None)
+            if gi is not None:
+                gta_it = items.pop(gi)
+                pos = next((i for i, it in enumerate(items) if it[1].casefold() > gta_it[1].casefold()), len(items))
+                items.insert(pos, gta_it)
+        out.append((n, items))
     return out
 
 
@@ -69162,7 +69873,7 @@ class _IgSheen(_IgW):
         hi.setColorAt(1.0, _IgCol(255, 255, 255, 0))
         p.fillRect(_IgRF(r.left(), r.top(), r.width(), hh), _IgBrush(hi))
         p.restore()
-        if not selected:                                 # hairline edge: a little brighter at the top-left / bottom-right corners
+        if not selected and not _igp_edge(p, w, h, light, k, selected, self.r):     # hairline edge (pre-rendered 9-slice, else live)
             g = _IgCG(r.center(), 135.0)
             for pos, v in ((0.0, 70), (0.12, 30), (0.3, 14), (0.5, 40), (0.7, 14), (0.88, 30), (1.0, 70)):
                 g.setColorAt(pos, _IgCol(255, 255, 255, a(v)))
@@ -69275,6 +69986,112 @@ class _IgPillCtl(QObject):
         a.start()
 
 
+# ── pre-rendered glass (made by prerender_glass.py + pack_glass.py): assets/glass_aurora.png + assets/glass_ui.png ──
+# glass_aurora.png: 120 frames (a seamless 120 s loop, 1 frame/s) x 3 blob masks, 128x80 each, 12 columns, blob 0/1/2 stacked
+# glass_ui.png: the glass edge hairline as 320x320 (@2x) 9-slice images: [dark r16, dark r18, light r16, light r18]
+# Missing / broken files (or env NCZ_IOS_GLASS_PRE=0) -> everything below returns None / False and the live painting runs as before.
+_IGP = {"tried": False, "aur": None, "ui": None, "fr": {}, "key": None}
+_IGP_N, _IGP_FW, _IGP_FH, _IGP_COLS = 120, 128, 80, 12
+
+
+def _igp_load():
+    if _IGP["tried"]:
+        return _IGP["aur"] is not None
+    _IGP["tried"] = True
+    if os.environ.get("NCZ_IOS_GLASS_PRE", "1") in ("0", "false", "off"):
+        return False
+    try:
+        a = _IgImg(asset_path("glass_aurora.png"))
+        u = _IgImg(asset_path("glass_ui.png"))
+        rows = _IGP_N // _IGP_COLS
+        if a.isNull() or a.width() != _IGP_COLS * _IGP_FW or a.height() != 3 * rows * _IGP_FH:
+            return False
+        _IGP["aur"] = a.convertToFormat(_IgImg.Format.Format_Grayscale8)
+        if not u.isNull() and u.width() == 1280 and u.height() == 320:
+            _IGP["ui"] = u.convertToFormat(_IgImg.Format.Format_ARGB32_Premultiplied)
+        return True
+    except Exception:
+        _log_exc("ios_glass prerender load")
+        _IGP["aur"] = None
+        return False
+
+
+def _igp_frame(i, light, acc):
+    """Frame i of the aurora, tinted with the accent (cached until the accent / light-dark changes)."""
+    hue = acc.hsvHueF()
+    base_h = hue if hue >= 0 else 0.7
+    sat = min(1.0, acc.hsvSaturationF() * 1.1)
+    key = (light, round(base_h, 3), round(sat, 3))
+    if _IGP["key"] != key:
+        _IGP["key"], _IGP["fr"] = key, {}
+    img = _IGP["fr"].get(i)
+    if img is not None:
+        return img
+    rows = _IGP_N // _IGP_COLS
+    img = _IgImg(_IGP_FW, _IGP_FH, _IgImg.Format.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    p = _IgPainter(img)
+    for b, (hs, a) in enumerate(((0.0, 0.34), (0.09, 0.26), (-0.08, 0.24))):
+        c = _IgCol.fromHsvF((base_h + hs) % 1.0, sat, 1.0 if not light else 0.95)
+        mask = _IGP["aur"].copy((i % _IGP_COLS) * _IGP_FW, (b * rows + i // _IGP_COLS) * _IGP_FH, _IGP_FW, _IGP_FH)
+        layer = _IgImg(_IGP_FW, _IGP_FH, _IgImg.Format.Format_ARGB32)
+        layer.fill(_IgCol(c.red(), c.green(), c.blue(), 255))
+        layer.setAlphaChannel(mask)
+        p.setOpacity(a * (0.6 if light else 0.30) * (0.35 + 0.65 * sat))    # same alpha as the live gradient
+        p.drawImage(0, 0, layer)
+    p.end()
+    if len(_IGP["fr"]) > _IGP_N:
+        _IGP["fr"].clear()
+    _IGP["fr"][i] = img
+    return img
+
+
+def _igp_aurora(t, light, acc):
+    """The aurora at time t (seconds) as a small image: two neighbouring pre-rendered frames cross-faded. None = use live painting."""
+    if not _igp_load():
+        return None
+    try:
+        t = float(t) % float(_IGP_N)
+        i = int(t)
+        f = t - i
+        a, b = _igp_frame(i, light, acc), _igp_frame((i + 1) % _IGP_N, light, acc)
+        out = _IgImg(_IGP_FW, _IGP_FH, _IgImg.Format.Format_ARGB32_Premultiplied)
+        out.fill(0)
+        p = _IgPainter(out)
+        p.setOpacity(1.0 - f)
+        p.drawImage(0, 0, a)
+        if f > 0.004:
+            p.setCompositionMode(_IgPainter.CompositionMode.CompositionMode_Plus)     # exact linear blend of premultiplied frames
+            p.setOpacity(f)
+            p.drawImage(0, 0, b)
+        p.end()
+        return out
+    except Exception:
+        _log_exc("ios_glass prerender aurora")
+        _IGP["aur"] = None                                  # give up on the pre-rendered path for this session
+        return None
+
+
+def _igp_edge(p, w, h, light, k, selected, radius):
+    """The glass hairline from the 9-slice image. True when drawn (False = the caller draws it live)."""
+    if selected or abs(k - 1.0) > 0.01 or radius not in (16, 18) or w < 100 or h < 100 or not _igp_load() or _IGP["ui"] is None:
+        return False
+    try:
+        s, d = 320, 48.0
+        x0 = (int(bool(light)) * 2 + (0 if radius == 16 else 1)) * s
+        xs, ys = (0, 96, s - 96, s), (0, 96, s - 96, s)
+        xd, yd = (0.0, d, w - d, float(w)), (0.0, d, h - d, float(h))
+        p.setRenderHint(_IgPainter.RenderHint.SmoothPixmapTransform)
+        for r in range(3):
+            for c in range(3):
+                p.drawImage(_IgRF(xd[c], yd[r], xd[c + 1] - xd[c], yd[r + 1] - yd[r]), _IGP["ui"],
+                            _IgRF(x0 + xs[c], ys[r], xs[c + 1] - xs[c], ys[r + 1] - ys[r]))
+        return True
+    except Exception:
+        _log_exc("ios_glass prerender edge")
+        return False
+
+
 class _IgAurora(_IgW):
     """Slow drifting blurry colour glow behind everything (drawn small, scaled up = free blur)."""
     def __init__(self, parent):
@@ -69286,7 +70103,7 @@ class _IgAurora(_IgW):
         self.tm = QTimer(self)
         self.tm.timeout.connect(self.tick)
         if _IG["motion"]:
-            self.tm.start(45)
+            self.tm.start(66)
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.lower()
@@ -69302,7 +70119,7 @@ class _IgAurora(_IgW):
         w = self.window()
         if w is None or not w.isVisible() or w.isMinimized() or not w.isActiveWindow():
             return
-        self.t0 += 0.045
+        self.t0 += 0.066
         self.update()
         self._n = getattr(self, "_n", 0) + 1
         if self._n % 3 == 0:                          # the glass frames re-sample the moving aurora
@@ -69315,6 +70132,14 @@ class _IgAurora(_IgW):
 
     def paintEvent(self, _e):
         light, acc, _t = _ig_pal()
+        pre = _igp_aurora(self.t0, light, acc)          # pre-rendered frames (None -> the live painting below)
+        if pre is not None:
+            self.img = pre
+            q = _IgPainter(self)
+            q.setRenderHint(_IgPainter.RenderHint.SmoothPixmapTransform)
+            q.drawImage(self.rect(), self.img)
+            q.end()
+            return
         W, H = max(2, self.width() // 6), max(2, self.height() // 6)
         if self.img is None or self.img.width() != W or self.img.height() != H:
             self.img = _IgImg(W, H, _IgImg.Format.Format_ARGB32_Premultiplied)
