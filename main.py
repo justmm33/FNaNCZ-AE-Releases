@@ -18,6 +18,20 @@ import urllib.error
 import ssl
 _NCZ_SSL_CTX = ssl.create_default_context()     # one shared context: a fresh one per urlopen re-reads the cert store (~13 ms each)
 
+# -- NCZ file hosting: replaces the old GitHub releases repo, same folder layout --
+NCZ_HOST = "https://ncz-file-hosting.pages.dev"
+NCZ_REPO = "ncz-launcher"
+NCZ_KEY = "cc804fcd25417d26275c2ba7"
+
+def _ncz_host(path):
+    """Download URL of a file in the hosted launcher repo, e.g. _ncz_host("build/NCZ Games Launcher.exe")."""
+    return f"{NCZ_HOST}/api/d/{NCZ_REPO}/{urllib.parse.quote(path.lstrip('/'), safe='/')}?k={NCZ_KEY}"
+
+def _ncz_bust(url):
+    """url with a cache-busting t=<time> added (? or & depending on the url)."""
+    return f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+
+
 # ── jsDelivr mirror for GitHub files. jsDelivr is a free CDN that serves public GitHub repos (no setup), and is often much faster than
 # raw.githubusercontent.com. Files it can't serve (over 50 MB, missing) fall back to GitHub automatically.
 # jsDelivr caches branch URLs for up to ~12 h, so main.py / companion files only use it when this is True (and you purge after a push:
@@ -571,14 +585,14 @@ GAME_INFO = {
         name=AE_GAME_NAME,
         exe="FNaNCZ AE.exe",
         zip_prefixes=("five nights at ncz ae", "fnancz_ae", "fnanczae"),
-        version_url="https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/version.txt",
+        version_url=_ncz_host("version.txt"),
         linux_cmd="rm -f fnancz-installer2.sh >/dev/null 2>&1 && wget https://raw.githubusercontent.com/AmrThePigeon/FNANCZAE1_Script_Builder/refs/heads/main/fnancz-installer2.sh --no-cache && chmod +x fnancz-installer2.sh && ./fnancz-installer2.sh",
     ),
     "ncz2": dict(
         name=NCZ2_GAME_NAME,
         exe="FNANCZ 2.exe",
         zip_prefixes=("five nights at ncz 2", "fnancz_2", "fnancz 2", "fnancz2"),
-        version_url="https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/version-2.txt",
+        version_url=_ncz_host("version-2.txt"),
         linux_cmd="rm -f fnancz2-installer1.sh >/dev/null 2>&1 && wget https://raw.githubusercontent.com/AmrThePigeon/FNANCZAE2_Script_Builder/refs/heads/main/fnancz2-installer1.sh --no-cache && chmod +x fnancz2-installer1.sh && ./fnancz2-installer1.sh",
     ),
 }
@@ -10679,10 +10693,10 @@ def set_windows_taskbar_identity(window):
     except Exception:    # expected: optional module may be missing
         pass
 
-UPDATE_URL_WIN = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/NCZ%20Games%20Launcher.exe"
-UPDATE_URL_DEB = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher_7.0_all.deb"
-UPDATE_URL_ARCH = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/build/ncz-games-launcher-7.0-1-any.pkg.tar.zst"
-UPDATE_URL_FALLBACK = "https://github.com/justmm33/FNaNCZ-AE-Releases/tree/main/build"
+UPDATE_URL_WIN = _ncz_host("build/NCZ Games Launcher.exe")
+UPDATE_URL_DEB = _ncz_host("build/ncz-games-launcher_7.0_all.deb")
+UPDATE_URL_ARCH = _ncz_host("build/ncz-games-launcher-7.0-1-any.pkg.tar.zst")
+UPDATE_URL_FALLBACK = NCZ_HOST
 
 
 def _launcher_update_url():
@@ -19314,8 +19328,8 @@ class _StopButtonFilter(QObject):
 
 
 # ── self-update at launch ──
-SELF_UPDATE_STABLE_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/main.py"
-SELF_UPDATE_NIGHTLY_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/nightly/main.py"
+SELF_UPDATE_STABLE_URL = _ncz_host("main.py")
+SELF_UPDATE_NIGHTLY_URL = _ncz_host("nightly/main.py")
 NIGHTLY_UIDS = {"XcqSn5Zvhsf1npoNl3FNG1bKpU63", "LtVp5drXTcfedfGmWGMhHSVzGiU2"}
 
 def self_update_check():
@@ -19327,7 +19341,7 @@ def self_update_check():
     path = os.path.abspath(__file__)
     acct = load_account()
     base = SELF_UPDATE_NIGHTLY_URL if (acct and acct.get("uid") in NIGHTLY_UIDS) else SELF_UPDATE_STABLE_URL
-    remote = _ncz_fetch_bytes(f"{base}?t={int(time.time())}", timeout=15,
+    remote = _ncz_fetch_bytes(_ncz_bust(base), timeout=15,
                               headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"},
                               mirror="first" if NCZ_UPDATES_VIA_JSDELIVR else None)
     if len(remote) < 2000:
@@ -19375,7 +19389,7 @@ def companion_update_check():
     frozen = getattr(sys, "frozen", False)
     acct = load_account()
     nightly = bool(acct and acct.get("uid") in NIGHTLY_UIDS)
-    base = (SELF_UPDATE_NIGHTLY_URL if nightly else SELF_UPDATE_STABLE_URL).rsplit("/", 1)[0] + "/"
+    base_dir = "nightly/" if nightly else ""      # companion files live next to main.py of the same channel
     norm = lambda b: b.replace(b"\r\n", b"\n").strip()
     changed = False
     # The list in THIS (possibly older) running code may lack files that the main.py we just downloaded knows about.
@@ -19393,7 +19407,7 @@ def companion_update_check():
         try:
             if (is_py and frozen) or (name.endswith(".dll") and not sys.platform.startswith("win")):
                 continue
-            remote = _ncz_fetch_bytes(f"{base}{name}?t={int(time.time())}", timeout=30,
+            remote = _ncz_fetch_bytes(_ncz_bust(_ncz_host(base_dir + name)), timeout=30,
                                       headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"},
                                       mirror="first" if NCZ_UPDATES_VIA_JSDELIVR else None)
             path = local_fn()
@@ -20026,7 +20040,7 @@ QTextEdit#GmodLog {{ background: {t['panel']}; color: {t['text']}; border: 1px s
 
 
 # ── Garry's Mod: "Apply Fix" menu item ──
-GMOD_FIX_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gm-fix.py"
+GMOD_FIX_URL = _ncz_host("gm-fix.py")
 GMOD_FIX_NAME = "gm-fix.py"
 
 def _is_gmod_card(title, appid=None):
@@ -20096,7 +20110,7 @@ def _apply_gmod_fix(app, existing=False):
             return
     answer = QMessageBox.question(
         app, "Apply Fix",
-        f"This downloads {GMOD_FIX_NAME} from GitHub and runs it inside:\n\n{root}\n\nContinue?",
+        f"This downloads {GMOD_FIX_NAME} from NCZ file hosting and runs it inside:\n\n{root}\n\nContinue?",
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
     if answer != QMessageBox.StandardButton.Yes:
         return
@@ -24450,7 +24464,7 @@ class FanDetailPage(StoreDetailPage):
             _FanShotViewer(self._shot_urls, min(index, len(self._shot_urls) - 1), self.window()).exec()
 
 # ── Scrape Games (downloads gamejolt_scraper.py and rebuilds fan_games.csv) ──
-GAMEJOLT_SCRAPER_URL = "https://github.com/justmm33/FNaNCZ-AE-Releases/raw/refs/heads/main/gamejolt_scraper.py"
+GAMEJOLT_SCRAPER_URL = _ncz_host("gamejolt_scraper.py")
 
 def _scraper_python():
     """A python that can run the scraper. Frozen builds have no python of their own, so look on the system."""
@@ -33913,18 +33927,15 @@ _OMAR_V4_EXTRA = ""      # Classic layout: the plain Classic stylesheet with thi
 
 _ACCOUNT_THEMES["mm33"].update(label="MM33 (custom)", theme=_MM33_THEME, extra=_MM33_EXTRA,
                                icon="icon_mm33.png",          # teal and gold launcher icon (assets/, downloaded if missing)
-                               icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_mm33.png",
-                                          "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_mm33.png?raw=true"])
+                               icon_urls=[_ncz_host("assets/icon_mm33.png")])
 
 _ACCOUNT_THEMES["omar_v4"].update(label="Omar V4", theme=_OMAR_V4_THEME, extra=_OMAR_V4_EXTRA,
                                   icon="icon-v4.png",            # assets/icon-v4.png (downloaded if missing; the normal icon is used if it can't be found)
-                                  icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon-v4.png",
-                                             "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon-v4.png?raw=true"])
+                                  icon_urls=[_ncz_host("assets/icon-v4.png")])
 
 _ACCOUNT_THEMES["kablooey"].update(label="Kablooey (custom)", theme=_CUSTOM_THEME, extra=_CUSTOM_EXTRA,
                                    icon="icon_kablooey.png",      # recoloured launcher icon (assets/, downloaded if missing)
-                                   icon_urls=["https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/main/assets/icon_kablooey.png",
-                                              "https://github.com/justmm33/FNaNCZ-AE-Releases/blob/main/assets/icon_kablooey.png?raw=true"])
+                                   icon_urls=[_ncz_host("assets/icon_kablooey.png")])
 
 # ── Legacy theme (side list, mint green) ──
 _LEGACY_MINT = "#12e87c"
@@ -62904,7 +62915,7 @@ def _as_save_art(folder, stem, data):
 
 # NCZ games (Five Nights at NCZ AE / 2, NCZFront): the logo and background are downloaded from the releases repository
 # first (<prefix>-logo.png, <prefix>-background.png); the 600x900 portrait cover is the one in assets/.
-_AS_NCZ_ART_BASE = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/"
+_AS_NCZ_ART_BASE = ""      # folder inside the hosted repo (repo root, same as the old GitHub layout)
 _AS_NCZ_ART = {"ae": ("fnanczae", "fnanczaecover.png"),
                "ncz2": ("fnancz2", "fnancz2cover.png"),
                "nczfront": ("nczfront", "nczfront-cover.png"),
@@ -62929,7 +62940,7 @@ def _as_fetch_ncz_art(key, cover):
         if _AS_NCZ_ICON.get(key):
             pieces.append(("icon", _AS_NCZ_ICON[key]))
     for name, fname in pieces:
-        b = _as_img(f"{_AS_NCZ_ART_BASE}{fname}")
+        b = _as_img(_ncz_host(_AS_NCZ_ART_BASE + fname))
         if b:
             art[name], src[name] = b, "NCZ repository"
         else:
@@ -66986,13 +66997,13 @@ _remote_cards = _nd_remote_cards
 
 
 # ── GTA VI tab (own tab next to Fangames: cover, trailers, details, Add to Library, gated Download) ──
-# The Download button only lights up while gtavi.txt (justmm33/FNaNCZ-AE-Releases, main branch) is NOT empty. The file's
+# The Download button only lights up while gtavi.txt (NCZ file hosting, ncz-launcher repo) is NOT empty. The file's
 # contents are the game's download link. The game goes into the library through the fan-game library (same cards,
 # Launch / Uninstall / shortcuts / cloud library as every other game) and downloads + installs through the same
 # download queue and archive installer as Game Jolt / itch.io games.
 GTA6_ID = 900_000_006                       # below ITCH_ID_BASE, so it never counts as an itch.io / GameBanana game
 GTA6_TITLE = "Grand Theft Auto VI"
-GTA6_LINK_URL = "https://raw.githubusercontent.com/justmm33/FNaNCZ-AE-Releases/refs/heads/main/gtavi.txt"
+GTA6_LINK_URL = _ncz_host("gtavi.txt")
 GTA6_TRAILERS = (("Trailer 1", "QdBZY2fkU-0"), ("Trailer 2", "VQRLujxTm3c"))      # official Rockstar uploads on YouTube
 GTA6_SITE = "https://www.rockstargames.com/VI"
 GTA6_WIKI_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/Grand_Theft_Auto_VI"
@@ -67015,8 +67026,8 @@ def _gta_parse_link(text):
 
 
 def _gta_read_link():
-    """The download link in gtavi.txt, '' while the file is empty / missing. Raises when GitHub can't be reached."""
-    url = f"{GTA6_LINK_URL}?nocache={int(time.time())}"
+    """The download link in gtavi.txt, '' while the file is empty / missing. Raises when NCZ file hosting can't be reached."""
+    url = _ncz_bust(GTA6_LINK_URL)
     req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher", "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(req, timeout=15, context=_NCZ_SSL_CTX) as resp:

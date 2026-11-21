@@ -13,7 +13,7 @@ Flow
   * Discord check -> pypresence reads which Discord user is logged in locally and compares the id with
                 BANNED_DISCORD_IDS. Banned: message, webhook alert, closes after 3 s, no sign-in on later starts.
   * Signed in -> downloads main.py, overlay.py, controller_input.py, controller_bridge.py, ncz_gm.py and assets/ from
-                GitHub into this folder ("Downloading Launcher..."), then starts main.py.
+                NCZ file hosting into this folder ("Downloading Launcher..."), then starts main.py.
 
 The session is saved in the same account.json the launcher itself uses, so main.py opens already signed in.
 
@@ -73,16 +73,16 @@ VERSION_TEXT = "v13.4.0"
 HANDLE_TEXT = "@jsmm33"
 
 # What gets downloaded after signing in
-GITHUB_REPO = "justmm33/FNaNCZ-AE-Releases"
-GITHUB_BRANCH = "main"
+NCZ_HOST = "https://ncz-file-hosting.pages.dev"       # NCZ file hosting (replaces the old GitHub repo, same folder layout)
+NCZ_REPO = "ncz-launcher"
+NCZ_KEY = "cc804fcd25417d26275c2ba7"
 LAUNCHER_FILES = ("main.py", "overlay.py", "controller_input.py", "controller_bridge.py","fan_games.csv","gamejolt_scraper.py")
 # Also downloaded (the `ncz-gm` command line), but the sign-in never fails if the repo doesn't have it. When it is
 # missing locally it is fetched on every start, even with Automatic Updates off.
 OPTIONAL_FILES = ("ncz_gm.py",)
 ASSETS_PREFIX = "assets/"
 KEEP_LOCAL_ASSETS = ("assets/overlay_hook.dll",)     # never overwritten when it already exists (locally built)
-TREE_URL = "https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
-RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+MANIFEST_NAME = ".ncz_manifest.json"      # path -> upload stamp of the copy on this PC (the host has no git sha)
 INSTALLED_MARKER = ".ncz_launcher_installed"
 # Files that belong to the optional "NCZ Big Picture Utilities" download. When one of them is about to be downloaded
 # (and is not on the PC yet), the user is asked first.
@@ -1069,44 +1069,118 @@ def send_ban_webhook(user_id):
         pass
 
 
-# ------------------------------------------------------------------------------------------------ GitHub download
-def _gh_open(url, timeout=30):
+# ------------------------------------------------------------------------------------------------ NCZ file hosting download
+def _host_url(path):
+    """Download link of a file in the hosted repo."""
+    return f"{NCZ_HOST}/api/d/{NCZ_REPO}/{urllib.parse.quote(path.lstrip('/'), safe='/')}?k={NCZ_KEY}"
+
+
+def _host_open(url, timeout=30):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher",
-                                                   "Accept": "application/vnd.github+json"})
+        req = urllib.request.Request(url, headers={"User-Agent": "NCZ-Games-Launcher"})
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
-        if e.code == 403 or e.code == 429:
-            raise CloudError("GitHub is limiting this connection right now. Try again in a few minutes.")
+        if e.code == 429:
+            raise CloudError("NCZ file hosting is limiting this connection right now. Try again in a few minutes.")
+        if e.code in (401, 403):
+            raise CloudError("NCZ file hosting refused the access key.")
         if e.code == 404:
-            raise CloudError(f"Not found on GitHub ({GITHUB_REPO}, branch {GITHUB_BRANCH}).")
-        raise CloudError(f"GitHub error: HTTP {e.code}")
+            raise CloudError(f"Not found on NCZ file hosting ({NCZ_REPO}).")
+        raise CloudError(f"NCZ file hosting error: HTTP {e.code}")
     except (urllib.error.URLError, OSError):
-        raise CloudError("Couldn't reach GitHub. Check your internet connection.")
+        raise CloudError("Couldn't reach NCZ file hosting. Check your internet connection.")
+
+
+def _host_list_dir(folder="", timeout=30):
+    """One folder of the hosted repo: {"folder", "folders": [...], "files": [{name, path, size, uploaded, url}]}."""
+    folder = folder.strip("/")
+    base = f"{NCZ_HOST}/api/f/{NCZ_REPO}"
+    urls = [f"{base}?k={NCZ_KEY}"]
+    if folder:
+        q = urllib.parse.quote(folder, safe="/")
+        urls = [f"{base}/{q}?k={NCZ_KEY}", f"{base}?folder={urllib.parse.quote(folder)}&k={NCZ_KEY}"]
+    last = None
+    for u in urls:
+        try:
+            with _host_open(u, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            # a server that ignores the folder and answers with the root listing must not be taken for this folder
+            if isinstance(data, dict) and isinstance(data.get("files"), list) and \
+                    str(data.get("folder", "")).strip("/") == folder:
+                return data
+            last = CloudError("NCZ file hosting sent an unexpected answer.")
+        except CloudError as e:
+            last = e
+        except (ValueError, OSError):
+            last = CloudError("NCZ file hosting sent an unreadable answer.")
+    raise last or CloudError("Couldn't read the file list from NCZ file hosting.")
+
+
+def host_tree(timeout=30, descend=None):
+    """[(path, size, uploaded)] for the files of the hosted repo, walking sub folders. descend(folder) says which sub
+    folders to open (default: only assets/), so the update check doesn't list build/, nightly/ ... every time."""
+    if descend is None:
+        descend = lambda f: f == ASSETS_PREFIX.strip("/") or f.startswith(ASSETS_PREFIX)
+    out, seen, queue = [], set(), [""]
+    while queue:
+        folder = queue.pop(0)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        data = _host_list_dir(folder, timeout=timeout)
+        for f in data.get("files", []):
+            path = (f.get("path") or (folder + "/" + str(f.get("name", ""))).strip("/")).strip("/")
+            if path:
+                out.append((path, int(f.get("size", 0) or 0), str(f.get("uploaded", "") or "")))
+        for sub in data.get("folders", []):
+            sub = str(sub).strip("/")
+            full = sub if (folder and sub.startswith(folder + "/")) else (folder + "/" + sub).strip("/")
+            if descend(full):
+                queue.append(full)
+    return out
 
 
 def list_launcher_files():
-    """[(path, size, git_sha)] for the launcher scripts and everything inside assets/."""
-    with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH)) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    blobs = {e["path"]: e for e in data.get("tree", []) if e.get("type") == "blob"}
+    """[(path, size, stamp)] for the launcher scripts and everything inside assets/."""
+    blobs = {p: (s, u) for p, s, u in host_tree()}
     missing = [f for f in LAUNCHER_FILES if f not in blobs]
     if missing:
-        raise CloudError("Not found in the GitHub repo: " + ", ".join(missing))
-    return [(p, int(e.get("size", 0)), e.get("sha", "")) for p, e in sorted(blobs.items())
+        raise CloudError("Not found on NCZ file hosting: " + ", ".join(missing))
+    return [(p, blobs[p][0], blobs[p][1]) for p in sorted(blobs)
             if p in LAUNCHER_FILES or p in OPTIONAL_FILES or p.startswith(ASSETS_PREFIX)]
 
 
-def git_blob_sha(path):
-    """The sha git uses for a file, so unchanged files can be skipped exactly."""
+def _manifest_file():
+    return os.path.join(INSTALL_DIR, MANIFEST_NAME)
+
+
+def load_manifest():
     try:
-        h = hashlib.sha1(b"blob %d\0" % os.path.getsize(path))
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
+        with open(_manifest_file(), encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_manifest(manifest):
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with open(_manifest_file(), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
     except OSError:
-        return None
+        pass
+
+
+def is_current(path, dest, size, stamp, manifest):
+    """True when the local copy is the one on the host: same size and the same upload stamp as when it was downloaded
+    (without a stamp only the size can be compared)."""
+    try:
+        if os.path.getsize(dest) != size:
+            return False
+    except OSError:
+        return False
+    return (not stamp) or manifest.get(path) == stamp
 
 
 def _is_bigpicture(path):
@@ -1142,16 +1216,12 @@ def auto_update_on():
 
 
 def list_asset_updates(timeout=8, include_scripts=False):
-    """Silent check before launching: [(path, size, git_sha)] for files in the repo's assets/ folder that are new or
-    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, GitHub rate limit, ...) returns [] so the launcher still starts."""
+    """Silent check before launching: [(path, size, stamp)] for files in the hosted assets/ folder that are new or
+    different from the local copy. include_scripts=True also checks main.py and the other launcher scripts. Any problem (offline, host down, ...) returns [] so the launcher still starts."""
     try:
-        with _gh_open(TREE_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH), timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        manifest = load_manifest()
         out = []
-        for e in data.get("tree", []):
-            path = e.get("path", "")
-            if e.get("type") != "blob":
-                continue
+        for path, size, stamp in host_tree(timeout=timeout):
             dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
             missing_optional = path in OPTIONAL_FILES and not os.path.exists(dest)
             if not (path.startswith(ASSETS_PREFIX) or missing_optional
@@ -1159,16 +1229,12 @@ def list_asset_updates(timeout=8, include_scripts=False):
                 continue
             if not dest.startswith(INSTALL_DIR + os.sep):
                 continue
-            size, sha = int(e.get("size", 0)), e.get("sha", "")
             if os.path.exists(dest):
-                if path in KEEP_LOCAL_ASSETS or not sha:
-                    continue                                   # locally built / can't compare: leave it alone
-                try:
-                    if os.path.getsize(dest) == size and git_blob_sha(dest) == sha:
-                        continue                               # identical: nothing to download
-                except OSError:
-                    pass
-            out.append((path, size, sha))
+                if path in KEEP_LOCAL_ASSETS:
+                    continue                                   # locally built: leave it alone
+                if is_current(path, dest, size, stamp, manifest):
+                    continue                                   # identical: nothing to download
+            out.append((path, size, stamp))
         return sorted(out)
     except Exception:
         return []
@@ -1181,7 +1247,7 @@ def _download_to(url, dest, on_bytes, is_cancelled):
     for attempt in range(3):
         written = 0
         try:
-            with _gh_open(url) as resp, open(tmp, "wb") as f:
+            with _host_open(url) as resp, open(tmp, "wb") as f:
                 while True:
                     if is_cancelled():
                         raise CloudError("Cancelled.")
@@ -1211,7 +1277,7 @@ def _download_to(url, dest, on_bytes, is_cancelled):
 def install_launcher(progress, is_cancelled, entries=None, full=None):
     """Downloads the launcher into INSTALL_DIR. progress(fraction, text). Files that are already identical are
     skipped; replaced scripts keep a one-time .bak copy of what was there before.
-    entries: a ready-made [(path, size, sha)] list (an assets update) -> only those files are downloaded."""
+    entries: a ready-made [(path, size, stamp)] list (an assets update) -> only those files are downloaded."""
     if full is None:
         full = entries is None
     if entries is None:
@@ -1233,7 +1299,8 @@ def install_launcher(progress, is_cancelled, entries=None, full=None):
         state["done"] += n
         emit()
 
-    for path, size, sha in entries:
+    manifest = load_manifest()
+    for path, size, stamp in entries:
         if is_cancelled():
             raise CloudError("Cancelled.")
         dest = os.path.normpath(os.path.join(INSTALL_DIR, *path.split("/")))
@@ -1241,7 +1308,7 @@ def install_launcher(progress, is_cancelled, entries=None, full=None):
             continue
         state["name"] = path
         exists = os.path.exists(dest)
-        if exists and (path in KEEP_LOCAL_ASSETS or (sha and git_blob_sha(dest) == sha)):
+        if exists and (path in KEEP_LOCAL_ASSETS or is_current(path, dest, size, stamp, manifest)):
             bump(size)
             continue
         if exists and (path in LAUNCHER_FILES or path in OPTIONAL_FILES) and not os.path.exists(dest + ".bak"):
@@ -1249,8 +1316,10 @@ def install_launcher(progress, is_cancelled, entries=None, full=None):
                 shutil.copy2(dest, dest + ".bak")
             except OSError:
                 pass
-        _download_to(RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=urllib.parse.quote(path)),
-                     dest, bump, is_cancelled)
+        _download_to(_host_url(path), dest, bump, is_cancelled)
+        if stamp:
+            manifest[path] = stamp
+            save_manifest(manifest)
     emit(force=True)
     if full:
         with open(os.path.join(INSTALL_DIR, INSTALLED_MARKER), "w", encoding="utf-8") as f:
@@ -1548,7 +1617,7 @@ class FontWorker(QThread):
     def run(self):
         for i, name in enumerate(self.names):
             try:
-                url = RAW_URL.format(repo=GITHUB_REPO, branch=GITHUB_BRANCH, path=ASSETS_PREFIX + name)
+                url = _host_url(ASSETS_PREFIX + name)
                 _download_to(url, os.path.join(ASSETS_DIR, name), lambda n: None, lambda: False)
             except Exception:
                 pass                         # no network / not in the repo: the app falls back to a system font
@@ -1847,7 +1916,7 @@ _AR = {
     "Creating your account...": "جارٍ إنشاء حسابك...", "Checking...": "جارٍ التحقق...",
     "Enter the email address of your account.": "أدخل البريد الإلكتروني لحسابك.",
     "If an account exists for that email, a reset link is on its way.": "إذا كان هناك حساب بهذا البريد، فسيصلك رابط إعادة التعيين قريبًا.",
-    "Sending reset email...": "جارٍ إرسال رسالة إعادة التعيين...", "Connecting to GitHub...": "جارٍ الاتصال بـ GitHub...",
+    "Sending reset email...": "جارٍ إرسال رسالة إعادة التعيين...", "Connecting to NCZ file hosting...": "جارٍ الاتصال باستضافة ملفات NCZ...",
     "Download complete": "اكتمل التنزيل", "That invite code was already used.": "رمز الدعوة هذا مستخدم من قبل.",
     "That invite code isn't valid.": "رمز الدعوة غير صالح.",
     "An account with this email already exists. Try signing in instead.": "يوجد حساب بهذا البريد بالفعل. جرّب تسجيل الدخول.",
@@ -1862,7 +1931,7 @@ _AR = {
     "Sign-in timed out. Please try again.": "انتهت مهلة تسجيل الدخول. حاول مرة أخرى.",
     "Couldn't open your web browser.": "تعذّر فتح المتصفح.",
     "Open the Discord desktop app, then try again.": "افتح تطبيق Discord على الكمبيوتر ثم حاول مرة أخرى.",
-    "Couldn't reach GitHub. Check your internet connection.": "تعذّر الوصول إلى GitHub. تحقق من اتصالك بالإنترنت.",
+    "Couldn't reach NCZ file hosting. Check your internet connection.": "تعذّر الوصول إلى استضافة ملفات NCZ. تحقق من اتصالك بالإنترنت.",
     "Cancelled.": "تم الإلغاء.",
 }
 _AR_PATTERNS = (
@@ -2885,7 +2954,7 @@ class LoginWindow(QWidget):
         self._update_only = entries is not None            # an assets update (launcher already installed)
         self.set_status("")
         self.progress.value = self.progress.shown = 0.0
-        self.progress.text = "Connecting to GitHub..."
+        self.progress.text = "Connecting to NCZ file hosting..."
         self._go("downloading")
         if entries is None:
             # full install: get the file list first (off the GUI thread), so the Big Picture question can be asked
@@ -2928,7 +2997,7 @@ class LoginWindow(QWidget):
         if not entries and not full:
             self.launch_now()                               # an update that only had the declined files: nothing to do
             return
-        self.progress.text = "Connecting to GitHub..."
+        self.progress.text = "Connecting to NCZ file hosting..."
         self._dl = DownloadWorker(self, entries, full)
         self._dl.progress.connect(self._on_progress)
         self._dl.done.connect(self._on_downloaded)
